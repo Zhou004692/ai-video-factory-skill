@@ -1,31 +1,74 @@
-"""豆包 TTS / 火山 TTS client。
+"""豆包 TTS。
 
-火山引擎语音合成大模型 API:
-  https://www.volcengine.com/docs/6561
+默认走**火山方舟**(只需 ARK_API_KEY),OpenAI-compatible audio.speech 接口:
+  POST https://ark.cn-beijing.volces.com/api/v3/audio/speech
+
+前提:在方舟控制台开通"豆包·语音合成"系列模型(model ID 类似
+doubao-seed-tts 或 doubao-tts-pro,以控制台为准)。
+
+如果你想走旧版「语音技术」控制台(APPID+Access Token),设置:
+  VOLC_TTS_PROVIDER=legacy
+  VOLC_TTS_APPID=...
+  VOLC_TTS_TOKEN=...
 环境变量:
-  ARK_API_KEY  (复用)
-  VOLC_TTS_APPID
-  VOLC_TTS_TOKEN
-  VOLC_TTS_VOICE  音色,默认 zh_female_qingxin
+  ARK_API_KEY        方舟 API Key
+  ARK_TTS_MODEL      方舟里的 TTS 模型 ID,默认 doubao-seed-tts
+  VOLC_TTS_VOICE     音色 ID,以方舟 TTS 模型详情为准
 """
+import base64
 import os
 import uuid
 
 import httpx
 
-VOLC_TTS_URL = "https://openspeech.bytedance.com/api/v1/tts"
-DEFAULT_VOICE = os.getenv("VOLC_TTS_VOICE", "zh_female_qingxin")
+ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
+DEFAULT_VOICE = os.getenv("VOLC_TTS_VOICE", "zh_female_shuangkuaisisi_moon_bigtts")
+DEFAULT_MODEL = os.getenv("ARK_TTS_MODEL", "doubao-seed-tts")
 
 
 async def synth(text: str, voice: str | None = None,
-                speed: float = 1.0,
-                emotion: str = "neutral") -> bytes:
-    """合成,返回 mp3 字节。"""
+                speed: float = 1.0, emotion: str = "neutral") -> bytes:
+    provider = os.getenv("VOLC_TTS_PROVIDER", "ark").lower()
+    if provider == "legacy":
+        return await _synth_legacy(text, voice, speed, emotion)
+    return await _synth_ark(text, voice, speed)
+
+
+async def _synth_ark(text: str, voice: str | None, speed: float) -> bytes:
+    """方舟 audio.speech 路径(默认)。"""
+    key = os.environ.get("ARK_API_KEY")
+    if not key:
+        raise RuntimeError("ARK_API_KEY not set in .env")
+    payload = {
+        "model": DEFAULT_MODEL,
+        "input": text,
+        "voice": voice or DEFAULT_VOICE,
+        "speed": speed,
+        "response_format": "mp3",
+    }
+    async with httpx.AsyncClient(timeout=60) as cli:
+        r = await cli.post(
+            f"{ARK_BASE}/audio/speech",
+            json=payload,
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"ark tts {r.status_code}: {r.text[:500]}\n"
+                f"提示: 1) 在方舟控制台开通 TTS 模型并核对 ARK_TTS_MODEL; "
+                f"2) 核对 VOLC_TTS_VOICE 是否是该模型支持的音色 ID; "
+                f"3) 想用旧路径设置 VOLC_TTS_PROVIDER=legacy"
+            )
+        return r.content
+
+
+async def _synth_legacy(text: str, voice: str | None,
+                        speed: float, emotion: str) -> bytes:
+    """旧版「语音技术」路径(openspeech.bytedance.com)。"""
     appid = os.environ.get("VOLC_TTS_APPID")
     token = os.environ.get("VOLC_TTS_TOKEN")
     if not (appid and token):
-        raise RuntimeError("VOLC_TTS_APPID/TOKEN not set")
-
+        raise RuntimeError("VOLC_TTS_APPID/TOKEN required for legacy provider")
     payload = {
         "app": {"appid": appid, "token": "access_token", "cluster": "volcano_tts"},
         "user": {"uid": "ai-video-factory"},
@@ -43,15 +86,17 @@ async def synth(text: str, voice: str | None = None,
     }
     headers = {"Authorization": f"Bearer; {token}"}
     async with httpx.AsyncClient(timeout=60) as cli:
-        r = await cli.post(VOLC_TTS_URL, json=payload, headers=headers)
+        r = await cli.post(
+            "https://openspeech.bytedance.com/api/v1/tts",
+            json=payload, headers=headers
+        )
         r.raise_for_status()
         data = r.json()
         if data.get("code") != 3000:
-            raise RuntimeError(f"tts error: {data}")
-        import base64
+            raise RuntimeError(f"legacy tts error: {data}")
         return base64.b64decode(data["data"])
 
 
 def estimate_cost_cents(char_count: int) -> int:
-    """火山 TTS 大约 0.0001 元/字符,1000 字 ≈ 1 分。"""
+    """火山 TTS 约 0.0001 元/字符,1000 字 ≈ 1 分。"""
     return max(1, char_count // 1000)
