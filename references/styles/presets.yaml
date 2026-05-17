@@ -1,0 +1,44 @@
+A:
+  name: 日系电影感
+  prompt: 黄昏暖光,柯达 Portra 400 胶片调色,2.39:1 宽画幅,浅景深 f/1.8,日系电影感,轻微胶片颗粒,自然手持微抖动
+  tracks: [情感语录, 治愈, 生活技巧, 都市情感]
+  bgm_default:
+    style: ambient piano
+    mood: 温柔
+    bpm_range: [70, 90]
+
+B:
+  name: 赛博都市感
+  prompt: 夜晚霓虹混合冷蓝,赛博朋克色彩,湿润街面反光,体积光,景深虚化,8K 锐利,Sony A7S 数字电影质感
+  tracks: [职场段子, 科技, 财经, AI 趋势]
+  bgm_default:
+    style: synthwave
+    mood: 紧张
+    bpm_range: [100, 120]
+
+C:
+  name: 国风水墨感
+  prompt: 水墨晕染背景,留白构图,宣纸纹理,工笔与写意结合,淡彩,中景为主,意境优先于细节
+  tracks: [历史故事, 文化, 古诗词, 传统]
+  bgm_default:
+    style: 中国风古筝
+    mood: 悠远
+    bpm_range: [60, 80]
+
+D:
+  name: 极简平面感
+  prompt: 莫兰迪低饱和色,纯色背景,单点光源,几何构图,产品摄影质感,Pinterest 杂志风,微观特写多
+  tracks: [知识科普, 财经, AIGC 展示, 设计]
+  bgm_default:
+    style: lo-fi
+    mood: 平静
+    bpm_range: [80, 100]
+
+E:
+  name: 怀旧港片感
+  prompt: 钨丝灯暖橙调,90 年代港片质感,VHS 轻微噪点,2.35:1 宽屏,逆光剪影常用,雨夜霓虹
+  tracks: [故事, 段子, 复古, 怀旧]
+  bgm_default:
+    style: 港乐萨克斯
+    mood: 暧昧
+    bpm_range: [85, 105]
