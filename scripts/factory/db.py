@@ -80,11 +80,12 @@ def conn() -> sqlite3.Connection:
         ("characters_json", "TEXT"),     # [{id,name,gender,image_path,image_url}]
     ])
     _add_cols_if_missing(db, "shots", [
-        ("narrative_type", "TEXT"),      # dialogue | broll
-        ("speaker_id",     "TEXT"),
-        ("audio_path",     "TEXT"),
-        ("audio_url",      "TEXT"),
-        ("video_url",      "TEXT"),
+        ("narrative_type",    "TEXT"),   # dialogue | broll
+        ("speaker_id",        "TEXT"),
+        ("audio_path",        "TEXT"),
+        ("audio_url",         "TEXT"),
+        ("video_url",         "TEXT"),
+        ("anchor_character",  "TEXT"),   # broll 可选,用 character 图做 Seedance 首帧
     ])
     db.commit()
     return db

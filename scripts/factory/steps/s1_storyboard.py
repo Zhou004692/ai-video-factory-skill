@@ -54,6 +54,13 @@ def _validate(sb: dict) -> None:
                 raise ValueError(f"dialogue shot {shot['idx']} > 12s (OmniHuman limit)")
             if not (shot.get("voiceover") or "").strip():
                 raise ValueError(f"dialogue shot {shot['idx']} has empty voiceover")
+        else:  # broll
+            anchor = shot.get("anchor_character")
+            if anchor is not None and anchor not in char_ids:
+                raise ValueError(
+                    f"broll shot {shot['idx']} anchor_character must be one of "
+                    f"{char_ids} or null: {anchor}"
+                )
 
 
 async def run(job_id: str) -> None:
@@ -85,8 +92,8 @@ async def run(job_id: str) -> None:
     for shot in sb["shots"]:
         db.execute(
             "INSERT OR REPLACE INTO shots(job_id, idx, duration_sec, shot_type, "
-            "camera, prompt, voiceover, subtitle, narrative_type, speaker_id) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "camera, prompt, voiceover, subtitle, narrative_type, speaker_id, "
+            "anchor_character) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
                 job_id, shot["idx"],
                 float(shot.get("duration", 6)),
@@ -97,6 +104,7 @@ async def run(job_id: str) -> None:
                 shot.get("subtitle", shot.get("voiceover", "")),
                 shot["type"],
                 shot.get("speaker"),
+                shot.get("anchor_character"),
             )
         )
 

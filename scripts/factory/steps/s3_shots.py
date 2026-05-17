@@ -52,13 +52,14 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict,
 
 
 async def _gen_broll(job_id: str, shot: dict, style_prefix: str,
+                     anchor_image_path: str | None,
                      sem: asyncio.Semaphore) -> tuple[int, Exception | None]:
     async with sem:
         try:
             prompt_full = f"{style_prefix}\n\n{shot['prompt']}"
             video = await seedance.text_to_video(
                 prompt=prompt_full,
-                reference_image=None,   # broll 不带角色参考(角色只在 dialogue 出现)
+                reference_image=anchor_image_path,   # 有锚定角色时用其定妆照做首帧
                 duration=shot["duration_sec"],
                 resolution=os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
                 ratio="9:16",
@@ -120,7 +121,17 @@ async def run(job_id: str) -> None:
                 )
             tasks.append(_gen_dialogue(job_id, shot, char, sem))
         else:
-            tasks.append(_gen_broll(job_id, shot, style_prefix, sem))
+            anchor_id = shot.get("anchor_character")
+            anchor_path = None
+            if anchor_id:
+                anchor_char = chars.get(anchor_id)
+                if not anchor_char:
+                    raise RuntimeError(
+                        f"shot #{shot['idx']} anchor_character "
+                        f"{anchor_id} not in characters"
+                    )
+                anchor_path = anchor_char.get("image_path")
+            tasks.append(_gen_broll(job_id, shot, style_prefix, anchor_path, sem))
 
     results = await asyncio.gather(*tasks)
     failed = [(i, e) for i, e in results if e is not None]
