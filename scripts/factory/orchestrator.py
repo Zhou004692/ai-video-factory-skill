@@ -129,6 +129,6 @@ async def run_batch(csv_path: str):
         "SELECT state, COUNT(*) c, COALESCE(SUM(cost_cents),0) cost "
         "FROM jobs GROUP BY state"
     ).fetchall()
-    print("\n=== 汇总 ===")
+    print("\n=== Summary ===")
     for r in rows:
-        print(f"  {r['state']:15} {r['c']:4d}  ¥{r['cost']/100:.2f}")
+        print(f"  {r['state']:15} {r['c']:4d}  RMB {r['cost']/100:.2f}")

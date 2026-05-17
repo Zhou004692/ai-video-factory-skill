@@ -18,7 +18,8 @@ async def run(job_id: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "character.png"
 
-    img_bytes = await seedance.text_to_image(char_prompt, resolution="1024x1536")
+    # Seedream 5.0 要求 >= 3686400 像素;1440x2560 = 3.69M,9:16 适配竖屏
+    img_bytes = await seedance.text_to_image(char_prompt, resolution="1440x2560")
     out_path.write_bytes(img_bytes)
 
     db.execute(

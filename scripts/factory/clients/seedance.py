@@ -33,23 +33,39 @@ def _img_to_data_uri(path: str) -> str:
     return f"data:image/{ext};base64,{b64}"
 
 
+_RES_MAP = {  # 字面分辨率 → 方舟预设
+    "480x854": "480p",   "854x480": "480p",
+    "720x1280": "720p",  "1280x720": "720p",
+    "1080x1920": "1080p", "1920x1080": "1080p",
+}
+
+
 async def text_to_video(prompt: str,
                         reference_image: str | None = None,
                         duration: float = 10.0,
-                        resolution: str = "1080x1920",
+                        resolution: str = "1080p",
                         ratio: str = "9:16",
                         seed: int | None = None,
                         timeout: int = 600) -> bytes:
     """文+图生视频。返回 mp4 字节。
 
-    内部走"提交 → 轮询 → 下载"三步。
+    Seedance 用预设分辨率(480p/720p/1080p) + ratio(9:16/16:9/1:1)。
+    传字面 WxH 会被自动映射;不在映射表里的直接报错。
     """
+    if resolution in _RES_MAP:
+        resolution = _RES_MAP[resolution]
+    elif resolution not in {"480p", "720p", "1080p"}:
+        raise ValueError(
+            f"unsupported resolution {resolution!r}; "
+            f"use one of 480p/720p/1080p, or a WxH from {list(_RES_MAP)}"
+        )
     content = [{"type": "text", "text": prompt}]
     if reference_image:
+        # Seedance Pro 1.0 不支持 r2v(参考图),只支持 i2v(首帧)
         content.append({
             "type": "image_url",
             "image_url": {"url": _img_to_data_uri(reference_image)},
-            "role": "reference_image",
+            "role": "first_frame",
         })
 
     payload = {

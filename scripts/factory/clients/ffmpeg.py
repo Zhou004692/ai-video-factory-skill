@@ -54,10 +54,11 @@ async def compose_final(video: Path, voice: Path, bgm: Path, out: Path,
     voice_db / bgm_db 用 dB 控制相对音量。BGM 默认压低 14dB。
     """
     # 音轨混合:口播主、BGM 衬底,以视频时长为准
+    # 以视频时长为基准:口播自然结束后剩 BGM,BGM 循环填满到视频末尾
     filt = (
-        f"[1:a]volume={voice_db}dB[v];"
+        f"[1:a]volume={voice_db}dB,apad[v];"  # 口播末尾补静音,自然延续
         f"[2:a]volume={bgm_db}dB,aloop=loop=-1:size=2e9[b];"
-        f"[v][b]amix=inputs=2:duration=first:dropout_transition=0[a]"
+        f"[v][b]amix=inputs=2:duration=longest:dropout_transition=0[a]"
     )
     await _run([
         "-i", str(video),

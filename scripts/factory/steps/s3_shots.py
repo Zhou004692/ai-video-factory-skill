@@ -31,7 +31,8 @@ async def _gen_one(job_id: str, shot: dict, character_img: str, style_prefix: st
                 prompt=prompt_full,
                 reference_image=character_img,
                 duration=shot["duration_sec"],
-                resolution="1080x1920",
+                resolution=os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
+                ratio="9:16",
             )
             out_path = ASSETS_DIR / job_id / "shots" / f"{shot['idx']:02d}.mp4"
             out_path.parent.mkdir(parents=True, exist_ok=True)
