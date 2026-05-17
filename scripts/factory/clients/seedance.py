@@ -103,7 +103,10 @@ async def text_to_image(prompt: str, resolution: str = "1024x1536",
         payload["seed"] = seed
     async with httpx.AsyncClient(timeout=120, headers=_headers()) as cli:
         r = await cli.post(f"{ARK_BASE}/images/generations", json=payload)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"seedream {r.status_code}: {r.text[:600]} | model={model}"
+            )
         url = r.json()["data"][0]["url"]
         img = await cli.get(url)
         return img.content

@@ -1,11 +1,27 @@
-"""s1: Claude 生成分镜表 + 主角描述 + 风格底色 + BGM 提示。"""
+"""s1: LLM 生成分镜表 + 主角描述 + 风格底色 + BGM 提示。
+
+DEFAULT_LLM_PROVIDER:
+  claude  -> 走 Anthropic API(质量天花板,但要美元余额)
+  doubao  -> 走火山方舟豆包大模型(国内合规,价格低,默认)
+"""
 import json
+import os
 from pathlib import Path
 
 from .. import ASSETS_DIR
 from ..db import conn
 from ..prompts import storyboard_prompt
-from ..clients import claude
+
+
+def _llm():
+    name = os.getenv("DEFAULT_LLM_PROVIDER", "doubao").lower()
+    if name == "claude":
+        from ..clients import claude as mod
+        return mod
+    if name == "doubao":
+        from ..clients import doubao_llm as mod
+        return mod
+    raise ValueError(f"unknown LLM provider: {name}")
 
 
 async def run(job_id: str) -> None:
@@ -21,7 +37,8 @@ async def run(job_id: str) -> None:
         duration=60,
         target_audience=job["target_audience"] or "通用",
     )
-    sb, usage = claude.complete_json(prompt, max_tokens=6000)
+    llm = _llm()
+    sb, usage = llm.complete_json(prompt, max_tokens=6000)
 
     # 校验关键字段
     for key in ("character", "style_prefix", "hook", "shots", "bgm"):
@@ -52,7 +69,7 @@ async def run(job_id: str) -> None:
                 shot.get("subtitle", shot.get("voiceover", "")),
             )
         )
-    cost = claude.usage_to_cents(usage)
+    cost = llm.usage_to_cents(usage)
     db.execute(
         "UPDATE jobs SET storyboard=?, cost_cents=cost_cents+? WHERE job_id=?",
         (json.dumps(sb, ensure_ascii=False), cost, job_id)
