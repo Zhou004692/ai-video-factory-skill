@@ -18,8 +18,15 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict,
     async with sem:
         try:
             res = int(os.getenv("OMNIHUMAN_RESOLUTION", "720"))
+            # 优先用该镜头的"角色 in 场景"图;回退到角色通用定妆照
+            image_url = shot.get("character_in_scene_url") or char.get("image_url")
+            if not image_url:
+                raise RuntimeError(
+                    f"shot #{shot['idx']} missing both "
+                    f"character_in_scene_url and character image_url"
+                )
             video = await omnihuman.generate(
-                image_url=char["image_url"],
+                image_url=image_url,
                 audio_url=shot["audio_url"],
                 resolution=res,
                 prompt=shot.get("prompt", "")[:300],

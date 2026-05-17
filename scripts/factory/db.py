@@ -86,6 +86,8 @@ def conn() -> sqlite3.Connection:
         ("audio_url",         "TEXT"),
         ("video_url",         "TEXT"),
         ("anchor_character",  "TEXT"),   # broll 可选,用 character 图做 Seedance 首帧
+        ("character_in_scene_path", "TEXT"),  # dialogue 镜头自己的 in-scene 图
+        ("character_in_scene_url",  "TEXT"),
     ])
     db.commit()
     return db

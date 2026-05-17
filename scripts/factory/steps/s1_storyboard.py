@@ -33,7 +33,10 @@ def _validate(sb: dict) -> None:
     catalog = load_voice_catalog()
     char_ids = set()
     for ch in sb["characters"]:
-        for f in ("id", "name", "gender", "image_prompt", "voice_id"):
+        # look 是新字段(简短特征,各镜头复用);image_prompt 旧版兼容
+        if "look" not in ch and "image_prompt" not in ch:
+            raise ValueError(f"character missing both 'look' and 'image_prompt': {ch}")
+        for f in ("id", "name", "gender", "voice_id"):
             if f not in ch:
                 raise ValueError(f"character missing {f}: {ch}")
         if ch["gender"] not in ("male", "female"):
@@ -75,6 +78,13 @@ def _validate(sb: dict) -> None:
                 raise ValueError(f"dialogue shot {shot['idx']} > 12s (OmniHuman limit)")
             if not (shot.get("voiceover") or "").strip():
                 raise ValueError(f"dialogue shot {shot['idx']} has empty voiceover")
+            # 新约束:每个 dialogue 镜头必须有 scene + action(用于生成 in-scene 主角图)
+            for fld in ("scene", "action"):
+                if not (shot.get(fld) or "").strip():
+                    raise ValueError(
+                        f"dialogue shot {shot['idx']} missing field {fld!r} "
+                        f"(needed for per-shot character-in-scene image)"
+                    )
         else:  # broll
             anchor = shot.get("anchor_character")
             if anchor is not None and anchor not in char_ids:
@@ -82,6 +92,14 @@ def _validate(sb: dict) -> None:
                     f"broll shot {shot['idx']} anchor_character must be one of "
                     f"{char_ids} or null: {anchor}"
                 )
+
+    # 软约束提醒:broll 镜头最多 1 个
+    n_broll = sum(1 for s in sb["shots"] if s["type"] == "broll")
+    if n_broll > 1:
+        raise ValueError(
+            f"too many broll shots ({n_broll}); max 1 broll per video. "
+            f"Make them dialogue with scene+action instead."
+        )
 
 
 async def run(job_id: str) -> None:
@@ -109,8 +127,12 @@ async def run(job_id: str) -> None:
         json.dumps(sb, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # shots 入库
+    # shots 入库 — prompt 字段用 "scene + action"(dialogue) 或 prompt(broll)
     for shot in sb["shots"]:
+        if shot["type"] == "dialogue":
+            shot_prompt = f"{shot.get('scene','')}\n{shot.get('action','')}"
+        else:
+            shot_prompt = shot.get("prompt", "")
         db.execute(
             "INSERT OR REPLACE INTO shots(job_id, idx, duration_sec, shot_type, "
             "camera, prompt, voiceover, subtitle, narrative_type, speaker_id, "
@@ -120,7 +142,7 @@ async def run(job_id: str) -> None:
                 float(shot.get("duration", 6)),
                 shot.get("shot_type", ""),
                 shot.get("camera", ""),
-                shot.get("prompt", ""),
+                shot_prompt,
                 shot.get("voiceover", ""),
                 shot.get("subtitle", shot.get("voiceover", "")),
                 shot["type"],
@@ -129,12 +151,16 @@ async def run(job_id: str) -> None:
             )
         )
 
-    # 角色信息存到 jobs.characters_json,后续 s2 填充 image_path/image_url
-    chars = [
-        {"id": c["id"], "name": c["name"], "gender": c["gender"],
-         "voice_id": c["voice_id"], "image_prompt": c["image_prompt"]}
-        for c in sb["characters"]
-    ]
+    # 角色信息存到 jobs.characters_json,新字段 look(每镜头复用)
+    chars = []
+    for c in sb["characters"]:
+        chars.append({
+            "id": c["id"],
+            "name": c["name"],
+            "gender": c["gender"],
+            "voice_id": c["voice_id"],
+            "look": c.get("look") or c.get("image_prompt", ""),
+        })
     cost = llm.usage_to_cents(usage)
     db.execute(
         "UPDATE jobs SET storyboard=?, characters_json=?, "
