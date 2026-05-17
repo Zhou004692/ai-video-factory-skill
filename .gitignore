@@ -7,3 +7,7 @@ references/bgm_library/*/*.mp3
 __pycache__/
 *.pyc
 .DS_Store
+
+# auto-sync 工具产物
+.sync.log
+.rebase-abort-count
