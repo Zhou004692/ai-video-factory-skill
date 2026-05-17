@@ -24,7 +24,7 @@ def _llm():
 
 
 def _validate(sb: dict) -> None:
-    for key in ("characters", "style_prefix", "hook", "shots", "bgm"):
+    for key in ("characters", "narrator", "style_prefix", "hook", "shots", "bgm"):
         if key not in sb:
             raise ValueError(f"storyboard missing key: {key}; got {list(sb)}")
 
@@ -50,6 +50,15 @@ def _validate(sb: dict) -> None:
                 f"voice gender={catalog[ch['voice_id']]['gender']}"
             )
         char_ids.add(ch["id"])
+
+    # narrator 校验
+    narrator = sb.get("narrator") or {}
+    if not narrator.get("voice_id"):
+        raise ValueError("narrator.voice_id is required")
+    if narrator["voice_id"] not in catalog:
+        raise ValueError(
+            f"narrator.voice_id {narrator['voice_id']!r} not in catalog"
+        )
 
     if not isinstance(sb["shots"], list) or not (5 <= len(sb["shots"]) <= 12):
         raise ValueError(f"shots count out of range: {len(sb.get('shots', []))}")

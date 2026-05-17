@@ -1,6 +1,8 @@
-"""s4: 每个 dialogue 镜头单独 TTS(SeedTTS 2.0 大模型),用 character.voice_id 指定音色。
+"""s4: 每个镜头 TTS。
+- dialogue: 用 character.voice_id(speaker 的音色)
+- broll:    用 narrator.voice_id(全片旁白音色,桥接片段)
 
-broll 镜头跳过(画面+字幕承担信息)。
+broll 镜头有了 voiceover(narrator 短句)就 TTS,空字符串就跳过(纯静音 broll)。
 """
 import json
 import os
@@ -19,7 +21,9 @@ def _tts_client():
 async def run(job_id: str) -> None:
     db = conn()
     job = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    sb = json.loads(job["storyboard"])
     chars = {c["id"]: c for c in json.loads(job["characters_json"])}
+    narrator_voice = sb.get("narrator", {}).get("voice_id")
 
     rows = db.execute(
         "SELECT idx, narrative_type, speaker_id, voiceover "
@@ -36,26 +40,27 @@ async def run(job_id: str) -> None:
     total_chars = 0
     for r in rows:
         idx = r["idx"]
-        if r["narrative_type"] != "dialogue":
-            continue
         text = (r["voiceover"] or "").strip()
         if not text:
             continue
-        speaker = chars.get(r["speaker_id"])
-        if not speaker:
-            raise RuntimeError(f"shot #{idx} unknown speaker {r['speaker_id']}")
 
-        if is_v2:
-            voice = speaker.get("voice_id")
-            if not voice:
-                raise RuntimeError(
-                    f"speaker {speaker['id']} missing voice_id (V2 需要)"
-                )
-            audio = await tts.synth(text, voice=voice)
-        else:
-            voice = doubao_tts.voice_for_gender(speaker.get("gender"))
-            audio = await tts.synth(text, voice=voice)
+        if r["narrative_type"] == "dialogue":
+            speaker = chars.get(r["speaker_id"])
+            if not speaker:
+                raise RuntimeError(f"shot #{idx} unknown speaker {r['speaker_id']}")
+            voice = speaker.get("voice_id") if is_v2 else \
+                    doubao_tts.voice_for_gender(speaker.get("gender"))
+        else:  # broll with narrator
+            if not narrator_voice:
+                # 没配 narrator,broll 旁白只能跳过
+                continue
+            voice = narrator_voice if is_v2 else \
+                    doubao_tts.voice_for_gender("female")  # V1 fallback
 
+        if not voice:
+            raise RuntimeError(f"shot #{idx} no voice resolved")
+
+        audio = await tts.synth(text, voice=voice)
         audio_path = voice_dir / f"{idx:02d}.mp3"
         audio_path.write_bytes(audio)
 

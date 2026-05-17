@@ -81,6 +81,23 @@ async def normalize_shot(in_path: Path, out_path: Path,
     await _run(args)
 
 
+async def mux_video_audio(video: Path, audio: Path, out_path: Path) -> None:
+    """把外部音频 mux 到视频上,替换/补足原音轨。
+
+    使用 apad 让 audio 补静音以匹配视频长度;-shortest 兜底防 audio 反超。
+    """
+    await _run([
+        "-i", str(video),
+        "-i", str(audio),
+        "-af", "apad",
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest",
+        str(out_path),
+    ])
+
+
 async def concat_shots(shot_paths: list[Path], out_path: Path) -> None:
     """concat demuxer 拼接。要求所有片段格式一致(请先 normalize_shot)。"""
     list_file = out_path.parent / "concat.txt"
