@@ -61,11 +61,32 @@ CREATE INDEX IF NOT EXISTS idx_events_job  ON events(job_id);
 _DB_PATH = DATA_DIR / "factory.db"
 
 
+def _add_cols_if_missing(db: sqlite3.Connection, table: str,
+                         cols: list[tuple[str, str]]) -> None:
+    existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, ddl in cols:
+        if name not in existing:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
 def conn() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(_DB_PATH), check_same_thread=False, timeout=30)
     db.row_factory = sqlite3.Row
     db.executescript(DDL)
+
+    # 增量迁移:多角色 + dialogue/broll + 每镜音频
+    _add_cols_if_missing(db, "jobs", [
+        ("characters_json", "TEXT"),     # [{id,name,gender,image_path,image_url}]
+    ])
+    _add_cols_if_missing(db, "shots", [
+        ("narrative_type", "TEXT"),      # dialogue | broll
+        ("speaker_id",     "TEXT"),
+        ("audio_path",     "TEXT"),
+        ("audio_url",      "TEXT"),
+        ("video_url",      "TEXT"),
+    ])
+    db.commit()
     return db
 
 

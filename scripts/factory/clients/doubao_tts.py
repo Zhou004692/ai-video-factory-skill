@@ -25,6 +25,19 @@ ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_VOICE = os.getenv("VOLC_TTS_VOICE", "zh_female_shuangkuaisisi_moon_bigtts")
 DEFAULT_MODEL = os.getenv("ARK_TTS_MODEL", "doubao-seed-tts")
 
+# 性别 → 音色 ID 默认映射,可通过 .env 覆盖
+GENDER_VOICE = {
+    "male":   os.getenv("VOLC_TTS_VOICE_MALE",   "BV002_streaming"),
+    "female": os.getenv("VOLC_TTS_VOICE_FEMALE", "BV001_streaming"),
+}
+
+
+def voice_for_gender(gender: str | None) -> str:
+    """根据性别选音色;None / 未知 → 用 DEFAULT_VOICE。"""
+    if not gender:
+        return DEFAULT_VOICE
+    return GENDER_VOICE.get(gender.lower(), DEFAULT_VOICE)
+
 
 async def synth(text: str, voice: str | None = None,
                 speed: float = 1.0, emotion: str = "neutral") -> bytes:
