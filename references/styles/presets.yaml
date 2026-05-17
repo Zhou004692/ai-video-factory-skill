@@ -42,3 +42,12 @@ E:
     style: 港乐萨克斯
     mood: 暧昧
     bpm_range: [85, 105]
+
+F:
+  name: 工业纪实
+  prompt: 工地黄金时刻晨雾, 深蓝冷调, 机械金属质感, 35mm 胶片颗粒, 自然光为主, 偶有体积光穿过尘埃, 镜头硬朗有重量感, 纪实电影感, 大量俯仰角和金属反光特写
+  tracks: [工程设备, 行业B2B, SaaS, 工业, 设备租赁, 制造业]
+  bgm_default:
+    style: industrial cinematic, low piano + sub-bass
+    mood: 沉稳
+    bpm_range: [70, 90]
