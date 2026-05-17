@@ -65,7 +65,12 @@ async def text_to_video(prompt: str,
     async with httpx.AsyncClient(timeout=timeout, headers=_headers()) as cli:
         # 1. 提交任务
         r = await cli.post(f"{ARK_BASE}/contents/generations/tasks", json=payload)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"seedance submit {r.status_code}: {r.text[:800]} | "
+                f"endpoint={ARK_BASE}/contents/generations/tasks, "
+                f"model={DEFAULT_MODEL}"
+            )
         task_id = r.json()["id"]
 
         # 2. 轮询
