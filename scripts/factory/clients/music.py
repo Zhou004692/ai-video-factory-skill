@@ -19,14 +19,36 @@ from .. import REFERENCES_DIR
 async def generate(style: str, duration_sec: int, bpm_range: tuple[int, int] = (80, 100),
                    mood: str = "积极") -> bytes:
     """生成或挑选一段 BGM。返回 mp3 字节。"""
-    provider = os.getenv("DEFAULT_MUSIC_PROVIDER", "library").lower()
+    provider = os.getenv("DEFAULT_MUSIC_PROVIDER", "silent").lower()
 
     if provider == "suno":
         return await _via_suno(style, duration_sec, bpm_range, mood)
     elif provider == "haimian":
         return await _via_haimian(style, duration_sec, bpm_range, mood)
-    else:
+    elif provider == "library":
         return _via_library(style, duration_sec)
+    else:  # silent — 跑通管线用的兜底,无声 BGM
+        return await _via_silent(duration_sec)
+
+
+async def _via_silent(duration_sec: int) -> bytes:
+    """用 ffmpeg 生成一段静音 mp3。测试和 BGM 不可用时的兜底。"""
+    import tempfile
+    out = Path(tempfile.mktemp(suffix=".mp3"))
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+        "-t", str(duration_sec), "-q:a", "9", "-acodec", "libmp3lame",
+        str(out),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"silent bgm gen failed: {err.decode()[-500:]}")
+    data = out.read_bytes()
+    out.unlink(missing_ok=True)
+    return data
 
 
 async def _via_suno(style: str, duration: int, bpm_range, mood: str) -> bytes:
@@ -66,7 +88,7 @@ def _via_library(style: str, duration_sec: int) -> bytes:
 
 
 def estimate_cost_cents(duration_sec: int, provider: str | None = None) -> int:
-    p = (provider or os.getenv("DEFAULT_MUSIC_PROVIDER", "library")).lower()
+    p = (provider or os.getenv("DEFAULT_MUSIC_PROVIDER", "silent")).lower()
     if p == "suno":
         return 20  # 大约 0.2 元/首
-    return 0      # library / haimian 暂记 0
+    return 0      # silent / library / haimian 暂记 0
