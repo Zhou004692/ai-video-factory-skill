@@ -138,18 +138,25 @@ async def synth(text: str,
                 gender: str | None = None,
                 fmt: str = "mp3",
                 sample_rate: int = 24000,
-                speech_rate: int = 0,
+                speech_rate: int | None = None,
                 emotion: str | None = None,
                 model: str | None = None,
                 additions: dict | None = None,
+                context_texts: list[str] | None = None,
                 timeout: float = 120.0) -> bytes:
     """合成,返回完整音频字节流(mp3/wav/pcm)。
 
     model 可选 seed-tts-2.0-standard / seed-tts-2.0-expressive。
     不传时读 env SEEDTTS_MODEL,默认 expressive(自然度强)。
+
+    speech_rate 默认 -10(略慢于 0),更接近自然对话节奏。可通过 SEEDTTS_SPEECH_RATE 覆盖。
+
+    context_texts 是 expressive 模型独有的语气指令,例如 ["用日常聊天的语气"]。
     """
     if model is None:
         model = os.getenv("SEEDTTS_MODEL", "seed-tts-2.0-expressive")
+    if speech_rate is None:
+        speech_rate = int(os.getenv("SEEDTTS_SPEECH_RATE", "-10"))
     appid = os.environ.get("VOLC_TTS_APPID")
     token = os.environ.get("VOLC_TTS_TOKEN")
     if not (appid and token):
@@ -170,8 +177,13 @@ async def synth(text: str,
     }
     if model:
         req_params["model"] = model
-    if additions:
-        req_params["additions"] = json.dumps(additions, ensure_ascii=False)
+
+    # additions / context_texts 合并(都是 expressive 独有)
+    _add = dict(additions or {})
+    if context_texts and "expressive" in (model or ""):
+        _add["context_texts"] = context_texts
+    if _add:
+        req_params["additions"] = json.dumps(_add, ensure_ascii=False)
 
     session_id = str(uuid.uuid4())
     headers = {

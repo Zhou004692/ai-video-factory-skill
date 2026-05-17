@@ -60,7 +60,13 @@ async def run(job_id: str) -> None:
         if not voice:
             raise RuntimeError(f"shot #{idx} no voice resolved")
 
-        audio = await tts.synth(text, voice=voice)
+        # 给 V2 加日常对话语气指令,减弱播报感(V1 自动忽略 context_texts)
+        kwargs = {"voice": voice}
+        if is_v2:
+            kwargs["context_texts"] = [
+                "你说话像是和朋友日常聊天,自然、有起伏,不要播音员腔调"
+            ]
+        audio = await tts.synth(text, **kwargs)
         audio_path = voice_dir / f"{idx:02d}.mp3"
         audio_path.write_bytes(audio)
 

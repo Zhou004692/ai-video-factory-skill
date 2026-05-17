@@ -7,8 +7,9 @@ zh_male_baqiqingshu_uranus_bigtts:
   display: 霸气青叔
   gender: male
   age: middle-aged
-  tone: 霸气、有威严、自信
-  fit_roles: [老板, 主管, 中年男, 大叔, 师傅, 江湖老炮]
+  tone: 霸气、有威严、宣讲式(警告:偏播报腔)
+  fit_roles: [影视权威反派, 演说, 训话, 严肃宣告]
+  # 注意:此音色"宣讲腔"较强,日常对话戏不推荐,优先选 大壹/邻家男孩
 
 zh_male_gaolengchenwen_uranus_bigtts:
   display: 高冷沉稳
@@ -63,15 +64,15 @@ zh_male_linjiananhai_uranus_bigtts:
   display: 邻家男孩
   gender: male
   age: young
-  tone: 邻家、亲切、平实
-  fit_roles: [外卖员, 邻居, 朋友, 学生, 普通职员, 实习男]
+  tone: 邻家、亲切、平实、日常对话感【推荐对话戏】
+  fit_roles: [外卖员, 邻居, 朋友, 学生, 普通职员, 实习男, 年轻打工人]
 
 zh_male_dayi_uranus_bigtts:
   display: 大壹
   gender: male
   age: adult
-  tone: 朴实、接地气、有烟火气
-  fit_roles: [工人, 司机, 师傅, 老乡, 蓝领, 工地老板, 蓝领老板]
+  tone: 朴实、接地气、烟火气、日常对话感【推荐对话戏】
+  fit_roles: [工地老板, 工程承包人, 工厂老板, 中小企业主, 司机, 师傅, 蓝领]
 
 zh_male_fanjuanqingnian_uranus_bigtts:
   display: 反卷青年
@@ -92,8 +93,9 @@ zh_female_shuangkuaisisi_uranus_bigtts:
   display: 爽快思思
   gender: female
   age: young-adult
-  tone: 爽快、利落、专业
-  fit_roles: [职场女, 销售女, 经理, 干练女, 行业专家]
+  tone: 爽快、利落、偏专业播主感(警告:略偏播报)
+  fit_roles: [职场女主播, 行业讲解, 干练女]
+  # 注意:对话戏不推荐,优先选 邻家女孩/暖阳女声
 
 zh_female_cancan_uranus_bigtts:
   display: 知性灿灿
@@ -106,15 +108,15 @@ zh_female_kefunvsheng_uranus_bigtts:
   display: 暖阳女声(客服)
   gender: female
   age: young-adult
-  tone: 温暖、专业、服务感
+  tone: 温暖、专业、服务感、对话感【推荐对话戏 — 销售/客服场景】
   fit_roles: [客服, 接待, 销售, 服务员, 前台, 助理]
 
 zh_female_linjianvhai_uranus_bigtts:
   display: 邻家女孩
   gender: female
   age: young
-  tone: 邻家、活泼、亲切
-  fit_roles: [邻居, 同事, 销售妹, 实习生, 普通女孩, 学妹]
+  tone: 邻家、活泼、亲切、日常对话感【推荐对话戏】
+  fit_roles: [邻居, 同事, 销售妹, 客服, 实习生, 普通女孩, 学妹]
 
 zh_female_kailangjiejie_uranus_bigtts:
   display: 开朗姐姐
