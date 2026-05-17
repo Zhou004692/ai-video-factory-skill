@@ -4,3 +4,5 @@ click>=8.1.0
 python-dotenv>=1.0.0
 pyyaml>=6.0
 pillow>=10.0.0
+volcengine>=1.0.179
+tos>=2.7.0
