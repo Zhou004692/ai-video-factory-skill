@@ -54,10 +54,10 @@ async def _synth_ark(text: str, voice: str | None, speed: float) -> bytes:
         )
         if r.status_code >= 400:
             raise RuntimeError(
-                f"ark tts {r.status_code}: {r.text[:500]}\n"
-                f"提示: 1) 在方舟控制台开通 TTS 模型并核对 ARK_TTS_MODEL; "
-                f"2) 核对 VOLC_TTS_VOICE 是否是该模型支持的音色 ID; "
-                f"3) 想用旧路径设置 VOLC_TTS_PROVIDER=legacy"
+                f"ark tts {r.status_code}: {r.text[:500]} | "
+                f"NOTE: ark.cn-beijing.volces.com does NOT host TTS. "
+                f"Use legacy path: set VOLC_TTS_PROVIDER=legacy and provide "
+                f"VOLC_TTS_APPID + VOLC_TTS_TOKEN from console.volcengine.com/speech/app"
             )
         return r.content
 
