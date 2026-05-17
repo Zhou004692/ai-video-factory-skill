@@ -24,6 +24,26 @@ def style_prefix(code: str) -> str:
     return styles[code]["prompt"]
 
 
+def load_voice_catalog() -> dict:
+    """读 references/voices/seedtts_v2_catalog.yaml。"""
+    p = REFERENCES_DIR / "voices" / "seedtts_v2_catalog.yaml"
+    return yaml.safe_load(p.read_text(encoding="utf-8"))
+
+
+def voice_catalog_table() -> str:
+    """把音色库格式化成 markdown 表格,塞进 prompt。"""
+    catalog = load_voice_catalog()
+    rows = ["| voice_id | 显示名 | 性别 | 年龄段 | 调性 | 适配角色 |",
+            "|---|---|---|---|---|---|"]
+    for vid, meta in catalog.items():
+        roles = ", ".join(meta.get("fit_roles", []))
+        rows.append(
+            f"| `{vid}` | {meta['display']} | {meta['gender']} | "
+            f"{meta['age']} | {meta['tone']} | {roles} |"
+        )
+    return "\n".join(rows)
+
+
 def storyboard_prompt(title: str, track: str, style_code: str, duration: int,
                       target_audience: str = "通用") -> str:
     tmpl = load_prompt("storyboard")
@@ -33,4 +53,5 @@ def storyboard_prompt(title: str, track: str, style_code: str, duration: int,
             .replace("{{track}}", track)
             .replace("{{style_desc}}", style_desc)
             .replace("{{duration}}", str(duration))
-            .replace("{{target_audience}}", target_audience))
+            .replace("{{target_audience}}", target_audience)
+            .replace("{{voice_catalog}}", voice_catalog_table()))

@@ -26,6 +26,15 @@
 8. **broll 镜头**:`voiceover` **必须留空字符串 ""** (broll 不配音,靠画面+字幕)
 9. **字幕 subtitle**:每镜都要,与 voiceover 可微调
 
+## 角色音色选择(必须)
+
+每个角色必须从下表选一个 `voice_id`(精确字符串),原则:
+- 性别必须匹配
+- 年龄段匹配角色设定(young / young-adult / adult / middle-aged / elder)
+- 调性/适配角色匹配角色身份(老板→霸气, 销售→爽快/暖阳, 妈妈→温柔, 段子手→反卷青年, 等等)
+
+{{voice_catalog}}
+
 ## 输出格式
 
 严格 JSON,字段如下(不要任何解释、不要 markdown 代码块):
@@ -37,12 +46,14 @@
       "id": "boss",
       "name": "工程老板",
       "gender": "male",
+      "voice_id": "zh_male_baqiqingshu_uranus_bigtts",
       "image_prompt": "80-120 字英文+中文混合提示词,具体到发型/瞳色/服装材质/气质/表情基调。9:16 竖屏构图,胸像或半身,主体清晰居中"
     },
     {
       "id": "sales",
       "name": "销售小妹",
       "gender": "female",
+      "voice_id": "zh_female_shuangkuaisisi_uranus_bigtts",
       "image_prompt": "..."
     }
   ],

@@ -9,7 +9,7 @@ import os
 
 from .. import ASSETS_DIR
 from ..db import conn
-from ..prompts import storyboard_prompt
+from ..prompts import storyboard_prompt, load_voice_catalog
 
 
 def _llm():
@@ -30,13 +30,25 @@ def _validate(sb: dict) -> None:
 
     if not isinstance(sb["characters"], list) or not sb["characters"]:
         raise ValueError("characters must be a non-empty list")
+    catalog = load_voice_catalog()
     char_ids = set()
     for ch in sb["characters"]:
-        for f in ("id", "name", "gender", "image_prompt"):
+        for f in ("id", "name", "gender", "image_prompt", "voice_id"):
             if f not in ch:
                 raise ValueError(f"character missing {f}: {ch}")
         if ch["gender"] not in ("male", "female"):
             raise ValueError(f"character gender must be male|female: {ch}")
+        if ch["voice_id"] not in catalog:
+            raise ValueError(
+                f"character {ch['id']} voice_id {ch['voice_id']!r} "
+                f"not in catalog. Available: {list(catalog)[:5]} ..."
+            )
+        # 性别一致性检查
+        if catalog[ch["voice_id"]]["gender"] != ch["gender"]:
+            raise ValueError(
+                f"character {ch['id']} gender={ch['gender']} mismatches "
+                f"voice gender={catalog[ch['voice_id']]['gender']}"
+            )
         char_ids.add(ch["id"])
 
     if not isinstance(sb["shots"], list) or not (5 <= len(sb["shots"]) <= 12):
@@ -111,7 +123,7 @@ async def run(job_id: str) -> None:
     # 角色信息存到 jobs.characters_json,后续 s2 填充 image_path/image_url
     chars = [
         {"id": c["id"], "name": c["name"], "gender": c["gender"],
-         "image_prompt": c["image_prompt"]}
+         "voice_id": c["voice_id"], "image_prompt": c["image_prompt"]}
         for c in sb["characters"]
     ]
     cost = llm.usage_to_cents(usage)
