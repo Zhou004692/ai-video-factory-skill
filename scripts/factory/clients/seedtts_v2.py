@@ -143,7 +143,13 @@ async def synth(text: str,
                 model: str | None = None,
                 additions: dict | None = None,
                 timeout: float = 120.0) -> bytes:
-    """合成,返回完整音频字节流(mp3/wav/pcm)。"""
+    """合成,返回完整音频字节流(mp3/wav/pcm)。
+
+    model 可选 seed-tts-2.0-standard / seed-tts-2.0-expressive。
+    不传时读 env SEEDTTS_MODEL,默认 expressive(自然度强)。
+    """
+    if model is None:
+        model = os.getenv("SEEDTTS_MODEL", "seed-tts-2.0-expressive")
     appid = os.environ.get("VOLC_TTS_APPID")
     token = os.environ.get("VOLC_TTS_TOKEN")
     if not (appid and token):
