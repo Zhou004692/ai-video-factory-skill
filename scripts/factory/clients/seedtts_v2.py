@@ -144,7 +144,42 @@ async def synth(text: str,
                 model: str | None = None,
                 additions: dict | None = None,
                 context_texts: list[str] | None = None,
+                resource_id: str | None = None,
                 timeout: float = 120.0) -> bytes:
+    """异常时自动尝试 seed-tts-1.0 fallback(不同音色 resource 不同)。"""
+    # 第一次尝试:默认或显式 resource
+    try:
+        return await _synth_once(
+            text, voice, gender, fmt, sample_rate, speech_rate,
+            emotion, emotion_scale, model, additions, context_texts,
+            resource_id, timeout
+        )
+    except RuntimeError as e:
+        if "resource ID is mismatched" not in str(e):
+            raise
+        # fallback 到 seed-tts-1.0(_moon_ / BV* 等老音色)
+        if resource_id == "seed-tts-1.0":
+            raise  # 已经试过 1.0,放弃
+        return await _synth_once(
+            text, voice, gender, fmt, sample_rate, speech_rate,
+            emotion, emotion_scale, None, additions, context_texts,
+            "seed-tts-1.0", timeout
+        )
+
+
+async def _synth_once(text: str,
+                      voice: str | None,
+                      gender: str | None,
+                      fmt: str,
+                      sample_rate: int,
+                      speech_rate: int | None,
+                      emotion: str | None,
+                      emotion_scale: int | None,
+                      model: str | None,
+                      additions: dict | None,
+                      context_texts: list[str] | None,
+                      resource_id: str | None,
+                      timeout: float) -> bytes:
     """合成,返回完整音频字节流(mp3/wav/pcm)。
 
     model 可选 seed-tts-2.0-standard / seed-tts-2.0-expressive。
@@ -154,8 +189,18 @@ async def synth(text: str,
 
     context_texts 是 expressive 模型独有的语气指令,例如 ["用日常聊天的语气"]。
     """
-    if model is None:
+    rid = resource_id or os.getenv("SEEDTTS_RESOURCE", "seed-tts-2.0")
+    is_v2 = (rid == "seed-tts-2.0")
+
+    # 1.0 资源不支持 expressive / context_texts / emotion 等 2.0 特有字段
+    if not is_v2:
+        model = None
+        context_texts = None
+        emotion = None
+        emotion_scale = None
+    elif model is None:
         model = os.getenv("SEEDTTS_MODEL", "seed-tts-2.0-expressive")
+
     if speech_rate is None:
         speech_rate = int(os.getenv("SEEDTTS_SPEECH_RATE", "-10"))
     appid = os.environ.get("VOLC_TTS_APPID")
@@ -181,7 +226,6 @@ async def synth(text: str,
     if model:
         req_params["model"] = model
 
-    # additions / context_texts 合并(都是 expressive 独有)
     _add = dict(additions or {})
     if context_texts and "expressive" in (model or ""):
         _add["context_texts"] = context_texts
@@ -192,7 +236,7 @@ async def synth(text: str,
     headers = {
         "X-Api-App-Id": appid,
         "X-Api-Access-Key": token,
-        "X-Api-Resource-Id": "seed-tts-2.0",
+        "X-Api-Resource-Id": rid,
         "X-Api-Connect-Id": str(uuid.uuid4()),
     }
 
