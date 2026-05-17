@@ -85,15 +85,25 @@ async def _synth_legacy(text: str, voice: str | None,
         },
     }
     headers = {"Authorization": f"Bearer; {token}"}
+    cluster = os.getenv("VOLC_TTS_CLUSTER", "volcano_tts")
+    payload["app"]["cluster"] = cluster
     async with httpx.AsyncClient(timeout=60) as cli:
         r = await cli.post(
             "https://openspeech.bytedance.com/api/v1/tts",
             json=payload, headers=headers
         )
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"legacy tts {r.status_code}: {r.text[:800]} | "
+                f"payload.cluster={cluster}, voice={payload['audio']['voice_type']}, "
+                f"appid={appid[:4]}... | "
+                f"Common fixes: VOLC_TTS_CLUSTER (volcano_tts for standard, "
+                f"volcano_icl_v2 for big-model) / VOLC_TTS_VOICE (zh_female_qingxin "
+                f"for standard, *_bigtts suffix for big-model)"
+            )
         data = r.json()
         if data.get("code") != 3000:
-            raise RuntimeError(f"legacy tts error: {data}")
+            raise RuntimeError(f"legacy tts: {data}")
         return base64.b64decode(data["data"])
 
 
