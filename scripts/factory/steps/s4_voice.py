@@ -1,8 +1,9 @@
 """s4: 每个镜头 TTS。
 - dialogue: 用 character.voice_id(speaker 的音色)
-- broll:    用 narrator.voice_id(全片旁白音色,桥接片段)
+- broll:    用 narrator.voice_id
 
-broll 镜头有了 voiceover(narrator 短句)就 TTS,空字符串就跳过(纯静音 broll)。
+每个 shot 可在 storyboard 里加 emotion / emotion_scale / voice_directive 字段,
+精细控制 TTS 情绪和语气。
 """
 import json
 import os
@@ -12,8 +13,10 @@ from ..db import conn
 from ..clients import seedtts_v2, doubao_tts, tos
 
 
+DEFAULT_CONTEXT = "你说话像是和朋友日常聊天,自然、有起伏,不要播音员腔调"
+
+
 def _tts_client():
-    """根据 TTS_VERSION 切换 V2(SeedTTS 2.0 大模型,默认) / V1(普通版兜底)。"""
     name = os.getenv("TTS_VERSION", "v2").lower()
     return seedtts_v2 if name == "v2" else doubao_tts
 
@@ -24,6 +27,7 @@ async def run(job_id: str) -> None:
     sb = json.loads(job["storyboard"])
     chars = {c["id"]: c for c in json.loads(job["characters_json"])}
     narrator_voice = sb.get("narrator", {}).get("voice_id")
+    sb_shots = {s["idx"]: s for s in sb["shots"]}
 
     rows = db.execute(
         "SELECT idx, narrative_type, speaker_id, voiceover "
@@ -44,29 +48,38 @@ async def run(job_id: str) -> None:
         if not text:
             continue
 
+        sb_shot = sb_shots.get(idx, {})
+
         if r["narrative_type"] == "dialogue":
             speaker = chars.get(r["speaker_id"])
             if not speaker:
                 raise RuntimeError(f"shot #{idx} unknown speaker {r['speaker_id']}")
             voice = speaker.get("voice_id") if is_v2 else \
                     doubao_tts.voice_for_gender(speaker.get("gender"))
-        else:  # broll with narrator
+        else:
             if not narrator_voice:
-                # 没配 narrator,broll 旁白只能跳过
                 continue
             voice = narrator_voice if is_v2 else \
-                    doubao_tts.voice_for_gender("female")  # V1 fallback
+                    doubao_tts.voice_for_gender("female")
 
         if not voice:
             raise RuntimeError(f"shot #{idx} no voice resolved")
 
-        # 给 V2 加日常对话语气指令,减弱播报感(V1 自动忽略 context_texts)
         kwargs = {"voice": voice}
         if is_v2:
-            kwargs["context_texts"] = [
-                "你说话像是和朋友日常聊天,自然、有起伏,不要播音员腔调"
-            ]
+            # context_texts:语气指令(每镜可覆盖)
+            directive = sb_shot.get("voice_directive") or DEFAULT_CONTEXT
+            kwargs["context_texts"] = [directive]
+            # emotion + emotion_scale(per-shot 精细控制情绪)
+            if sb_shot.get("emotion"):
+                kwargs["emotion"] = sb_shot["emotion"]
+            if sb_shot.get("emotion_scale"):
+                kwargs["emotion_scale"] = int(sb_shot["emotion_scale"])
+            # speech_rate per shot 可选
+            if sb_shot.get("speech_rate") is not None:
+                kwargs["speech_rate"] = int(sb_shot["speech_rate"])
         audio = await tts.synth(text, **kwargs)
+
         audio_path = voice_dir / f"{idx:02d}.mp3"
         audio_path.write_bytes(audio)
 

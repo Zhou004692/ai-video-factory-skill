@@ -25,13 +25,20 @@ def _build_prompt(character: dict, shot: dict, style_prefix: str) -> str:
     look = character["look"]
     scene = shot.get("scene") or ""
     action = shot.get("action") or ""
-    return (
-        f"{look}\n"
-        f"场景: {shot.get('camera','')} {shot.get('shot_type','')} 镜头. {scene}\n"
-        f"动作/表情: {action}\n"
-        f"风格: {style_prefix}\n"
-        f"竖屏 9:16 构图, 角色主体清晰可见, 嘴部保持自然闭合或微张(避免特殊嘴型)"
+    drama = shot.get("dramatic_keywords") or ""
+    parts = [
+        look,
+        f"场景: {shot.get('camera','')} {shot.get('shot_type','')} 镜头. {scene}",
+        f"动作/表情: {action}",
+    ]
+    if drama:
+        # 强调情绪 — 让 Seedream 出更有戏剧张力的图
+        parts.append(f"EMOTIONAL EXPRESSION (强烈,优先): {drama}")
+    parts.append(f"风格: {style_prefix}")
+    parts.append(
+        "竖屏 9:16 构图, 角色主体清晰可见, 嘴部保持自然闭合或微张(避免特殊嘴型)"
     )
+    return "\n".join(parts)
 
 
 async def _gen_one_shot_img(job_id: str, shot_idx: int, character: dict,

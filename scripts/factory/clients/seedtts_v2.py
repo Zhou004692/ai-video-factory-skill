@@ -140,6 +140,7 @@ async def synth(text: str,
                 sample_rate: int = 24000,
                 speech_rate: int | None = None,
                 emotion: str | None = None,
+                emotion_scale: int | None = None,
                 model: str | None = None,
                 additions: dict | None = None,
                 context_texts: list[str] | None = None,
@@ -170,6 +171,8 @@ async def synth(text: str,
         audio_params["speech_rate"] = speech_rate
     if emotion:
         audio_params["emotion"] = emotion
+    if emotion_scale:
+        audio_params["emotion_scale"] = max(1, min(5, emotion_scale))
 
     req_params: dict = {
         "speaker": voice,

@@ -13,23 +13,32 @@ from ..clients import seedance, omnihuman
 from ..orchestrator import MAX_CONCURRENT_SHOTS
 
 
-async def _gen_dialogue(job_id: str, shot: dict, char: dict,
+async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                         sem: asyncio.Semaphore) -> tuple[int, Exception | None]:
     async with sem:
         try:
             res = int(os.getenv("OMNIHUMAN_RESOLUTION", "720"))
-            # 优先用该镜头的"角色 in 场景"图;回退到角色通用定妆照
             image_url = shot.get("character_in_scene_url") or char.get("image_url")
             if not image_url:
                 raise RuntimeError(
                     f"shot #{shot['idx']} missing both "
                     f"character_in_scene_url and character image_url"
                 )
+
+            # 把 dramatic_keywords + voice_directive 拼进 OmniHuman 的 prompt
+            # (用于影响画面、动作、运镜)
+            parts = [shot.get("prompt", "")]
+            if sb_shot.get("dramatic_keywords"):
+                parts.append(f"EMOTION: {sb_shot['dramatic_keywords']}")
+            if sb_shot.get("voice_directive"):
+                parts.append(f"语气: {sb_shot['voice_directive']}")
+            omni_prompt = ". ".join(p for p in parts if p)[:300]
+
             video = await omnihuman.generate(
                 image_url=image_url,
                 audio_url=shot["audio_url"],
                 resolution=res,
-                prompt=shot.get("prompt", "")[:300],
+                prompt=omni_prompt,
             )
             out_path = ASSETS_DIR / job_id / "shots" / f"{shot['idx']:02d}.mp4"
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +113,7 @@ async def run(job_id: str) -> None:
     sb = json.loads(job["storyboard"])
     chars = {c["id"]: c for c in json.loads(job["characters_json"])}
     style_prefix = sb.get("style_prefix", "")
+    sb_shots = {s["idx"]: s for s in sb["shots"]}
 
     rows = db.execute(
         "SELECT * FROM shots WHERE job_id=? AND state!='OK' ORDER BY idx",
@@ -116,6 +126,7 @@ async def run(job_id: str) -> None:
     tasks = []
     for r in rows:
         shot = dict(r)
+        sb_shot = sb_shots.get(shot["idx"], {})
         if shot["narrative_type"] == "dialogue":
             char = chars.get(shot["speaker_id"])
             if not char:
@@ -126,7 +137,7 @@ async def run(job_id: str) -> None:
                 raise RuntimeError(
                     f"shot #{shot['idx']} missing audio_url (s4_voice 未生成?)"
                 )
-            tasks.append(_gen_dialogue(job_id, shot, char, sem))
+            tasks.append(_gen_dialogue(job_id, shot, char, sb_shot, sem))
         else:
             anchor_id = shot.get("anchor_character")
             anchor_path = None
