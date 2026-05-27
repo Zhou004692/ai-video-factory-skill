@@ -1,7 +1,7 @@
 """s3: 按 narrative_type 分流生成视频。
 
 - dialogue → OmniHuman(speaker 角色图 URL + 该镜音频 URL)→ 嘴型同步说话视频
-- broll    → Seedance 1.0 Pro(prompt + style_prefix)→ 空镜
+- broll    → Seedance 2.0(prompt + first/last_frame + multi-ref + motion)→ 空镜
 """
 import asyncio
 import json
@@ -10,6 +10,7 @@ import os
 from .. import ASSETS_DIR
 from ..db import conn
 from ..clients import seedance, omnihuman
+from ..clients.omnihuman import OmniHumanAccountOverdue
 from ..orchestrator import MAX_CONCURRENT_SHOTS
 
 
@@ -76,14 +77,39 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
             )
             db.commit()
             return shot["idx"], None
-        except Exception as e:
+        except OmniHumanAccountOverdue as e:
+            # 欠费类:写明确 prefix 到 shot.error,user 充值后 retry-shot 即可
             db = conn()
             db.execute(
-                "UPDATE shots SET state='FAILED', error=? WHERE job_id=? AND idx=?",
-                (str(e)[:1000], job_id, shot["idx"])
+                "UPDATE shots SET state='FAILED', "
+                "error=? WHERE job_id=? AND idx=?",
+                (f"[ACCOUNT_OVERDUE] {str(e)[:900]}", job_id, shot["idx"])
             )
             db.commit()
+            print(f"[s3] shot #{shot['idx']} 火山账户欠费 — 充值后跑 "
+                  f"`cli.py retry-shot {job_id} {shot['idx']}`",
+                  flush=True)
             return shot["idx"], e
+        except BaseException as e:
+            # 兜底任何异常(包括 CancelledError / SIGTERM 之外的 KeyboardInterrupt 等),
+            # 保证 shot state 不会停在 PENDING(避免数据状态歧义)。
+            # 注意:SIGKILL 救不了,只能尽力。
+            try:
+                db = conn()
+                db.execute(
+                    "UPDATE shots SET state='FAILED', error=? "
+                    "WHERE job_id=? AND idx=?",
+                    (f"{type(e).__name__}: {str(e)[:900]}",
+                     job_id, shot["idx"])
+                )
+                db.commit()
+            except Exception:
+                pass  # DB 也挂了,放弃
+            # 普通 Exception 走 return tuple(让 gather 汇总);
+            # CancelledError 等 BaseException 子类向上抛
+            if isinstance(e, Exception):
+                return shot["idx"], e
+            raise
 
 
 async def _gen_broll(job_id: str, shot: dict, style_prefix: str,

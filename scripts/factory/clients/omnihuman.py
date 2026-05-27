@@ -26,6 +26,23 @@ REQ_KEY = "jimeng_realman_avatar_picture_omni_v15"
 _RATE_LIMIT_CODES = {50429, 50430, 50431, 50432}
 
 
+class OmniHumanAccountOverdue(RuntimeError):
+    """火山账户欠费 / 配额耗尽。retry 没用,需要 user 充值后再 retry-shot。
+    单独子类让上层能区别于"真错误"做不同处理(如 jobs.error 写明 "充值后继续")。
+    """
+    pass
+
+
+def _is_account_overdue(message: str, code: int | None) -> bool:
+    """识别欠费类错误。火山不同接口码不一,用 message 关键词更稳健。"""
+    if not message:
+        return False
+    msg = message.lower()
+    return any(k in msg for k in (
+        "overdue", "balance", "insufficient", "account", "arrears", "欠费", "余额"
+    ))
+
+
 def _service() -> VisualService:
     ak = os.environ.get("VOLC_AK")
     sk = os.environ.get("VOLC_SK")
@@ -76,14 +93,21 @@ def _submit(image_url: str, audio_url: str,
         if isinstance(resp, str):
             resp = json.loads(resp)
         code = resp.get("code")
+        message = resp.get("message", "")
         if code == 10000:
             return resp["data"]["task_id"]
+        # 欠费类:retry 没用,raise 明确子类让上层区分
+        if _is_account_overdue(message, code):
+            raise OmniHumanAccountOverdue(
+                f"火山账户欠费/配额不足,请充值后 retry-shot。code={code} "
+                f"msg={message[:200]}"
+            )
         if code in _RATE_LIMIT_CODES and attempt < max_retries - 1:
             wait = 10 * (2 ** attempt)  # 10, 20, 40, 80
             print(
                 f"[omnihuman] {code} rate-limited, retry "
                 f"{attempt + 1}/{max_retries} after {wait}s "
-                f"(msg={resp.get('message', '')[:80]})",
+                f"(msg={message[:80]})",
                 flush=True,
             )
             time.sleep(wait)
