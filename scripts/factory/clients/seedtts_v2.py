@@ -53,11 +53,13 @@ EVT_TTSResponse = 352
 
 DEFAULT_VOICE_MALE = os.getenv(
     "SEEDTTS_VOICE_MALE",
-    "zh_male_M392_conversation_wvae_bigtts"
+    # 大壹:朴实接地气工地老板感,_uranus 2.0 资源音色(strict 2.0 兼容)
+    "zh_male_dayi_uranus_bigtts"
 )
 DEFAULT_VOICE_FEMALE = os.getenv(
     "SEEDTTS_VOICE_FEMALE",
-    "zh_female_shuangkuaisisi_moon_bigtts"
+    # 邻家女孩:通用对话戏,_uranus 2.0 资源音色(strict 2.0 兼容)
+    "zh_female_linjianvhai_uranus_bigtts"
 )
 
 
@@ -146,7 +148,23 @@ async def synth(text: str,
                 context_texts: list[str] | None = None,
                 resource_id: str | None = None,
                 timeout: float = 120.0) -> bytes:
-    """异常时自动尝试 seed-tts-1.0 fallback(不同音色 resource 不同)。"""
+    """TTS_STRICT_V2=true 时强制 2.0 资源,不静默 fallback 到 1.0;
+    TTS_STRICT_V2=false (默认) 时保留旧行为(_emo_ 音色自动走 1.0)。
+    """
+    strict_v2 = os.getenv("TTS_STRICT_V2", "false").lower() == "true"
+
+    # _emo_*_mars 多情感音色只存在于 1.0 资源
+    if voice and "_emo_" in voice:
+        if strict_v2:
+            raise RuntimeError(
+                f"voice {voice!r} 是 1.0 多情感音色,与 TTS_STRICT_V2=true 不兼容。"
+                f"改选 _uranus_bigtts 音色(22 个 2.0 资源音色)+ 用 voice_directive "
+                f"写自然语言情绪指令(如'用愤怒压抑的低沉语气')控情绪。"
+                f"见 references/voices/seedtts_v2_catalog.yaml"
+            )
+        if resource_id is None:
+            resource_id = "seed-tts-1.0"
+
     # 第一次尝试:默认或显式 resource
     try:
         return await _synth_once(
@@ -157,6 +175,12 @@ async def synth(text: str,
     except RuntimeError as e:
         if "resource ID is mismatched" not in str(e):
             raise
+        # strict 模式不允许 fallback
+        if strict_v2:
+            raise RuntimeError(
+                f"voice {voice!r} 在 2.0 资源里不可用(TTS_STRICT_V2=true 禁止降级)。"
+                f"原始错误: {e}"
+            )
         # fallback 到 seed-tts-1.0(_moon_ / BV* 等老音色)
         if resource_id == "seed-tts-1.0":
             raise  # 已经试过 1.0,放弃
@@ -192,12 +216,11 @@ async def _synth_once(text: str,
     rid = resource_id or os.getenv("SEEDTTS_RESOURCE", "seed-tts-2.0")
     is_v2 = (rid == "seed-tts-2.0")
 
-    # 1.0 资源不支持 expressive / context_texts / emotion 等 2.0 特有字段
+    # 1.0 资源不支持 model(expressive)/ context_texts(2.0 专属);
+    # 但 emotion/emotion_scale 正是 1.0 多情感音色(_emo_*_mars)的核心能力,必须保留
     if not is_v2:
         model = None
         context_texts = None
-        emotion = None
-        emotion_scale = None
     elif model is None:
         model = os.getenv("SEEDTTS_MODEL", "seed-tts-2.0-expressive")
 

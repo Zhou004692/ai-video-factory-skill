@@ -9,6 +9,7 @@ import json
 import os
 
 from .. import ASSETS_DIR
+from ..banned_words import sanitize as _sanitize_voiceover
 from ..db import conn
 from ..clients import seedtts_v2, doubao_tts, tos
 
@@ -44,9 +45,27 @@ async def run(job_id: str) -> None:
     total_chars = 0
     for r in rows:
         idx = r["idx"]
-        text = (r["voiceover"] or "").strip()
-        if not text:
+        raw_text = (r["voiceover"] or "").strip()
+        if not raw_text:
             continue
+
+        # 火山审核词预过滤(实测 OmniHuman 50514 Pre Audio Risk 都源于这类词)
+        text, hits = _sanitize_voiceover(raw_text, idx)
+        if hits:
+            # 同步回写 DB + storyboard,防止下次 retry 又触发同一条
+            db.execute(
+                "UPDATE shots SET voiceover=? WHERE job_id=? AND idx=?",
+                (text, job_id, idx),
+            )
+            for s in sb["shots"]:
+                if s["idx"] == idx:
+                    s["voiceover"] = text
+                    if s.get("subtitle") == raw_text:
+                        s["subtitle"] = text
+            db.execute(
+                "UPDATE jobs SET storyboard=? WHERE job_id=?",
+                (json.dumps(sb, ensure_ascii=False), job_id),
+            )
 
         sb_shot = sb_shots.get(idx, {})
 
@@ -70,11 +89,15 @@ async def run(job_id: str) -> None:
             # context_texts:语气指令(每镜可覆盖)
             directive = sb_shot.get("voice_directive") or DEFAULT_CONTEXT
             kwargs["context_texts"] = [directive]
-            # emotion + emotion_scale(per-shot 精细控制情绪)
-            if sb_shot.get("emotion"):
-                kwargs["emotion"] = sb_shot["emotion"]
-            if sb_shot.get("emotion_scale"):
-                kwargs["emotion_scale"] = int(sb_shot["emotion_scale"])
+            # TTS_STRICT_V2=true(走 2.0 资源):情绪靠 context_texts 自然语言指令,
+            # emotion/emotion_scale 是 1.0 多情感音色专属字段,2.0 不消费 —— 强制丢弃,
+            # 避免跟 voice_directive 冲突产出怪音频。
+            strict_v2 = os.getenv("TTS_STRICT_V2", "false").lower() == "true"
+            if not strict_v2:
+                if sb_shot.get("emotion"):
+                    kwargs["emotion"] = sb_shot["emotion"]
+                if sb_shot.get("emotion_scale"):
+                    kwargs["emotion_scale"] = int(sb_shot["emotion_scale"])
             # speech_rate per shot 可选
             if sb_shot.get("speech_rate") is not None:
                 kwargs["speech_rate"] = int(sb_shot["speech_rate"])

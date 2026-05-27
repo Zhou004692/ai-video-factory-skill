@@ -14,12 +14,16 @@
 import asyncio
 import json
 import os
+import time
 
 import httpx
 from volcengine.visual.VisualService import VisualService
 
 
 REQ_KEY = "jimeng_realman_avatar_picture_omni_v15"
+
+# 火山限流类错误码:遇到这些 code 时退避重试,而不是直接 fail
+_RATE_LIMIT_CODES = {50429, 50430, 50431, 50432}
 
 
 def _service() -> VisualService:
@@ -37,8 +41,21 @@ def _submit(image_url: str, audio_url: str,
             prompt: str | None = None,
             resolution: int = 1080,
             mask_url: list[str] | None = None,
-            seed: int = -1) -> str:
-    """提交任务,返回 task_id。"""
+            seed: int = -1,
+            turbo_mode: bool | None = None,
+            max_retries: int = 4) -> str:
+    """提交任务,返回 task_id。
+
+    50430 类限流错误自动退避重试(10s/20s/40s),不是真失败。
+    J-VERIFY05 实测多镜短时间内连续提交会 100% 触发 50430,必须 retry。
+
+    turbo_mode:
+        None  → 走 OMNIHUMAN_TURBO env 决定(默认 false)
+        True  → 加速生成,牺牲少量画质;测试期推荐开
+        False → 标准质量,生产推荐
+    """
+    if turbo_mode is None:
+        turbo_mode = os.getenv("OMNIHUMAN_TURBO", "false").lower() == "true"
     s = _service()
     body = {
         "req_key": REQ_KEY,
@@ -46,6 +63,7 @@ def _submit(image_url: str, audio_url: str,
         "audio_url": audio_url,
         "output_resolution": resolution,
         "pe_fast_mode": resolution == 720,   # 720→true,1080→false
+        "turbo_mode": turbo_mode,
         "seed": seed,
     }
     if prompt:
@@ -53,12 +71,27 @@ def _submit(image_url: str, audio_url: str,
     if mask_url:
         body["mask_url"] = mask_url
 
-    resp = s.cv_submit_task(body)
-    if isinstance(resp, str):
-        resp = json.loads(resp)
-    if resp.get("code") != 10000:
+    for attempt in range(max_retries):
+        resp = s.cv_submit_task(body)
+        if isinstance(resp, str):
+            resp = json.loads(resp)
+        code = resp.get("code")
+        if code == 10000:
+            return resp["data"]["task_id"]
+        if code in _RATE_LIMIT_CODES and attempt < max_retries - 1:
+            wait = 10 * (2 ** attempt)  # 10, 20, 40, 80
+            print(
+                f"[omnihuman] {code} rate-limited, retry "
+                f"{attempt + 1}/{max_retries} after {wait}s "
+                f"(msg={resp.get('message', '')[:80]})",
+                flush=True,
+            )
+            time.sleep(wait)
+            continue
         raise RuntimeError(f"omnihuman submit failed: {resp}")
-    return resp["data"]["task_id"]
+    raise RuntimeError(
+        f"omnihuman submit: exhausted {max_retries} retries on rate-limit"
+    )
 
 
 def _query(task_id: str) -> dict:
@@ -75,11 +108,13 @@ async def generate(image_url: str, audio_url: str,
                    resolution: int = 1080,
                    mask_url: list[str] | None = None,
                    seed: int = -1,
+                   turbo_mode: bool | None = None,
                    timeout: int = 600) -> bytes:
     """主入口:提交 + 轮询 + 下载,返回 mp4 字节。"""
     loop = asyncio.get_running_loop()
     task_id = await loop.run_in_executor(
-        None, _submit, image_url, audio_url, prompt, resolution, mask_url, seed
+        None, _submit, image_url, audio_url, prompt, resolution,
+        mask_url, seed, turbo_mode
     )
 
     deadline = loop.time() + timeout
