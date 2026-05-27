@@ -159,3 +159,135 @@ zh_female_liuchangnv_uranus_bigtts:
   age: young-adult
   tone: 流畅、专业、节奏稳
   fit_roles: [视频旁白, 解说, 主持, 新闻播报感, 纪录片解说]
+
+# --- 多情感音色(支持 emotion 情绪枚举 + emotion_scale 强度)---
+# dialogue 角色【必须】从这一组里选 —— 只有多情感音色能做出情绪。
+# 每条的 emotions 列出该音色支持的 emotion token,shot 的 emotion 字段只能取其中之一。
+
+zh_male_lengkugege_emo_v2_mars_bigtts:
+  display: 冷酷哥哥(多情感)
+  gender: male
+  age: young-adult
+  tone: 冷酷、有距离感、情绪张力强【多情感】
+  fit_roles: [冷峻男, 反派, 高冷男主, 有情绪戏的男性]
+  emotions: [angry, coldness, fear, happy, hate, neutral, sad, depressed]
+
+zh_male_aojiaobazong_emo_v2_mars_bigtts:
+  display: 傲娇霸总(多情感)
+  gender: male
+  age: adult
+  tone: 傲娇、霸气、总裁感【多情感】
+  fit_roles: [霸总, 老板, 总裁, 强势男]
+  emotions: [neutral, happy, angry, hate]
+
+zh_male_guangzhoudege_emo_mars_bigtts:
+  display: 广州德哥(多情感)
+  gender: male
+  age: middle-aged
+  tone: 广味、市井、接地气【多情感】
+  fit_roles: [广东老板, 生意人, 街坊大哥, 中小企业主]
+  emotions: [angry, fear, neutral]
+
+zh_male_jingqiangkanye_emo_mars_bigtts:
+  display: 京腔侃爷(多情感)
+  gender: male
+  age: middle-aged
+  tone: 京味、能侃、市井烟火气【多情感】
+  fit_roles: [北京大爷, 老板, 工程承包人, 生意人, 工地老板]
+  emotions: [happy, angry, surprised, hate, neutral]
+
+zh_male_yourougongzi_emo_v2_mars_bigtts:
+  display: 优柔公子(多情感)
+  gender: male
+  age: young
+  tone: 温润、书卷气、优柔【多情感】
+  fit_roles: [文弱男, 公子, 文艺青年, 知性男]
+  emotions: [happy, angry, fear, hate, excited, neutral, depressed]
+
+zh_male_ruyayichen_emo_v2_mars_bigtts:
+  display: 儒雅男友(多情感)
+  gender: male
+  age: young-adult
+  tone: 儒雅、温和、男友感【多情感】
+  fit_roles: [男友, 暖男, 知性男, 白领, 设计师]
+  emotions: [happy, sad, angry, fear, excited, coldness, neutral]
+
+zh_male_junlangnanyou_emo_v2_mars_bigtts:
+  display: 俊朗男友(多情感)
+  gender: male
+  age: young-adult
+  tone: 俊朗、阳光、男友感【多情感】
+  fit_roles: [男友, 阳光男, 年轻白领, 年轻打工人]
+  emotions: [happy, sad, angry, surprised, fear, neutral]
+
+zh_male_beijingxiaoye_emo_v2_mars_bigtts:
+  display: 北京小爷(多情感)
+  gender: male
+  age: young
+  tone: 京味、利落、带点痞气【多情感】
+  fit_roles: [北京年轻人, 痞帅男, 段子手, 年轻打工人]
+  emotions: [angry, surprised, fear, excited, coldness, neutral]
+
+zh_male_yangguangqingnian_emo_v2_mars_bigtts:
+  display: 阳光青年(多情感)
+  gender: male
+  age: young
+  tone: 阳光、活力、清爽【多情感】
+  fit_roles: [年轻人, 学生, 实习生, 销售新人, 阳光男]
+  emotions: [happy, sad, angry, fear, excited, coldness, neutral]
+
+zh_male_shenyeboke_emo_v2_mars_bigtts:
+  display: 深夜播客(多情感)
+  gender: male
+  age: middle-aged
+  tone: 沉稳、深夜感、情绪饱满【多情感】
+  fit_roles: [情感主播, 思考型男, 中年男, 旁白]
+  emotions: [surprised, sad, neutral, hate, happy, fear, excited, depressed, coldness, angry]
+
+zh_female_gaolengyujie_emo_v2_mars_bigtts:
+  display: 高冷御姐(多情感)
+  gender: female
+  age: adult
+  tone: 高冷、御姐、强势【多情感】
+  fit_roles: [女老板, 女总监, 女高管, 强势女]
+  emotions: [happy, sad, angry, surprised, fear, hate, excited, coldness, neutral]
+
+zh_female_roumeinvyou_emo_v2_mars_bigtts:
+  display: 柔美女友(多情感)
+  gender: female
+  age: young-adult
+  tone: 柔美、温柔、女友感【多情感】
+  fit_roles: [女友, 温柔女, 妻子, 知性女]
+  emotions: [happy, sad, angry, surprised, fear, hate, excited, coldness, neutral]
+
+zh_female_shuangkuaisisi_emo_v2_mars_bigtts:
+  display: 爽快思思(多情感)
+  gender: female
+  age: young-adult
+  tone: 爽快、利落、干练【多情感】
+  fit_roles: [干练女, 职场女, 销售妹, 行业女]
+  emotions: [happy, sad, angry, surprised, excited, coldness, neutral]
+
+zh_female_linjuayi_emo_v2_mars_bigtts:
+  display: 邻居阿姨(多情感)
+  gender: female
+  age: middle-aged
+  tone: 市井、家常、长辈感【多情感】
+  fit_roles: [阿姨, 街坊, 邻居, 中年女性, 大妈]
+  emotions: [neutral, angry, coldness, depressed, surprised]
+
+zh_female_tianxinxiaomei_emo_v2_mars_bigtts:
+  display: 甜心小美(多情感)
+  gender: female
+  age: young
+  tone: 甜美、年轻、软糯【多情感】
+  fit_roles: [甜妹, 学妹, 年轻女孩, 邻家妹妹]
+  emotions: [sad, fear, hate, neutral]
+
+zh_female_meilinvyou_emo_v2_mars_bigtts:
+  display: 魅力女友(多情感)
+  gender: female
+  age: young-adult
+  tone: 魅力、温柔、女友感【多情感】
+  fit_roles: [女友, 妻子, 魅力女]
+  emotions: [sad, fear, neutral]

@@ -33,13 +33,14 @@ def load_voice_catalog() -> dict:
 def voice_catalog_table() -> str:
     """把音色库格式化成 markdown 表格,塞进 prompt。"""
     catalog = load_voice_catalog()
-    rows = ["| voice_id | 显示名 | 性别 | 年龄段 | 调性 | 适配角色 |",
-            "|---|---|---|---|---|---|"]
+    rows = ["| voice_id | 显示名 | 性别 | 年龄段 | 调性 | 适配角色 | 支持情感(emotion) |",
+            "|---|---|---|---|---|---|---|"]
     for vid, meta in catalog.items():
         roles = ", ".join(meta.get("fit_roles", []))
+        emos = ", ".join(meta.get("emotions", [])) or "—"
         rows.append(
             f"| `{vid}` | {meta['display']} | {meta['gender']} | "
-            f"{meta['age']} | {meta['tone']} | {roles} |"
+            f"{meta['age']} | {meta['tone']} | {roles} | {emos} |"
         )
     return "\n".join(rows)
 

@@ -63,7 +63,7 @@ def _validate(sb: dict) -> None:
             f"narrator.voice_id {narrator['voice_id']!r} not in catalog"
         )
 
-    if not isinstance(sb["shots"], list) or not (5 <= len(sb["shots"]) <= 12):
+    if not isinstance(sb["shots"], list) or not (2 <= len(sb["shots"]) <= 12):
         raise ValueError(f"shots count out of range: {len(sb.get('shots', []))}")
 
     for shot in sb["shots"]:
