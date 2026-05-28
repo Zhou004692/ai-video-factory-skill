@@ -1,10 +1,43 @@
-"""FFmpeg 封装:分镜归一化 + 拼接 + 混入 BGM。"""
+"""FFmpeg 封装:分镜归一化 + 字幕/hook 烧制 + 转场 + 片尾 CTA + 拼接 + 混入 BGM。"""
 import asyncio
+import os
 from pathlib import Path
 
 
 class FFmpegError(RuntimeError):
     pass
+
+
+# 中文字幕字体(雅黑粗体,短视频清晰度好)。可用 SUBTITLE_FONT env 覆盖。
+SUBTITLE_FONT = os.getenv("SUBTITLE_FONT", "C:/Windows/Fonts/msyhbd.ttc")
+# 品牌信息(片尾 CTA 用),可 env 覆盖
+BRAND_NAME = os.getenv("BRAND_NAME", "众能联合")
+BRAND_CTA = os.getenv("BRAND_CTA", "设备租赁不踩坑 · 关注了解更多")
+
+
+def _esc(p: str) -> str:
+    """ffmpeg filter 里的路径转义(Windows 盘符冒号 + 反斜杠)。"""
+    return str(p).replace("\\", "/").replace(":", r"\:")
+
+
+def _drawtext(textfile: Path, *, fontsize: int, y: str,
+              color: str = "white", border: int = 4,
+              enable: str | None = None) -> str:
+    """构造一个 drawtext filter 片段。中文走 textfile(避免命令行编码坑)。"""
+    parts = [
+        f"fontfile='{_esc(SUBTITLE_FONT)}'",
+        f"textfile='{_esc(textfile)}'",
+        f"fontcolor={color}",
+        f"fontsize={fontsize}",
+        f"borderw={border}",
+        "bordercolor=black@0.9",
+        "x=(w-text_w)/2",
+        f"y={y}",
+        "line_spacing=10",
+    ]
+    if enable:
+        parts.append(f"enable='{enable}'")
+    return "drawtext=" + ":".join(parts)
 
 
 async def _run(args: list[str]) -> None:
@@ -51,12 +84,44 @@ async def has_audio_stream(path: Path) -> bool:
 
 
 async def normalize_shot(in_path: Path, out_path: Path,
-                         width: int = 1080, height: int = 1920) -> None:
-    """归一化:统一 9:16 H.264 AAC 44.1k 立体声;无音频则补静音。"""
-    vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
-    )
+                         width: int = 1080, height: int = 1920,
+                         subtitle: str | None = None,
+                         hook: str | None = None,
+                         fade: bool = True,
+                         duration: float | None = None) -> None:
+    """归一化:统一 9:16 H.264 AAC 44.1k 立体声;无音频则补静音。
+
+    subtitle: 该镜字幕(底部居中,白字黑边)。短视频 90% 静音看,必烧。
+    hook:     0-3 秒大字钩子(仅第一镜传,顶部偏上,黄字)。
+    fade:     首尾 0.15s 淡入淡出,缓解硬切割裂感(轻量转场)。
+    duration: 该镜时长(算 fade-out 起点用);不传则不加 fade-out。
+    """
+    vf_chain = [
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
+        "setsar=1",
+    ]
+    # 字幕(底部,距底 12%)
+    if subtitle and subtitle.strip():
+        sub_txt = out_path.parent / f"{out_path.stem}_sub.txt"
+        sub_txt.write_text(subtitle.strip(), encoding="utf-8")
+        vf_chain.append(_drawtext(
+            sub_txt, fontsize=int(width * 0.048), y="h-text_h-h*0.12",
+            color="white", border=4))
+    # hook 大字(仅第一镜,0-3 秒,顶部 18%,黄字大号)
+    if hook and hook.strip():
+        hook_txt = out_path.parent / f"{out_path.stem}_hook.txt"
+        hook_txt.write_text(hook.strip(), encoding="utf-8")
+        vf_chain.append(_drawtext(
+            hook_txt, fontsize=int(width * 0.072), y="h*0.16",
+            color="yellow", border=6, enable="between(t,0,3)"))
+    # fade 转场(轻量,缓解硬切)
+    if fade:
+        vf_chain.append("fade=t=in:st=0:d=0.15")
+        if duration and duration > 0.4:
+            vf_chain.append(f"fade=t=out:st={duration - 0.15:.2f}:d=0.15")
+    vf = ",".join(vf_chain)
+
     has_audio = await has_audio_stream(in_path)
     if has_audio:
         args = [
@@ -94,6 +159,40 @@ async def mux_video_audio(video: Path, audio: Path, out_path: Path) -> None:
         "-c:v", "copy",
         "-c:a", "aac", "-b:a", "128k",
         "-shortest",
+        str(out_path),
+    ])
+
+
+async def make_cta_card(out_path: Path, *, width: int = 1080, height: int = 1920,
+                        duration: float = 2.5,
+                        brand: str | None = None,
+                        cta: str | None = None) -> None:
+    """生成片尾 CTA 卡片(深蓝底 + 品牌名大字 + CTA 文案 + 淡入)。
+    输出格式与 normalize_shot 一致(H.264 + AAC 静音),可直接进 concat 列表。"""
+    brand = brand or BRAND_NAME
+    cta = cta or BRAND_CTA
+    brand_txt = out_path.parent / f"{out_path.stem}_brand.txt"
+    cta_txt = out_path.parent / f"{out_path.stem}_cta.txt"
+    brand_txt.write_text(brand.strip(), encoding="utf-8")
+    cta_txt.write_text(cta.strip(), encoding="utf-8")
+
+    vf = ",".join([
+        # 品牌名(居中偏上,大号白字)
+        _drawtext(brand_txt, fontsize=int(width * 0.10),
+                  y="h*0.40", color="white", border=5),
+        # CTA 文案(居中偏下,中号品牌色)
+        _drawtext(cta_txt, fontsize=int(width * 0.05),
+                  y="h*0.55", color="0xFF9D5C", border=4),
+        "fade=t=in:st=0:d=0.3",
+    ])
+    await _run([
+        "-f", "lavfi", "-i", f"color=c=0x1A2740:s={width}x{height}:d={duration}",
+        "-f", "lavfi", "-i", "anullsrc=cl=stereo:r=44100",
+        "-vf", vf,
+        "-t", str(duration),
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-c:a", "aac", "-b:a", "128k",
+        "-pix_fmt", "yuv420p",
         str(out_path),
     ])
 

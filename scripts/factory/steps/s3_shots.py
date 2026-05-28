@@ -202,7 +202,12 @@ async def run(job_id: str) -> None:
     for r in rows:
         shot = dict(r)
         sb_shot = sb_shots.get(shot["idx"], {})
-        if shot["narrative_type"] == "dialogue":
+        # 混合路线 B:dialogue 镜头按 render_mode 分流
+        #   digital_human(默认) → OmniHuman 真人脸开口(情绪爆点镜,贵但有表演)
+        #   scene              → Seedance i2v 场景视频 + 该镜 voice 作旁白(铺垫镜,省成本)
+        #                        s6 会把 voice mux 进无音轨的 Seedance 视频 + 烧字幕
+        render_mode = (sb_shot.get("render_mode") or "digital_human").lower()
+        if shot["narrative_type"] == "dialogue" and render_mode == "digital_human":
             char = chars.get(shot["speaker_id"])
             if not char:
                 raise RuntimeError(
@@ -213,6 +218,13 @@ async def run(job_id: str) -> None:
                     f"shot #{shot['idx']} missing audio_url (s4_voice 未生成?)"
                 )
             tasks.append(_gen_dialogue(job_id, shot, char, sb_shot, sem))
+        elif shot["narrative_type"] == "dialogue" and render_mode == "scene":
+            # 场景旁白模式:用 speaker 的 in-scene 静帧作 Seedance 首帧,
+            # voice 在 s6 mux(画外音/V.O.,不要求嘴型同步)
+            speaker = chars.get(shot["speaker_id"])
+            anchor_path = speaker.get("image_path") if speaker else None
+            tasks.append(_gen_broll(job_id, shot, style_prefix,
+                                    anchor_path, sb_shot, sem))
         else:
             anchor_id = shot.get("anchor_character")
             anchor_path = None
