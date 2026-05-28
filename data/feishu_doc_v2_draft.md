@@ -269,7 +269,7 @@ flowchart LR
 
 | 组件 | 版本 | model id |
 |---|---|---|
-| s1 LLM | Doubao 1.5 Pro 32k | `doubao-1-5-pro-32k-250115` |
+| s1 LLM | **Doubao Seed 2.0 Pro**（v2.3 升级，实测扣题+主动 broll+混合分配远胜 1.5） | `doubao-seed-2-0-pro-260215` |
 | s2 静帧 | **Seedream 4.5**（回滚自 5.0 Lite） | `doubao-seedream-4-5-251128` |
 | s3 dialogue 视频 | OmniHuman 1.5 | `jimeng_realman_avatar_picture_omni_v15` |
 | s3 broll 视频 | **Seedance 2.0**（client 深度改造） | `doubao-seedance-2-0-260128` |
@@ -338,6 +338,10 @@ flowchart LR
    - ✅ **s2 三条反幻觉约束**（单人/严格 look/反重力）
    - ✅ **双关键帧 broll**（首帧 + 尾帧锁定 i2v 起止）
    - ✅ **storyboard.md schema 三层情绪同步**（画面 + 配音 + 动态表情）
+7. **v2.3 隔天复盘 3 大改造**：
+   - ✅ **成片增强（补 P0）**：每镜烧字幕 + 0-3s hook 大字 + 片尾品牌 CTA 卡 + 轻量 fade 转场（J-VERIFY06 抽帧验证字幕/hook/CTA 全部正确，¥0 本地 ffmpeg）
+   - ✅ **混合路线 B（成本砍半）**：dialogue 镜 `render_mode` 分流 —— 情绪爆点 digital_human(OmniHuman) / 铺垫镜 scene(Seedance + 画外音)；s6 mux 通用化（has_audio_stream 判断）
+   - ✅ **s1 LLM 升 Doubao Seed 2.0 Pro**：实测同主题 2.0 扣题（1.5 跑题）+ 主动用 broll + render_mode 混合分配合理 + 输出更详细
 
 ### 9.2 v2.1 教训沉淀
 
@@ -436,3 +440,4 @@ flowchart LR
 | v2 | 2026-05-26 | 按 ToB PM 标准结构重组，加业务定位 + 用例画像，整合 Seedream 4.5 i2i 决策 |
 | **v2.1** | **2026-05-27** | **4 模型升级实战回顾：5.0 Lite 降级回滚 / 480p hard fail 回 720 / TTS strict 2.0 + 自然语言情绪 / Seedance 2.0 深度改造 / OmniHuman 50430 retry / s2 反幻觉 / 双关键帧 broll / 三层情绪同步** |
 | **v2.2** | **2026-05-27** | **异常处理加固：OmniHuman 欠费明确识别（`[ACCOUNT_OVERDUE]` 前缀）+ s3_shots BaseException 兜底防 shot 停留 PENDING（J-VERIFY06 充值后续跑实战暴露）** |
+| **v2.3** | **2026-05-28** | **隔天复盘 3 大改造：①成片增强（每镜烧字幕 + 0-3s hook 大字 + 片尾品牌 CTA 卡 + 轻量 fade 转场，补 P0 静音观看缺陷，J-VERIFY06 抽帧验证✅）②混合路线 B（dialogue 镜加 render_mode：digital_human 情绪爆点用 OmniHuman / scene 铺垫镜用 Seedance+画外音，成本砍半）③s1 LLM 升 Doubao Seed 2.0 Pro（扣题+主动 broll，实测远胜 1.5）** |
