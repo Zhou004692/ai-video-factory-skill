@@ -230,6 +230,7 @@ flowchart LR
 | **s2 静帧三类 artifact** | **3 条反幻觉/反重力/严格 look 约束** ([s2_character.py:99-117](C:/Users/zhoujianhua3/.claude/skills/ai-video-factory/scripts/factory/steps/s2_character.py#L99-L117)) | **v2.1** |
 | **Seedream 4.5 size <3686400 px** | **client 默认 1440×2560** | **v2.1** |
 | **OmniHuman omni_prompt 散文式拼接** | **结构化标签:`camera:` / `emotion:` / `body:` / `background:`**（[s3_shots.py:32-54](C:/Users/zhoujianhua3/.claude/skills/ai-video-factory/scripts/factory/steps/s3_shots.py#L32-L54)），跟 PoC 验证有效的 rich prompt 风格对齐 | **v2.1** |
+| **火山账户欠费时 cli.py 直接 crash，shot.error 留 NULL** | omnihuman.py 加 `OmniHumanAccountOverdue(RuntimeError)` 子类 + 关键词识别（overdue / balance / 欠费 / 余额 等），s3_shots._gen_dialogue 加 OAO 分支写 `[ACCOUNT_OVERDUE]` 前缀 + BaseException 兜底防 shot 停留 PENDING | **v2.2** |
 
 ---
 
@@ -434,3 +435,4 @@ flowchart LR
 | v1 | 2026-05-15 | 初始日志式文档，11 章按时间追加 |
 | v2 | 2026-05-26 | 按 ToB PM 标准结构重组，加业务定位 + 用例画像，整合 Seedream 4.5 i2i 决策 |
 | **v2.1** | **2026-05-27** | **4 模型升级实战回顾：5.0 Lite 降级回滚 / 480p hard fail 回 720 / TTS strict 2.0 + 自然语言情绪 / Seedance 2.0 深度改造 / OmniHuman 50430 retry / s2 反幻觉 / 双关键帧 broll / 三层情绪同步** |
+| **v2.2** | **2026-05-27** | **异常处理加固：OmniHuman 欠费明确识别（`[ACCOUNT_OVERDUE]` 前缀）+ s3_shots BaseException 兜底防 shot 停留 PENDING（J-VERIFY06 充值后续跑实战暴露）** |
