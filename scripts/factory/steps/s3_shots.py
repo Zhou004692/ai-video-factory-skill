@@ -128,13 +128,11 @@ async def _gen_broll(job_id: str, shot: dict, style_prefix: str,
                 / f"{shot['idx']:02d}_broll_end.png"
             )
             last_frame = str(end_keyframe_path) if end_keyframe_path.exists() else None
-            # 多 reference_image:除首帧外,如有 anchor 定妆照(且跟 keyframe 不同),
-            # 一起喂给 2.0,角色跨镜头一致性更强
-            extra_refs: list[str] = []
-            if (anchor_image_path
-                    and anchor_image_path != keyframe
-                    and shot.get("character_in_scene_path")):
-                extra_refs.append(anchor_image_path)
+            # ⚠️ Seedance 2.0 硬约束:first/last_frame 跟 reference_image **互斥**
+            # ("first/last frame content cannot be mixed with reference media content")
+            # J-VERIFY07 实测:scene-dialogue 模式传了 first_frame + anchor reference 直接 400
+            # 选择:i2v 优先(first_frame 已是该镜专属静帧,信息够),不混 reference_image
+            extra_refs: list[str] = []  # 保留变量给未来"无 first_frame + 多 ref"模式
             # camera_fixed / motion_strength 优先用 storyboard 显式字段,
             # 老 job(没这俩字段)走 fallback:从 camera 关键词推断 + 默认 0.4
             camera_fixed = sb_shot.get("camera_fixed")
