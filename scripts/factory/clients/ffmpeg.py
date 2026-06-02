@@ -197,6 +197,54 @@ async def make_cta_card(out_path: Path, *, width: int = 1080, height: int = 1920
     ])
 
 
+async def generate_thumbnail(video_path: Path, hook_text: str, out_path: Path,
+                             *, ts: float = 4.5,
+                             width: int = 720, height: int = 1280) -> None:
+    """从成片抽帧 + 叠超大 hook + 品牌色边框 + 底部品牌色块,生成视频号封面 jpg。
+
+    视频号封面决定 50% 点击率,当前管线默认抽首帧凑合,这步专门做"高点击率封面"。
+    ts 默认 4.5s(避开成片首 3 秒已烧的 hook 时段,防止"双层 hook"叠加);
+    封面大字在顶部偏下,不挡主角脸。
+    """
+    hook = (hook_text or BRAND_NAME).strip()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    hook_txt = out_path.parent / f"{out_path.stem}_hook.txt"
+    brand_txt = out_path.parent / f"{out_path.stem}_brand.txt"
+    hook_txt.write_text(hook, encoding="utf-8")
+    brand_txt.write_text(BRAND_NAME, encoding="utf-8")
+
+    # 字号比成片 hook 再大 60%(封面要"远处就能看清",但不能遮脸)
+    hook_fs = int(width * 0.11)
+    brand_fs = int(width * 0.06)
+    brand_band_y = int(height * 0.85)
+    brand_band_h = height - brand_band_y
+
+    vf = ",".join([
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
+        # 橙色品牌色厚边框
+        f"drawbox=x=15:y=15:w={width-30}:h={height-30}:color=0xFF6500@0.85:t=10",
+        # 顶部半透明黑条作 hook 文字背景(确保大字在任何背景下都清晰)
+        f"drawbox=x=0:y=80:w={width}:h={int(width*0.20)}:color=0x000000@0.55:t=fill",
+        # 超大 hook 大字(顶部 8-15%,不挡脸)
+        _drawtext(hook_txt, fontsize=hook_fs, y="120",
+                  color="yellow", border=8),
+        # 底部深蓝色块作品牌锚
+        f"drawbox=x=0:y={brand_band_y}:w={width}:h={brand_band_h}:color=0x1A2740:t=fill",
+        # 品牌名叠在底部色块上
+        _drawtext(brand_txt, fontsize=brand_fs, y="h*0.90",
+                  color="white", border=3),
+    ])
+    await _run([
+        "-ss", str(ts), "-i", str(video_path),
+        "-frames:v", "1",
+        "-vf", vf,
+        "-update", "1",
+        "-q:v", "2",
+        str(out_path),
+    ])
+
+
 async def concat_shots(shot_paths: list[Path], out_path: Path) -> None:
     """concat demuxer 拼接。要求所有片段格式一致(请先 normalize_shot)。"""
     list_file = out_path.parent / "concat.txt"

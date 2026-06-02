@@ -153,6 +153,12 @@ async def synth(text: str,
     """
     strict_v2 = os.getenv("TTS_STRICT_V2", "false").lower() == "true"
 
+    # 声音复刻 S_xxx 音色 → 走 seed-icl-2.0 资源(跟 strict_v2 兼容)
+    if voice and voice.startswith("S_") and resource_id is None:
+        resource_id = "seed-icl-2.0"
+        # 复刻音色不支持 expressive model + context_texts(走 ICL 路径)
+        # 让下游 _synth_once 自动按 is_v2 = False 处理(model/context_texts 清空)
+
     # _emo_*_mars 多情感音色只存在于 1.0 资源
     if voice and "_emo_" in voice:
         if strict_v2:

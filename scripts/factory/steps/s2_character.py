@@ -13,10 +13,14 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 
-from .. import ASSETS_DIR
+from .. import ASSETS_DIR, DATA_DIR
 from ..db import conn
 from ..clients import seedance, tos
+
+# 角色花名册 portrait 缓存目录(跨 job 复用同 char_id 的 portrait)
+CHAR_CACHE_DIR = DATA_DIR / "character_cache"
 
 try:
     from ..clients import gpt_image
@@ -221,21 +225,64 @@ async def _gen_broll_keyframe(job_id: str, shot_idx: int, shot: dict,
 async def _gen_reference_img(job_id: str, character: dict,
                              style_prefix: str,
                              sem: asyncio.Semaphore) -> dict:
-    """每角色一张通用定妆照(简单背景),用作 fallback / gpt-image edits 的 reference。"""
+    """每角色一张通用定妆照(简单背景)。
+
+    Portrait 缓存机制(v2.4 角色 IP 复用):
+    - 同 char_id(如 boss_laozhou / engineer_wanggong)首次出场 → 生成 + 写入
+      `data/character_cache/{char_id}.png` + .json(含 TOS URL)
+    - 后续 job 同 char_id → 直接复用缓存,跳过 ¥0.3/张 Seedream 调用
+    - 跨片人格连续性的关键(老周永远是同一张脸)
+    - 需要更新角色形象时,手动删除 cache 文件即可触发重生成
+    """
+    char_id = character["id"]
+    cache_png = CHAR_CACHE_DIR / f"{char_id}.png"
+    cache_meta = CHAR_CACHE_DIR / f"{char_id}.json"
+    job_path = ASSETS_DIR / job_id / "characters" / f"{char_id}.png"
+
+    # 缓存命中:复用 portrait + TOS URL
+    if cache_png.exists() and cache_meta.exists():
+        meta = json.loads(cache_meta.read_text(encoding="utf-8"))
+        job_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(cache_png, job_path)
+        print(
+            f"[s2] cache hit: {char_id} 复用 portrait (省 ¥0.3 + IP 一致性)",
+            flush=True,
+        )
+        return {
+            **character,
+            "image_path": str(job_path),
+            "image_url": meta["image_url"],
+        }
+
+    # 未命中:生成 + 写缓存
     async with sem:
         prompt = (
             f"{character['look']}\n"
             f"竖屏 9:16 半身像,简洁纯色背景,主体清晰居中,自然光"
         )
-        seed = _seed_for(character["id"])
+        seed = _seed_for(char_id)
         img = await _gen_image(prompt, seed=seed)
-        path = ASSETS_DIR / job_id / "characters" / f"{character['id']}.png"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(img)
-        url = tos.upload(path, key_hint=f"{job_id}-char-{character['id']}")
+        job_path.parent.mkdir(parents=True, exist_ok=True)
+        job_path.write_bytes(img)
+        url = tos.upload(job_path, key_hint=f"{job_id}-char-{char_id}")
+
+        # 写入缓存(下次复用)
+        CHAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(job_path, cache_png)
+        cache_meta.write_text(
+            json.dumps({
+                "char_id": char_id,
+                "image_url": url,
+                "first_job": job_id,
+                "look_preview": character["look"][:80],
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"[s2] cache MISS: {char_id} 新生成 portrait,已写入 cache",
+              flush=True)
         return {
             **character,
-            "image_path": str(path),
+            "image_path": str(job_path),
             "image_url": url,
         }
 

@@ -95,6 +95,16 @@ async def run(job_id: str) -> None:
     final = base / "final.mp4"
     await ffmpeg.mix_bgm(concat_out, bgm, final, bgm_db=-12.0)
 
+    # 5. 生成视频号封面 thumbnail(决定 50% 点击率)
+    #    抽 1.5s 帧 + 叠超大 hook 大字 + 品牌色边框 + 品牌锚
+    if os.getenv("GEN_THUMBNAIL", "true").lower() == "true":
+        thumb = base / "thumbnail.jpg"
+        try:
+            await ffmpeg.generate_thumbnail(final, hook_text, thumb)
+            print(f"[s6] thumbnail -> {thumb}", flush=True)
+        except Exception as e:
+            print(f"[s6] thumbnail gen failed (非致命): {e}", flush=True)
+
     db.execute("UPDATE jobs SET final_path=? WHERE job_id=?",
                (str(final), job_id))
     db.commit()
