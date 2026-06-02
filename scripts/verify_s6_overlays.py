@@ -14,7 +14,7 @@ sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 
 from factory.steps import s6_compose  # noqa: E402
 
-JOB_ID = "J-VERIFY06"
+JOB_ID = sys.argv[1] if len(sys.argv) > 1 else "J-VERIFY06"
 
 
 async def main() -> None:

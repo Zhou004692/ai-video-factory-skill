@@ -213,8 +213,20 @@ async def generate_thumbnail(video_path: Path, hook_text: str, out_path: Path,
     hook_txt.write_text(hook, encoding="utf-8")
     brand_txt.write_text(BRAND_NAME, encoding="utf-8")
 
-    # 字号比成片 hook 再大 60%(封面要"远处就能看清",但不能遮脸)
-    hook_fs = int(width * 0.11)
+    # 动态字号:按 hook 字数算,保证一行内可完整显示不溢出
+    # 公式:safe_w = width - 80(去边框+内边距),每字宽约 fontsize,留 8% 安全边
+    # 上限 width*0.13(短 hook 大字冲击力),下限 width*0.06(超长 hook 仍清晰)
+    safe_w = width - 80
+    char_count = max(len(hook), 1)
+    hook_fs = int(min(
+        max(safe_w / char_count * 0.92, width * 0.06),
+        width * 0.13,
+    ))
+    # 半透明黑底高度自适应字号(给字留充分上下 padding)
+    band_h = int(hook_fs * 1.6)
+    band_y = 80
+    text_y = band_y + (band_h - hook_fs) // 2 - 5  # 视觉居中(略上偏)
+
     brand_fs = int(width * 0.06)
     brand_band_y = int(height * 0.85)
     brand_band_h = height - brand_band_y
@@ -224,10 +236,10 @@ async def generate_thumbnail(video_path: Path, hook_text: str, out_path: Path,
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
         # 橙色品牌色厚边框
         f"drawbox=x=15:y=15:w={width-30}:h={height-30}:color=0xFF6500@0.85:t=10",
-        # 顶部半透明黑条作 hook 文字背景(确保大字在任何背景下都清晰)
-        f"drawbox=x=0:y=80:w={width}:h={int(width*0.20)}:color=0x000000@0.55:t=fill",
-        # 超大 hook 大字(顶部 8-15%,不挡脸)
-        _drawtext(hook_txt, fontsize=hook_fs, y="120",
+        # 半透明黑底(自适应字号高度)
+        f"drawbox=x=0:y={band_y}:w={width}:h={band_h}:color=0x000000@0.55:t=fill",
+        # hook 大字(动态字号 + 居中)
+        _drawtext(hook_txt, fontsize=hook_fs, y=str(text_y),
                   color="yellow", border=8),
         # 底部深蓝色块作品牌锚
         f"drawbox=x=0:y={brand_band_y}:w={width}:h={brand_band_h}:color=0x1A2740:t=fill",

@@ -156,7 +156,7 @@ OmniHuman 官方原话:**"结合音频内容描述细腻的情绪变化"**。情
     "voice_id": "zh_male_cixingjieshuonan_uranus_bigtts"
   },
   "style_prefix": "40-60 字风格底色前缀,所有镜头共用",
-  "hook": "0-3 秒字幕大字,15 字以内",
+  "hook": "0-3 秒字幕大字 + 视频号封面大字,**≤10 字**(留余地,封面字号大;>10 字封面会缩字号视觉冲击力下降)",
   "bgm": {
     "style": "...",
     "mood": "...",
