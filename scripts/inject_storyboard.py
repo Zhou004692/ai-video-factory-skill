@@ -12,6 +12,11 @@ import json
 import sys
 from pathlib import Path
 
+# Windows console GBK 编不出 ¥ 等字符,强制 UTF-8 stdout
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from dotenv import load_dotenv
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -53,8 +58,12 @@ def main() -> None:
     if not (5 <= len(sb["shots"]) <= 12):
         raise SystemExit(f"shots 数 {len(sb['shots'])} 不在 5-12 范围")
     n_broll = sum(1 for s in sb["shots"] if s.get("type") == "broll")
-    if n_broll > 1:
-        raise SystemExit(f"broll 镜头 {n_broll} 个,上限 1 个")
+    if n_broll > 6:
+        raise SystemExit(
+            f"broll 镜头 {n_broll} 个,上限 6 个(30s 内 5s/broll × 6 = 全 broll 极限);"
+            f"如确实需要 broll 主导主题(如老司机验车特写蒙太奇),"
+            f"也别超过 6 个,否则没角色感观众记不住品牌"
+        )
 
     chars = []
     char_ids = set()

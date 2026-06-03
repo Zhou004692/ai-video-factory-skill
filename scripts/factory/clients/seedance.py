@@ -177,8 +177,11 @@ async def text_to_video(
         "duration": int(round(duration)),
         "resolution": resolution,
         "ratio": ratio,
-        "camera_fixed": camera_fixed,
     }
+    # Seedance 2.0 硬约束 #2(J-VERIFY08 实测):flf2v 模式(有 last_frame)
+    # 不支持 camera_fixed 参数 ("must be empty"),只有 i2v/t2v 模式才传。
+    if not last_frame:
+        payload["camera_fixed"] = camera_fixed
     if seed is not None:
         payload["seed"] = seed
     if motion_strength is not None:

@@ -13,6 +13,12 @@ import json
 import sys
 from pathlib import Path
 
+# Windows console 默认 GBK 编不出 ¥/部分中文符号(会让子流程 print 直接 crash);
+# 入口强制 stdout/stderr UTF-8,管线后续 print 透明支持
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # 加载 skill 根目录的 .env
 from dotenv import load_dotenv
 SKILL_ROOT = Path(__file__).resolve().parent.parent

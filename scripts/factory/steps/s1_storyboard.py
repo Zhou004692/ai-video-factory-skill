@@ -93,12 +93,14 @@ def _validate(sb: dict) -> None:
                     f"{char_ids} or null: {anchor}"
                 )
 
-    # 软约束提醒:broll 镜头最多 1 个
+    # 软约束:broll 镜头最多 6 个(放宽,允许 broll 主导特写蒙太奇主题)
+    # v2.4 之前 ≤1 是因为 broll 没角色感影响品牌记忆;
+    # 现在允许 broll 主导(如老司机验车 5 处),但仍需至少 2-3 dialogue 镜头保品牌人格
     n_broll = sum(1 for s in sb["shots"] if s["type"] == "broll")
-    if n_broll > 1:
+    if n_broll > 6:
         raise ValueError(
-            f"too many broll shots ({n_broll}); max 1 broll per video. "
-            f"Make them dialogue with scene+action instead."
+            f"too many broll shots ({n_broll}); max 6 per video "
+            f"(30s 内 5s/broll × 6 = 全 broll 极限,再多没角色感观众记不住)"
         )
 
 
