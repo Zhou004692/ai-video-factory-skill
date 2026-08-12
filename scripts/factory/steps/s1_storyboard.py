@@ -7,9 +7,18 @@ DEFAULT_LLM_PROVIDER:
 import json
 import os
 
-from .. import ASSETS_DIR
+from .. import ASSETS_DIR, script_sources
 from ..db import conn
-from ..prompts import storyboard_prompt, load_voice_catalog
+from ..prompts import storyboard_prompt
+
+
+def _long_scene_enabled() -> bool:
+    configured = os.getenv("SEEDANCE25_LONG_SCENE_ENABLED")
+    if configured is None:
+        return True
+    return configured.strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def _llm():
@@ -23,50 +32,158 @@ def _llm():
     raise ValueError(f"unknown LLM provider: {name}")
 
 
+def _is_director_storyboard(sb: dict) -> bool:
+    return sb.get("production_mode") == "native_master_local_director"
+
+
+def _generation_units(sb: dict) -> list[dict]:
+    """Return paid Seedance units while preserving legacy storyboards."""
+    return (sb.get("masters") or []) if _is_director_storyboard(sb) else (
+        sb.get("shots") or []
+    )
+
+
+def _validate_director_storyboard(sb: dict) -> None:
+    for key in (
+        "production_profile", "production_mode", "characters", "hook",
+        "masters", "shots", "bgm",
+    ):
+        if key not in sb:
+            raise ValueError(f"storyboard missing key: {key}; got {list(sb)}")
+    if sb["production_profile"] != "standard":
+        raise ValueError("director pipeline production_profile must be standard")
+
+    characters = sb["characters"]
+    if not isinstance(characters, list) or not characters:
+        raise ValueError("characters must be a non-empty list")
+    char_ids: set[str] = set()
+    for character in characters:
+        if "look" not in character and "image_prompt" not in character:
+            raise ValueError(
+                f"character missing both 'look' and 'image_prompt': {character}"
+            )
+        for field in ("id", "name", "gender"):
+            if field not in character:
+                raise ValueError(f"character missing {field}: {character}")
+        if character["gender"] not in ("male", "female"):
+            raise ValueError(f"character gender must be male|female: {character}")
+        char_ids.add(character["id"])
+
+    masters = sb["masters"]
+    if not isinstance(masters, list) or not masters:
+        raise ValueError("standard director pipeline requires at least 1 paid master")
+    if len(masters) > 3:
+        raise ValueError("standard director pipeline allows at most 3 paid masters")
+    if sum(float(master.get("duration") or 0) for master in masters) > 36:
+        raise ValueError("standard director pipeline paid master duration exceeds 36s")
+    master_by_idx = {master.get("idx"): master for master in masters}
+    if len(master_by_idx) != len(masters) or None in master_by_idx:
+        raise ValueError("master idx values must be present and unique")
+
+    max_dialogue_duration = 30 if _long_scene_enabled() else 12
+    for master in masters:
+        if master.get("type") not in ("dialogue", "broll"):
+            raise ValueError(f"master.type must be dialogue|broll: {master}")
+        if float(master.get("duration") or 0) <= 0:
+            raise ValueError(f"master {master.get('idx')} duration must be > 0")
+        if master["type"] == "dialogue":
+            if master.get("speaker") not in char_ids:
+                raise ValueError(
+                    f"dialogue master speaker must be one of {char_ids}: {master}"
+                )
+            render_mode = (master.get("render_mode") or "presenter").lower()
+            if render_mode not in ("presenter", "digital_human", "scene"):
+                raise ValueError(
+                    f"dialogue master {master['idx']} render_mode must be "
+                    f"presenter|scene, got {master.get('render_mode')!r}"
+                )
+            if master["duration"] > max_dialogue_duration:
+                raise ValueError(
+                    f"dialogue master {master['idx']} > {max_dialogue_duration}s"
+                )
+            if not (master.get("voiceover") or "").strip():
+                raise ValueError(
+                    f"dialogue master {master['idx']} has empty voiceover"
+                )
+            for field in ("scene", "action"):
+                if not (master.get(field) or "").strip():
+                    raise ValueError(
+                        f"dialogue master {master['idx']} missing field {field!r}"
+                    )
+        else:
+            anchor = master.get("anchor_character")
+            if anchor is not None and anchor not in char_ids:
+                raise ValueError(
+                    f"broll master {master['idx']} anchor_character must be one "
+                    f"of {char_ids} or null: {anchor}"
+                )
+
+    timeline = sb["shots"]
+    if not isinstance(timeline, list) or not (4 <= len(timeline) <= 8):
+        raise ValueError("standard director timeline must contain 4 to 8 edit shots")
+    audio_ranges: dict[int, list[tuple[float, float]]] = {}
+    for edit in timeline:
+        duration = float(edit.get("duration") or 0)
+        if duration <= 0:
+            raise ValueError(f"edit shot {edit.get('idx')} duration must be > 0")
+        video_idx = edit.get("video_master_idx")
+        audio_idx = edit.get("audio_master_idx", video_idx)
+        if video_idx not in master_by_idx or audio_idx not in master_by_idx:
+            raise ValueError(
+                f"edit shot {edit.get('idx')} references an unknown master"
+            )
+        video_start = float(edit.get("video_start") or 0)
+        audio_start = float(edit.get("audio_start") or 0)
+        if min(video_start, audio_start) < 0:
+            raise ValueError(f"edit shot {edit.get('idx')} start must be >= 0")
+        if video_start + duration > float(master_by_idx[video_idx]["duration"]):
+            raise ValueError(f"edit shot {edit.get('idx')} exceeds video master")
+        if audio_start + duration > float(master_by_idx[audio_idx]["duration"]):
+            raise ValueError(f"edit shot {edit.get('idx')} exceeds audio master")
+        audio_ranges.setdefault(audio_idx, []).append((audio_start, duration))
+
+    for master_idx, master in master_by_idx.items():
+        if master["type"] != "dialogue":
+            continue
+        cursor = 0.0
+        for start, duration in audio_ranges.get(master_idx, []):
+            if abs(start - cursor) > 0.05:
+                raise ValueError(
+                    f"audio timeline for master {master_idx} must be continuous"
+                )
+            cursor += duration
+        if abs(cursor - float(master["duration"])) > 0.05:
+            raise ValueError(
+                f"audio timeline for master {master_idx} must be continuous"
+            )
+
+
 def _validate(sb: dict) -> None:
-    for key in ("characters", "narrator", "style_prefix", "hook", "shots", "bgm"):
+    if _is_director_storyboard(sb):
+        _validate_director_storyboard(sb)
+        return
+    for key in ("characters", "hook", "shots", "bgm"):
         if key not in sb:
             raise ValueError(f"storyboard missing key: {key}; got {list(sb)}")
 
     if not isinstance(sb["characters"], list) or not sb["characters"]:
         raise ValueError("characters must be a non-empty list")
-    catalog = load_voice_catalog()
     char_ids = set()
     for ch in sb["characters"]:
         # look 是新字段(简短特征,各镜头复用);image_prompt 旧版兼容
         if "look" not in ch and "image_prompt" not in ch:
             raise ValueError(f"character missing both 'look' and 'image_prompt': {ch}")
-        for f in ("id", "name", "gender", "voice_id"):
+        for f in ("id", "name", "gender"):
             if f not in ch:
                 raise ValueError(f"character missing {f}: {ch}")
         if ch["gender"] not in ("male", "female"):
             raise ValueError(f"character gender must be male|female: {ch}")
-        if ch["voice_id"] not in catalog:
-            raise ValueError(
-                f"character {ch['id']} voice_id {ch['voice_id']!r} "
-                f"not in catalog. Available: {list(catalog)[:5]} ..."
-            )
-        # 性别一致性检查
-        if catalog[ch["voice_id"]]["gender"] != ch["gender"]:
-            raise ValueError(
-                f"character {ch['id']} gender={ch['gender']} mismatches "
-                f"voice gender={catalog[ch['voice_id']]['gender']}"
-            )
         char_ids.add(ch["id"])
-
-    # narrator 校验
-    narrator = sb.get("narrator") or {}
-    if not narrator.get("voice_id"):
-        raise ValueError("narrator.voice_id is required")
-    if narrator["voice_id"] not in catalog:
-        raise ValueError(
-            f"narrator.voice_id {narrator['voice_id']!r} not in catalog"
-        )
 
     if not isinstance(sb["shots"], list) or not (2 <= len(sb["shots"]) <= 12):
         raise ValueError(f"shots count out of range: {len(sb.get('shots', []))}")
 
-    for shot in sb["shots"]:
+    for shot in _generation_units(sb):
         if shot.get("type") not in ("dialogue", "broll"):
             raise ValueError(f"shot.type must be dialogue|broll: {shot}")
         if shot["type"] == "dialogue":
@@ -74,16 +191,27 @@ def _validate(sb: dict) -> None:
                 raise ValueError(
                     f"dialogue shot speaker must be one of {char_ids}: {shot}"
                 )
-            if shot.get("duration", 0) > 12:
-                raise ValueError(f"dialogue shot {shot['idx']} > 12s (OmniHuman limit)")
+            render_mode = (shot.get("render_mode") or "presenter").lower()
+            if render_mode not in ("presenter", "digital_human", "scene"):
+                raise ValueError(
+                    f"dialogue shot {shot['idx']} render_mode must be "
+                    f"presenter|scene, got {shot.get('render_mode')!r}"
+                )
+            max_dialogue_duration = 30 if _long_scene_enabled() else 12
+            if shot.get("duration", 0) > max_dialogue_duration:
+                raise ValueError(
+                    f"dialogue shot {shot['idx']} > {max_dialogue_duration}s "
+                    "(configured Seedance native speech limit)"
+                )
             if not (shot.get("voiceover") or "").strip():
                 raise ValueError(f"dialogue shot {shot['idx']} has empty voiceover")
-            # 新约束:每个 dialogue 镜头必须有 scene + action(用于生成 in-scene 主角图)
+            # 两种模式都需要 scene + action：真人模式控制原生表演，
+            # scene 模式用于无人脸环境/物件画面。
             for fld in ("scene", "action"):
                 if not (shot.get(fld) or "").strip():
                     raise ValueError(
                         f"dialogue shot {shot['idx']} missing field {fld!r} "
-                        f"(needed for per-shot character-in-scene image)"
+                        f"(needed for per-shot visual generation)"
                     )
         else:  # broll
             anchor = shot.get("anchor_character")
@@ -114,10 +242,19 @@ async def run(job_id: str) -> None:
     prompt = storyboard_prompt(
         title=job["title"],
         track=job["track"] or "通用",
-        style_code=job["style"] or "D",
         duration=duration,
         target_audience=job["target_audience"] or "通用",
+        source_context=script_sources.topic_source_context(
+            db, job["topic_id"]
+        ),
     )
+    if _long_scene_enabled():
+        prompt += (
+            "\n\n# Seedance 2.5 长镜头\n"
+            "如内容适合一镜完整表达，优先使用 13—24 秒 dialogue；"
+            "25—30 秒只用于低密度台词并必须预留自然收尾时间。"
+            "所有长镜头都须保证台词能在镜头内自然说完，并使用连续三段式时间轴。"
+        )
     llm = _llm()
     sb, usage = llm.complete_json(prompt, max_tokens=6000)
     _validate(sb)
@@ -129,8 +266,9 @@ async def run(job_id: str) -> None:
         json.dumps(sb, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # shots 入库 — prompt 字段用 "scene + action"(dialogue) 或 prompt(broll)
-    for shot in sb["shots"]:
+    # Paid generation units enter the shots table. In director mode these are
+    # masters; final edit shots remain in storyboard JSON only.
+    for shot in _generation_units(sb):
         if shot["type"] == "dialogue":
             shot_prompt = f"{shot.get('scene','')}\n{shot.get('action','')}"
         else:
@@ -160,7 +298,6 @@ async def run(job_id: str) -> None:
             "id": c["id"],
             "name": c["name"],
             "gender": c["gender"],
-            "voice_id": c["voice_id"],
             "look": c.get("look") or c.get("image_prompt", ""),
         })
     cost = llm.usage_to_cents(usage)

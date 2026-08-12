@@ -1,5 +1,6 @@
 """s2:
-- 每个 dialogue 镜头 → 一张 "角色在场景中" 静帧,送 OmniHuman 当首帧。
+- presenter dialogue → 可选生成一张“角色在场景中”静帧供人工预览。
+- scene dialogue → 一张无可识别人脸的场景静帧,送 Seedance 当首帧。
 - 每个 broll 镜头 → 一张专属关键帧,送 Seedance i2v 当首帧。
 - 顺手为每角色保留一张通用定妆照(用作 fallback / seedream_45 i2i 的 reference)。
 
@@ -18,6 +19,7 @@ import shutil
 from .. import ASSETS_DIR, DATA_DIR
 from ..db import conn
 from ..clients import seedance, tos
+from ..scene_voiceover import faceless_visual_text
 
 # 角色花名册 portrait 缓存目录(跨 job 复用同 char_id 的 portrait)
 CHAR_CACHE_DIR = DATA_DIR / "character_cache"
@@ -72,8 +74,8 @@ def _seed_for(char_id: str) -> int:
     return int.from_bytes(h[:4], "big") & 0x7FFFFFFF
 
 
-def _build_prompt(character: dict, shot: dict, style_prefix: str) -> str:
-    """dialogue 镜头的 character-in-scene 静帧 prompt(OmniHuman 首帧)。"""
+def _build_prompt(character: dict, shot: dict) -> str:
+    """dialogue 镜头的 character-in-scene 静帧预览 prompt。"""
     look = character["look"]
     scene = shot.get("scene") or ""
     action = shot.get("action") or ""
@@ -95,17 +97,16 @@ def _build_prompt(character: dict, shot: dict, style_prefix: str) -> str:
         parts.append(f"光线: {lighting}")
     parts.append(f"动作/姿态: {action}")
     if expr:
-        # 静帧是 OmniHuman 的首帧 — 渲染表情弧线的"起"状态
+        # 静帧用于预览表情弧线的“起”状态。
         parts.append(f"表情(渲染镜头开始/「起」的瞬间状态): {expr}")
     if drama:
         parts.append(f"情绪基调(强烈,优先): {drama}")
-    parts.append(f"风格: {style_prefix}")
     parts.append(
         "竖屏 9:16 构图, 角色主体清晰可见, 嘴部保持自然闭合或微张(避免特殊嘴型)"
     )
     # === 三条反幻觉约束(P0,修复 J-VERIFY05 实测发现的问题)===
     # 1) 单人成画:LLM voiceover 经常写"老板,..."等对话台词,Seedream 会推断
-    #    对方在场加个对手角色背影。s3 OmniHuman 那层已加同款约束,但首帧
+    #    对方在场加个对手角色背影。s3 原生视频提示也有同款约束,但静帧
     #    在 s2 就已经画了对手,必须在 s2 卡住。
     parts.append(
         "**画面里只有这一个角色,严禁出现其他人物、背景人影、对手角色的身影或背影**"
@@ -123,7 +124,7 @@ def _build_prompt(character: dict, shot: dict, style_prefix: str) -> str:
     return "\n".join(parts)
 
 
-def _build_broll_prompt(shot: dict, style_prefix: str,
+def _build_broll_prompt(shot: dict,
                         character: dict | None = None) -> str:
     """broll 镜头的关键帧 prompt(Seedance i2v 首帧)。
     没有 character 时纯场景;有 anchor_character 时把 look 也放进去。"""
@@ -142,17 +143,58 @@ def _build_broll_prompt(shot: dict, style_prefix: str,
         parts.append(f"场景微动态: {dynamics}")
     if lighting:
         parts.append(f"光线: {lighting}")
-    parts.append(f"风格: {style_prefix}")
     parts.append("竖屏 9:16 构图, 空镜或物件特写, 不强调人物对话")
     return "\n".join(parts)
 
 
+def _dialogue_keyframe_kind(shot: dict) -> str:
+    """Return the s2 keyframe route for a dialogue storyboard shot."""
+    render_mode = (shot.get("render_mode") or "digital_human").lower()
+    return "scene_voiceover" if render_mode == "scene" else "digital_human"
+
+
+def _build_scene_voiceover_prompt(shot: dict) -> str:
+    """Build a faceless keyframe prompt for dialogue rendered as scene + V.O.
+
+    Spoken copy and character appearance are deliberately excluded.  Besides
+    preventing accidental text rendering, this keeps a portrait-like first
+    frame from triggering Seedance's real-face moderation.
+    """
+    speaker = shot.get("speaker") or shot.get("speaker_id")
+    scene = faceless_visual_text(
+        shot.get("scene") or shot.get("prompt"), speaker
+    )
+    lens = shot.get("lens") or ""
+    lighting = shot.get("lighting") or ""
+    dynamics = faceless_visual_text(shot.get("scene_dynamics"), speaker)
+    camera = faceless_visual_text(shot.get("camera"), speaker)
+    shot_type = faceless_visual_text(shot.get("shot_type"), speaker)
+    cam = f"{camera} {shot_type}".strip()
+
+    parts = [
+        f"镜头: {cam}" + (f", {lens}" if lens else ""),
+        f"场景: {scene}",
+    ]
+    if dynamics:
+        parts.append(f"环境与物件动态: {dynamics}")
+    if lighting:
+        parts.append(f"光线: {lighting}")
+    parts.extend([
+        "竖屏 9:16 构图，以环境、设备、文件、仪表或物件特写承载信息",
+        "这是画外音(V.O.)场景，台词只进入音轨，不在画面中呈现说话者",
+        "不得出现任何可识别人脸、正面人物、真人肖像或嘴部特写，不做口型同步",
+        "如必须出现人物，只能是脸部完全不可见的手部、背影或远景剪影",
+        "画面内不要生成字幕、标牌文字或其他可读文字",
+    ])
+    return "\n".join(parts)
+
+
 async def _gen_one_shot_img(job_id: str, shot_idx: int, character: dict,
-                            shot: dict, style_prefix: str,
+                            shot: dict,
                             sem: asyncio.Semaphore) -> None:
     """dialogue 镜头:每镜出一张 character-in-scene 静帧。"""
     async with sem:
-        prompt = _build_prompt(character, shot, style_prefix)
+        prompt = _build_prompt(character, shot)
         seed = _seed_for(character["id"])
         refs = [character["image_path"]] if (
             PROVIDER in ("gpt_image", "seedream_45")
@@ -178,7 +220,6 @@ async def _gen_one_shot_img(job_id: str, shot_idx: int, character: dict,
 
 async def _gen_broll_keyframe(job_id: str, shot_idx: int, shot: dict,
                               anchor_char: dict | None,
-                              style_prefix: str,
                               sem: asyncio.Semaphore) -> None:
     """broll 镜头:每镜出 1-2 张关键帧,送 Seedance i2v 当首帧/尾帧。
     深度利用 Seedance 2.0 first_frame + last_frame 锁定起止构图。
@@ -190,7 +231,7 @@ async def _gen_broll_keyframe(job_id: str, shot_idx: int, shot: dict,
         ) else None
 
         # 首帧关键帧(开始构图)
-        start_prompt = _build_broll_prompt(shot, style_prefix, anchor_char)
+        start_prompt = _build_broll_prompt(shot, anchor_char)
         img = await _gen_image(start_prompt, references=refs)
         out_path = (ASSETS_DIR / job_id / "scenes"
                     / f"{shot_idx:02d}_broll.png")
@@ -206,7 +247,7 @@ async def _gen_broll_keyframe(job_id: str, shot_idx: int, shot: dict,
         end_scene = shot.get("end_scene")
         if end_scene:
             end_shot = {**shot, "scene": end_scene}  # 用 end_scene 覆盖 scene
-            end_prompt = _build_broll_prompt(end_shot, style_prefix, anchor_char)
+            end_prompt = _build_broll_prompt(end_shot, anchor_char)
             end_img = await _gen_image(end_prompt, references=refs)
             end_path = (ASSETS_DIR / job_id / "scenes"
                         / f"{shot_idx:02d}_broll_end.png")
@@ -222,8 +263,48 @@ async def _gen_broll_keyframe(job_id: str, shot_idx: int, shot: dict,
         db.commit()
 
 
+async def _gen_scene_voiceover_keyframe(
+        job_id: str, shot_idx: int, shot: dict,
+        sem: asyncio.Semaphore) -> None:
+    """Generate faceless Seedance keyframes for a scene-dialogue shot."""
+    async with sem:
+        start_prompt = _build_scene_voiceover_prompt(shot)
+        img = await _gen_image(start_prompt, references=None)
+        out_path = (
+            ASSETS_DIR / job_id / "scenes" / f"{shot_idx:02d}_scene_vo.png"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(img)
+        url = tos.upload(
+            out_path,
+            key_hint=f"{job_id}-scene-vo-{shot_idx:02d}",
+        )
+
+        end_scene = shot.get("end_scene")
+        if end_scene:
+            end_shot = {**shot, "scene": end_scene}
+            end_prompt = _build_scene_voiceover_prompt(end_shot)
+            end_img = await _gen_image(end_prompt, references=None)
+            end_path = (
+                ASSETS_DIR / job_id / "scenes"
+                / f"{shot_idx:02d}_scene_vo_end.png"
+            )
+            end_path.write_bytes(end_img)
+            tos.upload(
+                end_path,
+                key_hint=f"{job_id}-scene-vo-{shot_idx:02d}-end",
+            )
+
+        db = conn()
+        db.execute(
+            "UPDATE shots SET character_in_scene_path=?, "
+            "character_in_scene_url=? WHERE job_id=? AND idx=?",
+            (str(out_path), url, job_id, shot_idx),
+        )
+        db.commit()
+
+
 async def _gen_reference_img(job_id: str, character: dict,
-                             style_prefix: str,
                              sem: asyncio.Semaphore) -> dict:
     """每角色一张通用定妆照(简单背景)。
 
@@ -292,8 +373,6 @@ async def run(job_id: str) -> None:
     job = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
     sb = json.loads(job["storyboard"])
     chars = {c["id"]: c for c in json.loads(job["characters_json"])}
-    style_prefix = sb["style_prefix"]
-
     sb_shots = {s["idx"]: s for s in sb["shots"]}
     dialogue_shots = db.execute(
         "SELECT * FROM shots WHERE job_id=? AND narrative_type='dialogue' "
@@ -308,19 +387,25 @@ async def run(job_id: str) -> None:
 
     # 1. 每角色一张 reference 定妆照
     enriched_chars = await asyncio.gather(*[
-        _gen_reference_img(job_id, c, style_prefix, sem)
+        _gen_reference_img(job_id, c, sem)
         for c in chars.values()
     ])
     enriched_by_id = {c["id"]: c for c in enriched_chars}
 
-    # 2. dialogue:每镜 character-in-scene 静帧(OmniHuman 首帧)
-    tasks_d = [
-        _gen_one_shot_img(
-            job_id, r["idx"], enriched_by_id[r["speaker_id"]],
-            sb_shots[r["idx"]], style_prefix, sem
-        )
-        for r in dialogue_shots
-    ]
+    # 2. dialogue 按 render_mode 分流:
+    #    digital_human → 有脸 character-in-scene;scene → 无脸场景 + V.O.
+    tasks_d = []
+    for r in dialogue_shots:
+        sb_shot = sb_shots[r["idx"]]
+        if _dialogue_keyframe_kind(sb_shot) == "scene_voiceover":
+            tasks_d.append(_gen_scene_voiceover_keyframe(
+                job_id, r["idx"], sb_shot, sem
+            ))
+        else:
+            tasks_d.append(_gen_one_shot_img(
+                job_id, r["idx"], enriched_by_id[r["speaker_id"]],
+                sb_shot, sem
+            ))
     # 3. broll:每镜专属关键帧(Seedance i2v 首帧)
     tasks_b = []
     for r in broll_shots:
@@ -328,7 +413,7 @@ async def run(job_id: str) -> None:
         anchor_id = sb_shot.get("anchor_character")
         anchor_char = enriched_by_id.get(anchor_id) if anchor_id else None
         tasks_b.append(_gen_broll_keyframe(
-            job_id, r["idx"], sb_shot, anchor_char, style_prefix, sem
+            job_id, r["idx"], sb_shot, anchor_char, sem
         ))
     await asyncio.gather(*(tasks_d + tasks_b))
 

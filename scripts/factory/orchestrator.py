@@ -11,9 +11,7 @@ from .models import TRANSITIONS, TERMINAL_STATES
 
 STEP_MODULES = {
     "s1_storyboard": "factory.steps.s1_storyboard",
-    "s2_character":  "factory.steps.s2_character",
     "s3_shots":      "factory.steps.s3_shots",
-    "s4_voice":      "factory.steps.s4_voice",
     "s5_bgm":        "factory.steps.s5_bgm",
     "s6_compose":    "factory.steps.s6_compose",
     "s7_publish":    "factory.steps.s7_publish",
@@ -27,6 +25,11 @@ MAX_RETRIES          = int(os.getenv("MAX_RETRIES", "3"))
 async def _run_step(job_id: str, step: str):
     mod = importlib.import_module(STEP_MODULES[step])
     return await mod.run(job_id)
+
+
+def _should_retry_step(error: BaseException) -> bool:
+    """Paid quality/budget guards require explicit human action."""
+    return not bool(getattr(error, "non_retryable", False))
 
 
 async def _process_job(job_id: str, sem: asyncio.Semaphore):
@@ -55,13 +58,22 @@ async def _process_job(job_id: str, sem: asyncio.Semaphore):
                 await _run_step(job_id, step)
                 db.execute(
                     "UPDATE jobs SET state=?, updated_at=CURRENT_TIMESTAMP, "
-                    "retries=0 WHERE job_id=?",
+                    "retries=0, error=NULL WHERE job_id=?",
                     (new_state.value, job_id)
                 )
                 db.commit()
                 log(db, job_id, step, "INFO", f"done {step} → {new_state.value}")
             except Exception as e:
                 tb = traceback.format_exc(limit=4)
+                if not _should_retry_step(e):
+                    db.execute(
+                        "UPDATE jobs SET state='FAILED', error=? WHERE job_id=?",
+                        (f"{step}: {e}", job_id)
+                    )
+                    db.commit()
+                    log(db, job_id, step, "ERROR",
+                        f"stopped without step retry: {e}\n{tb}")
+                    return
                 next_retry = retries + 1
                 if next_retry >= MAX_RETRIES:
                     db.execute(
@@ -82,7 +94,7 @@ async def _process_job(job_id: str, sem: asyncio.Semaphore):
                 await asyncio.sleep(min(2 ** retries, 30))
 
 
-def _import_topics(csv_path: str):
+def _import_topics(csv_path: str, batch_id: str | None = None):
     db = conn()
     n_new = 0
     with open(csv_path, encoding="utf-8-sig") as f:
@@ -94,26 +106,34 @@ def _import_topics(csv_path: str):
             job_id = f"J-{topic_id}"
             cur = db.execute(
                 "INSERT OR IGNORE INTO jobs(job_id, topic_id, title, track, "
-                "style, target_audience, priority) VALUES(?,?,?,?,?,?,?)",
+                "style, target_audience, priority, batch_id) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (job_id, topic_id, title,
                  row.get("track", "").strip(),
-                 row.get("style", "D").strip() or "D",
+                 (row.get("style") or "").strip() or None,
                  row.get("target_audience", "").strip(),
-                 int(row.get("priority") or 3))
+                 int(row.get("priority") or 3),
+                 batch_id)
             )
             n_new += cur.rowcount
     db.commit()
     return n_new
 
 
-async def run_batch(csv_path: str):
-    n = _import_topics(csv_path)
+async def run_batch(csv_path: str, batch_id: str | None = None):
+    n = _import_topics(csv_path, batch_id=batch_id)
     print(f"导入 {n} 条新主题")
 
     db = conn()
+    where = "state NOT IN ('PUBLISHED','FAILED','BLOCKED')"
+    params: tuple = ()
+    if batch_id:
+        where += " AND batch_id=?"
+        params = (batch_id,)
     pending = db.execute(
-        "SELECT job_id FROM jobs WHERE state NOT IN ('PUBLISHED','FAILED','BLOCKED') "
-        "ORDER BY priority DESC, created_at ASC"
+        f"SELECT job_id FROM jobs WHERE {where} "
+        "ORDER BY priority DESC, created_at ASC",
+        params,
     ).fetchall()
     print(f"待处理 {len(pending)} 个 job")
 
