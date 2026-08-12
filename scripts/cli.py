@@ -34,6 +34,7 @@ from factory.db import conn  # noqa: E402
 from factory.orchestrator import _process_job, run_batch  # noqa: E402
 from factory import (  # noqa: E402
     asset_library,
+    character_assets,
     creative_experiments,
     creative_learning,
     production_metrics,
@@ -46,11 +47,47 @@ from factory import (  # noqa: E402
     topic_briefs,
 )
 from factory.steps import s1_storyboard  # noqa: E402
+from factory.clients import volc_assets  # noqa: E402
 
 
 @click.group()
 def cli():
     """AI Video Factory."""
+
+
+@cli.command(name="character-resolve")
+@click.option("--character-id", required=True)
+@click.option("--name", "display_name", required=True)
+@click.option(
+    "--asset-id",
+    default=None,
+    help="Provider assetId supplied by the user when API discovery cannot resolve it.",
+)
+def character_resolve(character_id, display_name, asset_id):
+    """Agent-only real-person asset resolution; API first, assetId fallback."""
+    database = conn()
+    try:
+        if asset_id:
+            result = character_assets.bind_manual_asset(
+                database,
+                character_id=character_id,
+                display_name=display_name,
+                asset_id=asset_id,
+            )
+        else:
+            try:
+                api_client = volc_assets.from_environment()
+            except volc_assets.AssetApiUnavailable:
+                api_client = None
+            result = character_assets.resolve_character_asset(
+                database,
+                character_id=character_id,
+                display_name=display_name,
+                api_client=api_client,
+            )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
 
 
 @cli.command()
@@ -802,6 +839,12 @@ def produce_approved(job_id, yes):
     if not yes:
         click.echo("No production submitted. Re-run with --yes after review.")
         return
+    if not report["budget_ok"]:
+        raise click.ClickException(
+            "approved production exceeds the job budget before any paid call: "
+            f"estimated={report['estimated_cost_cents']} cents, "
+            f"limit={report['budget_cents']} cents"
+        )
     click.echo("Confirmed: resuming from s3_shots; s1_storyboard will not run.")
     asyncio.run(_process_job(job_id, asyncio.Semaphore(1)))
 

@@ -299,6 +299,8 @@ async def run(job_id: str) -> None:
             "name": c["name"],
             "gender": c["gender"],
             "look": c.get("look") or c.get("image_prompt", ""),
+            "identity_type": c.get("identity_type"),
+            "seedance_asset_uri": c.get("seedance_asset_uri"),
         })
     cost = llm.usage_to_cents(usage)
     db.execute(

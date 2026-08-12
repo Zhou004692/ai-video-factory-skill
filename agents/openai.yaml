@@ -1,4 +1,4 @@
 interface:
   display_name: "AI Video Factory"
-  short_description: "可追溯短视频剧本生成与 Seedance 标准成片工作流"
-  default_prompt: "使用 $ai-video-factory 将我的素材整理为三版可审批剧本，并在确认后生成标准短视频。"
+  short_description: "用自然语言完成短视频剧本、审批与 Seedance 标准成片"
+  default_prompt: "使用 $ai-video-factory 接管初始化和全部后台操作。我只提供素材、选择剧本并确认成片预算。"

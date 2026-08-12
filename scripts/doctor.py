@@ -29,7 +29,9 @@ def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
     env_path = root / ".env"
     config = {**dotenv_values(env_path), **os.environ}
     provider = str(config.get("DEFAULT_LLM_PROVIDER") or "doubao").strip().lower()
-    if profile == "script":
+    if profile == "learning":
+        required = ()
+    elif profile == "script":
         required = ("ANTHROPIC_API_KEY",) if provider == "claude" else ("ARK_API_KEY",)
     else:
         required = VIDEO_KEYS
@@ -67,7 +69,9 @@ def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("script", "video"), default="script")
+    parser.add_argument(
+        "--profile", choices=("script", "video", "learning"), default="script"
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     report = diagnose(profile=args.profile)

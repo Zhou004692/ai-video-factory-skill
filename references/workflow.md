@@ -20,6 +20,10 @@ PENDING → STORYBOARDED → SHOTS_OK → BGM_OK → COMPOSED → PUBLISHED
 | `s6_compose` | 已验收母片、导演时间线、字幕、BGM | `concat.mp4`、`final.mp4` | 从母片分别取画面/原生音频，本地裁切、B-roll 覆画、字幕、混音和 CTA |
 | `s7_publish` | `final.mp4` | 发布记录 | 默认人工预审并手工发布 |
 
+## 真人角色前置解析
+
+真人角色进入付费生产前执行：本地已绑定资产复用 → 火山 Assets API 精确唯一匹配 → 向用户索要 `assetId`。解析只接受可用的 `LivenessFace / Active` 资产，不使用浏览器兜底；无法唯一确认时停止在付费调用前。
+
 ## Seedance 镜头路由
 
 标准版默认采用“原生母片生成 + 本地导演剪辑”，不是把 4—8 个成片镜头全部送去生成：

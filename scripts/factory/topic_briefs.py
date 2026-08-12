@@ -14,7 +14,13 @@ from . import creative_learning
 SCORE_FIELDS = (
     "relevance", "story_potential", "evidence_quality", "production_fit",
 )
-BRIEF_PROMPT_VERSION = "creative-brief-v1"
+BRIEF_PROMPT_VERSION = "creative-brief-v2"
+CREATIVE_TAG_DEFAULTS = {
+    "hook_type": "pain_point",
+    "narrative_pattern": "problem_solution",
+    "proof_type": "none",
+    "cta_type": "none",
+}
 
 
 def _text(value) -> str:
@@ -56,15 +62,14 @@ def normalize_brief(raw: dict) -> dict:
         creative_tags = angle.get("creative_tags")
         if creative_tags is not None:
             normalized["creative_tags"] = {
-                field: _text(creative_tags.get(field))
+                field: (
+                    _text(creative_tags.get(field))
+                    if _text(creative_tags.get(field))
+                    in creative_learning.VOCABULARY[field]
+                    else CREATIVE_TAG_DEFAULTS[field]
+                )
                 for field in creative_learning.VOCABULARY
             }
-            for field, value in normalized["creative_tags"].items():
-                if value not in creative_learning.VOCABULARY[field]:
-                    raise ValueError(
-                        f"angle #{index + 1}.creative_tags.{field} "
-                        f"must be one of {sorted(creative_learning.VOCABULARY[field])}"
-                    )
         for field in ("title", "hook", "promise", "story_arc",
                       "production_notes"):
             if not normalized[field]:

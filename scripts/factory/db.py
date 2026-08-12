@@ -71,6 +71,23 @@ CREATE INDEX IF NOT EXISTS idx_events_job  ON events(job_id);
 CREATE INDEX IF NOT EXISTS idx_provider_calls_job
     ON provider_calls(job_id, shot_idx);
 
+CREATE TABLE IF NOT EXISTS character_asset_bindings (
+    character_id   TEXT PRIMARY KEY,
+    display_name   TEXT NOT NULL,
+    provider       TEXT NOT NULL DEFAULT 'volcengine_ark',
+    asset_id       TEXT NOT NULL,
+    asset_uri      TEXT NOT NULL,
+    asset_group_id TEXT,
+    source         TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'Active',
+    metadata_json  TEXT NOT NULL DEFAULT '{}',
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_character_asset_id
+    ON character_asset_bindings(asset_id);
+
 CREATE TABLE IF NOT EXISTS media_assets (
     asset_id         TEXT PRIMARY KEY,
     media_type       TEXT NOT NULL DEFAULT 'video',

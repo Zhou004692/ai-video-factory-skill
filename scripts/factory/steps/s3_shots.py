@@ -10,9 +10,9 @@ import json
 import os
 from pathlib import Path
 
-from .. import ASSETS_DIR, SKILL_ROOT, asset_library
+from .. import ASSETS_DIR, SKILL_ROOT, asset_library, character_assets
 from ..db import conn
-from ..clients import bigasr, ffmpeg, seedance, tos, video_qa
+from ..clients import bigasr, ffmpeg, seedance, tos, video_qa, volc_assets
 from ..orchestrator import MAX_CONCURRENT_SHOTS
 from ..scene_voiceover import faceless_visual_text, non_text_visual_text
 from ..video_routing import VideoRoute, precision_motion_reason, select_route
@@ -339,6 +339,46 @@ def _roster_character(character_id: str | None) -> dict:
         return character_roster().get(character_id, {})
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def _resolve_real_person_bindings(database, characters: list[dict]) -> bool:
+    """Resolve every missing real-person binding before a paid call."""
+    pending: list[dict] = []
+    for character in characters:
+        roster = _roster_character(character.get("id"))
+        identity_type = character.get("identity_type") or roster.get(
+            "identity_type"
+        )
+        asset_uri = character.get("seedance_asset_uri") or roster.get(
+            "seedance_asset_uri"
+        )
+        if identity_type == "real_person" and not str(asset_uri or "").startswith(
+            "asset://"
+        ):
+            pending.append(character)
+    if not pending:
+        return False
+
+    try:
+        api_client = volc_assets.from_environment()
+    except volc_assets.AssetApiUnavailable:
+        api_client = None
+
+    changed = False
+    for character in pending:
+        result = character_assets.resolve_character_asset(
+            database,
+            character_id=str(character.get("id") or ""),
+            display_name=str(character.get("name") or character.get("id") or ""),
+            api_client=api_client,
+        )
+        if result.status != "resolved":
+            raise SeedanceIdentityAuthorizationError(
+                result.user_prompt or "real-person assetId is required"
+            )
+        character["seedance_asset_uri"] = result.asset_uri
+        changed = True
+    return changed
 
 
 def _dialogue_anchor_from_completed_shot(
@@ -904,6 +944,17 @@ async def run(job_id: str) -> None:
     job = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
     sb = json.loads(job["storyboard"])
     chars = {c["id"]: c for c in json.loads(job["characters_json"])}
+    characters = list(chars.values())
+    bindings_changed = character_assets.apply_cached_bindings(db, characters)
+    bindings_changed = (
+        _resolve_real_person_bindings(db, characters) or bindings_changed
+    )
+    if bindings_changed:
+        db.execute(
+            "UPDATE jobs SET characters_json=? WHERE job_id=?",
+            (json.dumps(characters, ensure_ascii=False), job_id),
+        )
+        db.commit()
     generation_units = sb.get("masters") or sb["shots"]
     sb_shots = {s["idx"]: s for s in generation_units}
 

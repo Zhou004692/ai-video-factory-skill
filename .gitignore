@@ -1,9 +1,13 @@
 .env
 .venv/
-data/factory.db
-data/factory.db-journal
-data/assets/
+data/*
+!data/.gitkeep
+dist/
+docs/
+diagrams/
 references/bgm_library/*/*.mp3
+references/characters/*/
+!references/characters/roster.yaml
 __pycache__/
 *.pyc
 .DS_Store

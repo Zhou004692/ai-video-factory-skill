@@ -8,7 +8,7 @@ from typing import Callable
 from .clients import doubao_llm
 
 
-PROMPT_VERSION = "complete-script-v1"
+PROMPT_VERSION = "complete-script-v2"
 BEAT_ORDER = ("hook", "conflict", "evidence", "reversal", "solution", "cta")
 
 
@@ -44,7 +44,9 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
             raise ValueError(f"script beat {expected} references unknown source_id: {unknown}")
         normalized = {
             "beat": beat_type,
-            "speaker": _text(beat.get("speaker")),
+            # The standard product is one native dialogue master. Model-proposed
+            # role labels describe the acting perspective, not extra speakers.
+            "speaker": "presenter",
             "dialogue": _text(beat.get("dialogue")),
             "duration_sec": duration,
             "visual_intent": _text(beat.get("visual_intent")),
@@ -167,7 +169,8 @@ def _prompt(context: dict, sources: list[dict]) -> str:
     return (
         "你是设备租赁行业短视频编剧。根据已批准的创意角度生成恰好三版完整剧本。"
         "每版必须依次包含 hook、conflict、evidence、reversal、solution、cta 六个 beat，"
-        "每个 beat 必须有说话人、可直接朗读的中文台词、预计秒数、画面意图、来源 ID 和 B-roll 建议。"
+        "每版只允许一位固定主讲人，所有 beat 的 speaker 必须为 presenter；人物引语由主讲人转述。"
+        "每个 beat 必须有可直接朗读的中文台词、预计秒数、画面意图、来源 ID 和 B-roll 建议。"
         "只允许引用提供的 source_id；不得编造事实、金额、客户、政策或产品能力；"
         "不得照抄竞品台词，只能借鉴抽象结构。目标为 Seedance 2.5 原生母片加本地导演剪辑。"
         "只输出 JSON，结构参考：\n"
