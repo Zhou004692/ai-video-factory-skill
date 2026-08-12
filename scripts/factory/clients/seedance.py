@@ -1,9 +1,9 @@
-"""火山方舟 Seedance 2.0 (即梦视频底模) client。
+"""火山方舟 Seedance 2.5 视频与原生音频 client。
 
 历经 1.0 Pro → 2.0,API 结构基本兼容(content[] 数组 + role),但 2.0 新加多种
 reference 模式 + native audio + motion control + first/last frame 锁定等能力。
 
-本 client 暴露 2.0 全部 role 模式:
+本 client 暴露 2.x role 模式:
   first_frame         单图 i2v(1.0 已有,兼容老调用)
   last_frame          2.0 新:尾帧锁定
   reference_image     2.0 新:多张参考图(最多 9 张,角色/物件保持)
@@ -18,7 +18,7 @@ reference 模式 + native audio + motion control + first/last frame 锁定等能
 
 环境变量:
   ARK_API_KEY             火山方舟 API Key
-  ARK_VIDEO_MODEL         默认 doubao-seedance-2-0-260128
+  ARK_VIDEO_MODEL         默认 doubao-seedance-2-5-260628
   ARK_IMAGE_MODEL         t2i 走的图像模型,默认 doubao-seedream-5-0-260128
   ARK_VIDEO_RESOLUTION    覆盖默认分辨率(可在 .env 设)
 """
@@ -30,7 +30,7 @@ from pathlib import Path
 import httpx
 
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
-DEFAULT_MODEL = os.getenv("ARK_VIDEO_MODEL", "doubao-seedance-2-0-260128")
+DEFAULT_MODEL = os.getenv("ARK_VIDEO_MODEL", "doubao-seedance-2-5-260628")
 
 
 def _headers():
@@ -47,9 +47,10 @@ def _img_to_data_uri(path: str) -> str:
     return f"data:image/{ext};base64,{b64}"
 
 
-def _to_image_arg(item: str) -> str:
+def _to_image_arg(item: str | os.PathLike[str]) -> str:
     """本地路径 / URL / data URI 都规整成 URL/data URI。"""
-    if item.startswith(("http://", "https://", "data:")):
+    item = os.fspath(item)
+    if item.startswith(("http://", "https://", "data:", "asset://")):
         return item
     return _img_to_data_uri(item)
 
@@ -94,11 +95,95 @@ def _push_video(content: list, role: str, path: str) -> None:
 
 
 def _push_audio(content: list, role: str, path: str) -> None:
+    suffix = Path(path).suffix.lower() if not path.startswith(
+        ("http://", "https://", "data:")
+    ) else ""
+    mime = {
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".ogg": "audio/ogg",
+    }.get(suffix, "audio/mpeg")
     content.append({
         "type": "audio_url",
-        "audio_url": {"url": _file_to_data_uri(path, "audio/mp3")},
+        "audio_url": {"url": _file_to_data_uri(path, mime)},
         "role": role,
     })
+
+
+def _video_task_payload(*, model: str, content: list, duration: float,
+                        resolution: str, ratio: str,
+                        camera_fixed: bool, last_frame: str | None,
+                        seed: int | None, motion_strength: float | None,
+                        generate_audio: bool,
+                        output_format: str = "mp4",
+                        task_intent: str = "generate") -> dict:
+    """Build one Seedance task payload using official API field names."""
+    if output_format not in {"mp4", "mov"}:
+        raise ValueError("output_format must be 'mp4' or 'mov'")
+    if task_intent not in {"generate", "edit"}:
+        raise ValueError("task_intent must be 'generate' or 'edit'")
+    roles = {item.get("role") for item in content if item.get("role")}
+    if task_intent == "edit":
+        if ratio != "adaptive":
+            raise ValueError("Seedance edit tasks require ratio='adaptive'")
+        if duration != -1:
+            raise ValueError("Seedance edit tasks require duration=-1")
+        if not ({"reference_video", "reference_audio"} & roles):
+            raise ValueError(
+                "Seedance edit tasks require reference_video or reference_audio"
+            )
+    if "seedance-2-5" in model.lower():
+        if task_intent == "generate" and duration > 30:
+            raise ValueError("Seedance 2.5 generate duration cannot exceed 30 seconds")
+        if resolution not in {"480p", "720p"}:
+            raise ValueError("Seedance 2.5 resolution must be 480p or 720p")
+
+    payload = {
+        "model": model,
+        "content": content,
+        "duration": int(round(duration)),
+        "resolution": resolution,
+        "output_format": output_format,
+    }
+    if not ({"first_frame", "last_frame"} & roles):
+        payload["ratio"] = ratio
+    # Seedance 2.x rejects camera_fixed in both T2V and I2V (including when
+    # false); fixed-camera intent must be expressed in the prompt. Preserve
+    # the legacy field only for older model families that still accept it.
+    if "seedance-2-" not in model.lower() and not last_frame:
+        payload["camera_fixed"] = camera_fixed
+    if seed is not None:
+        payload["seed"] = seed
+    if motion_strength is not None:
+        payload["motion_strength"] = motion_strength
+    if generate_audio:
+        payload["generate_audio"] = True
+    return payload
+
+
+def _validate_reference_limits(
+    model: str,
+    *,
+    image_count: int,
+    video_count: int,
+    audio_count: int,
+) -> None:
+    """Validate model-specific multimodal reference limits before submission."""
+    if "seedance-2-5" in model.lower():
+        limits = {"reference_image": 30, "reference_video": 10, "reference_audio": 10}
+    else:
+        limits = {"reference_image": 9, "reference_video": 3, "reference_audio": 3}
+
+    counts = {
+        "reference_image": image_count,
+        "reference_video": video_count,
+        "reference_audio": audio_count,
+    }
+    for reference_type, count in counts.items():
+        maximum = limits[reference_type]
+        if count > maximum:
+            raise ValueError(f"{reference_type} count {count} exceeds max {maximum}")
 
 
 async def text_to_video(
@@ -114,14 +199,19 @@ async def text_to_video(
     reference_audios: list[str] | None = None,     # 最多 3 段
     # 基本控制
     duration: float = 10.0,
-    resolution: str = "1080p",
+    resolution: str = "720p",
     ratio: str = "9:16",
     seed: int | None = None,
+    model: str | None = None,
     # 2.0 运动控制
     camera_fixed: bool = False,
     motion_strength: float | None = None,          # 0.0-1.0 实测可调
     # native audio(2.0 新):让视频自带音轨(对话/音效/环境音/BGM)
-    audio_output: bool = False,
+    generate_audio: bool = False,
+    audio_output: bool | None = None,
+    output_format: str = "mp4",
+    task_intent: str = "generate",
+    metadata_out: dict | None = None,
     timeout: int = 600,
 ) -> bytes:
     """文+多 reference → 视频。返回 mp4 字节。
@@ -135,7 +225,7 @@ async def text_to_video(
       - reference_audios=[环境音/音效参考]         匹配节奏
       - motion_strength=0.3                       缓慢扫过镜头
       - camera_fixed=True                          固定特写
-      - audio_output=True                          视频自带音轨
+      - generate_audio=True                        视频自带音轨
     """
     # 分辨率归一化
     if resolution in _RES_MAP:
@@ -146,13 +236,13 @@ async def text_to_video(
             f"use 480p/720p/1080p or a WxH key from {list(_RES_MAP)}"
         )
 
-    # references 数量校验(2.0 文档限制)
-    if references and len(references) > 9:
-        raise ValueError(f"reference_image[] max 9, got {len(references)}")
-    if reference_videos and len(reference_videos) > 3:
-        raise ValueError(f"reference_video[] max 3, got {len(reference_videos)}")
-    if reference_audios and len(reference_audios) > 3:
-        raise ValueError(f"reference_audio[] max 3, got {len(reference_audios)}")
+    resolved_model = model or DEFAULT_MODEL
+    _validate_reference_limits(
+        resolved_model,
+        image_count=len(references or []),
+        video_count=len(reference_videos or []),
+        audio_count=len(reference_audios or []),
+    )
 
     # 兼容旧名
     if reference_image and not first_frame:
@@ -171,24 +261,24 @@ async def text_to_video(
     for a in reference_audios or []:
         _push_audio(content, "reference_audio", a)
 
-    payload = {
-        "model": DEFAULT_MODEL,
-        "content": content,
-        "duration": int(round(duration)),
-        "resolution": resolution,
-        "ratio": ratio,
-    }
-    # Seedance 2.0 硬约束 #2(J-VERIFY08 实测):flf2v 模式(有 last_frame)
-    # 不支持 camera_fixed 参数 ("must be empty"),只有 i2v/t2v 模式才传。
-    if not last_frame:
-        payload["camera_fixed"] = camera_fixed
-    if seed is not None:
-        payload["seed"] = seed
-    if motion_strength is not None:
-        payload["motion_strength"] = motion_strength
-    if audio_output:
-        # 2.0 native audio:视频带音轨返回
-        payload["audio_output"] = True
+    # Backward-compatible alias for older local scripts. The provider field is
+    # always the official `generate_audio`, never `audio_output`.
+    if audio_output is not None:
+        generate_audio = audio_output
+    payload = _video_task_payload(
+        model=resolved_model,
+        content=content,
+        duration=duration,
+        resolution=resolution,
+        ratio=ratio,
+        camera_fixed=camera_fixed,
+        last_frame=last_frame,
+        seed=seed,
+        motion_strength=motion_strength,
+        generate_audio=generate_audio,
+        output_format=output_format,
+        task_intent=task_intent,
+    )
 
     async with httpx.AsyncClient(timeout=timeout, headers=_headers()) as cli:
         # 1. 提交任务
@@ -197,7 +287,7 @@ async def text_to_video(
             raise RuntimeError(
                 f"seedance submit {r.status_code}: {r.text[:800]} | "
                 f"endpoint={ARK_BASE}/contents/generations/tasks, "
-                f"model={DEFAULT_MODEL}, "
+                f"model={payload['model']}, "
                 f"content_roles={[c.get('role') for c in content if c.get('role')]}"
             )
         task_id = r.json()["id"]
@@ -210,6 +300,13 @@ async def text_to_video(
             data = s.json()
             status = data.get("status")
             if status == "succeeded":
+                if metadata_out is not None:
+                    metadata_out.update({
+                        "task_id": task_id,
+                        "usage": data.get("usage") or {},
+                        "created_at": data.get("created_at"),
+                        "updated_at": data.get("updated_at"),
+                    })
                 video_url = data["content"]["video_url"]
                 vid = await cli.get(video_url, timeout=120)
                 vid.raise_for_status()
@@ -244,8 +341,22 @@ async def text_to_image(prompt: str, resolution: str = "1024x1536",
 
 
 def estimate_cost_cents(duration: float, resolution: str = "720p") -> int:
-    """Seedance 2.0 价格按分辨率分档(以方舟账单为准):
+    """Seedance 2.5 价格按分辨率分档(以方舟账单为准):
       480p ≈ 12 分/秒 / 720p ≈ 40 分/秒 / 1080p ≈ 80 分/秒
     """
     rate = {"480p": 12, "720p": 40, "1080p": 80}.get(resolution, 40)
     return int(rate * duration)
+
+
+def usage_cost_cents(
+    usage: dict,
+    *,
+    price_rmb_per_1k_tokens: float = 0.07,
+) -> int:
+    """Calculate billed cents from provider-reported output token usage."""
+    tokens = int(
+        usage.get("completion_tokens")
+        or usage.get("total_tokens")
+        or 0
+    )
+    return round(tokens * price_rmb_per_1k_tokens * 100 / 1000)

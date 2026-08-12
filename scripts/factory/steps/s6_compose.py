@@ -1,9 +1,6 @@
 """s6: 每镜处理(字幕/hook/fade) → 片尾 CTA → 拼接 → 混入 BGM → final.mp4。
 
-每个 shot 自带音轨:
-- dialogue: OmniHuman 烘焙了对白 → 视频已经有音轨,直接归一化
-- broll 有 narrator audio_path: 把外部 narrator mp3 mux 到静音视频,然后归一化
-- broll 无 narrator: 静音视频,normalize 时补静音
+每个 Seedance 2.5 shot 已自带对白/画外音/环境音轨，合成阶段直接保留。
 
 成片增强(短视频标配):
 - 每镜烧字幕(subtitle 字段,底部居中) —— 90% 用户静音刷,必须
@@ -28,16 +25,6 @@ async def _prep_shot(shot_row, prep_dir: Path,
     """准备单个 shot,返回归一化后(含字幕/hook/fade)的路径。"""
     idx = shot_row["idx"]
     src = Path(shot_row["video_path"])
-    audio_path = shot_row["audio_path"]
-
-    # 通用 mux:视频无音轨 + 有外部 audio → mux(画外音/旁白)。
-    # 覆盖两种情况:broll narrator 旁白 + 混合路线 scene-dialogue 的 speaker 配音。
-    # OmniHuman 视频自带嘴型同步音轨(has_audio=True),不会被 mux。
-    if audio_path and not await ffmpeg.has_audio_stream(src):
-        muxed = prep_dir / f"{idx:02d}_muxed.mp4"
-        await ffmpeg.mux_video_audio(src, Path(audio_path), muxed)
-        src = muxed
-
     duration = await ffmpeg.probe_duration(src)
     norm = prep_dir / f"{idx:02d}.mp4"
     await ffmpeg.normalize_shot(
@@ -45,6 +32,47 @@ async def _prep_shot(shot_row, prep_dir: Path,
         fade=True, duration=duration,
     )
     return norm
+
+
+def _director_segments(sb: dict, master_rows) -> list[dict]:
+    """Resolve final edit shots to local picture/audio master paths."""
+    paths = {int(row["idx"]): row["video_path"] for row in master_rows}
+    segments: list[dict] = []
+    for edit in sb.get("shots") or []:
+        video_idx = int(edit["video_master_idx"])
+        audio_idx = int(edit.get("audio_master_idx", video_idx))
+        if video_idx not in paths or audio_idx not in paths:
+            raise RuntimeError(
+                f"director shot #{edit.get('idx')} references missing master"
+            )
+        segments.append({
+            "idx": int(edit["idx"]),
+            "video_path": paths[video_idx],
+            "native_audio": paths[audio_idx],
+            "video_start": float(edit.get("video_start") or 0),
+            "audio_start": float(edit.get("audio_start") or 0),
+            "duration": float(edit["duration"]),
+            "subtitle": edit.get("subtitle"),
+            "subtitle_cues": edit.get("subtitle_cues") or [],
+        })
+    return segments
+
+
+async def _prep_director_segment(segment: dict, prep_dir: Path,
+                                 hook: str | None) -> Path:
+    out = prep_dir / f"{segment['idx']:02d}.mp4"
+    await ffmpeg.cut_director_segment(
+        Path(segment["video_path"]),
+        Path(segment["native_audio"]),
+        out,
+        video_start=segment["video_start"],
+        audio_start=segment["audio_start"],
+        duration=segment["duration"],
+        subtitle=segment.get("subtitle"),
+        subtitle_cues=segment.get("subtitle_cues"),
+        hook=hook,
+    )
+    return out
 
 
 async def run(job_id: str) -> None:
@@ -57,7 +85,7 @@ async def run(job_id: str) -> None:
     hook_text = sb.get("hook", "")
 
     rows = db.execute(
-        "SELECT idx, video_path, narrative_type, audio_path "
+        "SELECT idx, video_path "
         "FROM shots WHERE job_id=? AND state='OK' ORDER BY idx",
         (job_id,)
     ).fetchall()
@@ -67,17 +95,32 @@ async def run(job_id: str) -> None:
     prep_dir = base / "shots_prep"
     prep_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. 并发准备所有 shot(mux 旁白 + 字幕 + hook + fade + 归一化)
+    # 1. 并发准备所有 shot(保留原生音轨 + 字幕 + hook + fade + 归一化)
     #    hook 大字只烧在第一镜(idx 最小的那个)
-    first_idx = min(r["idx"] for r in rows)
-    norm_paths = await asyncio.gather(*[
-        _prep_shot(
-            r, prep_dir,
-            subtitle=sb_shots.get(r["idx"], {}).get("subtitle"),
-            hook=hook_text if r["idx"] == first_idx else None,
-        )
-        for r in rows
-    ])
+    director_mode = (
+        sb.get("production_mode") == "native_master_local_director"
+    )
+    if director_mode:
+        segments = _director_segments(sb, rows)
+        first_idx = min(segment["idx"] for segment in segments)
+        norm_paths = await asyncio.gather(*[
+            _prep_director_segment(
+                segment,
+                prep_dir,
+                hook=hook_text if segment["idx"] == first_idx else None,
+            )
+            for segment in segments
+        ])
+    else:
+        first_idx = min(r["idx"] for r in rows)
+        norm_paths = await asyncio.gather(*[
+            _prep_shot(
+                r, prep_dir,
+                subtitle=sb_shots.get(r["idx"], {}).get("subtitle"),
+                hook=hook_text if r["idx"] == first_idx else None,
+            )
+            for r in rows
+        ])
     norm_paths = list(norm_paths)
 
     # 2. 片尾 CTA 卡(APPEND_CTA=false 可关)

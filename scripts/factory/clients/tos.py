@@ -1,7 +1,6 @@
 """火山引擎 TOS 对象存储 client。
 
-OmniHuman 要求 image_url / audio_url 是公网 URL,所以本地生成的
-character.png / voice.mp3 都要先上传 TOS 拿到 URL。
+Seedance 成片上传后用于视频理解质检，并作为后续真人镜头的身份参考。
 
 环境变量:
   VOLC_AK             Access Key ID(同方舟那套,可复用)
