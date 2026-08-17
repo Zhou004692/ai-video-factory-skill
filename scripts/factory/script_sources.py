@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import socket
+import uuid
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -99,6 +100,46 @@ def ingest_text(db, content: str, *, title: str | None = None,
     )
     db.commit()
     return IngestResult(source_id, True)
+
+
+def instantiate_content_source(
+        db, source_id: str, *, title: str | None = None) -> IngestResult:
+    """Create an independent project root while reusing canonical source data."""
+    row = db.execute(
+        "SELECT source_type,title,source_uri,content,metadata_json "
+        "FROM script_sources WHERE source_id=?",
+        (str(source_id or "").strip(),),
+    ).fetchone()
+    if not row:
+        raise ValueError(f"script source not found: {source_id}")
+    metadata = json.loads(row["metadata_json"] or "{}")
+    canonical_source_id = str(
+        metadata.get("canonical_source_id") or source_id
+    ).strip()
+    metadata["canonical_source_id"] = canonical_source_id
+    while True:
+        token = uuid.uuid4().hex
+        instance_id = f"SRC-{token[:16]}"
+        fingerprint = _fingerprint(
+            f"content-project:{canonical_source_id}:{token}"
+        )
+        collision = db.execute(
+            "SELECT 1 FROM script_sources WHERE source_id=? OR fingerprint=?",
+            (instance_id, fingerprint),
+        ).fetchone()
+        if not collision:
+            break
+    db.execute(
+        "INSERT INTO script_sources(source_id,fingerprint,source_type,title,"
+        "source_uri,content,metadata_json) VALUES(?,?,?,?,?,?,?)",
+        (
+            instance_id, fingerprint, row["source_type"],
+            str(title or "").strip() or row["title"], row["source_uri"],
+            row["content"], json.dumps(metadata, ensure_ascii=False),
+        ),
+    )
+    db.commit()
+    return IngestResult(instance_id, True)
 
 
 def ingest_file(db, path: str | Path, *, title: str | None = None,
@@ -272,6 +313,17 @@ def topic_source_context(db, topic_id: str, *, max_chars: int = 12000) -> str:
                     f"{float(segment['end_sec']):.3f}s: "
                     f"{segment.get('evidence') or ''}"
                 )
+                for label, key in (
+                    ("场景", "scene"), ("人物与动作", "action"),
+                    ("镜头", "camera"), ("原声台词", "dialogue"),
+                    ("画面文字", "on_screen_text"), ("声音", "audio"),
+                ):
+                    value = segment.get(key)
+                    if value:
+                        parts.append(f"  - {label}: {value}")
+                characters = segment.get("characters") or []
+                if characters:
+                    parts.append(f"  - 出镜人物: {' / '.join(characters)}")
             phrases = analysis.get("catchphrases") or []
             if phrases:
                 parts.append(f"- 金句候选: {' / '.join(phrases)}")

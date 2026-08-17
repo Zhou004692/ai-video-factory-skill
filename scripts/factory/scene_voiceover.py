@@ -53,6 +53,14 @@ def faceless_visual_text(value: object, *extra_terms: object) -> str:
 def non_text_visual_text(value: object) -> str:
     """Reframe identifier-bearing props so the model need not draw glyphs."""
     text = str(value or "")
+    # Source reconstruction stores OCR evidence next to visual direction.
+    # That evidence belongs to local overlays/subtitles, never to the visual
+    # generation prompt; otherwise it directly contradicts the no-text gate.
+    text = re.split(
+        r"(?:画面文字|屏幕文字|字幕内容|可读文字)\s*[：:]",
+        text,
+        maxsplit=1,
+    )[0]
     replacements = (
         (r"车架号(?:钢印)?", "车架结构与打磨痕迹"),
         (r"(?:设备)?编号(?:贴纸|标签)?", "无字标签背面"),

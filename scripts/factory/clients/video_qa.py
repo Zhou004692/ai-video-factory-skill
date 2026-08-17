@@ -1,6 +1,7 @@
 """Doubao video-understanding quality gate."""
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+import json
 import os
 import re
 
@@ -94,6 +95,7 @@ def evaluate(result: dict, *, expect_speech: bool,
              expected_visual: str | None = None,
              forbid_people: bool = False,
              forbid_readable_text: bool = False,
+             require_broll_semantics: bool = False,
              min_confidence: float = 0.8,
              min_transcript_similarity: float = 0.95,
              min_visual_alignment: float = 0.75) -> QADecision:
@@ -125,7 +127,128 @@ def evaluate(result: dict, *, expect_speech: bool,
         reasons.append("unexpected_person")
     if forbid_readable_text and bool(result.get("has_readable_text")):
         reasons.append("unexpected_readable_text")
+    if require_broll_semantics:
+        semantics = result.get("broll_semantics") or {}
+        if not semantics:
+            reasons.append("broll_semantic_evidence_missing")
+        else:
+            if not bool(semantics.get("industry_subject_visible")):
+                reasons.append("missing_industry_subject")
+            if not bool(semantics.get("environment_context_visible")):
+                reasons.append("missing_environment_context")
+            if not bool(semantics.get("meaningful_action_visible")):
+                reasons.append("missing_meaningful_action")
+            dominant = str(semantics.get("dominant_subject") or "").lower()
+            hand_ratio = float(semantics.get("hand_closeup_ratio") or 0)
+            if dominant in {"hand", "hands", "finger", "fingers"} \
+                    and hand_ratio >= 0.55:
+                reasons.append("meaningless_hand_closeup")
     return QADecision(not reasons, tuple(reasons), similarity)
+
+
+def evaluate_continuity(
+    result: dict,
+    *,
+    min_identity_alignment: float = 0.82,
+    min_scene_alignment: float = 0.78,
+    min_blocking_alignment: float = 0.80,
+) -> QADecision:
+    """Fail closed only for continuity dimensions backed by references."""
+    reasons: list[str] = []
+    if bool(result.get("identity_checked")) and float(
+        result.get("identity_alignment") or 0
+    ) < min_identity_alignment:
+        reasons.append("identity_drift")
+    if bool(result.get("scene_checked")) and float(
+        result.get("scene_alignment") or 0
+    ) < min_scene_alignment:
+        reasons.append("scene_drift")
+    if bool(result.get("blocking_checked")) and float(
+        result.get("blocking_alignment") or 0
+    ) < min_blocking_alignment:
+        reasons.append("blocking_drift")
+    if (
+        bool(result.get("wardrobe_checked", "wardrobe_match" in result))
+        and result.get("wardrobe_match") is False
+    ):
+        reasons.append("wardrobe_drift")
+    if (
+        bool(result.get("prop_state_checked", "prop_state_match" in result))
+        and result.get("prop_state_match") is False
+    ):
+        reasons.append("prop_state_mismatch")
+    return QADecision(not reasons, tuple(reasons))
+
+
+def analyze_continuity(
+    current_video_url: str,
+    *,
+    contract: dict,
+    identity_image_urls: list[str] | tuple[str, ...] = (),
+    scene_image_url: str | None = None,
+    previous_video_url: str | None = None,
+    model: str | None = None,
+    timeout: int = 180,
+) -> tuple[dict, QADecision]:
+    """Compare a candidate master against canonical and incremental state."""
+    key = os.environ.get("ARK_API_KEY")
+    if not key:
+        raise RuntimeError("ARK_API_KEY not set in .env")
+    model = model or os.getenv(
+        "ARK_VIDEO_QA_MODEL",
+        os.getenv("ARK_LLM_MODEL", "doubao-seed-2-0-pro-260215"),
+    )
+    prompt = (
+        "你是跨镜头连续性质检器。第一个视频是当前候选母片；随后图片依次是"
+        "人物标准定妆照和场景标准锚点；最后一个视频（如有）是上一条已验收"
+        "的同场景母片。标准锚点是真值，上一母片只用于动作、站位和空间状态。"
+        "逐项判断人物身份、视觉年龄、发型、服装、场景结构、设备位置、人物"
+        "左右顺序、相对距离、朝向、道具状态和180度轴线。没有对应参考证据的"
+        "维度必须把 checked 设为 false，不得猜测。只输出 JSON："
+        '{"identity_checked":false,"identity_alignment":0.0,'
+        '"scene_checked":false,"scene_alignment":0.0,'
+        '"blocking_checked":false,"blocking_alignment":0.0,'
+        '"wardrobe_checked":false,"wardrobe_match":true,'
+        '"prop_state_checked":false,"prop_state_match":true,'
+        '"mismatches":[],"reason":""}。\n'
+        "continuity_contract="
+        + json.dumps(contract or {}, ensure_ascii=False)
+    )
+    content: list[dict] = [
+        {"type": "text", "text": prompt},
+        {"type": "video_url", "video_url": {"url": current_video_url}},
+    ]
+    for url in identity_image_urls:
+        if str(url or "").startswith("https://"):
+            content.append({"type": "image_url", "image_url": {"url": str(url)}})
+    if str(scene_image_url or "").startswith("https://"):
+        content.append({
+            "type": "image_url", "image_url": {"url": str(scene_image_url)}
+        })
+    if str(previous_video_url or "").startswith("https://"):
+        content.append({
+            "type": "video_url", "video_url": {"url": str(previous_video_url)}
+        })
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "user", "content": content}],
+    }
+    with httpx.Client(timeout=timeout) as cli:
+        response = cli.post(
+            f"{ARK_BASE}/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"continuity_qa {response.status_code}: {response.text[:800]} | "
+                f"model={model}"
+            )
+        body = response.json()
+    raw = _extract_json(body["choices"][0]["message"]["content"])
+    return raw, evaluate_continuity(raw)
 
 
 def analyze(video_url: str, *, expect_speech: bool,
@@ -133,6 +256,7 @@ def analyze(video_url: str, *, expect_speech: bool,
             expected_visual: str | None = None,
             forbid_people: bool = False,
             forbid_readable_text: bool = False,
+            require_broll_semantics: bool = False,
             model: str | None = None,
             timeout: int = 180) -> tuple[dict, QADecision]:
     """Analyze a remotely accessible MP4 and return raw output + decision."""
@@ -154,6 +278,16 @@ def analyze(video_url: str, *, expect_speech: bool,
         '"has_visible_person":false,"has_readable_text":false,'
         '"notes":"其他观察"}。'
     )
+    if require_broll_semantics:
+        prompt += (
+            "\n这是行业场景 B-roll 语义质检。还必须输出 broll_semantics："
+            "industry_subject_visible 表示是否清楚出现提示词要求的行业主体或设备；"
+            "environment_context_visible 表示是否存在能说明地点与主体关系的环境建立画面；"
+            "meaningful_action_visible 表示是否出现与业务相关的真实操作、移动或交互；"
+            "dominant_subject 只能填 equipment/environment/person/hands/fingers/object/other；"
+            "hand_closeup_ratio 为手或手指特写占整个视频时长的比例 0 到 1。"
+            "不要因为单帧短暂出现设备就判定主体已出现。"
+        )
     payload = {
         "model": model,
         "temperature": 0,
@@ -208,4 +342,5 @@ def analyze(video_url: str, *, expect_speech: bool,
         expected_visual=expected_visual,
         forbid_people=forbid_people,
         forbid_readable_text=forbid_readable_text,
+        require_broll_semantics=require_broll_semantics,
     )

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -73,6 +73,8 @@ PLATFORM_EXPORT_FIELDS = {
     },
 }
 
+PERFORMANCE_WINDOWS_HOURS = (24, 72, 168)
+
 
 def _nonnegative(name: str, value: int | float | None) -> int | None:
     if value is None:
@@ -110,6 +112,84 @@ def _utc_time(value: str, *, field: str) -> str:
     if parsed.tzinfo is None:
         raise ValueError(f"{field} must include a timezone")
     return parsed.astimezone(timezone.utc).isoformat()
+
+
+def performance_due_tasks(
+    db: sqlite3.Connection,
+    *,
+    now: str | datetime | None = None,
+) -> list[dict]:
+    """Return missing 24/72/168-hour cumulative snapshot tasks.
+
+    A snapshot belongs to the first collection interval containing its capture
+    time.  Late data therefore never overwrites or silently completes an
+    earlier missed window.
+    """
+    if now is None:
+        current = datetime.now(timezone.utc)
+    elif isinstance(now, datetime):
+        if now.tzinfo is None:
+            raise ValueError("now must include a timezone")
+        current = now.astimezone(timezone.utc)
+    else:
+        current = datetime.fromisoformat(str(now).replace("Z", "+00:00"))
+        if current.tzinfo is None:
+            raise ValueError("now must include a timezone")
+        current = current.astimezone(timezone.utc)
+    publications = db.execute(
+        "SELECT p.publication_id,p.job_id,p.platform,p.item_id,p.published_at,"
+        "p.metadata_json,j.title FROM platform_publications p "
+        "JOIN jobs j ON j.job_id=p.job_id WHERE p.published_at IS NOT NULL"
+    ).fetchall()
+    tasks: list[dict] = []
+    for publication in publications:
+        try:
+            metadata = json.loads(publication["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+        if str(metadata.get("review_status") or "").lower() in {
+            "pending", "pending_review", "submitted"
+        }:
+            continue
+        published = datetime.fromisoformat(
+            str(publication["published_at"]).replace("Z", "+00:00")
+        )
+        if published.tzinfo is None:
+            continue
+        published = published.astimezone(timezone.utc)
+        captures = [
+            datetime.fromisoformat(str(row[0]).replace("Z", "+00:00")).astimezone(timezone.utc)
+            for row in db.execute(
+                "SELECT captured_at FROM performance_snapshots "
+                "WHERE job_id=? AND platform=? ORDER BY captured_at",
+                (publication["job_id"], publication["platform"]),
+            ).fetchall()
+        ]
+        for index, window_hours in enumerate(PERFORMANCE_WINDOWS_HOURS):
+            due_at = published + timedelta(hours=window_hours)
+            if current < due_at:
+                continue
+            next_due = (
+                published + timedelta(hours=PERFORMANCE_WINDOWS_HOURS[index + 1])
+                if index + 1 < len(PERFORMANCE_WINDOWS_HOURS) else None
+            )
+            completed = any(
+                captured >= due_at and (next_due is None or captured < next_due)
+                for captured in captures
+            )
+            if completed:
+                continue
+            tasks.append({
+                "publication_id": publication["publication_id"],
+                "job_id": publication["job_id"],
+                "title": publication["title"],
+                "platform": publication["platform"],
+                "item_id": publication["item_id"],
+                "window_hours": window_hours,
+                "due_at": due_at.isoformat(),
+                "overdue_hours": max(0, int((current - due_at).total_seconds() // 3600)),
+            })
+    return sorted(tasks, key=lambda item: (item["due_at"], item["publication_id"]))
 
 
 def register_publication(

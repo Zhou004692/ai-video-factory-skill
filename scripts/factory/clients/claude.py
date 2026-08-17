@@ -19,23 +19,111 @@ def get_client():
     return _client
 
 
+def _json_candidate(text: str) -> str:
+    """Return the first JSON-looking top-level value, including truncation."""
+    starts = [index for index in (text.find("{"), text.find("[")) if index >= 0]
+    if not starts:
+        return ""
+    return text[min(starts):].strip().removesuffix("```").strip()
+
+
+def _repair_json_text(text: str) -> str:
+    """Conservatively repair common LLM JSON syntax damage.
+
+    This layer only repairs syntax. Domain validators still decide whether a
+    recovered object is complete enough to persist or requires a model retry.
+    """
+    candidate = _json_candidate(text)
+    if not candidate:
+        return ""
+    expected_closers = {"{": "}", "[": "]"}
+    stack: list[str] = []
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    for char in candidate:
+        if in_string:
+            if escaped:
+                output.append(char)
+                escaped = False
+            elif char == "\\":
+                output.append(char)
+                escaped = True
+            elif char == '"':
+                output.append(char)
+                in_string = False
+            elif char == "\n":
+                output.append("\\n")
+            elif char == "\r":
+                output.append("\\r")
+            elif char == "\t":
+                output.append("\\t")
+            elif ord(char) < 0x20:
+                output.append(f"\\u{ord(char):04x}")
+            else:
+                output.append(char)
+            continue
+        if char == '"':
+            output.append(char)
+            in_string = True
+            continue
+        if char in expected_closers:
+            stack.append(expected_closers[char])
+            output.append(char)
+            continue
+        if char in ("}", "]"):
+            output.append(char)
+            if stack and stack[-1] == char:
+                stack.pop()
+                if not stack:
+                    break
+            continue
+        output.append(char)
+    if escaped:
+        output.append("\\")
+    if in_string:
+        output.append('"')
+    output.extend(reversed(stack))
+    repaired = "".join(output)
+    string_token = r'"(?:\\.|[^"\\])*"'
+    value_token = rf'(?:{string_token}|[}}\]]|-?\d+(?:\.\d+)?|true|false|null)'
+    key_token = rf'(?={string_token}\s*:)'
+    repaired = re.sub(
+        rf'({value_token})\s+{key_token}', lambda match: match.group(1) + ",",
+        repaired,
+    )
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    return repaired
+
+
 def _extract_json(text: str):
-    """从 LLM 输出里抽 JSON。容忍 ```json ... ``` 围栏。"""
-    # 先试整段
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    # 找代码块
-    m = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", text, re.DOTALL)
-    if m:
-        return json.loads(m.group(1))
-    # 找首个 { 到末个 }
-    s = text.find("{")
-    e = text.rfind("}")
-    if s >= 0 and e > s:
-        return json.loads(text[s:e+1])
-    raise ValueError(f"could not parse JSON from: {text[:500]}")
+    """Extract strict JSON, then apply deterministic local syntax recovery."""
+    candidates = [str(text or "").strip()]
+    candidates.extend(
+        match.group(1).strip() for match in re.finditer(
+            r"```(?:json)?\s*([\s\S]*?)\s*```", str(text or ""), re.IGNORECASE
+        )
+    )
+    candidate = _json_candidate(str(text or ""))
+    if candidate:
+        candidates.append(candidate)
+    last_error: json.JSONDecodeError | None = None
+    for candidate in dict.fromkeys(item for item in candidates if item):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as error:
+            last_error = error
+    for candidate in dict.fromkeys(item for item in candidates if item):
+        repaired = _repair_json_text(candidate)
+        if not repaired:
+            continue
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError as error:
+            last_error = error
+    if last_error:
+        raise last_error
+    raise json.JSONDecodeError("could not find JSON object", str(text or ""), 0)
 
 
 def complete_json(prompt: str, system: str = None, max_tokens: int = 4000,

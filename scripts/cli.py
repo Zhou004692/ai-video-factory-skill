@@ -788,6 +788,11 @@ def plan(storyboard_path, budget_cents, resolution):
     click.echo(
         f"paid masters: {report['paid_master_count']}/{report['total_masters']}"
     )
+    click.echo(
+        "AI identity makeup anchors: "
+        f"{report['paid_identity_anchor_count']} "
+        f"(¥{report['identity_anchor_cost_cents'] / 100:.2f})"
+    )
     click.echo(f"library hits: {len(report['library_hits'])}")
     click.echo(
         f"estimated cost: ¥{report['estimated_cost_cents'] / 100:.2f} "
@@ -813,7 +818,13 @@ def plan(storyboard_path, budget_cents, resolution):
     is_flag=True,
     help="Confirm paid video generation for the existing approved Storyboard.",
 )
-def produce_approved(job_id, yes):
+@click.option(
+    "--dispatched",
+    is_flag=True,
+    hidden=True,
+    help="Internal: the queue supervisor already claimed this job.",
+)
+def produce_approved(job_id, yes, dispatched):
     """Resume one approved Storyboard without regenerating it."""
     database = conn()
     row = database.execute(
@@ -821,16 +832,71 @@ def produce_approved(job_id, yes):
     ).fetchone()
     if not row:
         raise click.ClickException(f"job not found: {job_id}")
-    if row["state"] != "STORYBOARDED" or not row["storyboard"]:
+    allowed_states = {"STORYBOARDED", "PRODUCTION_QUEUED"}
+    if dispatched:
+        allowed_states.add("PRODUCTION_RUNNING")
+    if row["state"] not in allowed_states or not row["storyboard"]:
         raise click.ClickException(
             "job must contain an approved Storyboard and be in STORYBOARDED state"
         )
     try:
         storyboard = json.loads(row["storyboard"])
         s1_storyboard._validate(storyboard)
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise click.ClickException(f"invalid approved Storyboard: {exc}") from exc
-    report = production_planner.analyze_storyboard(database, storyboard)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        error = f"invalid approved Storyboard: {exc}"
+        if row["state"] == "PRODUCTION_QUEUED" or dispatched:
+            database.execute(
+                "UPDATE jobs SET state='FAILED',error=?,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state IN ('PRODUCTION_QUEUED','PRODUCTION_RUNNING')",
+                (error, job_id),
+            )
+            database.commit()
+        raise click.ClickException(error) from exc
+    try:
+        completed_master_indexes = {
+            int(item["idx"])
+            for item in database.execute(
+                "SELECT idx FROM shots WHERE job_id=? AND state='OK'",
+                (job_id,),
+            ).fetchall()
+        }
+        completed_identity_keys = {
+            str(item["identity_key"])
+            for item in database.execute(
+                "SELECT identity_key FROM character_identity_anchors "
+                "WHERE job_id=? AND state='READY' AND source_type!='volc_asset'",
+                (job_id,),
+            ).fetchall()
+        }
+        completed_scene_keys = {
+            str(item["anchor_key"])
+            for item in database.execute(
+                "SELECT anchor_key FROM scene_visual_anchors "
+                "WHERE job_id=? AND state='READY'",
+                (job_id,),
+            ).fetchall()
+        }
+        report = production_planner.analyze_storyboard(
+            database,
+            storyboard,
+            budget_cents=(
+                storyboard.get("production_settings", {}).get("budget_cents")
+            ),
+            completed_master_indexes=completed_master_indexes,
+            completed_identity_keys=completed_identity_keys,
+            completed_scene_keys=completed_scene_keys,
+            current_cost_cents=int(row["cost_cents"] or 0),
+        )
+    except Exception as exc:
+        error = f"approved production preflight failed: {exc}"
+        if row["state"] == "PRODUCTION_QUEUED" or dispatched:
+            database.execute(
+                "UPDATE jobs SET state='FAILED',error=?,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state IN ('PRODUCTION_QUEUED','PRODUCTION_RUNNING')",
+                (error, job_id),
+            )
+            database.commit()
+        raise click.ClickException(error) from exc
     click.echo("=== Approved production preview (no provider call) ===")
     click.echo(f"job: {job_id}")
     click.echo(f"state: {row['state']}")
@@ -840,11 +906,34 @@ def produce_approved(job_id, yes):
         click.echo("No production submitted. Re-run with --yes after review.")
         return
     if not report["budget_ok"]:
-        raise click.ClickException(
-            "approved production exceeds the job budget before any paid call: "
-            f"estimated={report['estimated_cost_cents']} cents, "
-            f"limit={report['budget_cents']} cents"
+        error = (
+            "estimated total cost exceeds the confirmed job budget; "
+            "increase the job budget before production"
         )
+        if row["state"] == "PRODUCTION_QUEUED" or dispatched:
+            database.execute(
+                "UPDATE jobs SET state='FAILED',error=?,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state IN ('PRODUCTION_QUEUED','PRODUCTION_RUNNING')",
+                (error, job_id),
+            )
+            database.commit()
+        raise click.ClickException(error)
+    if row["state"] == "STORYBOARDED":
+        database.execute(
+            "UPDATE jobs SET state='PRODUCTION_QUEUED',updated_at=CURRENT_TIMESTAMP "
+            "WHERE job_id=? AND state='STORYBOARDED'", (job_id,),
+        )
+        database.commit()
+    if not dispatched:
+        claimed = database.execute(
+            "UPDATE jobs SET state='PRODUCTION_RUNNING',updated_at=CURRENT_TIMESTAMP "
+            "WHERE job_id=? AND state='PRODUCTION_QUEUED'", (job_id,),
+        )
+        database.commit()
+        if claimed.rowcount != 1:
+            raise click.ClickException(
+                "approved production is already running or was already claimed"
+            )
     click.echo("Confirmed: resuming from s3_shots; s1_storyboard will not run.")
     asyncio.run(_process_job(job_id, asyncio.Semaphore(1)))
 

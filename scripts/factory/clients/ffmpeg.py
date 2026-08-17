@@ -1,11 +1,28 @@
 """FFmpeg 封装:分镜归一化 + 字幕/hook 烧制 + 转场 + 片尾 CTA + 拼接 + 混入 BGM。"""
 import asyncio
+import math
 import os
 from pathlib import Path
+import re
+import shutil
 
 
 class FFmpegError(RuntimeError):
     pass
+
+
+def executable(name: str) -> str:
+    """Resolve FFmpeg tools even when a Windows service lacks the user PATH."""
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        links = Path(local_app_data) / "Microsoft" / "WinGet" / "Links"
+        candidate = links / f"{name}.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return name
 
 
 # 中文字幕字体(雅黑粗体,短视频清晰度好)。可用 SUBTITLE_FONT env 覆盖。
@@ -45,6 +62,70 @@ def _subtitle_display_text(text: str) -> str:
     return text.strip().removesuffix("。").removesuffix(".")
 
 
+def _wrap_subtitle_text(text: str, *, width: int, fontsize: int | None = None) -> str:
+    """Wrap captions into balanced lines that stay inside the video safe width."""
+    font_size = fontsize or int(width * 0.048)
+    max_chars = max(int(width * 0.84 / max(font_size, 1)), 8)
+    opening_punctuation = set("‘“（《【[")
+    closing_punctuation = set("，。！？；：、’”）》】],.!?;:")
+    wrapped: list[str] = []
+    for paragraph in text.splitlines() or [text]:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        line_count = max(math.ceil(len(paragraph) / max_chars), 1)
+        units = re.findall(r"[A-Za-z0-9]+|.", paragraph)
+        for remaining_lines in range(line_count, 0, -1):
+            if remaining_lines == 1:
+                wrapped.append("".join(units))
+                break
+            target = math.ceil(sum(len(unit) for unit in units) / remaining_lines)
+            candidates: list[tuple[int, int]] = []
+            visible = 0
+            for index, unit in enumerate(units[:-1], start=1):
+                visible += len(unit)
+                if visible > max_chars:
+                    break
+                penalty = abs(visible - target)
+                if unit[-1] in opening_punctuation:
+                    penalty += max_chars
+                if units[index][0] in closing_punctuation:
+                    penalty += max_chars
+                candidates.append((penalty, index))
+            cut = min(candidates)[1] if candidates else 1
+            wrapped.append("".join(units[:cut]))
+            units = units[cut:]
+    return "\n".join(wrapped)
+
+
+def _subtitle_drawtext_filters(
+        output_dir: Path, stem: str, text: str, *, width: int,
+        enable: str | None = None) -> list[str]:
+    """Render each subtitle line at an explicit compact vertical position."""
+    fontsize = int(width * 0.048)
+    lines = _wrap_subtitle_text(text, width=width, fontsize=fontsize).splitlines()
+    line_step = int(fontsize * 1.34)
+    center_offsets = [
+        int(round((line - (len(lines) - 1) / 2) * line_step))
+        for line in range(len(lines))
+    ]
+    filters: list[str] = []
+    for line_number, (line, offset) in enumerate(
+            zip(lines, center_offsets), start=1):
+        text_path = output_dir / f"{stem}_line_{line_number:02d}.txt"
+        text_path.write_text(line, encoding="utf-8")
+        sign = "+" if offset >= 0 else ""
+        filters.append(_drawtext(
+            text_path,
+            fontsize=fontsize,
+            y=f"h*0.80{sign}{offset}",
+            color="white",
+            border=4,
+            enable=enable,
+        ))
+    return filters
+
+
 def _timed_subtitle_filters(
         output_dir: Path, stem: str, cues: list[dict], *, width: int) -> list[str]:
     """Build one drawtext filter per subtitle cue with an explicit time window."""
@@ -55,14 +136,11 @@ def _timed_subtitle_filters(
         end = max(float(cue.get("end") or 0), start)
         if not text or end <= start:
             continue
-        text_path = output_dir / f"{stem}_sub_{number:02d}.txt"
-        text_path.write_text(text, encoding="utf-8")
-        filters.append(_drawtext(
-            text_path,
-            fontsize=int(width * 0.048),
-            y="h-text_h-h*0.12",
-            color="white",
-            border=4,
+        filters.extend(_subtitle_drawtext_filters(
+            output_dir,
+            f"{stem}_sub_{number:02d}",
+            text,
+            width=width,
             enable=f"between(t,{start:.3f},{end:.3f})",
         ))
     return filters
@@ -87,7 +165,7 @@ def _thumbnail_hook_font_size(text: str, width: int) -> int:
 
 async def _run(args: list[str]) -> None:
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
+        executable("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error", *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -99,7 +177,7 @@ async def _run(args: list[str]) -> None:
 
 async def _ffprobe(args: list[str]) -> str:
     proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error", *args,
+        executable("ffprobe"), "-v", "error", *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -174,11 +252,12 @@ async def normalize_shot(in_path: Path, out_path: Path,
     ]
     # 字幕(底部,距底 12%)
     if subtitle and subtitle.strip():
-        sub_txt = out_path.parent / f"{out_path.stem}_sub.txt"
-        sub_txt.write_text(subtitle.strip(), encoding="utf-8")
-        vf_chain.append(_drawtext(
-            sub_txt, fontsize=int(width * 0.048), y="h-text_h-h*0.12",
-            color="white", border=4))
+        vf_chain.extend(_subtitle_drawtext_filters(
+            out_path.parent,
+            f"{out_path.stem}_sub",
+            _subtitle_display_text(subtitle),
+            width=width,
+        ))
     # hook 大字(仅第一镜,0-3 秒,顶部 18%,黄字大号)
     if hook and hook.strip():
         hook_txt = out_path.parent / f"{out_path.stem}_hook.txt"
@@ -242,11 +321,11 @@ async def cut_director_segment(
             out_path.parent, out_path.stem, subtitle_cues, width=width,
         ))
     elif subtitle and subtitle.strip():
-        sub_txt = out_path.parent / f"{out_path.stem}_sub.txt"
-        sub_txt.write_text(subtitle.strip(), encoding="utf-8")
-        vf_chain.append(_drawtext(
-            sub_txt, fontsize=int(width * 0.048), y="h-text_h-h*0.12",
-            color="white", border=4,
+        vf_chain.extend(_subtitle_drawtext_filters(
+            out_path.parent,
+            f"{out_path.stem}_sub",
+            _subtitle_display_text(subtitle),
+            width=width,
         ))
     if hook and hook.strip():
         hook_txt = out_path.parent / f"{out_path.stem}_hook.txt"
@@ -363,6 +442,9 @@ async def generate_thumbnail(video_path: Path, hook_text: str, out_path: Path,
     """
     hook = (hook_text or BRAND_NAME).strip()
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.unlink(missing_ok=True)
+    duration = await probe_duration(video_path)
+    safe_ts = min(max(float(ts), 0.0), max(duration - 0.25, 0.0))
     hook_txt = out_path.parent / f"{out_path.stem}_hook.txt"
     brand_txt = out_path.parent / f"{out_path.stem}_brand.txt"
     hook_txt.write_text(hook, encoding="utf-8")
@@ -398,13 +480,17 @@ async def generate_thumbnail(video_path: Path, hook_text: str, out_path: Path,
                   color="white", border=3),
     ])
     await _run([
-        "-ss", str(ts), "-i", str(video_path),
+        "-ss", str(safe_ts), "-i", str(video_path),
         "-frames:v", "1",
         "-vf", vf,
         "-update", "1",
         "-q:v", "2",
+        "-pix_fmt", "yuvj420p",
+        "-threads", "1",
         str(out_path),
     ])
+    if not out_path.is_file() or out_path.stat().st_size <= 0:
+        raise FFmpegError("ffmpeg generated no output thumbnail")
 
 
 async def concat_shots(shot_paths: list[Path], out_path: Path) -> None:

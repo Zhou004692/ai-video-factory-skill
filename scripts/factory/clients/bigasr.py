@@ -6,6 +6,7 @@ import base64
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import time
 import uuid
 
 import httpx
@@ -14,7 +15,10 @@ import httpx
 FLASH_URL = (
     "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
 )
-RESOURCE_ID = "volc.bigasr.auc_turbo"
+STANDARD_SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
+STANDARD_QUERY_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
+LEGACY_RESOURCE_ID = "volc.bigasr.auc_turbo"
+SEED_ASR_2_RESOURCE_ID = "volc.seedasr.auc"
 
 
 @dataclass(frozen=True)
@@ -65,11 +69,18 @@ def parse_transcript(payload: dict) -> str:
 def transcribe_detailed(
     audio_path: str | Path,
     *,
+    api_key: str | None = None,
     app_id: str | None = None,
     access_token: str | None = None,
     transport: httpx.BaseTransport | None = None,
     timeout: int = 120,
+    poll_interval: float = 0.5,
+    max_wait_seconds: int = 120,
 ) -> Transcription:
+    explicit_legacy = bool(app_id and access_token)
+    api_key = api_key or (
+        None if explicit_legacy else os.environ.get("VOLC_ASR_API_KEY")
+    )
     app_id = app_id or os.environ.get("VOLC_ASR_APPID") or os.environ.get(
         "VOLC_TTS_APPID"
     )
@@ -78,19 +89,27 @@ def transcribe_detailed(
         or os.environ.get("VOLC_ASR_TOKEN")
         or os.environ.get("VOLC_TTS_TOKEN")
     )
-    if not app_id or not access_token:
-        raise RuntimeError("VOLC_ASR_APPID / VOLC_ASR_TOKEN not set")
+    if not api_key and (not app_id or not access_token):
+        raise RuntimeError(
+            "VOLC_ASR_API_KEY or VOLC_ASR_APPID / VOLC_ASR_TOKEN not set"
+        )
 
     audio_path = Path(audio_path)
+    request_id = str(uuid.uuid4())
     headers = {
-        "X-Api-App-Key": app_id,
-        "X-Api-Access-Key": access_token,
-        "X-Api-Resource-Id": RESOURCE_ID,
-        "X-Api-Request-Id": str(uuid.uuid4()),
+        "X-Api-Resource-Id": (
+            SEED_ASR_2_RESOURCE_ID if api_key else LEGACY_RESOURCE_ID
+        ),
+        "X-Api-Request-Id": request_id,
         "X-Api-Sequence": "-1",
     }
+    if api_key:
+        headers["X-Api-Key"] = api_key
+    else:
+        headers["X-Api-App-Key"] = app_id
+        headers["X-Api-Access-Key"] = access_token
     payload = {
-        "user": {"uid": app_id},
+        "user": {"uid": api_key or app_id},
         "audio": {
             "data": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
             "format": audio_path.suffix.lower().lstrip(".") or "wav",
@@ -98,7 +117,32 @@ def transcribe_detailed(
         "request": {"model_name": "bigmodel", "enable_itn": True},
     }
     with httpx.Client(timeout=timeout, transport=transport) as client:
-        response = client.post(FLASH_URL, headers=headers, json=payload)
+        if api_key:
+            response = client.post(STANDARD_SUBMIT_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            status = response.headers.get("X-Api-Status-Code", "20000000")
+            if status != "20000000":
+                raise RuntimeError(
+                    f"SeedASR submit failed status={status}: "
+                    f"{response.headers.get('X-Api-Message', '')}"
+                )
+            deadline = time.monotonic() + max_wait_seconds
+            while True:
+                response = client.post(STANDARD_QUERY_URL, headers=headers, json={})
+                response.raise_for_status()
+                status = response.headers.get("X-Api-Status-Code", "20000000")
+                if status == "20000000":
+                    break
+                if status not in {"20000001", "20000002", "20000003"}:
+                    raise RuntimeError(
+                        f"SeedASR query failed status={status}: "
+                        f"{response.headers.get('X-Api-Message', '')}"
+                    )
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("SeedASR query timed out")
+                time.sleep(max(0.0, poll_interval))
+        else:
+            response = client.post(FLASH_URL, headers=headers, json=payload)
     response.raise_for_status()
     status = response.headers.get("X-Api-Status-Code", "20000000")
     if status != "20000000":
@@ -112,16 +156,22 @@ def transcribe_detailed(
 def transcribe(
     audio_path: str | Path,
     *,
+    api_key: str | None = None,
     app_id: str | None = None,
     access_token: str | None = None,
     transport: httpx.BaseTransport | None = None,
     timeout: int = 120,
+    poll_interval: float = 0.5,
+    max_wait_seconds: int = 120,
 ) -> str:
     """Backward-compatible text-only transcription API."""
     return transcribe_detailed(
         audio_path,
+        api_key=api_key,
         app_id=app_id,
         access_token=access_token,
         transport=transport,
         timeout=timeout,
+        poll_interval=poll_interval,
+        max_wait_seconds=max_wait_seconds,
     ).text

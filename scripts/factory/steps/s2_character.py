@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 
 from .. import ASSETS_DIR, DATA_DIR
@@ -319,6 +320,25 @@ async def _gen_reference_img(job_id: str, character: dict,
     cache_png = CHAR_CACHE_DIR / f"{char_id}.png"
     cache_meta = CHAR_CACHE_DIR / f"{char_id}.json"
     job_path = ASSETS_DIR / job_id / "characters" / f"{char_id}.png"
+
+    # 自定义角色使用用户上传的首张图片，不重新生成定妆照。其余图片在
+    # 后续 i2i 镜头中作为一致性参考；这里上传首图供 Seedance 母片使用。
+    supplied = character.get("image_path")
+    if character.get("identity_type") == "custom" and supplied:
+        supplied_path = Path(supplied)
+        if not supplied_path.exists():
+            raise FileNotFoundError(f"custom character reference missing: {supplied_path}")
+        job_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(supplied_path, job_path)
+        url = tos.upload(job_path, key_hint=f"{job_id}-char-{char_id}")
+        references = [
+            str(path) for path in character.get("reference_images", [])
+            if Path(path).exists()
+        ]
+        return {
+            **character, "image_path": str(job_path), "image_url": url,
+            "reference_images": references or [str(supplied_path)],
+        }
 
     # 缓存命中:复用 portrait + TOS URL
     if cache_png.exists() and cache_meta.exists():

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AI Video Factory · 管理台设计选型</title>
+  <link rel="stylesheet" href="/design-options.css">
+</head>
+<body data-concept="a">
+  <header class="selection-header">
+    <div class="selection-title">
+      <span class="selection-mark" aria-hidden="true"></span>
+      <div>
+        <p>AI VIDEO FACTORY · DESIGN REVIEW</p>
+        <h1>管理台设计方向选型</h1>
+      </div>
+    </div>
+    <div class="selection-note">三套方案均保留完整业务链路，仅改变工作模型、信息密度与视觉语言</div>
+  </header>
+
+  <section class="concept-switcher" aria-label="设计方案">
+    <button class="concept-card active" data-concept="a">
+      <span class="concept-letter">A</span>
+      <span class="concept-copy"><b>效率中枢</b><small>高频操作 · 稳健清晰</small></span>
+      <span class="concept-fit">推荐</span>
+    </button>
+    <button class="concept-card" data-concept="b">
+      <span class="concept-letter">B</span>
+      <span class="concept-copy"><b>内容工作室</b><small>项目叙事 · 创作沉浸</small></span>
+      <span class="concept-fit">品牌感强</span>
+    </button>
+    <button class="concept-card" data-concept="c">
+      <span class="concept-letter">C</span>
+      <span class="concept-copy"><b>流程驾驶舱</b><small>全局态势 · 异常优先</small></span>
+      <span class="concept-fit">运营导向</span>
+    </button>
+  </section>
+
+  <main class="review-layout">
+    <section class="preview-shell" aria-label="高保真交互预览">
+      <div class="browser-bar">
+        <div class="browser-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+        <span id="concept-name">方案 A · 效率中枢</span>
+        <div class="viewport-switch" role="group" aria-label="预览尺寸">
+          <button class="active" data-width="desktop" title="桌面宽度">桌面</button>
+          <button data-width="compact" title="紧凑宽度">紧凑</button>
+        </div>
+      </div>
+      <div class="preview-stage">
+        <div class="product" id="product-preview">
+          <aside class="product-nav">
+            <div class="product-brand"><span class="brand-symbol">V</span><div><b>AI Video</b><small>内容生产中心</small></div></div>
+            <div class="nav-section-label">工作空间</div>
+            <nav id="preview-nav">
+              <button class="active" data-view="workspace"><span class="nav-icon">⌂</span><span>工作台</span></button>
+              <button data-view="scripts"><span class="nav-icon">✎</span><span>内容与剧本</span><em>7</em></button>
+              <button data-view="videos"><span class="nav-icon">▷</span><span>视频制作</span><em>3</em></button>
+              <button data-view="publish"><span class="nav-icon">↗</span><span>发布与数据</span></button>
+            </nav>
+            <div class="nav-section-label secondary-label">资源</div>
+            <nav class="secondary-nav">
+              <button data-view="characters"><span class="nav-icon">♙</span><span>角色资产</span></button>
+              <button data-view="config"><span class="nav-icon">⚙</span><span>配置中心</span></button>
+            </nav>
+            <div class="system-state"><i></i><span><b>服务运行正常</b><small>本地引擎 · 已连接</small></span></div>
+          </aside>
+
+          <section class="product-main">
+            <header class="product-topbar">
+              <div class="mobile-brand">AI Video</div>
+              <div class="crumb" id="preview-crumb">生产中心 / 工作台</div>
+              <div class="top-actions"><button aria-label="帮助">?</button><button aria-label="通知" class="notice">○</button><span class="avatar">管</span></div>
+            </header>
+            <div class="product-page" id="preview-content"></div>
+          </section>
+        </div>
+      </div>
+    </section>
+
+    <aside class="decision-panel">
+      <div class="decision-head">
+        <p>DESIGN RATIONALE</p>
+        <h2 id="decision-title">方案 A · 效率中枢</h2>
+        <span id="decision-summary">为每天反复操作生产任务的人设计，用更少的视觉噪音换取更快的判断和执行。</span>
+      </div>
+      <div class="principles" id="decision-principles"></div>
+      <div class="score-card">
+        <div class="score-head"><b>适配度</b><span id="total-score">92 / 100</span></div>
+        <div class="score-list" id="score-list"></div>
+      </div>
+      <div class="tradeoff"><b>主要取舍</b><p id="decision-tradeoff">视觉个性克制，但长期使用成本最低，最适合作为正式生产后台的基础方向。</p></div>
+    </aside>
+  </main>
+
+  <footer class="research-note">
+    <span>选型依据</span>
+    <p>任务优先、稳定主操作、浅层导航、列表可扫描、详情渐进披露、长任务持续反馈、异常可恢复。</p>
+  </footer>
+  <script src="/design-options.js"></script>
+</body>
+</html>

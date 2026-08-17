@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AI Video Factory · 本地管理台</title>
+  <link rel="stylesheet" href="/styles.css?v=20260817-todo-center">
+</head>
+<body data-page="overview">
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <div class="app-shell ant-layout">
+    <aside class="sidebar ant-layout-sider">
+      <div class="brand" title="AI Video Factory">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false">
+            <rect x="4.5" y="5" width="15" height="14" rx="3"></rect>
+            <path class="brand-mark-play" d="m10 9 5.5 3-5.5 3z"></path>
+            <path d="M7.5 3.5h5"></path>
+          </svg>
+        </div>
+        <div><strong>AI VIDEO</strong><small>FACTORY / LOCAL</small></div>
+      </div>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-page="overview" title="工作台"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 11.2 12 4l8 7.2v8.3a.5.5 0 0 1-.5.5h-5v-6h-5v6h-5a.5.5 0 0 1-.5-.5Z"/></svg></span><span class="nav-index">00</span><span class="nav-label">工作台</span></button>
+        <button class="nav-item" data-page="todos" title="统一待办"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8 9 1.5 1.5L12 8M8 15l1.5 1.5L12 14M14 9h3M14 15h3"/></svg></span><span class="nav-index">01</span><span class="nav-label">统一待办</span></button>
+        <button class="nav-item" data-page="projects" title="内容项目"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 7.5h6l1.6 2H20v8.8a1.7 1.7 0 0 1-1.7 1.7H5.7A1.7 1.7 0 0 1 4 18.3Z"/><path d="M4 7.5V5.7A1.7 1.7 0 0 1 5.7 4h4.1l1.7 2H18"/></svg></span><span class="nav-index">02</span><span class="nav-label">内容项目</span></button>
+        <button class="nav-item" data-page="scripts" title="内容与剧本"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 3 1.5 5.5L19 10l-5.5 1.5L12 17l-1.5-5.5L5 10l5.5-1.5Z"/><path d="m18.5 15 .7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7Z"/></svg></span><span class="nav-index">03</span><span class="nav-label">内容与剧本</span></button>
+        <button class="nav-item" data-page="videos" title="视频制作"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="16" rx="3"/><path d="m10 8.5 5.5 3.5-5.5 3.5Z"/></svg></span><span class="nav-index">04</span><span class="nav-label">视频制作</span></button>
+        <button class="nav-item" data-page="publishing" title="发布与数据"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m4 12 16-7-6.8 15-2.1-6.8Z"/><path d="m11.1 13.2 4.1-4.1"/></svg></span><span class="nav-index">05</span><span class="nav-label">发布与数据</span></button>
+        <button class="nav-item" data-page="characters" title="角色资产库"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c.6-4 3-6 7-6s6.4 2 7 6"/></svg></span><span class="nav-index">06</span><span class="nav-label">角色资产库</span></button>
+        <button class="nav-item" data-page="config" title="配置中心"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7.8 7.8 0 0 0-.1-1l2-1.5-2-3.4-2.4 1a8 8 0 0 0-1.8-1L14.4 3h-4.8l-.3 3.1a8 8 0 0 0-1.8 1l-2.4-1-2 3.4 2 1.5a7.8 7.8 0 0 0 0 2l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 1.8 1l.3 3.1h4.8l.3-3.1a8 8 0 0 0 1.8-1l2.4 1 2-3.4-2-1.5a7.8 7.8 0 0 0 .1-1Z"/></svg></span><span class="nav-index">07</span><span class="nav-label">配置中心</span></button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="connection"><i></i><span>LOCAL ENGINE</span></div>
+        <p>数据留在本机<br>付费动作需二次确认</p>
+      </div>
+    </aside>
+
+    <aside class="global-project-panel" aria-label="项目空间">
+      <header><div><span>工作空间</span><b>设备租赁内容库</b></div><button id="global-new-project" title="新建内容项目">＋</button></header>
+      <label class="global-project-search"><span>⌕</span><input id="global-project-search" type="search" placeholder="搜索作品或来源"></label>
+      <section class="global-smart-groups">
+        <div class="global-group-title"><span>智能集合</span></div>
+        <button data-global-filter="review"><i class="amber"></i><span>等待内容决策</span><em id="global-review-count">0</em></button>
+        <button data-global-filter="production"><i class="violet"></i><span>生成进行中</span><em id="global-production-count">0</em></button>
+        <button data-global-filter="video-review"><i class="amber"></i><span>母片待复核</span><em id="global-video-review-count">0</em></button>
+        <button data-global-filter="publish"><i class="green"></i><span>可发布成片</span><em id="global-publish-count">0</em></button>
+      </section>
+      <section class="global-recent-projects">
+        <div class="global-group-title"><span>最近项目</span><button>···</button></div>
+        <div id="global-project-list"></div>
+      </section>
+      <button class="global-new-project" id="global-new-project-bottom">＋ 新建内容项目</button>
+    </aside>
+
+    <main class="ant-layout-content" id="main-content">
+      <header class="topbar ant-layout-header">
+        <div>
+          <p class="eyebrow" id="page-kicker">CONTROL ROOM / 00</p>
+          <h1 id="page-title">内容项目工作室</h1>
+        </div>
+        <div class="top-actions">
+          <div class="clock"><span id="clock-time">--:--</span><small id="clock-date">----</small></div>
+          <button class="icon-button" id="refresh" title="刷新数据" aria-label="刷新数据">↻</button>
+        </div>
+      </header>
+      <nav class="global-stage-strip" id="global-stage-strip" aria-label="内容生产阶段">
+        <button data-global-stage="source"><span>01</span><b>来源</b><small>输入归档</small></button><i></i>
+        <button data-global-stage="brief"><span>02</span><b>选题</b><small>创意决策</small></button><i></i>
+        <button data-global-stage="script"><span>03</span><b>剧本</b><small>版本审核</small></button><i></i>
+        <button data-global-stage="video"><span>04</span><b>成片</b><small>生成与验收</small></button><i></i>
+        <button data-global-stage="publish"><span>05</span><b>发布</b><small>渠道与数据</small></button>
+      </nav>
+
+      <section class="page active" id="page-overview">
+        <section class="studio-workbench" id="studio-workbench" aria-label="内容项目工作室">
+          <aside class="studio-projects">
+            <header><div><p class="section-no">CONTENT PROJECTS</p><h2>内容项目</h2></div><button class="studio-icon-button" id="studio-new-source" title="创建内容项目" aria-label="创建内容项目">＋</button></header>
+            <label class="studio-project-search"><span aria-hidden="true">⌕</span><input id="studio-project-search" type="search" placeholder="搜索项目"></label>
+            <div class="studio-project-list" id="studio-project-list"></div>
+          </aside>
+          <section class="studio-canvas">
+            <header class="studio-project-head">
+              <div><p class="section-no" id="studio-project-code">CONTENT PROJECT</p><h2 id="studio-project-title">选择一个项目开始</h2><p id="studio-project-meta">来源、选题、剧本、视频和发布保持在同一工作上下文</p></div>
+              <div class="studio-head-actions"><span class="studio-save-state"><i></i> 本地已同步</span><button class="primary-action" id="studio-primary-action" disabled>选择项目</button></div>
+            </header>
+            <nav class="studio-stages" id="studio-stages" aria-label="项目生产阶段">
+              <button data-studio-stage="source"><b>01</b><span>来源</span><small>输入归档</small></button>
+              <i></i><button data-studio-stage="brief"><b>02</b><span>选题</span><small>创意决策</small></button>
+              <i></i><button data-studio-stage="script"><b>03</b><span>剧本</span><small>版本审核</small></button>
+              <i></i><button data-studio-stage="video"><b>04</b><span>视频</span><small>母片与剪辑</small></button>
+              <i></i><button data-studio-stage="publish"><b>05</b><span>发布</span><small>渠道与数据</small></button>
+            </nav>
+            <div class="studio-stage-body" id="studio-stage-body"><div class="studio-empty"><b>选择左侧内容项目</b><span>进入从选题到发布的一体化工作区</span></div></div>
+          </section>
+          <aside class="studio-inspector">
+            <header><div><p class="section-no">PROJECT INSPECTOR</p><h3>项目检查器</h3></div><span id="studio-stage-status" class="tag">等待选择</span></header>
+            <div class="studio-inspector-body" id="studio-inspector-body"><div class="studio-empty compact"><b>暂无项目上下文</b><span>选择项目后展示质量、人物、成本与下一步</span></div></div>
+          </aside>
+        </section>
+        <details class="legacy-dashboard">
+          <summary>查看全局生产总览</summary>
+        <div class="hero-strip">
+          <div><span class="hero-code">V3.0</span><h2>从一个想法，到一条可发布的视频</h2><p>剧本、生成、剪辑、发布与反馈，集中在同一条本地生产线上</p></div>
+          <div class="hero-flow" aria-label="生产流程"><span>INPUT</span><i></i><span>SCRIPT</span><i></i><span>MASTER</span><i></i><span>PUBLISH</span></div>
+        </div>
+        <div class="metric-grid" id="overview-metrics"></div>
+        <div class="two-column">
+          <section class="panel flow-panel"><div class="panel-head"><div><p class="section-no">PRODUCTION MAP</p><h3>当前生产链路</h3></div><span class="live-pill">LIVE</span></div><div class="factory-flow" id="factory-flow"></div></section>
+          <section class="panel"><div class="panel-head"><div><p class="section-no">ACTIVITY FEED</p><h3>最近事件</h3></div></div><div class="event-list" id="recent-events"></div></section>
+        </div>
+        </details>
+      </section>
+
+      <section class="page" id="page-todos">
+        <div class="section-intro"><div><p class="section-no">01 / UNIFIED TODO</p><h2>统一待办中心</h2><p>只汇总需要人工判断或确认的节点；点击事项后进入对应工作区继续处理</p></div><span class="todo-page-rule">按生产阶段分组 · 实时读取</span></div>
+        <div class="todo-page-shell">
+          <section class="action-queue todo-page-queue" id="action-queue" aria-label="统一待办中心">
+            <div class="action-queue-title"><div><p class="section-no">DECISION QUEUE</p><h3>全流程决策队列</h3></div><span>正在加载需要人工处理的事项</span></div>
+            <div class="todo-groups" aria-busy="true"></div>
+          </section>
+          <footer class="todo-page-foot"><span>内容决策 → 制作设置 → 人工复核 → 成片验收 → 发布 → 绩效录入</span><small>系统执行过程不会进入待办，避免把日志当任务</small></footer>
+        </div>
+      </section>
+
+      <section class="page" id="page-projects">
+        <div class="section-intro"><div><p class="section-no">01 / CONTENT PROJECTS</p><h2>一条内容，一个完整生产档案</h2><p>来源、选题、剧本、制作、成片、发布与效果始终保持在同一项目上下文中</p></div><button class="primary-action" id="project-new-source">＋ 创建内容项目</button></div>
+        <div class="module-workbench project-archive-workbench"><aside class="module-rail"><header><p class="section-no">PORTFOLIO</p><h3>项目概览</h3></header><div class="project-summary" id="project-summary"></div></aside><section class="module-canvas"><header class="module-canvas-head"><div><p class="section-no">ALL PROJECTS</p><h3>完整生产档案</h3></div><span>点击项目进入详情与下一步</span></header><section class="project-panel"><div class="project-list-head"><span>内容项目</span><span>当前阶段</span><span>质量</span><span>发布</span><span>下一步</span></div><div id="project-list"></div></section></section><aside class="module-inspector"><header><p class="section-no">WORKFLOW</p><h3>项目规则</h3></header><div class="module-inspector-card"><b>一个项目贯穿全流程</b><p>来源、剧本、视频、发布和绩效不会拆成孤立记录</p></div><ol class="module-step-list"><li><b>01</b><span>创建内容来源</span></li><li><b>02</b><span>完成选题与剧本决策</span></li><li><b>03</b><span>制作并验收成片</span></li><li><b>04</b><span>登记渠道结果与绩效</span></li></ol></aside></div>
+      </section>
+
+      <section class="page" id="page-scripts">
+        <div class="section-intro"><div><p class="section-no">01 / SCRIPT PIPELINE</p><h2>两条入口，一套剧本标准</h2><p>人工输入用于明确命题；自动抓取用于热点与竞品内容归档。所有来源进入选题分析，再生成三版可审剧本</p></div><button class="primary-action" id="new-source">＋ 新增来源</button></div>
+        <div class="module-workbench script-module-workbench"><aside class="module-rail"><header><p class="section-no">PIPELINE</p><h3>创作阶段</h3></header><div class="script-stage-tabs vertical" id="script-stage-tabs" role="tablist"><button class="active" data-script-stage="all"><b>00</b><span>全部阶段</span></button><button data-script-stage="candidates"><b>01</b><span>自动选题</span></button><button data-script-stage="sources"><b>02</b><span>内容来源</span></button><button data-script-stage="briefs"><b>03</b><span>选题简报</span></button><button data-script-stage="drafts"><b>04</b><span>待审剧本</span></button></div><div class="module-rail-note"><b>安全候选池</b><p>候选池不会自动生成剧本或视频，必须人工晋级为内容来源</p></div></aside><section class="module-canvas"><header class="module-canvas-head"><div><p class="section-no">CREATIVE DESK</p><h3>剧本创作与审核</h3></div><button class="mini-action" id="manage-source-feeds">管理自动来源</button></header><div class="three-column boards">
+          <section class="panel board" data-stage-board="candidates"><div class="panel-head"><div><p class="section-no">AUTO DISCOVERY</p><h3>自动选题候选</h3></div><span class="counter" id="candidate-count">0</span></div><div class="record-list" id="candidate-list"></div></section>
+          <section class="panel board" data-stage-board="sources"><div class="panel-head"><div><p class="section-no">SOURCE LIBRARY</p><h3>内容来源</h3></div><span class="counter" id="source-count">0</span></div><div class="record-list" id="source-list"></div></section>
+          <section class="panel board" data-stage-board="briefs"><div class="panel-head"><div><p class="section-no">TOPIC BRIEFS</p><h3>选题简报</h3></div><span class="counter" id="brief-count">0</span></div><div class="record-list" id="brief-list"></div></section>
+          <section class="panel board" data-stage-board="drafts"><div class="panel-head"><div><p class="section-no">SCRIPT VARIANTS</p><h3>剧本候选</h3></div><span class="counter" id="draft-count">0</span></div><div class="record-list" id="draft-list"></div></section>
+        </div></section><aside class="module-inspector"><header><p class="section-no">REVIEW GUIDE</p><h3>审核检查器</h3></header><div class="module-inspector-card accent"><b>审核的不是文字</b><p>确认钩子、证据、节奏和可生产性，再把唯一选定版本提交视频制作</p></div><ul class="module-check-list"><li>前三秒是否建立冲突</li><li>观点是否有来源依据</li><li>人物和场景是否可生成</li><li>时长是否符合发布目标</li></ul><button class="primary-action module-inspector-action" id="script-new-source-secondary">新增内容来源</button></aside></div>
+      </section>
+
+      <section class="page" id="page-videos">
+        <div class="section-intro"><div><p class="section-no">02 / VIDEO PIPELINE</p><h2>原生母片生成 + 本地导演剪辑</h2><p>Seedance 2.5 负责画面、原生人声和口型；本地完成导演切镜、字幕、BGM 与包装</p></div><div class="budget-badge"><small>累计模型成本</small><strong id="total-cost">¥0.00</strong></div></div>
+        <div class="module-workbench video-module-workbench"><aside class="module-rail"><header><p class="section-no">PRODUCTION QUEUE</p><h3>制作队列</h3></header><div class="status-filter vertical" id="video-filters"><button class="active" data-state="all">全部任务</button><button data-state="STORYBOARDED">待生成</button><button data-state="in_progress">生成中</button><button data-state="REVIEW_REQUIRED">待复核</button><button data-state="COMPOSED">成品</button><button data-state="READY_TO_PUBLISH">已提交发布</button><button data-state="FAILED">其他异常</button></div><label class="table-search module-search"><span aria-hidden="true">⌕</span><input id="video-search" type="search" placeholder="搜索任务"></label></aside><section class="module-canvas"><header class="module-canvas-head"><div><p class="section-no">DIRECTOR DESK</p><h3>视频生产与验收</h3></div><span>任务状态、成本和下一步集中处理</span></header><section class="table-panel"><div class="data-table" id="video-table"></div></section></section><aside class="module-inspector"><header><p class="section-no">PRODUCTION CONTROL</p><h3>制作检查器</h3></header><div class="module-inspector-card accent"><b>标准生产方案</b><p>Seedance 2.5 原生母片，本地完成导演剪辑、字幕、BGM 与包装</p></div><div class="production-health" id="production-health"><span>正在读取生产队列…</span></div><div class="module-stat"><span>累计模型成本</span><strong id="video-inspector-cost">—</strong></div><ul class="module-check-list"><li>角色形象一致</li><li>口型与原生语音自然</li><li>字幕安全区无截断</li><li>成片必须人工验收</li></ul></aside></div>
+      </section>
+
+      <section class="page" id="page-publishing">
+        <div class="section-intro"><div><p class="section-no">03 / PUBLISH PIPELINE</p><h2>直连发布与结果回流</h2><p>抖音通过 OAuth 账号直连并提交平台审核；暂未直连的渠道继续下载成片、发布后登记作品证据</p></div><button class="primary-action" id="register-publication">选择待发布成片</button></div>
+        <div class="module-workbench publish-module-workbench"><aside class="module-rail"><header><p class="section-no">CHANNELS</p><h3>发布渠道</h3></header><div class="channel-status vertical" id="channel-status"></div><div class="module-rail-note"><b>混合发布模式</b><p>直连渠道一键投稿；辅助渠道保留人工发布与结果登记</p></div></aside><section class="module-canvas"><header class="module-canvas-head"><div><p class="section-no">DISTRIBUTION DESK</p><h3>发布与绩效工作区</h3></div><span>从待发布成片到渠道审核与数据回流</span></header><div class="two-column publish-grid"><section class="panel"><div class="panel-head"><div><p class="section-no">READY QUEUE</p><h3>待渠道发布</h3></div></div><div class="record-list" id="publish-ready"></div></section><section class="panel"><div class="panel-head"><div><p class="section-no">PLATFORM MAP</p><h3>平台投稿与作品</h3></div></div><div class="record-list" id="publication-list"></div></section></div><section class="panel unverified-panel"><div class="panel-head"><div><p class="section-no">LEGACY STATE</p><h3>历史状态待核实</h3></div><span class="config-hint">不计入真实发布数量</span></div><div class="record-list" id="publication-unverified"></div></section></section><aside class="module-inspector"><header><p class="section-no">DISTRIBUTION CHECK</p><h3>发布检查器</h3></header><div class="module-inspector-card accent"><b>所有外发都需确认</b><p>抖音直推前确认账号、标题和成片；平台返回作品 ID 先记为审核中，审核成功后才计入发布</p></div><ul class="module-check-list"><li>确认目标账号</li><li>核对标题、话题与封面</li><li>提交平台审核</li><li>持续录入绩效快照</li></ul><button class="primary-action module-inspector-action" id="publish-register-secondary">处理待发布成片</button></aside></div>
+        <section class="panel performance-due-panel"><div class="panel-head"><div><p class="section-no">PERFORMANCE TODO</p><h3>绩效回收待办</h3></div><span class="counter" id="performance-due-count">0</span></div><div class="record-list" id="performance-due"></div></section>
+      </section>
+
+      <section class="page" id="page-characters">
+        <div class="section-intro"><div><p class="section-no">05 / CHARACTER ASSETS</p><h2>角色资产库</h2><p>统一管理火山真人、虚拟人像与本地自定义角色。自定义角色支持多张参考图和完整人物描述，可直接用于视频制作</p></div><button class="primary-action" id="character-add">＋ 新增角色</button></div>
+        <div class="module-workbench character-module-workbench"><aside class="module-rail"><header><p class="section-no">ASSET FILTER</p><h3>资产筛选</h3></header><div class="character-metrics" id="character-metrics"></div><div class="character-toolbar vertical">
+            <label class="table-search character-search"><span aria-hidden="true">⌕</span><input id="character-search" type="search" placeholder="搜索名称、角色 ID 或 assetId"></label>
+            <label><span>资产类型</span><select id="character-type-filter"><option value="">全部类型</option><option value="real_person">真人资产</option><option value="virtual_person">虚拟人像</option><option value="custom">自定义角色</option></select></label>
+            <label><span>状态</span><select id="character-status-filter"><option value="">全部状态</option><option value="Active">已启用</option><option value="Inactive">已停用</option></select></label>
+          </div></aside><section class="module-canvas"><header class="module-canvas-head"><div><p class="section-no">PORTRAIT LIBRARY</p><h3>角色资产浏览</h3></div><span>点击资产预览详情与使用关系</span></header><div class="character-grid" id="character-grid"></div></section><aside class="module-inspector"><header><p class="section-no">ASSET GUIDE</p><h3>角色检查器</h3></header><div class="module-inspector-card accent"><b>固定资产是可选能力</b><p>未指定角色时由 AI 按剧本人物生成；需要稳定形象时可绑定任一角色资产</p></div><ul class="module-check-list"><li>真人资产需要火山授权</li><li>虚拟人像直接使用 assetId</li><li>自定义角色支持 1–12 张图片</li><li>人物描述会参与画面生成</li><li>使用中的角色不可删除</li></ul><button class="primary-action module-inspector-action" id="character-add-secondary">新增角色资产</button></aside></div>
+      </section>
+
+      <section class="page" id="page-config">
+        <div class="section-intro"><div><p class="section-no">06 / SYSTEM CONFIG</p><h2>先完成必要配置，其余保持默认</h2><p>普通用户只需配置三组账号信息。模型、画质、预算和并发等可选参数已固化默认值；密钥仅保存在本机且不会回显</p></div><button class="primary-action" id="save-config">保存配置</button></div>
+        <div class="module-workbench config-module-workbench"><aside class="module-rail"><header><p class="section-no">READINESS</p><h3>能力就绪度</h3></header><div class="setup-copy"><p id="required-progress">正在检查必要配置…</p></div><div class="readiness-grid vertical" id="readiness"></div></aside><section class="module-canvas"><header class="module-canvas-head"><div><p class="section-no">SETTINGS DESK</p><h3>能力配置工作区</h3></div><span>必要配置优先，其余保持默认</span></header><div class="config-layout config-layout-full"><div class="config-main">
+            <section class="panel required-panel">
+              <div class="panel-head"><div><p class="section-no">REQUIRED / 3 STEPS</p><h3>必要配置</h3></div><span class="config-hint">按需完成，不必一次配齐</span></div>
+              <div class="required-config-list" id="required-config"></div>
+            </section>
+            <details class="panel advanced-panel" id="advanced-config">
+              <summary><span><small>ADVANCED / DEFAULTS INCLUDED</small><strong>可选配置</strong></span><em>默认值可直接使用</em></summary>
+              <div class="optional-intro">仅在需要调整模型、画质、成本上限、并发或品牌信息时修改</div>
+              <div class="config-groups" id="optional-config"></div>
+            </details>
+            <section class="panel publish-platform-config"><div class="panel-head"><div><p class="section-no">PUBLISH ACCOUNTS</p><h3>发布平台配置</h3></div><span class="config-hint">按渠道独立配置</span></div><div id="publish-platform-config"></div></section>
+          </div></div></section><aside class="module-inspector"><header><p class="section-no">SETUP GUIDE</p><h3>配置检查器</h3></header><div class="module-inspector-card accent"><b>只配需要的能力</b><p>剧本、完整视频、发布三条能力链可以分阶段启用，不要求一次配齐</p></div><ul class="module-check-list"><li>P0：火山方舟，生成视频必需</li><li>P1：ASR，影响字幕校准</li><li>P1：TOS，影响素材与资产访问</li><li>发布渠道可后续独立配置</li></ul><button class="primary-action module-inspector-action" id="save-config-secondary">保存当前配置</button></aside></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <button class="modal-close" id="modal-close" aria-label="关闭">×</button>
+      <p class="section-no" id="modal-kicker">ACTION</p><h2 id="modal-title">操作</h2><div id="modal-body"></div>
+    </div>
+  </div>
+  <div class="drawer-backdrop" id="context-drawer" hidden></div>
+  <aside class="context-drawer" id="drawer" aria-hidden="true" aria-labelledby="drawer-title">
+    <header><div><p class="section-no" id="drawer-kicker">DETAIL</p><h2 id="drawer-title">详情</h2></div><button class="drawer-close" id="drawer-close" aria-label="关闭详情">×</button></header>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js?v=20260817-todo-center"></script>
+</body>
+</html>

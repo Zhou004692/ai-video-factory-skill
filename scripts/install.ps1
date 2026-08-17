@@ -11,10 +11,7 @@ if (-not $pythonCmd) {
 
 & $pythonCmd.Source (Join-Path $PSScriptRoot "install.py") --root $skillDir
 if ($LASTEXITCODE -ne 0) {
-    throw "AI Video Factory installation failed with exit code $LASTEXITCODE"
+    throw "AI 视频工厂自动初始化失败"
 }
 
-$venvPython = Join-Path $skillDir ".venv\Scripts\python.exe"
-Write-Host "Run readiness check:" -ForegroundColor Cyan
-Write-Host "  & `"$venvPython`" `"$PSScriptRoot\doctor.py`" --profile script"
-Write-Host "  & `"$venvPython`" `"$PSScriptRoot\doctor.py`" --profile video"
+& (Join-Path $PSScriptRoot "open_management.ps1")

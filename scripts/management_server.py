@@ -1,0 +1,757 @@
+"""Local-only HTTP server for the AI Video Factory management console."""
+from __future__ import annotations
+
+import argparse
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html import escape
+import json
+import mimetypes
+from pathlib import Path
+import re
+import tempfile
+import threading
+from urllib import request
+from urllib.parse import parse_qs, urlparse
+import webbrowser
+
+from factory import SKILL_ROOT
+from factory.db import conn
+from factory.management_api import (
+    CUSTOM_CHARACTER_IMAGE_MAX_BYTES, ManagementService,
+)
+
+
+UI_ROOT = Path(__file__).resolve().parent / "management_ui"
+MEDIA_UPLOAD_MAX_BYTES = 512 * 1024 * 1024
+MEDIA_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def existing_console_url(
+    host: str,
+    port: int,
+    *,
+    start_page: str = "overview",
+) -> str | None:
+    """Return the existing local console URL only when its API shape matches."""
+    base_url = f"http://{host}:{port}"
+    try:
+        with request.urlopen(f"{base_url}/api/overview", timeout=0.75) as response:
+            if response.status != HTTPStatus.OK:
+                return None
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not all(key in payload for key in ("scripts", "videos", "publishing")):
+        return None
+    page = start_page if start_page in {
+        "overview", "projects", "scripts", "videos", "publishing", "characters", "config"
+    } else "overview"
+    return f"{base_url}/#{page}"
+
+
+def run_queue_supervisor(
+    service: ManagementService,
+    service_lock: threading.RLock,
+    stop_event: threading.Event,
+    *,
+    interval_sec: float = 2.0,
+) -> None:
+    """Continuously reconcile persisted queued work with local workers."""
+    while not stop_event.wait(interval_sec):
+        try:
+            with service_lock:
+                service.dispatch_production_queue()
+        except Exception as exc:
+            # Keep the console available; persist the cause before retrying.
+            with service_lock:
+                service.record_queue_supervisor_error(str(exc))
+            continue
+
+
+def run_source_feed_scheduler(
+    service: ManagementService,
+    service_lock: threading.RLock,
+    stop_event: threading.Event,
+    *,
+    interval_sec: float = 300.0,
+) -> None:
+    """Collect enabled public feeds periodically, never during server startup."""
+    while not stop_event.wait(interval_sec):
+        try:
+            with service_lock:
+                service.collect_enabled_source_feeds()
+        except Exception:
+            # Individual feed failures are persisted by the scheduler service.
+            # A process-level error must not take down the management console.
+            continue
+
+
+def validate_local_bind_host(host: str) -> str:
+    """Keep this credential-bearing console reachable from this machine only."""
+    value = str(host or "").strip().lower()
+    if value not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("管理台只允许绑定本机回环地址")
+    return str(host).strip()
+
+
+def _safe_upload_name(filename: str) -> str:
+    leaf = Path(str(filename or "").replace("\\", "/")).name
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(leaf).stem).strip("._")
+    suffix = re.sub(r"[^A-Za-z0-9.]", "", Path(leaf).suffix.lower())
+    return f"{stem or 'media'}{suffix}"
+
+
+def parse_byte_range(header: str, size: int) -> tuple[int, int]:
+    """Parse one RFC 7233 byte range for local video streaming."""
+    if size <= 0 or not str(header).startswith("bytes="):
+        raise ValueError("无效的视频分段请求")
+    value = str(header)[6:].strip()
+    if "," in value or "-" not in value:
+        raise ValueError("一次仅支持一个视频分段")
+    start_text, end_text = value.split("-", 1)
+    if not start_text:
+        length = int(end_text)
+        if length <= 0:
+            raise ValueError("无效的视频分段请求")
+        return max(0, size - length), size - 1
+    start = int(start_text)
+    end = int(end_text) if end_text else size - 1
+    if start < 0 or start >= size or end < start:
+        raise ValueError("视频分段超出文件范围")
+    return start, min(end, size - 1)
+
+
+class ConsoleHandler(BaseHTTPRequestHandler):
+    service: ManagementService
+    queue_supervisor: threading.Thread | None = None
+    service_lock = threading.RLock()
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def _json(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, title: str, message: str, status: int = 200) -> None:
+        body = (
+            "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+            f"<title>{escape(title)}</title><style>body{{font-family:system-ui;"
+            "display:grid;place-items:center;min-height:100vh;margin:0;background:#f5f7f5;"
+            "color:#22352b}.card{max-width:520px;padding:36px;border:1px solid #d9e1dc;"
+            "border-radius:16px;background:white;box-shadow:0 18px 60px #20362b18}"
+            "h1{font-size:24px}p{line-height:1.7;color:#627069}</style></head>"
+            f"<body><main class='card'><h1>{escape(title)}</h1><p>{escape(message)}</p>"
+            "<p>现在可以关闭此页面，返回 AI Video Factory 管理台。</p></main></body></html>"
+        ).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > 1_000_000:
+            raise ValueError("请求内容过大")
+        raw = self.rfile.read(length) if length else b"{}"
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("请求必须是 JSON 对象")
+        return payload
+
+    def _media_upload(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        filename = _safe_upload_name(query.get("filename", [""])[0])
+        title = query.get("title", [""])[0]
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError as exc:
+            raise ValueError("上传文件大小无效") from exc
+        if length <= 0:
+            raise ValueError("请选择需要上传的音视频文件")
+        if length > MEDIA_UPLOAD_MAX_BYTES:
+            raise OverflowError("上传文件过大，单个文件不能超过 512 MB")
+        upload_root = self.service.root / "data" / "management_uploads"
+        upload_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="source-", dir=upload_root) as tmp:
+            target = Path(tmp) / filename
+            remaining = length
+            with target.open("xb") as stream:
+                while remaining:
+                    chunk = self.rfile.read(min(MEDIA_UPLOAD_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        raise ValueError("上传文件不完整，请重试")
+                    stream.write(chunk)
+                    remaining -= len(chunk)
+            self._json(self.service.add_media_source(target, title=title))
+
+    def _character_image_upload(self, character_id: str) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        filename = _safe_upload_name(query.get("filename", [""])[0])
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError as exc:
+            raise ValueError("角色图片大小无效") from exc
+        if length <= 0:
+            raise ValueError("请选择需要上传的角色图片")
+        if length > CUSTOM_CHARACTER_IMAGE_MAX_BYTES:
+            raise OverflowError("单张角色图片不能超过 20 MB")
+        upload_root = self.service.root / "data" / "management_uploads"
+        upload_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="character-", dir=upload_root) as tmp:
+            target = Path(tmp) / filename
+            remaining = length
+            with target.open("xb") as stream:
+                while remaining:
+                    chunk = self.rfile.read(min(MEDIA_UPLOAD_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        raise ValueError("角色图片上传不完整，请重试")
+                    stream.write(chunk)
+                    remaining -= len(chunk)
+            self._json(self.service.add_custom_character_image(
+                character_id, target, original_name=filename,
+            ))
+
+    def do_GET(self) -> None:
+        with self.service_lock:
+            return self._do_GET()
+
+    def _do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/integrations/douyin/oauth/callback":
+            query = parse_qs(parsed.query)
+            if query.get("error"):
+                return self._html(
+                    "抖音绑定未完成",
+                    query.get("error_description", query["error"])[0],
+                    400,
+                )
+            try:
+                status = self.service.complete_douyin_oauth(
+                    code=query.get("code", [""])[0],
+                    state=query.get("state", [""])[0],
+                )
+                return self._html(
+                    "抖音账号绑定成功",
+                    f"已绑定账号 {status.get('open_id_masked', '')}。",
+                )
+            except Exception as exc:
+                return self._html("抖音绑定失败", str(exc), 400)
+        if (parsed.path.startswith("/api/characters/")
+                and "/images/" in parsed.path):
+            try:
+                parts = parsed.path.split("/")
+                path = self.service.character_image_file(parts[3], parts[5])
+                body = path.read_bytes()
+                media_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", media_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 404)
+        if parsed.path.startswith("/api/characters/") and parsed.path.endswith("/preview"):
+            try:
+                character_id = parsed.path.split("/")[3]
+                path = self.service.character_preview_file(character_id)
+                body = path.read_bytes()
+                media_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", media_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 404)
+        if (parsed.path.startswith("/api/videos/")
+                and "/scenes/" in parsed.path
+                and parsed.path.endswith("/preview")):
+            try:
+                parts = parsed.path.split("/")
+                path = self.service.scene_anchor_preview_file(
+                    parts[3], parts[5]
+                )
+                body = path.read_bytes()
+                media_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", media_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            except (IndexError, ValueError) as exc:
+                return self._json({"error": str(exc)}, 404)
+        if (parsed.path.startswith("/api/videos/")
+                and "/identities/" in parsed.path
+                and parsed.path.endswith("/preview")):
+            try:
+                parts = parsed.path.split("/")
+                path = self.service.character_identity_preview_file(
+                    parts[3], parts[5]
+                )
+                body = path.read_bytes()
+                media_type = mimetypes.guess_type(str(path))[0] or "image/jpeg"
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", media_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            except (IndexError, ValueError) as exc:
+                return self._json({"error": str(exc)}, 404)
+        if (parsed.path.startswith("/api/videos/")
+                and parsed.path.endswith("/candidate")
+                and "/masters/" in parsed.path):
+            try:
+                parts = parsed.path.split("/")
+                path = self.service.master_candidate_file(
+                    parts[3], int(parts[5])
+                )
+                size = path.stat().st_size
+                byte_range = self.headers.get("Range")
+                start, end = (0, size - 1)
+                if byte_range:
+                    start, end = parse_byte_range(byte_range, size)
+                length = end - start + 1
+                self.send_response(
+                    HTTPStatus.PARTIAL_CONTENT if byte_range else HTTPStatus.OK
+                )
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "no-store")
+                if byte_range:
+                    self.send_header(
+                        "Content-Range", f"bytes {start}-{end}/{size}"
+                    )
+                self.end_headers()
+                with path.open("rb") as stream:
+                    stream.seek(start)
+                    remaining = length
+                    while remaining:
+                        chunk = stream.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 404)
+        if parsed.path.startswith("/api/videos/") and parsed.path.endswith("/file"):
+            try:
+                job_id = parsed.path.split("/")[3]
+                path = self.service.video_file(job_id)
+                download = parse_qs(parsed.query).get("download", ["0"])[0] == "1"
+                size = path.stat().st_size
+                byte_range = self.headers.get("Range")
+                start, end = (0, size - 1)
+                if byte_range:
+                    start, end = parse_byte_range(byte_range, size)
+                length = end - start + 1
+                self.send_response(
+                    HTTPStatus.PARTIAL_CONTENT if byte_range else HTTPStatus.OK
+                )
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "no-store")
+                if byte_range:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                if download:
+                    self.send_header(
+                        "Content-Disposition", f'attachment; filename="{job_id}.mp4"'
+                    )
+                self.end_headers()
+                with path.open("rb") as stream:
+                    stream.seek(start)
+                    remaining = length
+                    while remaining:
+                        chunk = stream.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 404)
+        endpoints = {
+            "/api/overview": self.service.overview,
+            "/api/todos": self.service.todo_center,
+            "/api/scripts": self.service.scripts,
+            "/api/videos": self.service.videos,
+            "/api/publishing": self.service.publishing,
+            "/api/config": self.service.config_status,
+            "/api/projects": self.service.content_projects,
+            "/api/integrations/douyin": self.service.douyin_account_status,
+            "/api/production/health": lambda: self.service.production_health(
+                supervisor_alive=bool(
+                    self.queue_supervisor and self.queue_supervisor.is_alive()
+                )
+            ),
+            "/api/source-feeds": self.service.source_feeds,
+        }
+        if parsed.path == "/api/events":
+            limit = parse_qs(parsed.query).get("limit", ["40"])[0]
+            return self._json(self.service.recent_events(int(limit)))
+        if parsed.path == "/api/characters":
+            query = parse_qs(parsed.query)
+            return self._json(self.service.characters(
+                keyword=query.get("keyword", [""])[0],
+                identity_type=query.get("identity_type", [""])[0],
+                status=query.get("status", [""])[0],
+            ))
+        if parsed.path == "/api/source-candidates":
+            query = parse_qs(parsed.query)
+            status = query.get("status", ["candidate"])[0]
+            return self._json(self.service.source_candidates(status=status or None))
+        if parsed.path in endpoints:
+            try:
+                return self._json(endpoints[parsed.path]())
+            except Exception as exc:
+                return self._json({"error": str(exc)}, 500)
+        self._static(parsed.path)
+
+    def do_POST(self) -> None:
+        with self.service_lock:
+            return self._do_POST()
+
+    def _do_POST(self) -> None:
+        try:
+            request_path = urlparse(self.path).path
+            if request_path == "/api/sources/media":
+                return self._media_upload()
+            if (request_path.startswith("/api/characters/")
+                    and request_path.endswith("/images")):
+                return self._character_image_upload(request_path.split("/")[3])
+            payload = self._body()
+            if request_path == "/api/integrations/douyin/oauth/start":
+                result = self.service.start_douyin_oauth()
+            elif request_path == "/api/integrations/douyin/disconnect":
+                result = self.service.disconnect_douyin()
+            elif (request_path.startswith("/api/videos/")
+                  and request_path.endswith("/publish/douyin")):
+                job_id = request_path.split("/")[3]
+                result = self.service.publish_to_douyin(job_id, payload)
+            elif self.path == "/api/config":
+                result = self.service.update_config(payload.get("changes") or {})
+            elif self.path == "/api/sources":
+                result = self.service.add_source(
+                    source_type=str(payload.get("source_type") or "manual"),
+                    title=str(payload.get("title") or ""),
+                    content=str(payload.get("content") or ""),
+                )
+            elif request_path == "/api/source-feeds":
+                result = self.service.create_source_feed(payload)
+            elif request_path == "/api/source-candidates/batch-delete":
+                result = self.service.batch_delete_source_candidates(
+                    payload.get("candidate_ids") or []
+                )
+            elif request_path == "/api/scripts/batch-reject":
+                result = self.service.batch_reject_scripts(
+                    payload.get("draft_ids") or []
+                )
+            elif request_path == "/api/videos/batch-preflight":
+                result = self.service.batch_production_preflight(
+                    payload.get("job_ids") or []
+                )
+            elif (request_path.startswith("/api/source-feeds/")
+                  and request_path.endswith("/collect")):
+                result = self.service.collect_source_feed(request_path.split("/")[3])
+            elif (request_path.startswith("/api/source-candidates/")
+                  and request_path.endswith("/promote")):
+                result = self.service.promote_source_candidate(request_path.split("/")[3])
+            elif (request_path.startswith("/api/sources/")
+                  and request_path.endswith("/analyze")):
+                if payload.get("confirmed") is not True:
+                    raise ValueError("请确认后再调用 AI 解析视频内容")
+                result = self.service.analyze_media_source(
+                    request_path.split("/")[3], force=True
+                )
+            elif self.path.endswith("/generate-brief") and self.path.startswith("/api/sources/"):
+                if payload.get("confirmed") is not True:
+                    raise ValueError("请确认后再调用 AI 生成选题简报")
+                source_id = self.path.split("/")[3]
+                result = self.service.generate_brief_from_source(
+                    source_id, risk_confirmed=payload.get("risk_confirmed") is True
+                )
+            elif self.path.endswith("/generate-scripts") and self.path.startswith("/api/briefs/"):
+                if payload.get("confirmed") is not True:
+                    raise ValueError("请确认后再调用 AI 生成候选剧本")
+                brief_id = self.path.split("/")[3]
+                generation_preferences = {
+                    key: payload.get(key)
+                    for key in (
+                        "suggested_duration_sec",
+                        "suggested_shot_count",
+                        "suggested_character_count",
+                    )
+                    if payload.get(key) not in (None, "")
+                }
+                result = self.service.confirm_brief_and_generate_scripts(
+                    brief_id,
+                    angle_index=int(payload.get("angle_index", -1)),
+                    generation_preferences=generation_preferences,
+                )
+            elif request_path.endswith("/edit") and request_path.startswith("/api/briefs/"):
+                brief_id = request_path.split("/")[3]
+                result = self.service.update_brief(
+                    brief_id, payload.get("brief") or {},
+                    change_note=str(payload.get("change_note") or ""),
+                )
+            elif request_path.endswith("/edit") and request_path.startswith("/api/scripts/"):
+                draft_id = request_path.split("/")[3]
+                result = self.service.update_script_draft(
+                    draft_id, payload.get("script") or {},
+                    change_note=str(payload.get("change_note") or ""),
+                    auto_adjust_durations=(
+                        payload.get("auto_adjust_durations") is True
+                    ),
+                )
+            elif self.path.endswith("/approve") and self.path.startswith("/api/scripts/"):
+                draft_id = self.path.split("/")[3]
+                result = self.service.approve_script(draft_id)
+            elif self.path == "/api/characters":
+                result = self.service.bind_character(
+                    character_id=str(payload.get("character_id") or ""),
+                    display_name=str(payload.get("display_name") or ""),
+                    asset_id=str(payload.get("asset_id") or ""),
+                    identity_type=str(
+                        payload.get("identity_type") or "real_person"
+                    ),
+                    background_description=str(
+                        payload.get("background_description") or ""
+                    ),
+                    gender=str(payload.get("gender") or ""),
+                )
+            elif self.path.endswith("/background") and self.path.startswith("/api/characters/"):
+                character_id = self.path.split("/")[3]
+                result = self.service.update_character_background(
+                    character_id,
+                    str(payload.get("background_description") or ""),
+                )
+            elif self.path.endswith("/status") and self.path.startswith("/api/characters/"):
+                character_id = self.path.split("/")[3]
+                result = self.service.set_character_status(
+                    character_id, str(payload.get("status") or "")
+                )
+            elif self.path.endswith("/refresh") and self.path.startswith("/api/characters/"):
+                character_id = self.path.split("/")[3]
+                result = self.service.refresh_character(character_id)
+            elif (request_path.startswith("/api/videos/")
+                  and request_path.endswith("/anchors/approve")):
+                job_id = request_path.split("/")[3]
+                result = self.service.approve_continuity_anchors(
+                    job_id, note=str(payload.get("note") or "")
+                )
+            elif self.path.endswith("/produce") and self.path.startswith("/api/videos/"):
+                job_id = self.path.split("/")[3]
+                result = self.service.start_video_job(
+                    job_id, confirmed=payload.get("confirmed") is True
+                )
+            elif (request_path.endswith("/upgrade-director")
+                  and request_path.startswith("/api/videos/")):
+                job_id = request_path.split("/")[3]
+                result = self.service.upgrade_director_plan(job_id)
+            elif self.path.endswith("/resume") and self.path.startswith("/api/videos/"):
+                job_id = self.path.split("/")[3]
+                result = self.service.resume_failed_video(job_id)
+            elif (request_path.startswith("/api/videos/")
+                  and request_path.endswith("/regenerate")
+                  and "/masters/" in request_path):
+                parts = request_path.split("/")
+                job_id = parts[3]
+                master_idx = int(parts[5])
+                result = self.service.prepare_master_regeneration(
+                    job_id,
+                    master_idx,
+                    reason=str(payload.get("reason") or ""),
+                )
+            elif (request_path.startswith("/api/videos/")
+                  and request_path.endswith("/candidate-review")
+                  and "/masters/" in request_path):
+                parts = request_path.split("/")
+                result = self.service.review_master_candidate(
+                    parts[3], int(parts[5]),
+                    decision=str(payload.get("decision") or ""),
+                )
+            elif self.path.endswith("/configure") and self.path.startswith("/api/videos/"):
+                job_id = self.path.split("/")[3]
+                result = self.service.configure_video(job_id, payload)
+            elif self.path.endswith("/review") and self.path.startswith("/api/videos/"):
+                job_id = self.path.split("/")[3]
+                first_pass = payload.get("first_pass")
+                result = self.service.review_video(
+                    job_id,
+                    decision=str(payload.get("decision") or ""),
+                    manual_minutes=float(payload.get("manual_minutes") or 0),
+                    notes=str(payload.get("notes") or ""),
+                    first_pass=(first_pass if isinstance(first_pass, bool) else None),
+                    checks=(payload.get("checks") if isinstance(payload.get("checks"), dict) else None),
+                )
+            elif self.path.endswith("/submit-publish") and self.path.startswith("/api/videos/"):
+                job_id = self.path.split("/")[3]
+                result = self.service.submit_for_publish(job_id)
+            elif self.path == "/api/publications":
+                result = self.service.register_publication(payload)
+            elif self.path == "/api/publications/batch":
+                result = self.service.register_publications(payload)
+            elif (self.path.startswith("/api/publications/")
+                  and self.path.endswith("/performance")):
+                publication_id = self.path.split("/")[3]
+                result = self.service.record_performance_snapshot(
+                    publication_id, payload
+                )
+            else:
+                return self._json({"error": "接口不存在"}, 404)
+            return self._json(result)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return self._json({"error": str(exc)}, 400)
+        except OverflowError as exc:
+            return self._json({"error": str(exc)}, 413)
+        except Exception as exc:
+            return self._json({"error": str(exc)}, 500)
+
+    def do_DELETE(self) -> None:
+        with self.service_lock:
+            return self._do_DELETE()
+
+    def _do_DELETE(self) -> None:
+        try:
+            if self.path.startswith("/api/source-feeds/"):
+                result = self.service.delete_source_feed(self.path.split("/")[3])
+            elif self.path.startswith("/api/source-candidates/"):
+                result = self.service.delete_source_candidate(self.path.split("/")[3])
+            elif self.path.startswith("/api/sources/"):
+                result = self.service.delete_source(self.path.split("/")[3])
+            elif self.path.startswith("/api/briefs/"):
+                result = self.service.delete_brief(self.path.split("/")[3])
+            elif self.path.startswith("/api/scripts/"):
+                result = self.service.delete_script(self.path.split("/")[3])
+            elif self.path.startswith("/api/videos/"):
+                result = self.service.delete_video(self.path.split("/")[3])
+            elif self.path.startswith("/api/characters/"):
+                result = self.service.delete_character(self.path.split("/")[3])
+            else:
+                return self._json({"error": "接口不存在"}, 404)
+            return self._json(result)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, 400)
+        except Exception as exc:
+            return self._json({"error": str(exc)}, 500)
+
+    def _static(self, request_path: str) -> None:
+        relative = "index.html" if request_path in {"", "/"} else request_path.lstrip("/")
+        target = (UI_ROOT / relative).resolve()
+        if UI_ROOT.resolve() not in target.parents and target != UI_ROOT.resolve():
+            return self._json({"error": "not found"}, 404)
+        if not target.is_file():
+            target = UI_ROOT / "index.html"
+        body = target.read_bytes()
+        media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", media_type + ("; charset=utf-8" if media_type.startswith("text/") else ""))
+        self.send_header("Content-Length", str(len(body)))
+        # This local console is edited in place.  Never let a long-lived tab
+        # keep stale filtering or workflow JavaScript after a server update.
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def serve(
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    *,
+    open_browser: bool = True,
+    start_page: str = "overview",
+) -> None:
+    host = validate_local_bind_host(host)
+    database = conn()
+    ConsoleHandler.service = ManagementService(database, SKILL_ROOT)
+    stop_event = threading.Event()
+    supervisor = threading.Thread(
+        target=run_queue_supervisor,
+        args=(ConsoleHandler.service, ConsoleHandler.service_lock, stop_event),
+        name="video-queue-supervisor",
+        daemon=True,
+    )
+    ConsoleHandler.queue_supervisor = supervisor
+    supervisor.start()
+    source_scheduler = threading.Thread(
+        target=run_source_feed_scheduler,
+        args=(ConsoleHandler.service, ConsoleHandler.service_lock, stop_event),
+        name="public-source-feed-scheduler",
+        daemon=True,
+    )
+    source_scheduler.start()
+    server = ThreadingHTTPServer((host, port), ConsoleHandler)
+    start_page = start_page if start_page in {
+        "overview", "projects", "scripts", "videos", "publishing", "characters", "config"
+    } else "overview"
+    url = f"http://{host}:{port}/#{start_page}"
+    print(f"AI Video Factory 管理台已启动：{url}")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        supervisor.join(timeout=3)
+        source_scheduler.join(timeout=3)
+        ConsoleHandler.queue_supervisor = None
+        server.server_close()
+        database.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--start-page",
+        choices=("overview", "projects", "scripts", "videos", "publishing", "characters", "config"),
+        default="overview",
+    )
+    args = parser.parse_args()
+    existing = existing_console_url(
+        args.host,
+        args.port,
+        start_page=args.start_page,
+    )
+    if existing:
+        print(f"AI Video Factory 管理台已在运行：{existing}")
+        if not args.no_browser:
+            webbrowser.open(existing)
+        return 0
+    serve(
+        args.host,
+        args.port,
+        open_browser=not args.no_browser,
+        start_page=args.start_page,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,4 +1,6 @@
 """SQLite 持久层。任何 step 都通过这里读写状态。"""
+import os
+from pathlib import Path
 import sqlite3
 from . import DATA_DIR
 
@@ -22,6 +24,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     cost_cents      INTEGER DEFAULT 0,
     error           TEXT,
     retries         INTEGER DEFAULT 0,
+    production_worker_pid INTEGER,
+    production_started_at TIMESTAMP,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -39,6 +43,9 @@ CREATE TABLE IF NOT EXISTS shots (
     video_path    TEXT,
     state         TEXT DEFAULT 'PENDING',
     provider      TEXT,
+    video_model   TEXT,
+    native_audio  INTEGER DEFAULT 0,
+    video_qa      TEXT,
     cost_cents    INTEGER DEFAULT 0,
     error         TEXT,
     FOREIGN KEY(job_id) REFERENCES jobs(job_id),
@@ -74,12 +81,15 @@ CREATE INDEX IF NOT EXISTS idx_provider_calls_job
 CREATE TABLE IF NOT EXISTS character_asset_bindings (
     character_id   TEXT PRIMARY KEY,
     display_name   TEXT NOT NULL,
+    identity_type  TEXT NOT NULL DEFAULT 'real_person',
     provider       TEXT NOT NULL DEFAULT 'volcengine_ark',
     asset_id       TEXT NOT NULL,
     asset_uri      TEXT NOT NULL,
     asset_group_id TEXT,
     source         TEXT NOT NULL,
     status         TEXT NOT NULL DEFAULT 'Active',
+    background_description TEXT NOT NULL DEFAULT '',
+    background_description_source TEXT NOT NULL DEFAULT '',
     metadata_json  TEXT NOT NULL DEFAULT '{}',
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -87,6 +97,72 @@ CREATE TABLE IF NOT EXISTS character_asset_bindings (
 
 CREATE INDEX IF NOT EXISTS idx_character_asset_id
     ON character_asset_bindings(asset_id);
+
+CREATE TABLE IF NOT EXISTS character_reference_images (
+    image_id       TEXT PRIMARY KEY,
+    character_id   TEXT NOT NULL,
+    relative_path  TEXT NOT NULL UNIQUE,
+    original_name  TEXT NOT NULL,
+    sort_order     INTEGER NOT NULL DEFAULT 0,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(character_id) REFERENCES character_asset_bindings(character_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_character_reference_images_character
+    ON character_reference_images(character_id, sort_order, created_at);
+
+CREATE TABLE IF NOT EXISTS character_identity_anchors (
+    job_id        TEXT NOT NULL,
+    identity_key  TEXT NOT NULL,
+    character_id  TEXT NOT NULL,
+    display_name  TEXT NOT NULL,
+    source_type   TEXT NOT NULL,
+    state         TEXT NOT NULL DEFAULT 'PENDING',
+    asset_uri     TEXT,
+    anchor_mode   TEXT NOT NULL DEFAULT 'dynamic_video',
+    image_path    TEXT,
+    image_url     TEXT,
+    video_path    TEXT,
+    video_url     TEXT,
+    preview_path  TEXT,
+    duration_sec  REAL NOT NULL DEFAULT 0,
+    cost_cents    INTEGER NOT NULL DEFAULT 0,
+    approval_state TEXT NOT NULL DEFAULT 'PENDING_REVIEW',
+    approved_at   TIMESTAMP,
+    review_note   TEXT NOT NULL DEFAULT '',
+    error         TEXT,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(job_id, identity_key),
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_character_identity_anchors_job
+    ON character_identity_anchors(job_id, state);
+
+CREATE TABLE IF NOT EXISTS scene_visual_anchors (
+    anchor_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL,
+    anchor_key      TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    master_indexes  TEXT NOT NULL DEFAULT '[]',
+    state           TEXT NOT NULL DEFAULT 'PENDING',
+    image_path      TEXT,
+    image_url       TEXT,
+    preview_path    TEXT,
+    cost_cents      INTEGER NOT NULL DEFAULT 0,
+    approval_state  TEXT NOT NULL DEFAULT 'PENDING_REVIEW',
+    approved_at     TIMESTAMP,
+    review_note     TEXT NOT NULL DEFAULT '',
+    error           TEXT,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(job_id, anchor_key),
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_scene_visual_anchors_job
+    ON scene_visual_anchors(job_id, state);
 
 CREATE TABLE IF NOT EXISTS media_assets (
     asset_id         TEXT PRIMARY KEY,
@@ -125,6 +201,7 @@ CREATE TABLE IF NOT EXISTS review_events (
     manual_minutes REAL NOT NULL DEFAULT 0,
     first_pass     INTEGER,
     notes          TEXT,
+    checks_json    TEXT NOT NULL DEFAULT '{}',
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(job_id) REFERENCES jobs(job_id)
 );
@@ -142,6 +219,43 @@ CREATE TABLE IF NOT EXISTS script_sources (
     metadata_json  TEXT NOT NULL DEFAULT '{}',
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS source_feeds (
+    feed_id             TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    feed_type           TEXT NOT NULL,
+    endpoint            TEXT NOT NULL,
+    source_kind         TEXT NOT NULL DEFAULT 'hotspot',
+    enabled             INTEGER NOT NULL DEFAULT 1,
+    cursor              TEXT,
+    last_collected_at   TIMESTAMP,
+    last_error          TEXT NOT NULL DEFAULT '',
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS source_candidates (
+    candidate_id    TEXT PRIMARY KEY,
+    feed_id         TEXT NOT NULL,
+    external_id     TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    source_url      TEXT NOT NULL DEFAULT '',
+    excerpt         TEXT NOT NULL DEFAULT '',
+    published_at    TEXT,
+    status          TEXT NOT NULL DEFAULT 'candidate',
+    source_id       TEXT,
+    raw_json        TEXT NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(feed_id, external_id),
+    FOREIGN KEY(feed_id) REFERENCES source_feeds(feed_id),
+    FOREIGN KEY(source_id) REFERENCES script_sources(source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_candidates_status
+    ON source_candidates(status, published_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_source_candidates_feed
+    ON source_candidates(feed_id, created_at);
 
 CREATE TABLE IF NOT EXISTS topic_script_sources (
     topic_id     TEXT NOT NULL,
@@ -166,6 +280,7 @@ CREATE TABLE IF NOT EXISTS topic_briefs (
     approved_topic_id  TEXT,
     approved_job_id    TEXT,
     approved_angle_index INTEGER,
+    revision            INTEGER NOT NULL DEFAULT 1,
     created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -195,6 +310,7 @@ CREATE TABLE IF NOT EXISTS script_drafts (
     output_tokens       INTEGER NOT NULL DEFAULT 0,
     approved_job_id     TEXT,
     storyboard_json     TEXT,
+    revision             INTEGER NOT NULL DEFAULT 1,
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(brief_id, request_fingerprint, variant_index),
@@ -204,6 +320,20 @@ CREATE TABLE IF NOT EXISTS script_drafts (
 
 CREATE INDEX IF NOT EXISTS idx_script_drafts_brief
     ON script_drafts(brief_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS content_revisions (
+    revision_id  TEXT PRIMARY KEY,
+    entity_type  TEXT NOT NULL,
+    entity_id    TEXT NOT NULL,
+    revision     INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    change_note  TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(entity_type, entity_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_revisions_entity
+    ON content_revisions(entity_type, entity_id, revision DESC);
 
 CREATE TABLE IF NOT EXISTS performance_snapshots (
     snapshot_id       TEXT PRIMARY KEY,
@@ -248,6 +378,53 @@ CREATE TABLE IF NOT EXISTS platform_publications (
 
 CREATE INDEX IF NOT EXISTS idx_platform_publications_job
     ON platform_publications(job_id, platform);
+
+CREATE TABLE IF NOT EXISTS platform_submissions (
+    submission_id TEXT PRIMARY KEY,
+    job_id         TEXT NOT NULL,
+    platform       TEXT NOT NULL,
+    state          TEXT NOT NULL DEFAULT 'draft'
+                   CHECK(state IN ('draft','uploading','submitted','pending_review','published','rejected')),
+    upload_id      TEXT,
+    item_id        TEXT,
+    title          TEXT,
+    cover_tsp      REAL,
+    last_error     TEXT NOT NULL DEFAULT '',
+    metadata_json  TEXT NOT NULL DEFAULT '{}',
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(job_id, platform),
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_platform_submissions_state
+    ON platform_submissions(platform, state, updated_at);
+
+CREATE TABLE IF NOT EXISTS platform_accounts (
+    platform           TEXT PRIMARY KEY,
+    account_id         TEXT NOT NULL,
+    access_token       TEXT NOT NULL,
+    refresh_token      TEXT NOT NULL,
+    scope              TEXT NOT NULL DEFAULT '',
+    access_expires_at  INTEGER NOT NULL,
+    refresh_expires_at INTEGER NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'active',
+    metadata_json      TEXT NOT NULL DEFAULT '{}',
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS platform_oauth_states (
+    state        TEXT PRIMARY KEY,
+    platform     TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    used_at      TIMESTAMP,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_platform_oauth_states_platform
+    ON platform_oauth_states(platform, expires_at);
 
 CREATE TABLE IF NOT EXISTS creative_angle_tags (
     brief_id          TEXT NOT NULL,
@@ -339,26 +516,66 @@ def _add_cols_if_missing(db: sqlite3.Connection, table: str,
             db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
+def database_path() -> Path:
+    """Resolve the database path, allowing isolated test/runtime instances."""
+    override = os.environ.get("FACTORY_DB_PATH", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path(_DB_PATH)
+
+
 def conn() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(_DB_PATH), check_same_thread=False, timeout=30)
+    path = database_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys=ON")
     db.executescript(DDL)
 
     # 增量迁移:多角色 + dialogue/broll + 每镜音频
     _add_cols_if_missing(db, "jobs", [
         ("characters_json", "TEXT"),     # [{id,name,gender,image_path,image_url}]
         ("batch_id", "TEXT"),
+        ("production_worker_pid", "INTEGER"),
+        ("production_started_at", "TIMESTAMP"),
     ])
+    _add_cols_if_missing(db, "character_asset_bindings", [
+        ("identity_type", "TEXT NOT NULL DEFAULT 'real_person'"),
+        ("background_description", "TEXT NOT NULL DEFAULT ''"),
+        ("background_description_source", "TEXT NOT NULL DEFAULT ''"),
+    ])
+    _add_cols_if_missing(db, "character_identity_anchors", [
+        ("anchor_mode", "TEXT NOT NULL DEFAULT 'dynamic_video'"),
+        ("image_path", "TEXT"),
+        ("image_url", "TEXT"),
+        ("approval_state", "TEXT NOT NULL DEFAULT 'PENDING_REVIEW'"),
+        ("approved_at", "TIMESTAMP"),
+        ("review_note", "TEXT NOT NULL DEFAULT ''"),
+    ])
+    _add_cols_if_missing(db, "scene_visual_anchors", [
+        ("approval_state", "TEXT NOT NULL DEFAULT 'PENDING_REVIEW'"),
+        ("approved_at", "TIMESTAMP"),
+        ("review_note", "TEXT NOT NULL DEFAULT ''"),
+    ])
+    db.execute(
+        "UPDATE character_identity_anchors SET approval_state='APPROVED' "
+        "WHERE source_type='volc_asset' AND state='READY'"
+    )
     _add_cols_if_missing(db, "review_events", [
         ("first_pass", "INTEGER"),
+        ("checks_json", "TEXT NOT NULL DEFAULT '{}'"),
     ])
     _add_cols_if_missing(db, "topic_briefs", [
         ("request_fingerprint", "TEXT NOT NULL DEFAULT ''"),
         ("approved_angle_index", "INTEGER"),
+        ("revision", "INTEGER NOT NULL DEFAULT 1"),
+    ])
+    _add_cols_if_missing(db, "script_drafts", [
+        ("revision", "INTEGER NOT NULL DEFAULT 1"),
     ])
     _add_cols_if_missing(db, "platform_publications", [
         ("published_at", "TEXT"),
+        ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
     ])
     _add_cols_if_missing(db, "creative_experiment_jobs", [
         ("assignment_method", "TEXT NOT NULL DEFAULT 'manual'"),

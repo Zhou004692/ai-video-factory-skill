@@ -60,7 +60,10 @@ async def ingest_media(
         db, path: str | Path, *, title: str | None = None,
         topic_id: str | None = None,
         archive_dir: str | Path = DEFAULT_ARCHIVE_DIR,
-        frame_interval_sec: float = 4.0) -> MediaIngestResult:
+        frame_interval_sec: float = 4.0,
+        asr_api_key: str | None = None,
+        asr_app_id: str | None = None,
+        asr_access_token: str | None = None) -> MediaIngestResult:
     source_path = Path(path).resolve()
     suffix = source_path.suffix.lower()
     if suffix not in MEDIA_EXTENSIONS:
@@ -84,6 +87,7 @@ async def ingest_media(
 
     media_type = "video" if suffix in VIDEO_EXTENSIONS else "audio"
     archive_root = Path(archive_dir).resolve() / media_sha256[:16]
+    archive_created = not archive_root.exists()
     archive_root.mkdir(parents=True, exist_ok=True)
     archived_path = archive_root / f"source{suffix}"
     if not archived_path.exists():
@@ -92,22 +96,29 @@ async def ingest_media(
     duration: float | None = None
     frame_paths: list[Path] = []
     timestamps: list[float] = []
-    if media_type == "video":
-        duration = await ffmpeg.probe_duration(archived_path)
-        audio_path = archive_root / "audio.wav"
-        await ffmpeg.extract_audio_wav(archived_path, audio_path)
-        timestamps = _sample_timestamps(duration, frame_interval_sec)
-        frame_paths = await ffmpeg.extract_frames(
-            archived_path, archive_root / "frames", timestamps
-        )
-    else:
-        audio_path = archived_path
+    try:
+        if media_type == "video":
+            duration = await ffmpeg.probe_duration(archived_path)
+            audio_path = archive_root / "audio.wav"
+            await ffmpeg.extract_audio_wav(archived_path, audio_path)
+            timestamps = _sample_timestamps(duration, frame_interval_sec)
+            frame_paths = await ffmpeg.extract_frames(
+                archived_path, archive_root / "frames", timestamps
+            )
+        else:
+            audio_path = archived_path
 
-    transcription = await asyncio.to_thread(
-        bigasr.transcribe_detailed, audio_path
-    )
-    if not transcription.text.strip():
-        raise ValueError("media source contains no recognizable speech")
+        transcription = await asyncio.to_thread(
+            bigasr.transcribe_detailed, audio_path,
+            api_key=asr_api_key, app_id=asr_app_id,
+            access_token=asr_access_token,
+        )
+        if not transcription.text.strip():
+            raise ValueError("media source contains no recognizable speech")
+    except Exception:
+        if archive_created and archive_root.exists():
+            shutil.rmtree(archive_root, ignore_errors=True)
+        raise
 
     metadata = {
         "media_sha256": media_sha256,

@@ -12,6 +12,22 @@ STORY_ROLES = frozenset({
     "hook", "setup", "pain", "conflict", "turn", "proof",
     "catchphrase", "cta", "other",
 })
+DEFAULT_MAX_ANALYSIS_FRAMES = 16
+
+
+def _select_timeline_frames(frames: list[dict], *, max_frames: int) -> list[dict]:
+    """Select representative frames across the complete source timeline."""
+    items = list(frames or [])
+    limit = max(0, int(max_frames))
+    if not items or limit == 0:
+        return []
+    if len(items) <= limit:
+        return items
+    if limit == 1:
+        return [items[len(items) // 2]]
+    last = len(items) - 1
+    indices = [round(position * last / (limit - 1)) for position in range(limit)]
+    return [items[index] for index in indices]
 
 
 def _text(value) -> str:
@@ -58,11 +74,31 @@ def normalize_structure_report(raw: dict, *, duration_sec: float,
         end = min(duration, max(start, float(segment.get("end_sec") or start)))
         if end <= start:
             continue
+        characters = segment.get("characters") or []
+        if not isinstance(characters, list):
+            characters = [characters]
+        frame_indices = segment.get("evidence_frame_indices") or []
+        if not isinstance(frame_indices, list):
+            frame_indices = [frame_indices]
         segments.append({
             "role": role,
             "start_sec": round(start, 3),
             "end_sec": round(end, 3),
+            "scene": _text(segment.get("scene")),
+            "characters": [
+                str(item).strip() for item in characters if str(item).strip()
+            ],
+            "speaker": _text(segment.get("speaker")),
+            "action": _text(segment.get("action")),
+            "camera": _text(segment.get("camera")),
+            "dialogue": _text(segment.get("dialogue")),
+            "on_screen_text": _text(segment.get("on_screen_text")),
+            "audio": _text(segment.get("audio")),
             "evidence": _text(segment.get("evidence")),
+            "evidence_frame_indices": [
+                int(item) for item in frame_indices
+                if str(item).strip().isdigit()
+            ],
         })
     segments.sort(key=lambda item: (item["start_sec"], item["end_sec"]))
     return {
@@ -100,17 +136,29 @@ def _structure_prompt(content: str, metadata: dict,
         "frame_observations": observations,
     }
     return (
-        "你只基于以下 ASR 与抽帧观察拆解短视频结构，不得补充不存在的事实。"
+        "你只基于以下 ASR 与抽帧观察还原短视频的完整可复用剧本，不得补充不存在的事实。"
         "role 只能使用 hook/setup/pain/conflict/turn/proof/catchphrase/cta/other。"
+        "segments 必须覆盖整条视频时间线；每段都尽量还原场景、出镜人物、人物动作、"
+        "运镜、原声台词、屏幕文字与环境声音。看不清或听不清的字段留空，不要猜测。"
+        "speaker 表示该段台词的实际说话人；只有画面、口型或上下文证据足够时填写，"
+        "无法判断时留空，不能把介绍他人的人误写成被介绍者。"
+        "同一人物在所有分段中必须使用完全相同的 speaker，不能因服装描述详略不同"
+        "而拆成多个人物；优先使用简短稳定称谓，例如‘女销售’、‘海外客户’。"
         "无法确认的声明放入 claims_to_verify。只输出 JSON："
         '{"summary":"一句话结构摘要","segments":[{"role":"hook",'
-        '"start_sec":0,"end_sec":1,"evidence":"原始证据"}],'
+        '"start_sec":0,"end_sec":1,"scene":"地点与环境",'
+        '"characters":["人物"],"speaker":"实际说话人或空字符串",'
+        '"action":"人物动作",'
+        '"camera":"景别、机位与运动", "dialogue":"该段原声台词",'
+        '"on_screen_text":"画面文字", "audio":"环境声或音乐",'
+        '"evidence":"原始证据", "evidence_frame_indices":[1]}],'
         '"catchphrases":["原句"],"claims_to_verify":["待核验声明"]}\n\n'
         + json.dumps(evidence, ensure_ascii=False)
     )
 
 
-def analyze_source(db, source_id: str, *, max_frames: int = 8,
+def analyze_source(db, source_id: str, *,
+                   max_frames: int = DEFAULT_MAX_ANALYSIS_FRAMES,
                    force: bool = False,
                    analyze_json: Callable = image_vision.analyze_json) -> dict:
     row = db.execute(
@@ -127,7 +175,8 @@ def analyze_source(db, source_id: str, *, max_frames: int = 8,
         return cached
     usage = {"input_tokens": 0, "output_tokens": 0}
     observations: list[dict] = []
-    for frame in (metadata.get("frames") or [])[:max(0, int(max_frames))]:
+    for frame in _select_timeline_frames(
+            metadata.get("frames") or [], max_frames=max_frames):
         path = Path(frame["path"])
         if not path.exists():
             continue

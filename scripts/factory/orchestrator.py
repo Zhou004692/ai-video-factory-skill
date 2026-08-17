@@ -65,6 +65,17 @@ async def _process_job(job_id: str, sem: asyncio.Semaphore):
                 log(db, job_id, step, "INFO", f"done {step} → {new_state.value}")
             except Exception as e:
                 tb = traceback.format_exc(limit=4)
+                pause_state = str(getattr(e, "pause_state", "") or "").strip()
+                if pause_state:
+                    db.execute(
+                        "UPDATE jobs SET state=?,error=NULL,"
+                        "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
+                        "WHERE job_id=?",
+                        (pause_state, job_id),
+                    )
+                    db.commit()
+                    log(db, job_id, step, "INFO", f"paused for review: {e}")
+                    return
                 if not _should_retry_step(e):
                     db.execute(
                         "UPDATE jobs SET state='FAILED', error=? WHERE job_id=?",

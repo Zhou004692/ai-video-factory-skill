@@ -24,13 +24,108 @@ reference 模式 + native audio + motion control + first/last frame 锁定等能
 """
 import asyncio
 import base64
+import math
 import os
 from pathlib import Path
 
 import httpx
 
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
+SEEDANCE_25_MIN_GENERATION_DURATION_SEC = 4
+SEEDANCE_25_MAX_GENERATION_DURATION_SEC = 30
+
+
+class SeedanceParameterError(ValueError):
+    """A provider contract violation that must never be retried as-is."""
+
+    non_retryable = True
+
+
+def normalize_generation_duration(duration: float) -> int:
+    """Map editorial seconds to one valid Seedance 2.5 paid request."""
+    try:
+        value = float(duration)
+    except (TypeError, ValueError) as exc:
+        raise SeedanceParameterError(
+            "Seedance 2.5 generation duration must be numeric"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise SeedanceParameterError(
+            "Seedance 2.5 generation duration must be greater than 0"
+        )
+    if value > SEEDANCE_25_MAX_GENERATION_DURATION_SEC:
+        raise SeedanceParameterError(
+            "Seedance 2.5 generation duration maximum is 30 seconds; "
+            "split the provider-facing master before submission"
+        )
+    return max(SEEDANCE_25_MIN_GENERATION_DURATION_SEC, math.ceil(value))
 DEFAULT_MODEL = os.getenv("ARK_VIDEO_MODEL", "doubao-seedance-2-5-260628")
+
+
+class SeedanceInputPrivacyError(RuntimeError):
+    """An ordinary image reference was classified as real-person material."""
+
+    non_retryable = True
+
+
+class SeedanceSubmissionUnknownError(RuntimeError):
+    """The submit connection broke before a provider task id was received."""
+
+    non_retryable = True
+
+
+class SeedanceOutputPolicyError(RuntimeError):
+    """The provider rejected generated output for a policy reason."""
+
+    non_retryable = True
+
+
+def _submission_transport_error(exc: BaseException) -> RuntimeError:
+    return SeedanceSubmissionUnknownError(
+        "Seedance 提交连接中断，任务是否已创建未知；为避免重复付费，系统不会"
+        "自动重提。请先在火山方舟任务列表核对本次任务，再决定是否续跑。"
+    )
+
+
+def _task_failure_error(task_id: str, data: dict) -> RuntimeError:
+    detail = data.get("error") or {}
+    code = str(detail.get("code") or "")
+    if (
+        "OutputVideoSensitiveContentDetected" in code
+        or "PolicyViolation" in code
+    ):
+        return SeedanceOutputPolicyError(
+            f"Seedance 任务 {task_id} 被输出版权或敏感内容策略拦截；"
+            "请去除无关作品名、角色背景或受保护形象后，仅重试该母片。"
+        )
+    message = str(detail.get("message") or "provider task failed")[:500]
+    return RuntimeError(
+        f"Seedance 任务 {task_id} 生成失败：{code or 'unknown_error'}；"
+        f"{message}"
+    )
+
+
+def _submission_error(response, *, endpoint: str, model: str,
+                      content_roles: list[str]) -> Exception:
+    detail = response.text[:800]
+    if "InputImageSensitiveContentDetected.PrivacyInformation" in detail:
+        return SeedanceInputPrivacyError(
+            "Seedance rejected an ordinary image reference because it may "
+            "contain a real person. Use an authorized asset:// portrait for "
+            "a fixed real/virtual identity, or description-only generation "
+            "for a custom fictional role; the rejected request is not "
+            "automatically retried."
+        )
+    if "InvalidParameter" in detail:
+        return SeedanceParameterError(
+            "Seedance 请求参数未通过服务端校验；系统已停止自动重试。"
+            f"provider_detail={detail} | endpoint={endpoint}, model={model}, "
+            f"content_roles={content_roles}"
+        )
+    return RuntimeError(
+        f"seedance submit {response.status_code}: {detail} | "
+        f"endpoint={endpoint}, model={model}, content_roles={content_roles}"
+    )
 
 
 def _headers():
@@ -134,10 +229,10 @@ def _video_task_payload(*, model: str, content: list, duration: float,
                 "Seedance edit tasks require reference_video or reference_audio"
             )
     if "seedance-2-5" in model.lower():
-        if task_intent == "generate" and duration > 30:
-            raise ValueError("Seedance 2.5 generate duration cannot exceed 30 seconds")
         if resolution not in {"480p", "720p"}:
             raise ValueError("Seedance 2.5 resolution must be 480p or 720p")
+        if task_intent == "generate":
+            duration = normalize_generation_duration(duration)
 
     payload = {
         "model": model,
@@ -282,20 +377,34 @@ async def text_to_video(
 
     async with httpx.AsyncClient(timeout=timeout, headers=_headers()) as cli:
         # 1. 提交任务
-        r = await cli.post(f"{ARK_BASE}/contents/generations/tasks", json=payload)
+        try:
+            r = await cli.post(
+                f"{ARK_BASE}/contents/generations/tasks", json=payload
+            )
+        except httpx.TransportError as exc:
+            raise _submission_transport_error(exc) from exc
         if r.status_code >= 400:
-            raise RuntimeError(
-                f"seedance submit {r.status_code}: {r.text[:800]} | "
-                f"endpoint={ARK_BASE}/contents/generations/tasks, "
-                f"model={payload['model']}, "
-                f"content_roles={[c.get('role') for c in content if c.get('role')]}"
+            raise _submission_error(
+                r,
+                endpoint=f"{ARK_BASE}/contents/generations/tasks",
+                model=payload["model"],
+                content_roles=[
+                    c.get("role") for c in content if c.get("role")
+                ],
             )
         task_id = r.json()["id"]
 
         # 2. 轮询
         for _ in range(timeout // 5):
             await asyncio.sleep(5)
-            s = await cli.get(f"{ARK_BASE}/contents/generations/tasks/{task_id}")
+            try:
+                s = await cli.get(
+                    f"{ARK_BASE}/contents/generations/tasks/{task_id}"
+                )
+            except httpx.TransportError:
+                # The paid task id is known. Continue polling that same task;
+                # never create a second task because a status request failed.
+                continue
             s.raise_for_status()
             data = s.json()
             status = data.get("status")
@@ -312,16 +421,19 @@ async def text_to_video(
                 vid.raise_for_status()
                 return vid.content
             if status == "failed":
-                raise RuntimeError(f"seedance task {task_id} failed: {data}")
+                raise _task_failure_error(task_id, data)
         raise TimeoutError(f"seedance task {task_id} timed out")
 
 
 async def text_to_image(prompt: str, resolution: str = "1024x1536",
-                        seed: int | None = None) -> bytes:
-    """t2i 兜底入口(用 ARK_IMAGE_MODEL 指向的图像模型,默认 Seedream 5.0)。
+                        seed: int | None = None,
+                        model: str | None = None) -> bytes:
+    """t2i 入口（可显式锁定模型，默认读取 ARK_IMAGE_MODEL）。
     主路径是 seedream_45.t2i / i2i;这里只作 IMAGE_PROVIDER=seedream 时的最终 fallback。
     """
-    model = os.getenv("ARK_IMAGE_MODEL", "doubao-seedream-5-0-260128")
+    model = model or os.getenv(
+        "ARK_IMAGE_MODEL", "doubao-seedream-5-0-260128"
+    )
     payload = {
         "model": model,
         "prompt": prompt,
@@ -341,10 +453,8 @@ async def text_to_image(prompt: str, resolution: str = "1024x1536",
 
 
 def estimate_cost_cents(duration: float, resolution: str = "720p") -> int:
-    """Seedance 2.5 价格按分辨率分档(以方舟账单为准):
-      480p ≈ 12 分/秒 / 720p ≈ 40 分/秒 / 1080p ≈ 80 分/秒
-    """
-    rate = {"480p": 12, "720p": 40, "1080p": 80}.get(resolution, 40)
+    """Conservative Seedance 2.5 estimate derived from measured token bills."""
+    rate = {"480p": 68, "720p": 102, "1080p": 136}.get(resolution, 102)
     return int(rate * duration)
 
 

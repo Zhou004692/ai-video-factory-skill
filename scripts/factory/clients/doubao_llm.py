@@ -5,6 +5,7 @@
   ARK_LLM_MODEL      豆包模型 ID,默认 doubao-1-5-pro-32k-250115
                      如方舟要求带日期版本,以控制台为准
 """
+import json
 import os
 
 import httpx
@@ -50,7 +51,12 @@ def complete_json(prompt: str, system: str | None = None,
             )
         body = r.json()
 
-    text = body["choices"][0]["message"]["content"]
+    choice = body["choices"][0]
+    text = choice["message"]["content"]
+    if choice.get("finish_reason") in {"length", "max_tokens"}:
+        raise json.JSONDecodeError(
+            "LLM JSON output truncated by token limit", text, len(text)
+        )
     data = _extract_json(text)
     usage = {
         "input_tokens": body["usage"]["prompt_tokens"],

@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AI Video Factory · 内容工作室 B v2</title>
+  <link rel="stylesheet" href="/studio-concepts.css">
+</head>
+<body data-mode="review">
+  <header class="review-bar">
+    <div><span class="review-logo">V</span><p><b>内容工作室 B v2</b><small>现代创作工具方向验证 · 非正式管理台</small></p></div>
+    <nav aria-label="原型场景">
+      <button class="active" data-mode="review">作品审阅</button>
+      <button data-mode="ideate">选题创作</button>
+      <button data-mode="produce">视频制作</button>
+    </nav>
+    <a href="/design-options.html">返回第一轮选型</a>
+  </header>
+
+  <main class="studio-shell">
+    <aside class="tool-rail">
+      <button class="rail-logo" aria-label="首页">V</button>
+      <div class="rail-tools">
+        <button class="active" title="项目">▰</button>
+        <button title="搜索">⌕</button>
+        <button title="生成">✦</button>
+        <button title="角色">♙</button>
+      </div>
+      <div class="rail-bottom"><button title="设置">⚙</button><span>管</span></div>
+    </aside>
+
+    <aside class="project-panel">
+      <header><div><span>工作空间</span><b>设备租赁内容库</b></div><button>⌄</button></header>
+      <div class="project-search">⌕ <span>搜索作品、来源或角色</span><kbd>⌘K</kbd></div>
+      <section class="project-group">
+        <div class="group-title"><span>智能集合</span><button>＋</button></div>
+        <button><i class="dot amber"></i><span>等待我审核</span><em>4</em></button>
+        <button><i class="dot violet"></i><span>生成进行中</span><em>2</em></button>
+        <button><i class="dot green"></i><span>可发布成片</span><em>5</em></button>
+      </section>
+      <section class="project-group projects">
+        <div class="group-title"><span>最近项目</span><button>···</button></div>
+        <button class="selected" data-project="rental"><span class="mini-cover rental"></span><span><b>设备租赁狗都不做？</b><small>审核成片 · 刚刚</small></span></button>
+        <button data-project="number"><span class="mini-cover number"></span><span><b>神秘数字背后的玄机</b><small>成片 · 今天 13:17</small></span></button>
+        <button data-project="goku"><span class="mini-cover goku"></span><span><b>悟空与佛利沙对波</b><small>待复核 · 今天 15:07</small></span></button>
+      </section>
+      <button class="new-project">＋ 新建内容项目</button>
+    </aside>
+
+    <section class="workspace">
+      <header class="workspace-head">
+        <div class="workspace-title"><span id="context-path">内容项目 / 成片审核</span><input id="project-title" value="设备租赁狗都不做？其实亏的都是用老方法干的人" aria-label="项目名称"></div>
+        <div class="workspace-actions"><span class="save-state"><i></i> 已自动保存</span><button class="ghost">分享</button><button class="primary" id="main-action">通过并提交发布</button></div>
+      </header>
+
+      <div class="stage-strip" id="stage-strip">
+        <button><span>01</span><b>来源</b><small>已归档</small></button><i></i>
+        <button><span>02</span><b>选题</b><small>评分 91.8</small></button><i></i>
+        <button><span>03</span><b>剧本</b><small>已审核</small></button><i></i>
+        <button class="current"><span>04</span><b>成片</b><small>等待审核</small></button><i></i>
+        <button><span>05</span><b>发布</b><small>尚未提交</small></button>
+      </div>
+
+      <div class="work-area">
+        <section class="asset-browser" id="asset-browser">
+          <header><div><b id="asset-title">项目资产</b><span id="asset-count">6 项</span></div><div><button>筛选</button><button>▦</button></div></header>
+          <div class="asset-tabs"><button class="active">全部</button><button>来源</button><button>剧本</button><button>母片</button></div>
+          <div class="asset-grid" id="asset-grid">
+            <button class="asset-card selected"><span class="asset-thumb rental"><i>▶</i><em>00:33</em></span><b>final_v3.mp4</b><small>最终成片 · 1080 × 1920</small></button>
+            <button class="asset-card"><span class="asset-thumb script"><i>文</i></span><b>反转版剧本</b><small>已审核 · 428 字</small></button>
+            <button class="asset-card"><span class="asset-thumb source"><i>链</i></span><b>核心业务材料</b><small>人工创建 · 可信来源</small></button>
+            <button class="asset-card"><span class="asset-thumb xiaoling"><i>人</i></span><b>小玲</b><small>角色资产 · 已启用</small></button>
+          </div>
+        </section>
+
+        <section class="canvas" id="canvas">
+          <div class="canvas-toolbar"><div><button>−</button><span>72%</span><button>＋</button></div><div><button>适应窗口</button><button>全屏</button></div></div>
+          <div class="viewer" id="viewer">
+            <video id="preview-video" src="/api/videos/J-SD25-DIRECTOR-20260811/file" preload="metadata" poster="/design-assets/story-rental.jpg"></video>
+            <button class="play" id="play-button" aria-label="播放">▶</button>
+            <div class="viewer-caption">“真正的问题不是设备租赁不能做”</div>
+          </div>
+          <div class="transport">
+            <button id="transport-play">▶</button><time id="time-current">00:00</time>
+            <div class="scrubber" id="scrubber"><i id="scrubber-fill"></i><span class="comment-mark one"></span><span class="comment-mark two"></span></div>
+            <time id="time-total">00:33</time><button>⌁</button><button>⋮</button>
+          </div>
+          <div class="filmstrip" id="filmstrip">
+            <button class="active"><span class="frame rental"></span><small>开场钩子</small></button>
+            <button><span class="frame number"></span><small>痛点拆解</small></button>
+            <button><span class="frame rental"></span><small>方案反转</small></button>
+            <button><span class="frame goku"></span><small>行动号召</small></button>
+          </div>
+          <div class="ai-dock" id="ai-dock">
+            <span class="spark">✦</span><div><span>告诉 AI 你想调整什么</span><small>例如：把开场压缩到 3 秒，字幕更克制</small></div><button>⌘ ↵</button>
+          </div>
+        </section>
+
+        <aside class="inspector" id="inspector">
+          <header><div class="inspector-tabs"><button class="active">审核</button><button>信息</button><button>版本</button></div><button>×</button></header>
+          <div class="approval-card"><div><span class="avatar-stack"><i>周</i><i>AI</i></span><span><b>等待最终审核</b><small>完成后可进入发布队列</small></span></div><div><button class="reject">退回修改</button><button class="approve">通过</button></div></div>
+          <section class="quality"><header><b>AI 预检</b><span>6 / 6 通过</span></header><div class="quality-grid"><span><i></i>口型同步</span><span><i></i>字幕完整</span><span><i></i>角色一致</span><span><i></i>无异常文字</span></div></section>
+          <section class="comments"><header><b>时间点评论</b><button>＋ 添加</button></header>
+            <article><span class="comment-avatar">周</span><div><header><b>周建华</b><time>00:06</time></header><p>这里的反转节奏不错，字幕可以再往上提一点。</p><footer><button>回复</button><button>解决</button></footer></div></article>
+            <article><span class="comment-avatar ai">AI</span><div><header><b>质量助手</b><time>00:18</time></header><p>检测到人物面部稳定，语音和口型对齐度良好。</p><footer><button>查看详情</button></footer></div></article>
+          </section>
+          <div class="comment-input"><span>在当前时间点留下评论…</span><button>↑</button></div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <div class="reference-note"><b>融合参考</b><span>Frame.io 三面板审阅</span><span>Firefly 上下文生成</span><span>DaVinci 视觉胶片带</span><span>Linear 精密材质</span></div>
+  <script src="/studio-concepts.js"></script>
+</body>
+</html>

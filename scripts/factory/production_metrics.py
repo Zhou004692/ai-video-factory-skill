@@ -1,6 +1,7 @@
 """Production-economics measurements based on approved output."""
 from __future__ import annotations
 
+import json
 import sqlite3
 
 
@@ -15,6 +16,7 @@ def record_review(
     manual_minutes: float = 0,
     notes: str | None = None,
     first_pass: bool | None = None,
+    checks: dict[str, bool] | None = None,
 ) -> None:
     if decision not in REVIEW_DECISIONS:
         raise ValueError(
@@ -26,13 +28,14 @@ def record_review(
         raise ValueError(f"job {job_id} not found")
     db.execute(
         "INSERT INTO review_events(job_id, decision, manual_minutes, notes, "
-        "first_pass) VALUES(?,?,?,?,?)",
+        "first_pass, checks_json) VALUES(?,?,?,?,?,?)",
         (
             job_id,
             decision,
             float(manual_minutes),
             notes,
             None if first_pass is None else int(first_pass),
+            json.dumps(checks or {}, ensure_ascii=False),
         ),
     )
     db.commit()

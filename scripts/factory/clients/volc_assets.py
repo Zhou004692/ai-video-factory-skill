@@ -57,6 +57,9 @@ class VolcAssetClient:
 
         self._http = httpx.Client(timeout=15)
 
+    def close(self) -> None:
+        self._http.close()
+
     @staticmethod
     def _hmac(key: bytes, value: str) -> bytes:
         return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
@@ -211,6 +214,13 @@ class VolcAssetClient:
         return self._call(
             "GetAsset",
             {"Id": asset_id, "ProjectName": self.project_name},
+        )
+
+    def get_asset_group(self, group_id: str) -> dict:
+        """Return the asset group that carries the portrait's catalog profile."""
+        return self._call(
+            "GetAssetGroup",
+            {"Id": group_id, "ProjectName": self.project_name},
         )
 
     def find_real_person_assets(self, display_name: str) -> list[dict]:

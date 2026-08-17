@@ -15,8 +15,7 @@ from dotenv import dotenv_values
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_PACKAGES = ("click", "dotenv", "httpx", "yaml", "tos")
 VIDEO_KEYS = (
-    "ARK_API_KEY", "VOLC_ASR_APPID", "VOLC_ASR_TOKEN",
-    "VOLC_AK", "VOLC_SK", "TOS_BUCKET",
+    "ARK_API_KEY", "VOLC_AK", "VOLC_SK", "TOS_BUCKET",
 )
 
 
@@ -27,7 +26,7 @@ def _configured(value: object) -> bool:
 
 def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
     env_path = root / ".env"
-    config = {**dotenv_values(env_path), **os.environ}
+    config = dict(dotenv_values(env_path))
     provider = str(config.get("DEFAULT_LLM_PROVIDER") or "doubao").strip().lower()
     if profile == "learning":
         required = ()
@@ -35,6 +34,10 @@ def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
         required = ("ANTHROPIC_API_KEY",) if provider == "claude" else ("ARK_API_KEY",)
     else:
         required = VIDEO_KEYS
+    asr_ready = _configured(config.get("VOLC_ASR_API_KEY")) or all(
+        _configured(config.get(key))
+        for key in ("VOLC_ASR_APPID", "VOLC_ASR_TOKEN")
+    )
     checks = {
         "python": {"ok": sys.version_info >= (3, 11), "detail": sys.version.split()[0]},
         "packages": {
@@ -43,10 +46,12 @@ def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
         },
         "environment_file": {"ok": env_path.is_file(), "detail": str(env_path)},
         "credentials": {
-            "ok": all(_configured(config.get(key)) for key in required),
+            "ok": all(_configured(config.get(key)) for key in required)
+            and (profile != "video" or asr_ready),
             "detail": {
                 "provider": provider,
                 **{key: _configured(config.get(key)) for key in required},
+                **({"VOLC_ASR": asr_ready} if profile == "video" else {}),
             },
         },
         "data_directory": {

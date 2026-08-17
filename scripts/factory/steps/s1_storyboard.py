@@ -58,29 +58,34 @@ def _validate_director_storyboard(sb: dict) -> None:
         raise ValueError("characters must be a non-empty list")
     char_ids: set[str] = set()
     for character in characters:
-        if "look" not in character and "image_prompt" not in character:
+        asset_backed = (
+            character.get("identity_type") in {"real_person", "virtual_person"}
+            and str(character.get("seedance_asset_uri") or "").startswith("asset://")
+        )
+        if not asset_backed and "look" not in character and "image_prompt" not in character:
             raise ValueError(
                 f"character missing both 'look' and 'image_prompt': {character}"
             )
-        for field in ("id", "name", "gender"):
+        for field in (("id", "name") if asset_backed else ("id", "name", "gender")):
             if field not in character:
                 raise ValueError(f"character missing {field}: {character}")
-        if character["gender"] not in ("male", "female"):
-            raise ValueError(f"character gender must be male|female: {character}")
+        if not asset_backed and character["gender"] not in (
+            "male", "female", "unspecified"
+        ):
+            raise ValueError(
+                f"character gender must be male|female|unspecified: {character}"
+            )
         char_ids.add(character["id"])
 
     masters = sb["masters"]
     if not isinstance(masters, list) or not masters:
         raise ValueError("standard director pipeline requires at least 1 paid master")
-    if len(masters) > 3:
-        raise ValueError("standard director pipeline allows at most 3 paid masters")
-    if sum(float(master.get("duration") or 0) for master in masters) > 36:
-        raise ValueError("standard director pipeline paid master duration exceeds 36s")
+    if sum(float(master.get("duration") or 0) for master in masters) > 90:
+        raise ValueError("standard director pipeline paid master duration exceeds 90s")
     master_by_idx = {master.get("idx"): master for master in masters}
     if len(master_by_idx) != len(masters) or None in master_by_idx:
         raise ValueError("master idx values must be present and unique")
 
-    max_dialogue_duration = 30 if _long_scene_enabled() else 12
     for master in masters:
         if master.get("type") not in ("dialogue", "broll"):
             raise ValueError(f"master.type must be dialogue|broll: {master}")
@@ -92,14 +97,13 @@ def _validate_director_storyboard(sb: dict) -> None:
                     f"dialogue master speaker must be one of {char_ids}: {master}"
                 )
             render_mode = (master.get("render_mode") or "presenter").lower()
-            if render_mode not in ("presenter", "digital_human", "scene"):
+            if render_mode not in (
+                "presenter", "digital_human", "scene", "cinematic_character"
+            ):
                 raise ValueError(
                     f"dialogue master {master['idx']} render_mode must be "
-                    f"presenter|scene, got {master.get('render_mode')!r}"
-                )
-            if master["duration"] > max_dialogue_duration:
-                raise ValueError(
-                    f"dialogue master {master['idx']} > {max_dialogue_duration}s"
+                    "presenter|scene|cinematic_character, got "
+                    f"{master.get('render_mode')!r}"
                 )
             if not (master.get("voiceover") or "").strip():
                 raise ValueError(
@@ -119,8 +123,8 @@ def _validate_director_storyboard(sb: dict) -> None:
                 )
 
     timeline = sb["shots"]
-    if not isinstance(timeline, list) or not (4 <= len(timeline) <= 8):
-        raise ValueError("standard director timeline must contain 4 to 8 edit shots")
+    if not isinstance(timeline, list) or not timeline:
+        raise ValueError("director timeline must contain at least 1 edit shot")
     audio_ranges: dict[int, list[tuple[float, float]]] = {}
     for edit in timeline:
         duration = float(edit.get("duration") or 0)
@@ -170,14 +174,23 @@ def _validate(sb: dict) -> None:
         raise ValueError("characters must be a non-empty list")
     char_ids = set()
     for ch in sb["characters"]:
-        # look 是新字段(简短特征,各镜头复用);image_prompt 旧版兼容
-        if "look" not in ch and "image_prompt" not in ch:
+        # Asset-backed identities use the Volc portrait asset as their source
+        # of truth; prompt-only fictional characters still need a stable look.
+        asset_backed = (
+            ch.get("identity_type") in {"real_person", "virtual_person"}
+            and str(ch.get("seedance_asset_uri") or "").startswith("asset://")
+        )
+        if not asset_backed and "look" not in ch and "image_prompt" not in ch:
             raise ValueError(f"character missing both 'look' and 'image_prompt': {ch}")
-        for f in ("id", "name", "gender"):
+        for f in (("id", "name") if asset_backed else ("id", "name", "gender")):
             if f not in ch:
                 raise ValueError(f"character missing {f}: {ch}")
-        if ch["gender"] not in ("male", "female"):
-            raise ValueError(f"character gender must be male|female: {ch}")
+        if not asset_backed and ch["gender"] not in (
+            "male", "female", "unspecified"
+        ):
+            raise ValueError(
+                f"character gender must be male|female|unspecified: {ch}"
+            )
         char_ids.add(ch["id"])
 
     if not isinstance(sb["shots"], list) or not (2 <= len(sb["shots"]) <= 12):
@@ -192,16 +205,13 @@ def _validate(sb: dict) -> None:
                     f"dialogue shot speaker must be one of {char_ids}: {shot}"
                 )
             render_mode = (shot.get("render_mode") or "presenter").lower()
-            if render_mode not in ("presenter", "digital_human", "scene"):
+            if render_mode not in (
+                "presenter", "digital_human", "scene", "cinematic_character"
+            ):
                 raise ValueError(
                     f"dialogue shot {shot['idx']} render_mode must be "
-                    f"presenter|scene, got {shot.get('render_mode')!r}"
-                )
-            max_dialogue_duration = 30 if _long_scene_enabled() else 12
-            if shot.get("duration", 0) > max_dialogue_duration:
-                raise ValueError(
-                    f"dialogue shot {shot['idx']} > {max_dialogue_duration}s "
-                    "(configured Seedance native speech limit)"
+                    "presenter|scene|cinematic_character, got "
+                    f"{shot.get('render_mode')!r}"
                 )
             if not (shot.get("voiceover") or "").strip():
                 raise ValueError(f"dialogue shot {shot['idx']} has empty voiceover")
@@ -297,7 +307,7 @@ async def run(job_id: str) -> None:
         chars.append({
             "id": c["id"],
             "name": c["name"],
-            "gender": c["gender"],
+            "gender": c.get("gender"),
             "look": c.get("look") or c.get("image_prompt", ""),
             "identity_type": c.get("identity_type"),
             "seedance_asset_uri": c.get("seedance_asset_uri"),

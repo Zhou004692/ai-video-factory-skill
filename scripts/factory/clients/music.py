@@ -14,6 +14,7 @@ from pathlib import Path
 import httpx
 
 from .. import REFERENCES_DIR
+from . import ffmpeg
 
 
 async def generate(style: str, duration_sec: int, bpm_range: tuple[int, int] = (80, 100),
@@ -26,7 +27,12 @@ async def generate(style: str, duration_sec: int, bpm_range: tuple[int, int] = (
     elif provider == "haimian":
         return await _via_haimian(style, duration_sec, bpm_range, mood)
     elif provider == "library":
-        return _via_library(style, duration_sec)
+        try:
+            return _via_library(style, duration_sec)
+        except (OSError, RuntimeError):
+            # BGM is optional packaging. A missing local library must not
+            # discard an otherwise valid, already-paid Seedance master.
+            return await _via_silent(duration_sec)
     else:  # silent — 跑通管线用的兜底,无声 BGM
         return await _via_silent(duration_sec)
 
@@ -36,7 +42,7 @@ async def _via_silent(duration_sec: int) -> bytes:
     import tempfile
     out = Path(tempfile.mktemp(suffix=".mp3"))
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        ffmpeg.executable("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error",
         "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
         "-t", str(duration_sec), "-q:a", "9", "-acodec", "libmp3lame",
         str(out),

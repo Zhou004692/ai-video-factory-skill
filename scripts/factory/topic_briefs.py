@@ -14,7 +14,7 @@ from . import creative_learning
 SCORE_FIELDS = (
     "relevance", "story_potential", "evidence_quality", "production_fit",
 )
-BRIEF_PROMPT_VERSION = "creative-brief-v2"
+BRIEF_PROMPT_VERSION = "creative-brief-v3-evidence-ledger"
 CREATIVE_TAG_DEFAULTS = {
     "hook_type": "pain_point",
     "narrative_pattern": "problem_solution",
@@ -31,7 +31,9 @@ def _string_list(value) -> list[str]:
     return [str(item).strip() for item in (value or []) if str(item).strip()]
 
 
-def normalize_brief(raw: dict) -> dict:
+def normalize_brief(
+    raw: dict, *, allowed_source_ids: set[str] | None = None
+) -> dict:
     score_raw = raw.get("source_score") or {}
     score: dict = {}
     for field in SCORE_FIELDS:
@@ -45,9 +47,36 @@ def normalize_brief(raw: dict) -> dict:
     score["overall"] = round(sum(score.values()) / len(SCORE_FIELDS), 1)
     score["reason"] = _text(score_raw.get("reason"))
 
-    raw_angles = raw.get("angles") or []
-    if len(raw_angles) != 3:
-        raise ValueError("creative brief requires exactly 3 angles")
+    digest_raw = raw.get("source_digest") or {}
+    facts: list[dict] = []
+    fact_ids: set[str] = set()
+    for index, item in enumerate(digest_raw.get("facts") or []):
+        fact = {
+            "fact_id": _text(item.get("fact_id")) or f"F{index + 1}",
+            "statement": _text(item.get("statement")),
+            "quote": _text(item.get("quote")),
+            "source_id": _text(item.get("source_id")),
+            "importance": (
+                _text(item.get("importance"))
+                if _text(item.get("importance")) in {"must_keep", "supporting"}
+                else "supporting"
+            ),
+        }
+        for field in ("statement", "quote", "source_id"):
+            if not fact[field]:
+                raise ValueError(f"source_digest.fact #{index + 1}.{field} is required")
+        if fact["fact_id"] in fact_ids:
+            raise ValueError(f"duplicate source_digest fact_id: {fact['fact_id']}")
+        if allowed_source_ids is not None and fact["source_id"] not in allowed_source_ids:
+            raise ValueError(
+                f"source_digest fact references unknown source_id: {fact['source_id']}"
+            )
+        fact_ids.add(fact["fact_id"])
+        facts.append(fact)
+
+    raw_angles = list(raw.get("angles") or [])[:3]
+    if not raw_angles:
+        raise ValueError("creative brief requires at least 1 angle")
     angles: list[dict] = []
     for index, angle in enumerate(raw_angles):
         normalized = {
@@ -58,7 +87,15 @@ def normalize_brief(raw: dict) -> dict:
             "evidence": _string_list(angle.get("evidence")),
             "risk_notes": _string_list(angle.get("risk_notes")),
             "production_notes": _text(angle.get("production_notes")),
+            "fact_ids": list(dict.fromkeys(
+                _text(item) for item in (angle.get("fact_ids") or []) if _text(item)
+            )),
         }
+        unknown_fact_ids = sorted(set(normalized["fact_ids"]) - fact_ids)
+        if unknown_fact_ids:
+            raise ValueError(
+                f"angle #{index + 1} references unknown fact_id: {unknown_fact_ids}"
+            )
         creative_tags = angle.get("creative_tags")
         if creative_tags is not None:
             normalized["creative_tags"] = {
@@ -77,12 +114,28 @@ def normalize_brief(raw: dict) -> dict:
         if not normalized["evidence"]:
             raise ValueError(f"angle #{index + 1}.evidence is required")
         angles.append(normalized)
-    recommended = int(raw.get("recommended_index", -1))
-    if recommended not in range(3):
-        raise ValueError("recommended_index must be 0, 1 or 2")
+    try:
+        recommended = int(raw.get("recommended_index", 0))
+    except (TypeError, ValueError):
+        recommended = 0
+    recommended = min(max(0, recommended), len(angles) - 1)
+    must_keep = {
+        fact["fact_id"] for fact in facts if fact["importance"] == "must_keep"
+    }
+    covered = {
+        fact_id for angle in angles for fact_id in angle.get("fact_ids") or []
+    } & must_keep
     return {
         "audience": _text(raw.get("audience")),
         "source_score": score,
+        "source_digest": {
+            "facts": facts,
+            "coverage": {
+                "must_keep_total": len(must_keep),
+                "covered": len(covered),
+                "missing_fact_ids": sorted(must_keep - covered),
+            },
+        },
         "angles": angles,
         "recommended_index": recommended,
         "recommendation_reason": _text(raw.get("recommendation_reason")),
@@ -125,13 +178,17 @@ def _brief_prompt(sources: list[dict]) -> str:
     return (
         "你是设备租赁行业短视频创意总监。只基于来源内容与机器分析提出三个明显"
         "不同的创意角度，不得照抄来源标题，不得编造事实、金额、客户或产品能力。"
-        "每个角度必须引用来源中已有证据，并说明适合 Seedance 2.5 原生母片 + "
+        "先提炼来源事实底稿：标记必须保留与辅助事实，逐条保留原文引句和 source_id。"
+        "每个角度必须通过 fact_ids 关联事实底稿，并引用来源中已有证据；不得遗漏所有"
+        " must_keep 事实。说明适合 Seedance 2.5 原生母片 + "
         "本地导演剪辑的生产方式。评分 0—100。只输出 JSON："
         '{"audience":"目标受众","source_score":{"relevance":0,'
         '"story_potential":0,"evidence_quality":0,"production_fit":0,'
-        '"reason":"理由"},"angles":[{"title":"选题标题","hook":"前三秒",'
+        '"reason":"理由"},"source_digest":{"facts":[{"fact_id":"F1",'
+        '"statement":"关键事实","quote":"来源原句","source_id":"SRC-...",'
+        '"importance":"must_keep|supporting"}]},"angles":[{"title":"选题标题","hook":"前三秒",'
         '"promise":"观众收益","story_arc":"故事弧",'
-        '"evidence":["来源原句或观察"],"risk_notes":["风险"],'
+        '"evidence":["来源原句或观察"],"fact_ids":["F1"],"risk_notes":["风险"],'
         '"production_notes":"母片与剪辑建议","creative_tags":{'
         '"hook_type":"pain_point","narrative_pattern":"problem_solution",'
         '"proof_type":"source_quote","cta_type":"consult"}}],'
@@ -139,6 +196,28 @@ def _brief_prompt(sources: list[dict]) -> str:
         '"recommendation_reason":"推荐理由"}\n\n来源：'
         + json.dumps(sources, ensure_ascii=False)
     )
+
+
+def _angle_count(raw: dict) -> int:
+    angles = raw.get("angles") if isinstance(raw, dict) else None
+    return len(angles) if isinstance(angles, list) else 0
+
+
+def _repair_angle_prompt(sources: list[dict], previous_count: int) -> str:
+    return (
+        _brief_prompt(sources)
+        + f"\n\n契约修复要求：上一次响应只生成了 {previous_count} 个角度，"
+        "不符合要求。请重新生成完整 JSON；angles 必须恰好包含 3 个非空、"
+        "彼此明显不同且均有来源证据的创意角度，recommended_index 必须指向"
+        "其中一个角度。不要解释失败原因。"
+    )
+
+
+def _combined_usage(*items: dict) -> dict:
+    return {
+        key: sum(int(item.get(key) or 0) for item in items)
+        for key in ("input_tokens", "output_tokens")
+    }
 
 
 def _request_fingerprint(sources: list[dict]) -> str:
@@ -179,6 +258,46 @@ def _cached_brief(db, request_fingerprint: str) -> dict | None:
     }
 
 
+def _backfill_source_digest(brief: dict, sources: list[dict]) -> dict:
+    """Give legacy/model-degraded responses a traceable minimum fact ledger."""
+    if (brief.get("source_digest") or {}).get("facts") or not sources:
+        return brief
+    source_ids = [str(source["source_id"]) for source in sources]
+    facts: list[dict] = []
+    fact_id_by_quote: dict[str, str] = {}
+    recommended = int(brief.get("recommended_index") or 0)
+    for angle_index, angle in enumerate(brief.get("angles") or []):
+        angle_fact_ids: list[str] = []
+        for evidence in angle.get("evidence") or []:
+            quote = _text(evidence)
+            if not quote:
+                continue
+            fact_id = fact_id_by_quote.get(quote)
+            if not fact_id:
+                fact_id = f"F{len(facts) + 1}"
+                fact_id_by_quote[quote] = fact_id
+                matching_source = next(
+                    (
+                        str(source["source_id"]) for source in sources
+                        if quote in str(source.get("content") or "")
+                    ),
+                    source_ids[0],
+                )
+                facts.append({
+                    "fact_id": fact_id,
+                    "statement": quote,
+                    "quote": quote,
+                    "source_id": matching_source,
+                    "importance": (
+                        "must_keep" if angle_index == recommended else "supporting"
+                    ),
+                })
+            angle_fact_ids.append(fact_id)
+        angle["fact_ids"] = angle_fact_ids
+    brief["source_digest"] = {"facts": facts}
+    return normalize_brief(brief, allowed_source_ids=set(source_ids))
+
+
 def generate_brief(db, source_ids: list[str], *, force: bool = False,
                    generate_json: Callable = doubao_llm.complete_json) -> dict:
     unique_ids = sorted(dict.fromkeys(
@@ -207,8 +326,27 @@ def generate_brief(db, source_ids: list[str], *, force: bool = False,
         cached = _cached_brief(db, request_fingerprint)
         if cached:
             return cached
-    raw, usage = generate_json(_brief_prompt(sources), max_tokens=3000)
-    brief = normalize_brief(raw)
+    brief_prompt = _brief_prompt(sources)
+    try:
+        raw, usage = generate_json(brief_prompt, max_tokens=3000)
+    except json.JSONDecodeError:
+        raw, usage = generate_json(
+            brief_prompt + "\n\n请重新输出完整且闭合的 JSON，不要截断。",
+            max_tokens=6000,
+        )
+    first_angle_count = _angle_count(raw)
+    if first_angle_count != 3:
+        repaired_raw, repaired_usage = generate_json(
+            _repair_angle_prompt(sources, first_angle_count), max_tokens=3000
+        )
+        usage = _combined_usage(usage, repaired_usage)
+        raw = repaired_raw
+        if _angle_count(raw) == 0:
+            raise ValueError(
+                "模型连续两次未能生成可用创意角度；请补充来源内容后重试"
+            )
+    brief = normalize_brief(raw, allowed_source_ids=set(unique_ids))
+    brief = _backfill_source_digest(brief, sources)
     recommended_title = brief["angles"][brief["recommended_index"]]["title"]
     duplicate = find_similar_topic(db, recommended_title)
     identity = json.dumps({"sources": unique_ids, "brief": brief},
@@ -251,7 +389,8 @@ def generate_brief(db, source_ids: list[str], *, force: bool = False,
 
 def approve_brief(db, brief_id: str, *, topic_id: str, track: str = "",
                   target_audience: str = "", priority: int = 3,
-                  angle_index: int | None = None) -> str:
+                  angle_index: int | None = None,
+                  commit: bool = True) -> str:
     row = db.execute(
         "SELECT status, recommended_title, brief_json, approved_topic_id, "
         "approved_job_id, approved_angle_index "
@@ -271,23 +410,12 @@ def approve_brief(db, brief_id: str, *, topic_id: str, track: str = "",
         raise ValueError("angle_index must select one of the three angles")
     selected_title = brief["angles"][selected_index]["title"]
     job_id = f"J-{topic_id}"
-    if row["approved_job_id"]:
+    if row["status"] == "approved":
         if row["approved_topic_id"] != topic_id:
             raise ValueError("brief is already approved with another topic_id")
         if row["approved_angle_index"] != selected_index:
             raise ValueError("brief is already approved with another angle")
-        return str(row["approved_job_id"])
-    existing = db.execute(
-        "SELECT title FROM jobs WHERE job_id=?", (job_id,)
-    ).fetchone()
-    if existing and existing["title"] != selected_title:
-        raise ValueError(f"job {job_id} already exists with another title")
-    db.execute(
-        "INSERT OR IGNORE INTO jobs(job_id, topic_id, title, track, "
-        "target_audience, priority) VALUES(?,?,?,?,?,?)",
-        (job_id, topic_id, selected_title, track,
-         target_audience, int(priority)),
-    )
+        return str(row["approved_job_id"] or job_id)
     sources = db.execute(
         "SELECT source_id FROM topic_brief_sources WHERE brief_id=?",
         (brief_id,),
@@ -299,9 +427,10 @@ def approve_brief(db, brief_id: str, *, topic_id: str, track: str = "",
         )
     db.execute(
         "UPDATE topic_briefs SET status='approved', approved_topic_id=?, "
-        "approved_job_id=?, approved_angle_index=?, "
+        "approved_job_id=NULL, approved_angle_index=?, "
         "updated_at=CURRENT_TIMESTAMP WHERE brief_id=?",
-        (topic_id, job_id, selected_index, brief_id),
+        (topic_id, selected_index, brief_id),
     )
-    db.commit()
+    if commit:
+        db.commit()
     return job_id

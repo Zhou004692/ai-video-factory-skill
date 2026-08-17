@@ -16,8 +16,6 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 VIDEO_KEYS = (
     "ARK_API_KEY",
-    "VOLC_ASR_APPID",
-    "VOLC_ASR_TOKEN",
     "VOLC_AK",
     "VOLC_SK",
     "TOS_BUCKET",
@@ -50,7 +48,11 @@ def _required_fields(profile: str, config: dict[str, str]) -> tuple[str, ...]:
     if profile == "learning":
         return ()
     if profile == "video":
-        return VIDEO_KEYS
+        asr_ready = _configured(config.get("VOLC_ASR_API_KEY")) or all(
+            _configured(config.get(key))
+            for key in ("VOLC_ASR_APPID", "VOLC_ASR_TOKEN")
+        )
+        return VIDEO_KEYS if asr_ready else (*VIDEO_KEYS, "VOLC_ASR_API_KEY")
     provider = str(config.get("DEFAULT_LLM_PROVIDER") or "doubao").lower()
     return ("ANTHROPIC_API_KEY",) if provider == "claude" else ("ARK_API_KEY",)
 
