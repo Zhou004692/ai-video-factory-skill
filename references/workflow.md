@@ -31,7 +31,7 @@ PENDING → STORYBOARDED → SHOTS_OK → BGM_OK → COMPOSED → PUBLISHED
 1. 按叙事场景、人物连续性和音画需求生成最少必要母片；单次 Seedance 调用遵循 4—30 秒模型边界，整单不设置人为总时长上限。
 2. 成片时间线按内容拆解，每段分别用 `video_master_idx` 和 `audio_master_idx` 选择画面与音频来源。
 3. B-roll 段只替换画面，音频继续按时间顺序取自主体真人母片；对白母片必须从 0 秒开始连续消费到结尾，不允许漏词、重叠或重排。
-4. 字幕、hook、CTA 和 BGM 全部后期合成，不要求生成模型产出文字。
+4. 字幕、CTA 和 BGM 全部后期合成，不要求生成模型产出文字。hook 默认只用于营销封面；只有任务显式启用 `production_settings.hook_overlay_enabled` 时才叠加到正片。
 
 母片内部路由仍遵循以下规则：
 
