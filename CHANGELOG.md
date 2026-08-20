@@ -2,6 +2,25 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.0.2.0] - 2026-08-20
+
+### Added
+
+- Added bounded parallel generation for independent Seedance masters while preserving scene, character and continuity dependencies.
+- Added configurable reference-video attention budgets and task-first recovery evidence for paid provider calls.
+
+### Changed
+
+- Improved Seedance 2.5 prompts, duration planning, native speech timelines and continuity reference selection around longer cinematic masters.
+- Improved management-console recovery guidance for provider account failures and policy-rejected jobs.
+- Improved subtitle segmentation so captions follow semantic speech phrases instead of splitting words at fixed character counts.
+
+### Fixed
+
+- Disabled provider image watermarks and in-video hook overlays by default while retaining marketing-thumbnail hooks.
+- Fixed duplicate or misattributed paid submissions, unsafe provider-result downloads, unresolved-task recovery gaps and concurrent budget oversubscription.
+- Fixed stalled review/reconciliation states, incomplete failure classification and dependent masters continuing after an unresolved provider task.
+
 ## [3.0.1.0] - 2026-08-20
 
 ### Added
