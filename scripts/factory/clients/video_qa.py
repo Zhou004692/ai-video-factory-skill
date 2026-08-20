@@ -116,6 +116,8 @@ def evaluate(result: dict, *, expect_speech: bool,
         similarity = SequenceMatcher(None, expected, transcript).ratio()
         if similarity < min_transcript_similarity:
             reasons.append("transcript_mismatch")
+    if expect_speech and result.get("lip_sync") is False:
+        reasons.append("lip_sync_mismatch")
     if expected_visual:
         comparison = result.get("visual_comparison") or {}
         visual_alignment = float(

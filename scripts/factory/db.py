@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     publish_url     TEXT,
     cost_cents      INTEGER DEFAULT 0,
     error           TEXT,
+    failure_code    TEXT,
     retries         INTEGER DEFAULT 0,
     production_worker_pid INTEGER,
     production_started_at TIMESTAMP,
@@ -78,6 +79,16 @@ CREATE INDEX IF NOT EXISTS idx_events_job  ON events(job_id);
 CREATE INDEX IF NOT EXISTS idx_provider_calls_job
     ON provider_calls(job_id, shot_idx);
 
+CREATE TABLE IF NOT EXISTS provider_runtime (
+    provider       TEXT PRIMARY KEY,
+    status         TEXT NOT NULL DEFAULT 'available'
+                   CHECK(status IN ('available','action_required')),
+    reason_code    TEXT,
+    reason_message TEXT,
+    blocked_at     TIMESTAMP,
+    cleared_at     TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS character_asset_bindings (
     character_id   TEXT PRIMARY KEY,
     display_name   TEXT NOT NULL,
@@ -97,6 +108,26 @@ CREATE TABLE IF NOT EXISTS character_asset_bindings (
 
 CREATE INDEX IF NOT EXISTS idx_character_asset_id
     ON character_asset_bindings(asset_id);
+
+CREATE TABLE IF NOT EXISTS character_voice_bindings (
+    character_id   TEXT PRIMARY KEY,
+    display_name   TEXT NOT NULL,
+    provider       TEXT NOT NULL DEFAULT 'volcengine_tts',
+    resource_id    TEXT NOT NULL DEFAULT 'seed-tts-2.0',
+    voice_type     TEXT NOT NULL,
+    voice_name     TEXT NOT NULL DEFAULT '',
+    preview_url    TEXT NOT NULL DEFAULT '',
+    source         TEXT NOT NULL CHECK(source IN ('auto','manual')),
+    match_score    INTEGER NOT NULL DEFAULT 0,
+    match_reasons_json TEXT NOT NULL DEFAULT '[]',
+    profile_json   TEXT NOT NULL DEFAULT '{}',
+    status         TEXT NOT NULL DEFAULT 'Active',
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_character_voice_type
+    ON character_voice_bindings(voice_type);
 
 CREATE TABLE IF NOT EXISTS character_reference_images (
     image_id       TEXT PRIMARY KEY,
@@ -130,6 +161,8 @@ CREATE TABLE IF NOT EXISTS character_identity_anchors (
     approval_state TEXT NOT NULL DEFAULT 'PENDING_REVIEW',
     approved_at   TIMESTAMP,
     review_note   TEXT NOT NULL DEFAULT '',
+    generator     TEXT NOT NULL DEFAULT '',
+    model         TEXT NOT NULL DEFAULT '',
     error         TEXT,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -150,7 +183,11 @@ CREATE TABLE IF NOT EXISTS scene_visual_anchors (
     image_path      TEXT,
     image_url       TEXT,
     preview_path    TEXT,
+    video_path      TEXT,
+    video_url       TEXT,
     cost_cents      INTEGER NOT NULL DEFAULT 0,
+    generator       TEXT NOT NULL DEFAULT '',
+    model           TEXT NOT NULL DEFAULT '',
     approval_state  TEXT NOT NULL DEFAULT 'PENDING_REVIEW',
     approved_at     TIMESTAMP,
     review_note     TEXT NOT NULL DEFAULT '',
@@ -536,6 +573,7 @@ def conn() -> sqlite3.Connection:
     _add_cols_if_missing(db, "jobs", [
         ("characters_json", "TEXT"),     # [{id,name,gender,image_path,image_url}]
         ("batch_id", "TEXT"),
+        ("failure_code", "TEXT"),
         ("production_worker_pid", "INTEGER"),
         ("production_started_at", "TIMESTAMP"),
     ])
@@ -551,11 +589,17 @@ def conn() -> sqlite3.Connection:
         ("approval_state", "TEXT NOT NULL DEFAULT 'PENDING_REVIEW'"),
         ("approved_at", "TIMESTAMP"),
         ("review_note", "TEXT NOT NULL DEFAULT ''"),
+        ("generator", "TEXT NOT NULL DEFAULT ''"),
+        ("model", "TEXT NOT NULL DEFAULT ''"),
     ])
     _add_cols_if_missing(db, "scene_visual_anchors", [
         ("approval_state", "TEXT NOT NULL DEFAULT 'PENDING_REVIEW'"),
         ("approved_at", "TIMESTAMP"),
         ("review_note", "TEXT NOT NULL DEFAULT ''"),
+        ("video_path", "TEXT"),
+        ("video_url", "TEXT"),
+        ("generator", "TEXT NOT NULL DEFAULT ''"),
+        ("model", "TEXT NOT NULL DEFAULT ''"),
     ])
     db.execute(
         "UPDATE character_identity_anchors SET approval_state='APPROVED' "

@@ -1,0 +1,8 @@
+{
+  "status": 403,
+  "error": {
+    "code": "AccountOverdue",
+    "message": "Provider account balance is overdue"
+  },
+  "provider_task_state": "failed"
+}

@@ -2,6 +2,24 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.0.1.0] - 2026-08-20
+
+### Added
+
+- Added a local end-to-end management console for source intake, briefs, script review, video production, publication, configuration, todo handling and character assets.
+- Added fixed, virtual and custom character assets, continuity anchors, configurable Seedream/Seedance anchor generation, native or external voice routing, and single-master lip-sync repair.
+- Added durable provider task accounting, account circuit breaking, manual quality review, crash-safe reconciliation, bounded independent-master concurrency and a release fault matrix.
+
+### Changed
+
+- Improved Seedance 2.5 cinematic master generation with adaptive durations, continuous integer speech timelines, scene and character continuity constraints, and safer retry behavior.
+- Improved subtitle timing, ASR segmentation, local director composition, BGM handling, source reconstruction and editable brief/script workflows.
+- Hardened provider downloads, API mutation guards, cost ownership, recovery state transitions and local management-server safety.
+
+### Fixed
+
+- Fixed stuck queued or review jobs, duplicate paid submissions, cost drift, invalid state recovery, incomplete media playback, inconsistent character/scene anchors, subtitle truncation and lip-sync repair handoff.
+
 ## [3.0.0.0] - 2026-08-12
 
 ### Added

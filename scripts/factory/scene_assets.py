@@ -62,22 +62,31 @@ def apply_continuity_metadata(
     alias_to_identity: dict[str, str] = {}
     for character in runtime_characters:
         identity_key = character_assets.character_identity_key(character)
+        explicit_wardrobe = str(
+            character.get("wardrobe") or character.get("costume") or ""
+        ).strip()
+        mapped_fixed_asset = (
+            character.get("generation_mode") == "fixed_asset"
+            and bool(character.get("script_character_name"))
+        )
+        look = str(character.get("look") or "").strip()
+        placeholder_look = (
+            not look or "待在视频制作设置中绑定角色资产" in look
+        )
+        wardrobe_contract = explicit_wardrobe or (
+            "服装与职业装备服从本剧本场景；同一场景内保持一致"
+            if mapped_fixed_asset or placeholder_look else look
+        )
         group = identity_groups.setdefault(identity_key, {
             "identity_key": identity_key,
             "display_name": str(
                 character.get("name") or character.get("id") or identity_key
             ),
             "character_ids": [],
-            "wardrobe": str(
-                character.get("wardrobe") or character.get("costume")
-                or character.get("look") or ""
-            ).strip(),
+            "wardrobe": wardrobe_contract,
         })
-        if not group["wardrobe"]:
-            group["wardrobe"] = str(
-                character.get("wardrobe") or character.get("costume")
-                or character.get("look") or ""
-            ).strip()
+        if explicit_wardrobe or not group["wardrobe"]:
+            group["wardrobe"] = wardrobe_contract
         for alias in (
             character.get("id"), character.get("name"),
             character.get("script_character_name"),

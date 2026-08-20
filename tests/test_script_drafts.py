@@ -226,6 +226,39 @@ class ScriptDraftGenerationTests(unittest.TestCase):
 
         self.assertGreater(duration, 30)
 
+    def test_storyboard_expands_impossible_editorial_duration_before_paid_master(self):
+        variant = _variant(0, self.source_id)
+        long_line = (
+            "非洲客户一次租了一万台设备，这么大的租赁需求，"
+            "众能联合凭什么获得认可？这就是我们的交付实力。"
+        )
+        variant["beats"][0]["dialogue"] = long_line
+        variant["beats"][0]["duration_sec"] = 4.5
+        normalized = script_drafts._normalize_variant(
+            variant, allowed_source_ids={self.source_id}
+        )
+
+        storyboard = script_drafts._storyboard(normalized)
+
+        first_beat_duration = sum(
+            float(shot["duration"])
+            for shot in storyboard["shots"]
+            if shot["source_beat_index"] == 0
+        )
+        self.assertGreaterEqual(
+            first_beat_duration,
+            script_drafts.estimate_dialogue_duration(long_line),
+        )
+        self.assertTrue(storyboard["director_plan"]["speech_duration_adjusted"])
+        self.assertGreater(
+            storyboard["director_plan"]["production_duration_sec"],
+            storyboard["director_plan"]["requested_duration_sec"],
+        )
+        self.assertLessEqual(
+            max(float(master["duration"]) for master in storyboard["masters"]),
+            script_drafts.MAX_PROVIDER_MASTER_DURATION_SEC,
+        )
+
     def test_invalid_derived_durations_are_reestimated_from_dialogue(self):
         invalid_values = (None, "", 0, -3, float("nan"), float("inf"))
         for invalid in invalid_values:
@@ -291,7 +324,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
             script["target_duration_sec"], script["total_duration_sec"]
         )
 
-    def test_generate_repairs_one_malformed_model_response_once(self):
+    def test_generate_preserves_valid_siblings_without_repairing_whole_response(self):
         calls = []
         malformed = [_variant(i, self.source_id) for i in range(3)]
         malformed[0]["beats"][1].pop("speaker")
@@ -315,14 +348,13 @@ class ScriptDraftGenerationTests(unittest.TestCase):
             self.database, self.brief_id, generate_json=fake_generate
         )
 
-        self.assertEqual(len(calls), 2)
-        self.assertIn("契约修复", calls[1])
-        self.assertEqual(len(result["drafts"]), 3)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(result["drafts"]), 2)
         usage = self.database.execute(
             "SELECT input_tokens,output_tokens FROM script_drafts LIMIT 1"
         ).fetchone()
-        self.assertEqual(usage["input_tokens"], 40)
-        self.assertEqual(usage["output_tokens"], 60)
+        self.assertEqual(usage["input_tokens"], 10)
+        self.assertEqual(usage["output_tokens"], 20)
 
     def test_generate_retries_once_when_model_returns_invalid_json_syntax(self):
         calls = []
@@ -350,17 +382,44 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertEqual(len(result["drafts"]), 3)
 
     def test_generate_reports_chinese_error_after_two_invalid_json_responses(self):
+        calls = 0
+        initial_jobs = self.database.execute(
+            "SELECT COUNT(*) FROM jobs"
+        ).fetchone()[0]
+
         def invalid_json(prompt, max_tokens):
+            nonlocal calls
+            calls += 1
             raise json.JSONDecodeError(
                 "Expecting ',' delimiter", '{"variants": [}', 14
             )
 
         with self.assertRaisesRegex(
             ValueError, "AI 连续两次返回的剧本 JSON 格式无效"
-        ):
+        ) as raised:
             script_drafts.generate_drafts(
                 self.database, self.brief_id, generate_json=invalid_json
             )
+
+        self.assertEqual(calls, 2, "只允许首次生成加一次结构修复")
+        self.assertEqual(
+            self.database.execute(
+                "SELECT COUNT(*) FROM script_drafts WHERE brief_id=?",
+                (self.brief_id,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.database.execute("SELECT COUNT(*) FROM provider_calls").fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.database.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            initial_jobs,
+        )
+        message = str(raised.exception)
+        self.assertNotIn("Traceback", message)
+        self.assertNotRegex(message.casefold(), r"authorization|api[_-]?key|bearer\s+")
 
     def test_standard_generation_preserves_explicit_speaker_roles(self):
         variants = [_variant(i, self.source_id) for i in range(3)]
@@ -392,8 +451,10 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("多人剧情不得默认写成办公室站桩口播", prompt)
         self.assertIn("人物走位、动作或技能展示", prompt)
         self.assertIn("景别与运镜", prompt)
+        self.assertIn("不要按说话人或固定秒数更换 continuity_id", prompt)
+        self.assertIn('"broll_required": false', prompt)
         self.assertEqual(
-            script_drafts.PROMPT_VERSION, "complete-script-v7-video-reconstruction"
+            script_drafts.PROMPT_VERSION, "complete-script-v9-balanced-source-sampling"
         )
 
     def test_video_structure_is_passed_to_reconstruction_prompt(self):
@@ -584,14 +645,44 @@ class ScriptDraftGenerationTests(unittest.TestCase):
 
     def test_generation_preferences_reject_out_of_range_values(self):
         invalid_cases = (
-            ({"suggested_duration_sec": 14}, "建议总时长需在 15–72 秒之间"),
-            ({"suggested_shot_count": 9}, "建议分镜数需在 4–8 个之间"),
-            ({"suggested_character_count": 0}, "建议角色数需在 1–6 人之间"),
+            ({"suggested_duration_sec": 0}, "建议总时长必须是正整数"),
+            ({"suggested_shot_count": -1}, "建议分镜数必须是正整数"),
+            ({"suggested_character_count": 0}, "建议角色数必须是正整数"),
         )
         for preferences, message in invalid_cases:
             with self.subTest(preferences=preferences):
                 with self.assertRaisesRegex(ValueError, message):
                     script_drafts.normalize_generation_preferences(preferences)
+
+    def test_generation_preferences_accept_large_positive_creative_guidance(self):
+        self.assertEqual(
+            script_drafts.normalize_generation_preferences({
+                "suggested_duration_sec": 180,
+                "suggested_shot_count": 24,
+                "suggested_character_count": 12,
+            }),
+            {
+                "suggested_duration_sec": 180,
+                "suggested_shot_count": 24,
+                "suggested_character_count": 12,
+            },
+        )
+
+    def test_response_keeps_usable_variants_when_a_sibling_is_invalid(self):
+        invalid = _variant(1, self.source_id)
+        invalid["beats"][0].pop("speaker")
+
+        normalized = script_drafts.normalize_response(
+            {
+                "variants": [_variant(0, self.source_id), invalid],
+                "recommended_index": 1,
+                "recommendation_reason": "keep the usable result",
+            },
+            allowed_source_ids={self.source_id},
+        )
+
+        self.assertEqual(len(normalized["variants"]), 1)
+        self.assertEqual(normalized["recommended_index"], 0)
 
     def test_dialogue_duration_estimate_scales_and_uses_half_second_steps(self):
         short = script_drafts.estimate_dialogue_duration("你好")
@@ -616,8 +707,33 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("确实只有单一视角时无需硬凑多人", prompt)
         self.assertEqual(
             script_drafts.PROMPT_VERSION,
-            "complete-script-v7-video-reconstruction",
+            "complete-script-v9-balanced-source-sampling",
         )
+
+    def test_generation_prompt_samples_head_middle_and_tail_of_long_sources(self):
+        long_content = (
+            "HEAD-FACT\n"
+            + ("甲" * 70000)
+            + "\nMIDDLE-FACT\n"
+            + ("乙" * 70000)
+            + "\nTAIL-FACT"
+        )
+        self.database.execute(
+            "UPDATE script_sources SET content=? WHERE source_id=?",
+            (long_content, self.source_id),
+        )
+        self.database.commit()
+        context, sources = script_drafts._load_context(
+            self.database, self.brief_id
+        )
+
+        prompt = script_drafts._prompt(context, sources)
+
+        self.assertIn("HEAD-FACT", prompt)
+        self.assertIn("MIDDLE-FACT", prompt)
+        self.assertIn("TAIL-FACT", prompt)
+        self.assertIn("content omitted between sampled sections", prompt)
+        self.assertLess(len(prompt), 100000)
 
     def test_generation_prompt_assigns_story_conflict_to_story_characters(self):
         context, sources = script_drafts._load_context(
@@ -632,7 +748,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("不得由 presenter 转述或代说", prompt)
         self.assertEqual(
             script_drafts.PROMPT_VERSION,
-            "complete-script-v7-video-reconstruction",
+            "complete-script-v9-balanced-source-sampling",
         )
 
     def test_normalization_rejects_missing_speaker_instead_of_adding_presenter(self):
@@ -676,7 +792,8 @@ class ScriptDraftGenerationTests(unittest.TestCase):
 
     def test_unknown_source_reference_is_rejected_without_persistence(self):
         invalid = [_variant(i, self.source_id) for i in range(3)]
-        invalid[0]["beats"][2]["source_ids"] = ["SRC-NOT-ALLOWED"]
+        for variant in invalid:
+            variant["beats"][2]["source_ids"] = ["SRC-NOT-ALLOWED"]
 
         with self.assertRaisesRegex(ValueError, "unknown source_id"):
             script_drafts.generate_drafts(
@@ -820,7 +937,7 @@ class ScriptDraftApprovalTests(unittest.TestCase):
             for character in result["storyboard"]["characters"]
         ))
 
-    def test_approve_splits_only_provider_master_over_thirty_seconds(self):
+    def test_approve_balances_continuous_story_over_thirty_seconds(self):
         draft_id = self.draft_ids[0]
         row = self.database.execute(
             "SELECT script_json FROM script_drafts WHERE draft_id=?", (draft_id,)
@@ -844,7 +961,7 @@ class ScriptDraftApprovalTests(unittest.TestCase):
             if master["type"] == "dialogue"
         ]
         self.assertEqual(
-            [master["duration"] for master in dialogue_masters], [30, 6]
+            [master["duration"] for master in dialogue_masters], [18, 18]
         )
         self.assertEqual(
             "".join(master["voiceover"] for master in dialogue_masters),
@@ -854,9 +971,9 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         self.assertLessEqual(storyboard["masters"][2]["duration"], 12)
         self.assertEqual(
             [shot["audio_master_idx"] for shot in storyboard["shots"]],
-            [1, 1, 1, 1, 1, 2],
+            [1, 1, 1, 2, 2, 2],
         )
-        self.assertEqual(storyboard["shots"][-1]["audio_start"], 0)
+        self.assertEqual(storyboard["shots"][-1]["audio_start"], 12)
         self.assertEqual(result["status"], "approved")
         self.assertEqual(
             self.database.execute(
@@ -954,7 +1071,7 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         self.assertEqual(brief["approved_job_id"], self.job_id)
         self.assertTrue(job["storyboard"])
 
-    def test_approve_preserves_multiple_speakers_as_separate_masters(self):
+    def test_same_scene_multiple_speakers_share_one_native_master(self):
         draft_id = self.draft_ids[0]
         row = self.database.execute(
             "SELECT script_json FROM script_drafts WHERE draft_id=?", (draft_id,)
@@ -976,8 +1093,12 @@ class ScriptDraftApprovalTests(unittest.TestCase):
             master for master in storyboard["masters"]
             if master["type"] == "dialogue"
         ]
+        self.assertEqual(len(dialogue_masters), 1)
+        self.assertEqual(dialogue_masters[0]["speaker"], "sales")
+        self.assertEqual(dialogue_masters[0]["speakers"], ["sales", "boss"])
         self.assertEqual(
-            [master["speaker"] for master in dialogue_masters], ["sales", "boss"]
+            [beat["speaker"] for beat in dialogue_masters[0]["performance_beats"]],
+            speakers,
         )
         self.assertEqual(
             [master["type"] for master in storyboard["masters"]].count("broll"), 1
@@ -988,15 +1109,15 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         )
         self.assertEqual(
             [shot["audio_master_idx"] for shot in storyboard["shots"]],
-            [1, 2, 1, 2, 1, 2],
+            [1, 1, 1, 1, 1, 1],
         )
         self.assertEqual(
             [shot["audio_start"] for shot in storyboard["shots"]],
-            [0, 0, 4, 4, 8, 8],
+            [0, 4, 8, 12, 16, 20],
         )
         s1_storyboard._validate(storyboard)
 
-    def test_three_speaker_story_uses_three_cinematic_dialogue_masters(self):
+    def test_three_speaker_continuous_scene_uses_one_ensemble_master(self):
         draft_id = self.draft_ids[0]
         row = self.database.execute(
             "SELECT script_json FROM script_drafts WHERE draft_id=?", (draft_id,)
@@ -1016,14 +1137,19 @@ class ScriptDraftApprovalTests(unittest.TestCase):
             self.database, draft_id
         )["storyboard"]
 
-        self.assertEqual(len(storyboard["masters"]), 3)
-        self.assertTrue(all(
-            master["type"] == "dialogue"
-            and master["render_mode"] == "cinematic_character"
-            for master in storyboard["masters"]
-        ))
+        dialogue_masters = [
+            master for master in storyboard["masters"]
+            if master["type"] == "dialogue"
+        ]
+        self.assertEqual(len(dialogue_masters), 1)
         self.assertEqual(
-            storyboard["director_plan"]["strategy"], "cinematic_dialogue_only"
+            dialogue_masters[0]["speakers"], ["klein", "audrey", "alger"]
+        )
+        self.assertEqual(
+            dialogue_masters[0]["render_mode"], "cinematic_character"
+        )
+        self.assertEqual(
+            storyboard["director_plan"]["strategy"], "dialogue_plus_broll"
         )
         s1_storyboard._validate(storyboard)
 
@@ -1045,27 +1171,227 @@ class ScriptDraftApprovalTests(unittest.TestCase):
 
         storyboard = script_drafts._storyboard(script)
 
+        dialogue_masters = [
+            master for master in storyboard["masters"]
+            if master["type"] == "dialogue"
+        ]
         self.assertEqual(
-            [master["render_mode"] for master in storyboard["masters"]],
-            ["cinematic_character", "cinematic_character", "cinematic_character"],
+            [master["render_mode"] for master in dialogue_masters],
+            ["cinematic_character"],
+        )
+        self.assertEqual(
+            dialogue_masters[0]["speakers"], ["klein", "audrey", "alger"]
         )
         self.assertTrue(all(
             master["shot_type"] == "电影化连续情境表演"
-            for master in storyboard["masters"]
+            for master in dialogue_masters
         ))
         self.assertTrue(all(
             "办公室" not in master["scene"]
-            for master in storyboard["masters"]
+            for master in dialogue_masters
         ))
         self.assertEqual(
-            [item["visual_intent"] for item in storyboard["masters"][0]["performance_beats"]],
-            visuals[:3],
+            [item["visual_intent"] for item in dialogue_masters[0]["performance_beats"]],
+            visuals,
         )
         self.assertEqual(
-            sum(item["duration"] for item in storyboard["masters"][0]["performance_beats"]),
-            storyboard["masters"][0]["duration"],
+            sum(item["duration"] for item in dialogue_masters[0]["performance_beats"]),
+            dialogue_masters[0]["duration"],
         )
         s1_storyboard._validate(storyboard)
+
+    def test_dialogue_master_cast_includes_silent_people_declared_in_scene(self):
+        script = _variant(0, self.source_id)
+        script["beats"] = [script["beats"][0]]
+        script["beats"][0].update({
+            "speaker": "Malik",
+            "characters": ["林夏", "周工", "Malik"],
+            "continuity_id": "repair",
+            "scene": "白天，工厂高空作业区",
+            "visual_intent": "Malik检查安全绳，林夏与周工确认地面承载区域",
+            "broll_hint": "",
+            "broll_required": False,
+        })
+
+        master = script_drafts._storyboard(script)["masters"][0]
+
+        self.assertEqual(master["speakers"], ["Malik"])
+        self.assertEqual(master["cast"], ["林夏", "周工", "Malik"])
+
+    def test_explicit_scene_change_starts_a_new_master_under_thirty_seconds(self):
+        script = _variant(0, self.source_id)
+        for beat in script["beats"][:3]:
+            beat["scene"] = "warehouse"
+        for beat in script["beats"][3:]:
+            beat["scene"] = "customer-office"
+
+        storyboard = script_drafts._storyboard(script)
+        dialogue_masters = [
+            master for master in storyboard["masters"]
+            if master["type"] == "dialogue"
+        ]
+
+        self.assertEqual([master["duration"] for master in dialogue_masters], [12, 12])
+        self.assertEqual(
+            [master["continuity_key"] for master in dialogue_masters],
+            ["scene:warehouse", "scene:customer-office"],
+        )
+        s1_storyboard._validate(storyboard)
+
+    def test_same_continuity_id_cannot_merge_different_physical_scenes(self):
+        script = _variant(0, self.source_id)
+        script["beats"] = script["beats"][:2]
+        script["beats"][0].update({
+            "continuity_id": "incident-call",
+            "scene": "暴雨夜，工厂装卸区",
+            "visual_intent": "周工站在工厂雨棚下查看停机输送线",
+        })
+        script["beats"][1].update({
+            "continuity_id": "incident-call",
+            "scene": "办公室，林夏通过视频参与",
+            "visual_intent": "林夏坐在办公室查看现场视频",
+        })
+
+        storyboard = script_drafts._storyboard(script)
+        dialogue = [
+            master for master in storyboard["masters"]
+            if master["type"] == "dialogue"
+        ]
+
+        self.assertEqual(len(dialogue), 2)
+        self.assertNotEqual(
+            dialogue[0]["scene_anchor_key"],
+            dialogue[1]["scene_anchor_key"],
+        )
+
+    def test_broll_is_split_by_story_scene_and_carries_only_that_scene_cast(self):
+        script = _variant(0, self.source_id)
+        script["beats"] = script["beats"][:4]
+        for beat in script["beats"]:
+            beat["broll_required"] = False
+            beat["broll_hint"] = ""
+        script["beats"][1].update({
+            "speaker": "林夏",
+            "continuity_id": "dispatch",
+            "scene": "清晨，设备调度中心",
+            "characters": ["林夏", "Malik"],
+            "broll_required": True,
+            "broll_hint": "调度屏、设备轮廓与两人核对方案",
+        })
+        script["beats"][3].update({
+            "speaker": "Malik",
+            "continuity_id": "repair",
+            "scene": "白天，工厂高空作业区",
+            "characters": ["林夏", "周工", "Malik"],
+            "broll_required": True,
+            "broll_hint": "三人检查安全绳并操作曲臂平台",
+        })
+
+        storyboard = script_drafts._storyboard(script)
+        broll = [
+            master for master in storyboard["masters"]
+            if master["type"] == "broll"
+        ]
+
+        self.assertEqual(len(broll), 2)
+        self.assertEqual(
+            {tuple(master["cast"]) for master in broll},
+            {("林夏", "Malik"), ("林夏", "周工", "Malik")},
+        )
+        self.assertNotEqual(
+            broll[0]["scene_anchor_key"], broll[1]["scene_anchor_key"]
+        )
+        self.assertIn("不得生成未列角色", broll[0]["prompt"])
+        self.assertEqual(
+            storyboard["director_plan"]["broll_master_count"], 2
+        )
+
+    def test_three_scene_masters_do_not_suppress_evidence_broll(self):
+        script = _variant(0, self.source_id)
+        for beat, scene in zip(script["beats"], ["a", "a", "b", "b", "c", "c"]):
+            beat["scene"] = scene
+
+        storyboard = script_drafts._storyboard(script)
+
+        self.assertEqual(
+            [master["type"] for master in storyboard["masters"]],
+            ["dialogue", "dialogue", "dialogue", "broll"],
+        )
+        self.assertIn("evidence", storyboard["director_plan"]["broll_beats"])
+        s1_storyboard._validate(storyboard)
+
+    def test_large_indivisible_beats_use_the_minimum_feasible_master_count(self):
+        script = _variant(0, self.source_id)
+        script["beats"] = script["beats"][:3]
+        for beat in script["beats"]:
+            beat["duration_sec"] = 20
+            beat["broll_hint"] = ""
+
+        storyboard = script_drafts._storyboard(script)
+        dialogue_masters = [
+            master for master in storyboard["masters"]
+            if master["type"] == "dialogue"
+        ]
+
+        self.assertEqual([master["duration"] for master in dialogue_masters], [20, 20, 20])
+        self.assertEqual(
+            [shot["continuity_relation"] for shot in storyboard["shots"]],
+            ["opening", "same_scene_angle_change", "same_scene_angle_change"],
+        )
+        self.assertEqual(
+            [shot["transition_type"] for shot in storyboard["shots"]],
+            ["none", "match_cut", "match_cut"],
+        )
+        s1_storyboard._validate(storyboard)
+
+    def test_director_shots_describe_same_scene_and_scene_change_transitions(self):
+        script = _variant(0, self.source_id)
+        for beat, scene in zip(
+            script["beats"],
+            ["warehouse", "warehouse", "customer-office", "customer-office",
+             "customer-office", "customer-office"],
+        ):
+            beat["scene"] = scene
+            beat["broll_hint"] = ""
+
+        storyboard = script_drafts._storyboard(script)
+
+        self.assertEqual(
+            [shot["continuity_relation"] for shot in storyboard["shots"]],
+            [
+                "opening",
+                "same_master_continuation",
+                "scene_change",
+                "same_master_continuation",
+                "same_master_continuation",
+                "same_master_continuation",
+            ],
+        )
+        self.assertEqual(
+            [shot["transition_type"] for shot in storyboard["shots"]],
+            ["none", "cut", "dip_to_black", "cut", "cut", "cut"],
+        )
+        self.assertEqual(storyboard["shots"][2]["transition_duration_sec"], 0.12)
+        self.assertTrue(all(
+            "单一连续运动路径" in master["camera"]
+            for master in storyboard["masters"]
+            if master["type"] == "dialogue"
+        ))
+
+    def test_broll_picture_change_uses_continuous_audio_bridge(self):
+        storyboard = script_drafts._storyboard(_variant(0, self.source_id))
+        broll_shots = [
+            shot for shot in storyboard["shots"]
+            if shot["video_master_idx"] != shot["audio_master_idx"]
+        ]
+
+        self.assertTrue(broll_shots)
+        self.assertTrue(all(
+            shot["continuity_relation"] == "audio_bridge"
+            and shot["transition_type"] == "cut"
+            and shot["preserve_audio_continuity"] is True
+            for shot in broll_shots
+        ))
 
     def test_single_presenter_script_keeps_presenter_master(self):
         script = _variant(0, self.source_id)
@@ -1104,9 +1430,14 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         result = script_drafts.approve_draft(self.database, draft_id)
         storyboard = result["storyboard"]
 
+        dialogue_masters = [
+            master for master in storyboard["masters"]
+            if master["type"] == "dialogue"
+        ]
+        self.assertEqual(len(dialogue_masters), 1)
+        self.assertEqual(dialogue_masters[0]["speaker"], "klein")
         self.assertEqual(
-            [master["speaker"] for master in storyboard["masters"]],
-            ["klein", "audrey", "alger"],
+            dialogue_masters[0]["speakers"], ["klein", "audrey", "alger"]
         )
         self.assertEqual(
             [character["id"] for character in storyboard["characters"]],
@@ -1114,7 +1445,7 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         )
         self.assertEqual(
             [shot["audio_master_idx"] for shot in storyboard["shots"]],
-            [1, 1, 1, 2, 3, 1],
+            [1, 1, 1, 1, 1, 1],
         )
         s1_storyboard._validate(storyboard)
 
@@ -1258,10 +1589,18 @@ class ScriptDraftCliTests(ScriptDraftApprovalTests):
         self.assertNotEqual(produced.exit_code, 0, produced.output)
         self.assertIn("maximum is 30 seconds", produced.output)
         row = self.database.execute(
-            "SELECT state,error FROM jobs WHERE job_id=?", (self.job_id,)
+            "SELECT state,error,cost_cents FROM jobs WHERE job_id=?", (self.job_id,)
         ).fetchone()
         self.assertEqual(row["state"], "FAILED")
+        self.assertEqual(row["cost_cents"], 0)
         self.assertIn("maximum is 30 seconds", row["error"])
+        self.assertNotIn("Traceback", row["error"])
+        self.assertEqual(
+            self.database.execute(
+                "SELECT COUNT(*) FROM provider_calls WHERE job_id=?", (self.job_id,)
+            ).fetchone()[0],
+            0,
+        )
         process.assert_not_called()
 
     def test_dispatched_worker_accepts_an_atomically_claimed_running_job(self):

@@ -63,21 +63,12 @@ def _validate_storyboard(sb: dict) -> int:
         if field not in sb:
             raise SystemExit(f"storyboard 缺字段: {field}")
     units = _generation_units(sb)
-    minimum = (
-        1 if sb.get("production_mode") == "native_master_local_director"
-        else 2
-    )
-    if not (minimum <= len(units) <= 12):
+    minimum = 1
+    if len(units) < minimum:
         raise SystemExit(
-            f"生成单元数 {len(units)} 不在 {minimum}-12 范围"
+            f"生成单元数 {len(units)} 少于最低要求 {minimum}"
         )
     n_broll = sum(1 for shot in units if shot.get("type") == "broll")
-    if n_broll > 6:
-        raise SystemExit(
-            f"broll 镜头 {n_broll} 个,上限 6 个(30s 内 5s/broll × 6 = 全 broll 极限);"
-            f"如确实需要 broll 主导主题(如老司机验车特写蒙太奇),"
-            f"也别超过 6 个,否则没角色感观众记不住品牌"
-        )
     return n_broll
 
 

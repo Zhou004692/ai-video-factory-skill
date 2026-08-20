@@ -27,6 +27,8 @@ from pathlib import Path
 
 import httpx
 
+from . import provider_downloads
+
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_MODEL = os.getenv("SEEDREAM_45_MODEL_ID", "doubao-seedream-4-5-251128")
 
@@ -88,9 +90,8 @@ async def i2i(prompt: str,
             )
         body = r.json()
         url = body["data"][0]["url"]
-        img = await cli.get(url, timeout=60)
-        img.raise_for_status()
-        return img.content
+        img, _ = await provider_downloads.download_bytes(url, timeout=60)
+        return img
 
 
 async def t2i(prompt: str,
@@ -114,9 +115,8 @@ async def t2i(prompt: str,
                 f"model={DEFAULT_MODEL}"
             )
         url = r.json()["data"][0]["url"]
-        img = await cli.get(url, timeout=60)
-        img.raise_for_status()
-        return img.content
+        img, _ = await provider_downloads.download_bytes(url, timeout=60)
+        return img
 
 
 def estimate_cost_cents() -> int:

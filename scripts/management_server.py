@@ -167,6 +167,41 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             raise ValueError("请求必须是 JSON 对象")
         return payload
 
+    def _post_request_error(
+        self, *, binary_kind: str | None = None
+    ) -> tuple[int, str] | None:
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed_origin = urlparse(origin)
+            host = self.headers.get("Host", "")
+            parsed_host = urlparse(f"//{host}")
+            loopback = {"127.0.0.1", "localhost", "::1"}
+            if (
+                parsed_origin.scheme not in {"http", "https"}
+                or parsed_origin.hostname not in loopback
+                or parsed_host.hostname not in loopback
+                or parsed_origin.netloc.casefold() != host.casefold()
+            ):
+                return HTTPStatus.FORBIDDEN, "拒绝跨来源 POST 请求"
+        media_type = self.headers.get("Content-Type", "").split(";", 1)[0]
+        media_type = media_type.strip().lower()
+        if binary_kind == "media":
+            accepted = (
+                media_type == "application/octet-stream"
+                or re.fullmatch(r"(?:audio|video)/[^/\s]+", media_type)
+                is not None
+            )
+        elif binary_kind == "character_image":
+            accepted = (
+                media_type == "application/octet-stream"
+                or re.fullmatch(r"image/[^/\s]+", media_type) is not None
+            )
+        else:
+            accepted = media_type == "application/json"
+        if not accepted:
+            return HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "不支持的 Content-Type"
+        return None
+
     def _media_upload(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
@@ -354,6 +389,20 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return
             except ValueError as exc:
                 return self._json({"error": str(exc)}, 404)
+        if parsed.path.startswith("/api/videos/") and parsed.path.endswith("/cover"):
+            try:
+                job_id = parsed.path.split("/")[3]
+                path = self.service.video_cover_file(job_id)
+                body = path.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 404)
         if parsed.path.startswith("/api/videos/") and parsed.path.endswith("/file"):
             try:
                 job_id = parsed.path.split("/")[3]
@@ -398,6 +447,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "/api/videos": self.service.videos,
             "/api/publishing": self.service.publishing,
             "/api/config": self.service.config_status,
+            "/api/providers": self.service.provider_statuses,
             "/api/projects": self.service.content_projects,
             "/api/integrations/douyin": self.service.douyin_account_status,
             "/api/production/health": lambda: self.service.production_health(
@@ -406,6 +456,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 )
             ),
             "/api/source-feeds": self.service.source_feeds,
+            "/api/voices": self.service.voice_catalog,
         }
         if parsed.path == "/api/events":
             limit = parse_qs(parsed.query).get("limit", ["40"])[0]
@@ -435,14 +486,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def _do_POST(self) -> None:
         try:
             request_path = urlparse(self.path).path
+            character_upload = re.fullmatch(
+                r"/api/characters/([^/]+)/images", request_path
+            )
+            binary_kind = (
+                "media" if request_path == "/api/sources/media"
+                else "character_image" if character_upload
+                else None
+            )
+            rejection = self._post_request_error(binary_kind=binary_kind)
+            if rejection is not None:
+                status, message = rejection
+                return self._json({"error": message}, status)
             if request_path == "/api/sources/media":
                 return self._media_upload()
-            if (request_path.startswith("/api/characters/")
-                    and request_path.endswith("/images")):
-                return self._character_image_upload(request_path.split("/")[3])
+            if character_upload:
+                return self._character_image_upload(character_upload.group(1))
             payload = self._body()
             if request_path == "/api/integrations/douyin/oauth/start":
                 result = self.service.start_douyin_oauth()
+            elif request_path == "/api/providers/seedance/clear-block":
+                result = self.service.clear_seedance_provider_block()
             elif request_path == "/api/integrations/douyin/disconnect":
                 result = self.service.disconnect_douyin()
             elif (request_path.startswith("/api/videos/")
@@ -554,6 +618,22 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             elif self.path.endswith("/refresh") and self.path.startswith("/api/characters/"):
                 character_id = self.path.split("/")[3]
                 result = self.service.refresh_character(character_id)
+            elif (request_path.startswith("/api/characters/")
+                  and request_path.endswith("/voice/auto")):
+                character_id = request_path.split("/")[3]
+                result = self.service.auto_match_character_voice(character_id)
+            elif (request_path.startswith("/api/characters/")
+                  and request_path.endswith("/voice")):
+                character_id = request_path.split("/")[3]
+                result = self.service.set_character_voice(
+                    character_id,
+                    voice_type=str(payload.get("voice_type") or ""),
+                    voice_name=str(payload.get("voice_name") or ""),
+                    resource_id=str(
+                        payload.get("resource_id") or "seed-tts-2.0"
+                    ),
+                    preview_url=str(payload.get("preview_url") or ""),
+                )
             elif (request_path.startswith("/api/videos/")
                   and request_path.endswith("/anchors/approve")):
                 job_id = request_path.split("/")[3]
@@ -563,15 +643,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             elif self.path.endswith("/produce") and self.path.startswith("/api/videos/"):
                 job_id = self.path.split("/")[3]
                 result = self.service.start_video_job(
-                    job_id, confirmed=payload.get("confirmed") is True
+                    job_id,
+                    confirmed=payload.get("confirmed") is True,
+                    approved_budget_cents=payload.get("approved_budget_cents"),
                 )
             elif (request_path.endswith("/upgrade-director")
                   and request_path.startswith("/api/videos/")):
                 job_id = request_path.split("/")[3]
                 result = self.service.upgrade_director_plan(job_id)
+            elif (request_path.endswith("/rebuild-director")
+                  and request_path.startswith("/api/videos/")):
+                job_id = request_path.split("/")[3]
+                result = self.service.rebuild_failed_director_plan(job_id)
             elif self.path.endswith("/resume") and self.path.startswith("/api/videos/"):
                 job_id = self.path.split("/")[3]
                 result = self.service.resume_failed_video(job_id)
+            elif (request_path.startswith("/api/videos/")
+                  and request_path.endswith("/provider-task/reconcile")):
+                job_id = request_path.split("/")[3]
+                result = self.service.reconcile_provider_task(
+                    job_id, str(payload.get("task_id") or "")
+                )
             elif (request_path.startswith("/api/videos/")
                   and request_path.endswith("/regenerate")
                   and "/masters/" in request_path):
@@ -581,6 +673,19 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 result = self.service.prepare_master_regeneration(
                     job_id,
                     master_idx,
+                    reason=str(payload.get("reason") or ""),
+                )
+            elif (request_path.startswith("/api/videos/")
+                  and request_path.endswith("/lip-sync-repair")
+                  and "/masters/" in request_path):
+                parts = request_path.split("/")
+                job_id = parts[3]
+                master_idx = int(parts[5])
+                result = self.service.prepare_master_lip_sync_repair(
+                    job_id,
+                    master_idx,
+                    start_sec=float(payload.get("repair_start_sec")),
+                    end_sec=float(payload.get("repair_end_sec")),
                     reason=str(payload.get("reason") or ""),
                 )
             elif (request_path.startswith("/api/videos/")

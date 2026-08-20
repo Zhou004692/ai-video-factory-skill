@@ -32,7 +32,7 @@ with sync_playwright() as playwright:
     source_type = page.locator("#source-type")
     source_type.select_option("video")
     assert page.locator("#source-file").is_visible()
-    assert page.get_by_role("button", name="上传并转写").is_visible()
+    assert page.get_by_role("button", name="上传并解析").is_visible()
     page.locator("#modal-close").click()
 
     page.locator('.nav-item[data-page="videos"]').click()
@@ -44,9 +44,12 @@ with sync_playwright() as playwright:
     if setup_job.count():
         setup_job.click()
         page.locator("#drawer-produce").click()
-        page.wait_for_selector("#setting-orientation")
-        assert page.locator("#setting-orientation").is_visible()
-        assert page.locator("#setting-budget").is_visible()
+        page.wait_for_selector("#setting-orientation, #produce-confirm")
+        if page.locator("#setting-orientation").count():
+            assert page.locator("#setting-orientation").is_visible()
+            assert page.locator("#setting-budget").is_visible()
+        else:
+            assert page.locator("#produce-confirm").is_visible()
         page.locator("#modal-close").click()
     page.locator('#video-filters [data-state="COMPOSED"]').click()
     review_job = page.locator("[data-video-id]").first

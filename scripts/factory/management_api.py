@@ -19,16 +19,21 @@ from urllib.parse import urlparse
 import httpx
 
 from . import (
-    character_assets, media_sources, performance_feedback, production_metrics, production_planner,
-    scene_assets, script_drafts, script_sources, source_analysis, source_scheduler, topic_briefs,
+    anchor_generation, character_assets, character_voices, media_sources, performance_feedback, production_metrics, production_planner,
+    provider_health, provider_tasks, scene_assets, script_drafts, script_sources, source_analysis, source_scheduler, topic_briefs,
 )
-from .clients import douyin, volc_assets
-from .steps import s6_compose
+from .clients import douyin, music, seedance, volc_assets, volc_tts
+from .video_routing import AUDIO_MODE_FIXED_TTS, normalize_audio_mode
+from .review_candidates import (
+    controlled_candidate_path, controlled_job_asset_path,
+    finalize_accepted_candidates,
+)
+from .steps import s3_shots, s5_bgm, s6_compose
 
 
 CUSTOM_CHARACTER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 CUSTOM_CHARACTER_IMAGE_MAX_BYTES = 20 * 1024 * 1024
-CUSTOM_CHARACTER_IMAGE_MAX_COUNT = 12
+CUSTOM_CHARACTER_IMAGE_MAX_COUNT = 24
 WEIXIN_CHANNELS_ASSISTANT_URL = "https://channels.weixin.qq.com/login"
 
 
@@ -36,6 +41,7 @@ SECRET_KEYS = {
     "ANTHROPIC_API_KEY",
     "ARK_API_KEY",
     "VOLC_ASR_API_KEY",
+    "VOLC_TTS_API_KEY",
     "VOLC_ASR_TOKEN",
     "VOLC_AK",
     "VOLC_SK",
@@ -43,6 +49,27 @@ SECRET_KEYS = {
     "DOUYIN_CLIENT_SECRET",
     "DOUYIN_ACCESS_TOKEN",
 }
+
+
+def _files_have_same_content(left: Path, right: Path) -> bool:
+    if left.stat().st_size != right.stat().st_size:
+        return False
+    digests = []
+    for path in (left, right):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digests.append(digest.digest())
+    return digests[0] == digests[1]
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 EDITABLE_CONFIG = {
     "DEFAULT_LLM_PROVIDER",
@@ -57,7 +84,13 @@ EDITABLE_CONFIG = {
     "SEEDANCE_MAX_AUTO_RETRIES",
     "SEEDANCE_AUTO_RETRY_BUDGET_CENTS",
     "SEEDANCE_JOB_BUDGET_CENTS",
+    "CHARACTER_ANCHOR_GENERATOR",
+    "SCENE_ANCHOR_GENERATOR",
     "VOLC_ASR_API_KEY",
+    "VOLC_TTS_APPID",
+    "VOLC_TTS_API_KEY",
+    "VOLC_TTS_PRICE_CENTS_PER_10K_CHARS",
+    "DIALOGUE_AUDIO_MODE",
     "VOLC_AK",
     "VOLC_SK",
     "VOLC_ASSETS_ENDPOINT",
@@ -96,6 +129,24 @@ REQUIRED_CONFIG_GROUPS = (
                 "登录火山方舟控制台，进入“系统管理 → API Key 管理”",
                 "复制具备模型调用权限的 API Key",
                 "粘贴到本页并保存；剧本流水线即可使用",
+            ),
+        },
+    },
+    {
+        "id": "tts",
+        "priority": "P0",
+        "blocking": True,
+        "impact": "未配置时，对白角色无法使用固定声线，系统会在 Seedance 付费调用前停止",
+        "title": "角色固定声线",
+        "capability": "按角色设定匹配火山声线，并生成可复用的精确对白音轨",
+        "keys": ("VOLC_TTS_APPID", "VOLC_TTS_API_KEY"),
+        "guide": {
+            "url": "https://www.volcengine.com/docs/6561/2228192?lang=zh",
+            "label": "打开火山语音合成 2.0 接入指引",
+            "steps": (
+                "在豆包语音控制台开通语音合成 2.0（seed-tts-2.0）",
+                "复制 App ID 与 API Key，保存到本页",
+                "如需自动挑选声线，再配置同账号 VOLC_AK / VOLC_SK；手工绑定声线则不需要",
             ),
         },
     },
@@ -273,6 +324,17 @@ def _director_timeline(storyboard: dict) -> list[dict]:
             "speaker": str(audio_master.get("speaker") or ""),
             "visual_intent": str(edit.get("visual_intent") or ""),
             "broll_hint": str(edit.get("broll_hint") or ""),
+            "continuity_relation": str(
+                edit.get("continuity_relation") or ""
+            ),
+            "transition_type": str(edit.get("transition_type") or "none"),
+            "transition_duration_sec": float(
+                edit.get("transition_duration_sec") or 0
+            ),
+            "transition_reason": str(edit.get("transition_reason") or ""),
+            "preserve_audio_continuity": bool(
+                edit.get("preserve_audio_continuity")
+            ),
         })
     return timeline
 
@@ -317,12 +379,14 @@ class ManagementService:
         self.env_path = self.root / ".env"
         self._production_workers: dict[str, subprocess.Popen] = {}
         character_assets.ensure_schema(self.database)
+        character_voices.ensure_schema(self.database)
         source_scheduler.ensure_schema(self.database)
         job_columns = {
             row[1] for row in self.database.execute("PRAGMA table_info(jobs)")
         }
         for column, ddl in (
             ("characters_json", "TEXT"),
+            ("failure_code", "TEXT"),
             ("production_worker_pid", "INTEGER"),
             ("production_started_at", "TIMESTAMP"),
         ):
@@ -357,9 +421,628 @@ class ManagementService:
             "UNIQUE(entity_type,entity_id,revision))"
         )
         self.database.commit()
+        self._recover_review_operations()
         self._repair_dangling_job_links()
         self._reconcile_orphaned_production_workers()
         self._clear_stale_success_errors()
+
+    def _recover_review_operations(self) -> None:
+        """Recover durable review file operations left by a process exit."""
+        rows = self.database.execute(
+            "SELECT job_id,idx,state,video_qa FROM shots "
+            "WHERE state='REVIEW_DECIDING' OR video_qa LIKE '%review_operation%'"
+        ).fetchall()
+        changed = False
+        for row in rows:
+            try:
+                qa = json.loads(row["video_qa"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            operation = qa.get("review_operation")
+            if not isinstance(operation, dict):
+                continue
+            job_id = str(row["job_id"])
+            decision = str(operation.get("decision") or "")
+            phase = str(operation.get("phase") or "claimed")
+
+            def controlled(key: str, *, require_file: bool = False) -> Path | None:
+                return controlled_job_asset_path(
+                    self.root / "data" / "assets", job_id,
+                    operation.get(key), require_file=require_file,
+                )
+
+            rejected_interrupted = bool(
+                row["state"] == "FAILED"
+                and qa.get("human_decision") == "reject_job"
+                and phase != "committed"
+            )
+            if row["state"] == "REVIEW_DECIDING" or rejected_interrupted:
+                recovered_state = (
+                    "FAILED" if rejected_interrupted else "REVIEW_REQUIRED"
+                )
+                expected_state = str(row["state"])
+                cleanup_after_commit: list[Path] = []
+                try:
+                    if decision == "accept_candidate":
+                        active = controlled("active_path")
+                        active_audio = active.with_suffix(".wav") if active else None
+                        backup = controlled("prior_backup_path", require_file=True)
+                        backup_audio = controlled(
+                            "prior_audio_backup_path", require_file=True
+                        )
+                        if active and backup:
+                            shutil.copy2(backup, active)
+                        elif active and phase != "claimed":
+                            active.unlink(missing_ok=True)
+                        if active_audio and backup_audio:
+                            shutil.copy2(backup_audio, active_audio)
+                        elif active_audio and phase in {
+                            "audio_published", "committed",
+                        }:
+                            active_audio.unlink(missing_ok=True)
+                    elif decision == "regenerate_master":
+                        candidate_path = controlled("candidate_path")
+                        archive = controlled("archive_path", require_file=True)
+                        if candidate_path and archive:
+                            candidate_path.parent.mkdir(parents=True, exist_ok=True)
+                            archive.replace(candidate_path)
+                        candidate_audio = (
+                            candidate_path.with_suffix(".wav")
+                            if candidate_path else None
+                        )
+                        archive_audio = controlled(
+                            "archive_audio_path", require_file=True
+                        )
+                        if candidate_audio and archive_audio:
+                            archive_audio.replace(candidate_audio)
+                    for key in (
+                        "prepared_video_path", "prepared_audio_path",
+                        "prior_backup_path", "prior_audio_backup_path",
+                    ):
+                        path = controlled(key)
+                        if path:
+                            cleanup_after_commit.append(path)
+                except OSError:
+                    continue
+                qa.pop("review_operation", None)
+                try:
+                    restored = self.database.execute(
+                        "UPDATE shots SET state=?,video_qa=? "
+                        "WHERE job_id=? AND idx=? AND state=?",
+                        (
+                            recovered_state,
+                            json.dumps(qa, ensure_ascii=False),
+                            job_id, int(row["idx"]), expected_state,
+                        ),
+                    )
+                    if int(restored.rowcount or 0) != 1:
+                        self.database.rollback()
+                        continue
+                    # The restored DB state is the recovery linearization point.
+                    # Keep every backup until it is durable so a second restart
+                    # can safely repeat the file restoration.
+                    self.database.commit()
+                except Exception:
+                    self.database.rollback()
+                    raise
+                for path in cleanup_after_commit:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        # Recovery is already durable; stale backups are safe for
+                        # later GC and must not put the shot back into limbo.
+                        pass
+                continue
+            if phase != "committed":
+                continue
+            if decision == "regenerate_master":
+                cleanup_ok = True
+                for key in ("archive_path", "archive_audio_path"):
+                    path = controlled(key)
+                    if path:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            cleanup_ok = False
+                if cleanup_ok:
+                    self.database.execute(
+                        "UPDATE shots SET video_qa=NULL WHERE job_id=? AND idx=?",
+                        (job_id, int(row["idx"])),
+                    )
+                    changed = True
+            elif decision == "keep_prior":
+                cleanup_ok = True
+                candidate_path = controlled("candidate_path")
+                for path in (
+                    candidate_path,
+                    candidate_path.with_suffix(".wav") if candidate_path else None,
+                ):
+                    if path:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            cleanup_ok = False
+                if cleanup_ok:
+                    qa.pop("review_operation", None)
+                    self.database.execute(
+                        "UPDATE shots SET video_qa=? WHERE job_id=? AND idx=?",
+                        (
+                            json.dumps(qa, ensure_ascii=False),
+                            job_id, int(row["idx"]),
+                        ),
+                    )
+                    changed = True
+        if changed:
+            self.database.commit()
+
+    def _assert_no_unresolved_provider_tasks(self, job_id: str) -> None:
+        """Prevent a paid repost while a remote task still needs reconciliation."""
+        try:
+            provider_tasks.assert_no_unresolved(self.database, job_id)
+        except provider_tasks.ProviderTaskGateError as exc:
+            raise ValueError(str(exc)) from exc
+
+    def _music_provider(self) -> str:
+        return music.resolve_provider(_read_env(self.env_path))
+
+    def _resume_reconcile_publish(
+        self, job_id: str, task_id: str, usage: dict, *, initial_delta: int = 0
+    ) -> dict:
+        """Publish a reconciled asset journal without another provider request."""
+        staging = self._controlled_job_asset(
+            job_id, usage.get("publish_staging_path"),
+            label="远端核对暂存文件", require_file=True,
+        )
+        target = self._controlled_job_asset(
+            job_id, usage.get("publish_target_path"),
+            label="远端核对目标文件",
+        )
+        if not staging or not target:
+            raise ValueError("远端核对发布日志不完整，无法安全恢复")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        publish_copy = self._controlled_job_asset(
+            job_id,
+            target.parent / f".{target.name}.{secrets.token_hex(8)}.publish",
+            label="远端核对发布副本",
+        )
+        try:
+            shutil.copy2(staging, publish_copy)
+            with publish_copy.open("rb+") as stream:
+                os.fsync(stream.fileno())
+            publish_copy.replace(target)
+        except Exception:
+            publish_copy.unlink(missing_ok=True)
+            raise
+
+        completed_usage = dict(usage)
+        for key in (
+            "publish_staging_path", "publish_target_path",
+            "publish_resume_state", "publish_kind",
+        ):
+            completed_usage.pop(key, None)
+        completed_usage["status"] = "completed"
+        try:
+            self.database.execute("BEGIN IMMEDIATE")
+            call_updated = self.database.execute(
+                "UPDATE provider_calls SET usage_json=? "
+                "WHERE task_id=? AND job_id=?",
+                (
+                    json.dumps(completed_usage, ensure_ascii=False),
+                    str(task_id), job_id,
+                ),
+            )
+            if int(call_updated.rowcount or 0) != 1:
+                raise ValueError("远端核对任务已被并发处理")
+            unresolved = provider_tasks.unresolved_task_ids(
+                self.database, job_id
+            )
+            review_count = int(self.database.execute(
+                "SELECT COUNT(*) FROM shots WHERE job_id=? "
+                "AND state='REVIEW_REQUIRED'", (job_id,)
+            ).fetchone()[0])
+            non_ok_count = int(self.database.execute(
+                "SELECT COUNT(*) FROM shots WHERE job_id=? AND state!='OK'",
+                (job_id,),
+            ).fetchone()[0])
+            current_job = self.database.execute(
+                "SELECT bgm_path FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if unresolved:
+                resume_state = "PROVIDER_ACTION_REQUIRED"
+            elif review_count:
+                resume_state = "PRODUCTION_REVIEW_REQUIRED"
+            elif non_ok_count:
+                resume_state = "PRODUCTION_QUEUED"
+            elif current_job and current_job["bgm_path"] and (
+                self._controlled_job_asset(
+                    job_id, current_job["bgm_path"], label="核对后配乐",
+                    require_file=True,
+                )
+            ):
+                resume_state = "BGM_OK"
+            else:
+                resume_state = "SHOTS_OK"
+            job_updated = self.database.execute(
+                "UPDATE jobs SET state=?,error=NULL,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state='PROVIDER_ACTION_REQUIRED'",
+                (resume_state, job_id),
+            )
+            if int(job_updated.rowcount or 0) != 1:
+                raise ValueError("远端核对任务已被并发处理")
+            self.database.execute(
+                "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+                (
+                    job_id, "provider_task_reconcile", "info",
+                    f"远端任务 {task_id} 的暂存产物已恢复发布到 {resume_state}",
+                ),
+            )
+            self.database.commit()
+        except Exception:
+            self.database.rollback()
+            raise
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {
+            "job_id": job_id, "task_id": str(task_id),
+            "remote_status": "completed", "state": resume_state,
+            "cost_delta_cents": max(0, int(initial_delta or 0)),
+        }
+
+    def reconcile_provider_task(self, job_id: str, task_id: str) -> dict:
+        """Inspect one known task, persist final evidence, then CAS-resume safely."""
+        job = self.database.execute(
+            "SELECT state,bgm_path FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        call = self.database.execute(
+            "SELECT task_id,shot_idx,provider,intent,cost_cents,usage_json "
+            "FROM provider_calls WHERE job_id=? AND task_id=?",
+            (job_id, str(task_id)),
+        ).fetchone()
+        if call is None:
+            for candidate in self.database.execute(
+                "SELECT task_id,shot_idx,provider,intent,cost_cents,usage_json "
+                "FROM provider_calls WHERE job_id=? "
+                "AND task_id LIKE 'local-submit:%'",
+                (job_id,),
+            ).fetchall():
+                if provider_tasks.effective_task_id(
+                    candidate["task_id"], candidate["usage_json"]
+                ) == str(task_id):
+                    call = candidate
+                    break
+        if not job or not call:
+            raise ValueError("待核对的远端任务不存在")
+        terminal_reconciliation = (
+            job["state"] == "REJECTED_PENDING_RECONCILIATION"
+        )
+        if job["state"] not in {
+            "PROVIDER_ACTION_REQUIRED", "REJECTED_PENDING_RECONCILIATION",
+        }:
+            raise ValueError("当前任务不在模型任务待核对状态")
+        provider = str(call["provider"] or "").strip().casefold()
+        try:
+            existing_usage = json.loads(call["usage_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            existing_usage = {}
+        storage_task_id = str(call["task_id"])
+        remote_value = existing_usage.get("remote_task_id")
+        remote_task_id = (
+            remote_value.strip() if isinstance(remote_value, str) else ""
+        )
+        if storage_task_id.startswith("local-submit:"):
+            if not remote_task_id or remote_task_id == storage_task_id:
+                raise ValueError(
+                    "本地 Provider 预留记录缺少可核对的 remote_task_id；"
+                    "已保留证据，请人工核查 Provider 后处置，禁止重新提交"
+                )
+            provider_tasks.promote_reservation(
+                self.database,
+                storage_task_id,
+                task_id=remote_task_id,
+                job_id=job_id,
+                shot_idx=int(call["shot_idx"] or 0),
+                provider=str(call["provider"] or ""),
+                intent=str(call["intent"] or ""),
+            )
+            task_id = remote_task_id
+            call = self.database.execute(
+                "SELECT task_id,shot_idx,provider,intent,cost_cents,usage_json "
+                "FROM provider_calls WHERE job_id=? AND task_id=?",
+                (job_id, remote_task_id),
+            ).fetchone()
+            existing_usage = json.loads(call["usage_json"] or "{}")
+        if existing_usage.get("publish_staging_path"):
+            return self._resume_reconcile_publish(
+                job_id, str(task_id), existing_usage
+            )
+        if provider == "seedance":
+            inspected = asyncio.run(seedance.inspect_task(str(task_id)))
+        elif provider == "suno":
+            inspected = asyncio.run(
+                music.inspect_task(str(task_id), provider=provider)
+            )
+        else:
+            raise ValueError(f"provider {provider} 不支持远端任务核对")
+        status = str(inspected.get("status") or "unknown").strip().casefold()
+        if status not in {"completed", "failed"}:
+            provider_tasks.mark_action_required(
+                self.database, str(task_id),
+                message=f"remote status: {status}",
+            )
+            return {
+                "job_id": job_id, "task_id": str(task_id),
+                "remote_status": status,
+                "state": str(job["state"]),
+            }
+
+        if terminal_reconciliation:
+            try:
+                self.database.execute("BEGIN IMMEDIATE")
+                current = self.database.execute(
+                    "SELECT state FROM jobs WHERE job_id=?", (job_id,)
+                ).fetchone()
+                if (
+                    not current
+                    or current["state"] != "REJECTED_PENDING_RECONCILIATION"
+                ):
+                    raise ValueError("终止任务的成本核对已被并发处理")
+                delta = provider_tasks.upsert_final_call(
+                    self.database,
+                    task_id=str(task_id),
+                    job_id=job_id,
+                    shot_idx=int(call["shot_idx"] or 0),
+                    provider=provider,
+                    intent=str(call["intent"] or ""),
+                    status=status,
+                    usage=(inspected.get("usage")
+                           if isinstance(inspected.get("usage"), dict) else {}),
+                    cost_cents=max(0, int(inspected.get("cost_cents") or 0)),
+                )
+                unresolved = provider_tasks.unresolved_task_ids(
+                    self.database, job_id
+                )
+                next_state = (
+                    "REJECTED_PENDING_RECONCILIATION"
+                    if unresolved else "REJECTED"
+                )
+                updated = self.database.execute(
+                    "UPDATE jobs SET state=?,cost_cents=cost_cents+?,error=?,"
+                    "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE job_id=? AND state='REJECTED_PENDING_RECONCILIATION'",
+                    (
+                        next_state, delta,
+                        (
+                            "已人工终止，仍有远端成本待核对"
+                            if unresolved else "人工终止视频任务；成本已核对"
+                        ),
+                        job_id,
+                    ),
+                )
+                if int(updated.rowcount or 0) != 1:
+                    raise ValueError("终止任务的成本核对已被并发处理")
+                self.database.execute(
+                    "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+                    (
+                        job_id, "provider_task_reconcile", "info",
+                        f"已终止任务的远端成本 {task_id} 核对为 {status}",
+                    ),
+                )
+                self.database.commit()
+            except Exception:
+                self.database.rollback()
+                raise
+            return {
+                "job_id": job_id, "task_id": str(task_id),
+                "remote_status": status, "state": next_state,
+                "cost_delta_cents": delta,
+            }
+
+        shot_idx = int(call["shot_idx"] or 0)
+        candidate_path = None
+        bgm_path = None
+        staged_asset = None
+        if provider == "seedance" and status == "completed":
+            video = inspected.get("video")
+            if not isinstance(video, (bytes, bytearray)) or not video:
+                provider_tasks.mark_action_required(
+                    self.database, str(task_id),
+                    message="completed task missing downloadable video",
+                )
+                return {
+                    "job_id": job_id, "task_id": str(task_id),
+                    "remote_status": "unknown",
+                    "state": "PROVIDER_ACTION_REQUIRED",
+                }
+            candidate_path = (
+                self.root / "data" / "assets" / job_id / "shots" / "review"
+                / f"{shot_idx:02d}-reconciled-{str(task_id)[-12:]}.mp4"
+            ).resolve()
+            staging_dir = candidate_path.parent / "staging"
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            staged_asset = staging_dir / (
+                f".{candidate_path.name}.{secrets.token_hex(8)}.stage"
+            )
+            with staged_asset.open("xb") as stream:
+                stream.write(bytes(video))
+                stream.flush()
+                os.fsync(stream.fileno())
+        if provider == "suno" and status == "completed":
+            audio = inspected.get("audio")
+            if not isinstance(audio, (bytes, bytearray)) or not audio:
+                provider_tasks.mark_action_required(
+                    self.database, str(task_id),
+                    message="completed task missing downloadable audio",
+                )
+                return {
+                    "job_id": job_id, "task_id": str(task_id),
+                    "remote_status": "unknown",
+                    "state": "PROVIDER_ACTION_REQUIRED",
+                }
+            bgm_path = (
+                self.root / "data" / "assets" / job_id / "bgm.mp3"
+            ).resolve()
+            staging_dir = bgm_path.parent / "review" / "staging"
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            staged_asset = staging_dir / (
+                f".{bgm_path.name}.{secrets.token_hex(8)}.stage"
+            )
+            with staged_asset.open("xb") as stream:
+                stream.write(bytes(audio))
+                stream.flush()
+                os.fsync(stream.fileno())
+
+        try:
+            self.database.execute("BEGIN IMMEDIATE")
+            current = self.database.execute(
+                "SELECT state FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if not current or current["state"] != "PROVIDER_ACTION_REQUIRED":
+                raise ValueError("模型任务已被其他请求处理")
+            delta = provider_tasks.upsert_final_call(
+                self.database,
+                task_id=str(task_id),
+                job_id=job_id,
+                shot_idx=shot_idx,
+                provider=provider,
+                intent=str(call["intent"] or ""),
+                status=status,
+                usage=(inspected.get("usage")
+                       if isinstance(inspected.get("usage"), dict) else {}),
+                cost_cents=max(0, int(inspected.get("cost_cents") or 0)),
+            )
+            if provider == "seedance" and shot_idx:
+                shot = self.database.execute(
+                    "SELECT state FROM shots WHERE job_id=? AND idx=?",
+                    (job_id, shot_idx),
+                ).fetchone()
+                if shot and shot["state"] != "OK":
+                    if status == "completed":
+                        qa = json.dumps({
+                            "status": "manual_review_required",
+                            "reason": "远端任务已核对完成，候选需人工复核",
+                            "reasons": ["provider_task_reconciled"],
+                            "candidate_path": str(candidate_path),
+                            "candidate_url": inspected.get("video_url"),
+                            "provider_calls": [{
+                                "task_id": str(task_id),
+                                "usage": inspected.get("usage") or {},
+                                "cost_cents": max(0, int(
+                                    inspected.get("cost_cents") or 0
+                                )),
+                            }],
+                        }, ensure_ascii=False)
+                        self.database.execute(
+                            "UPDATE shots SET state='REVIEW_REQUIRED',video_qa=?,"
+                            "error=?,provider='seedance',cost_cents=cost_cents+? "
+                            "WHERE job_id=? AND idx=?",
+                            (
+                                qa, "远端任务已完成，等待人工复核", delta,
+                                job_id, shot_idx,
+                            ),
+                        )
+                    else:
+                        self.database.execute(
+                            "UPDATE shots SET state='PENDING',error=NULL "
+                            "WHERE job_id=? AND idx=?",
+                            (job_id, shot_idx),
+                        )
+            if bgm_path:
+                self.database.execute(
+                    "UPDATE jobs SET bgm_path=? WHERE job_id=?",
+                    (str(bgm_path), job_id),
+                )
+
+            review_count = int(self.database.execute(
+                "SELECT COUNT(*) FROM shots WHERE job_id=? "
+                "AND state='REVIEW_REQUIRED'", (job_id,)
+            ).fetchone()[0])
+            non_ok_count = int(self.database.execute(
+                "SELECT COUNT(*) FROM shots WHERE job_id=? AND state!='OK'",
+                (job_id,),
+            ).fetchone()[0])
+            unresolved = provider_tasks.unresolved_task_ids(self.database, job_id)
+            if unresolved:
+                next_state = "PROVIDER_ACTION_REQUIRED"
+            elif review_count:
+                next_state = "PRODUCTION_REVIEW_REQUIRED"
+            elif non_ok_count:
+                next_state = "PRODUCTION_QUEUED"
+            elif bgm_path or (
+                job["bgm_path"]
+                and self._controlled_job_asset(
+                    job_id, job["bgm_path"], label="历史配乐",
+                    require_file=True,
+                )
+            ):
+                next_state = "BGM_OK"
+            else:
+                next_state = "SHOTS_OK"
+            persisted_state = next_state
+            job_error = None
+            if staged_asset:
+                target = candidate_path or bgm_path
+                if target is None:
+                    raise RuntimeError("远端任务核对缺少受控落盘目标")
+                journal_usage = (
+                    dict(inspected.get("usage"))
+                    if isinstance(inspected.get("usage"), dict) else {}
+                )
+                journal_usage.update({
+                    "status": "action_required",
+                    "publish_staging_path": str(staged_asset),
+                    "publish_target_path": str(target),
+                    "publish_resume_state": next_state,
+                    "publish_kind": provider,
+                })
+                call_updated = self.database.execute(
+                    "UPDATE provider_calls SET usage_json=? "
+                    "WHERE task_id=? AND job_id=?",
+                    (
+                        json.dumps(journal_usage, ensure_ascii=False),
+                        str(task_id), job_id,
+                    ),
+                )
+                if int(call_updated.rowcount or 0) != 1:
+                    raise ValueError("模型任务已被其他请求处理")
+                persisted_state = "PROVIDER_ACTION_REQUIRED"
+                job_error = "远端任务已核对，等待原子发布暂存产物"
+            updated = self.database.execute(
+                "UPDATE jobs SET state=?,cost_cents=cost_cents+?,error=?,"
+                "updated_at=CURRENT_TIMESTAMP WHERE job_id=? "
+                "AND state='PROVIDER_ACTION_REQUIRED'",
+                (persisted_state, delta, job_error, job_id),
+            )
+            if int(updated.rowcount or 0) != 1:
+                raise ValueError("模型任务已被其他请求处理")
+            self.database.execute(
+                "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+                (
+                    job_id, "provider_task_reconcile", "info",
+                    f"远端任务 {task_id} 已核对为 {status}，恢复到 {next_state}",
+                ),
+            )
+            self.database.commit()
+        except Exception:
+            self.database.rollback()
+            if staged_asset:
+                staged_asset.unlink(missing_ok=True)
+            raise
+        if staged_asset:
+            journal = json.loads(self.database.execute(
+                "SELECT usage_json FROM provider_calls "
+                "WHERE task_id=? AND job_id=?",
+                (str(task_id), job_id),
+            ).fetchone()[0])
+            return self._resume_reconcile_publish(
+                job_id, str(task_id), journal, initial_delta=delta
+            )
+        return {
+            "job_id": job_id, "task_id": str(task_id),
+            "remote_status": status, "state": next_state,
+            "cost_delta_cents": delta,
+        }
 
     def _repair_dangling_job_links(self) -> list[str]:
         """Return approved drafts with a deleted production job to review."""
@@ -496,11 +1179,14 @@ class ManagementService:
             str(row["job_id"]): str(row["state"]) for row in jobs
         }
         manual_review_job_ids: set[str] = set()
+        manual_review_failure_job_ids: set[str] = set()
         for row in self.database.execute(
             "SELECT job_id,video_qa FROM shots WHERE video_qa IS NOT NULL"
         ).fetchall():
             job_id = str(row["job_id"])
-            if job_state_by_id.get(job_id) not in {"FAILED", "BLOCKED"}:
+            if job_state_by_id.get(job_id) not in {
+                "FAILED", "BLOCKED", "PRODUCTION_REVIEW_REQUIRED",
+            }:
                 continue
             try:
                 qa = json.loads(row["video_qa"] or "{}")
@@ -508,6 +1194,8 @@ class ManagementService:
                 continue
             if qa.get("status") == "manual_review_required":
                 manual_review_job_ids.add(job_id)
+                if job_state_by_id.get(job_id) in {"FAILED", "BLOCKED"}:
+                    manual_review_failure_job_ids.add(job_id)
         tracked_by_job = {
             str(row["job_id"]): int(row["tracked_cost_cents"] or 0)
             for row in self.database.execute(
@@ -565,7 +1253,9 @@ class ManagementService:
                     + states.get("PUBLISHED", 0)
                 ),
                 "review_required": len(manual_review_job_ids),
-                "failed": max(0, failures_total - len(manual_review_job_ids)),
+                "failed": max(
+                    0, failures_total - len(manual_review_failure_job_ids)
+                ),
                 "failures_total": failures_total,
                 "cost_cents": total_cost_cents,
                 "tracked_call_cost_cents": tracked_call_cost_cents,
@@ -661,7 +1351,8 @@ class ManagementService:
             titles = {
                 str(row["job_id"]): str(row["title"] or row["job_id"])
                 for row in self.database.execute(
-                    f"SELECT job_id,title FROM jobs WHERE job_id IN ({placeholders})",
+                    f"SELECT job_id,title FROM jobs WHERE job_id IN ({placeholders}) "
+                    "AND state IN ('FAILED','PRODUCTION_REVIEW_REQUIRED')",
                     manual_review_ids,
                 ).fetchall()
             }
@@ -695,12 +1386,23 @@ class ManagementService:
             "window_hours": int(item["window_hours"]),
             "due_at": str(item["due_at"]),
         } for item in performance_feedback.performance_due_tasks(self.database)]
+        provider_action_items = job_items(
+            "PROVIDER_ACTION_REQUIRED",
+            kind="provider_action",
+            stage="PROVIDER_ACTION_REQUIRED",
+        )
+        provider_action_items.extend(job_items(
+            "REJECTED_PENDING_RECONCILIATION",
+            kind="provider_action",
+            stage="REJECTED_PENDING_RECONCILIATION",
+        ))
         groups = [
             ("content_decision", "需内容决策", content_items),
             ("production_setup", "需制作设置", job_items(
                 "STORYBOARDED", kind="production_setup", stage="STORYBOARDED"
             )),
             ("manual_review", "需人工复核", manual_review_items),
+            ("provider_action", "需模型核对", provider_action_items),
             ("final_acceptance", "需成片验收", acceptance_items),
             ("publish", "需发布", job_items(
                 "READY_TO_PUBLISH", kind="publish", stage="READY_TO_PUBLISH"
@@ -1405,7 +2107,8 @@ class ManagementService:
     def videos(self) -> dict:
         jobs = _rows(self.database.execute(
             "SELECT j.job_id,j.title,j.state,j.cost_cents,j.final_path,j.error,"
-            "j.storyboard,j.created_at,j.updated_at FROM jobs j WHERE NOT ("
+            "j.failure_code,j.storyboard,j.created_at,j.updated_at "
+            "FROM jobs j WHERE NOT ("
             "j.state='PENDING' AND NOT EXISTS (SELECT 1 FROM script_drafts d "
             "WHERE d.approved_job_id=j.job_id AND d.status='approved') "
             "AND NOT EXISTS (SELECT 1 FROM shots s WHERE s.job_id=j.job_id)) "
@@ -1439,6 +2142,51 @@ class ManagementService:
             job["cost_reconciliation_status"] = (
                 "reconciled" if cost_delta == 0 else "partial"
             )
+            unresolved_ids = set(provider_tasks.unresolved_task_ids(
+                self.database, job["job_id"]
+            ))
+            job["unresolved_provider_tasks"] = []
+            if unresolved_ids:
+                for task in self.database.execute(
+                    "SELECT task_id,provider,intent,usage_json,cost_cents "
+                    "FROM provider_calls WHERE job_id=? ORDER BY created_at,task_id",
+                    (job["job_id"],),
+                ).fetchall():
+                    display_task_id = provider_tasks.effective_task_id(
+                        task["task_id"], task["usage_json"]
+                    )
+                    if display_task_id not in unresolved_ids:
+                        continue
+                    storage_task_id = str(task["task_id"])
+                    is_local = storage_task_id.startswith("local-submit:")
+                    try:
+                        task_usage = json.loads(task["usage_json"] or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        task_usage = {}
+                    remote_value = (
+                        task_usage.get("remote_task_id")
+                        if isinstance(task_usage, dict) else None
+                    )
+                    remote_task_id = (
+                        remote_value.strip()
+                        if isinstance(remote_value, str) else ""
+                    )
+                    reconcilable = not is_local or bool(
+                        remote_task_id and remote_task_id != storage_task_id
+                    )
+                    item = {
+                        "task_id": display_task_id,
+                        "provider": str(task["provider"]),
+                        "intent": str(task["intent"] or ""),
+                        "cost_cents": int(task["cost_cents"] or 0),
+                        "reconcilable": reconcilable,
+                    }
+                    if not reconcilable:
+                        item["action_message"] = (
+                            "缺少远端任务 ID，当前不可自动核对；"
+                            "请人工核查 Provider 后处置，禁止重新提交"
+                        )
+                    job["unresolved_provider_tasks"].append(item)
             planned_masters = list(
                 storyboard.get("masters") or storyboard.get("shots") or []
             )
@@ -1469,9 +2217,10 @@ class ManagementService:
             job["director_timeline"] = _director_timeline(storyboard)
             shots = _rows(self.database.execute(
                 "SELECT idx,duration_sec,state,provider,cost_cents,video_path,"
-                "video_qa,error "
+                "video_url,video_qa,error "
                 "FROM shots WHERE job_id=? ORDER BY idx", (job["job_id"],)
             ))
+            previous_master_preview_url = None
             for shot in shots:
                 try:
                     qa = json.loads(shot.pop("video_qa") or "{}")
@@ -1482,6 +2231,7 @@ class ManagementService:
                 )
                 shot["quality_reasons"] = list(qa.get("reasons") or [])
                 shot["quality_status"] = str(qa.get("status") or "")
+                shot["failure_code"] = str(qa.get("failure_code") or "")
                 shot["human_decision"] = str(
                     qa.get("human_decision") or ""
                 )
@@ -1497,6 +2247,7 @@ class ManagementService:
                     in {"accept_candidate", "keep_prior"}
                 )
                 shot["candidate_preview_url"] = None
+                shot["previous_master_preview_url"] = previous_master_preview_url
                 video_path = str(shot.get("video_path") or "").strip()
                 shot["has_prior_master"] = bool(
                     video_path and Path(video_path).is_file()
@@ -1510,6 +2261,10 @@ class ManagementService:
                         )
                     except ValueError:
                         pass
+                if shot.get("state") == "OK" and str(
+                    shot.get("video_url") or ""
+                ).strip():
+                    previous_master_preview_url = str(shot["video_url"]).strip()
             job["shots"] = shots
             if shots:
                 job["director_plan_upgradeable"] = False
@@ -1562,7 +2317,30 @@ class ManagementService:
                     job["state"] in {"COMPOSED", "FAILED", "BLOCKED"}
                     and shot.get("state") in {"OK", "FAILED"}
                 )
+                shot["lip_sync_repair_eligible"] = bool(
+                    job["state"] in {
+                        "COMPOSED", "FAILED", "BLOCKED",
+                        "PRODUCTION_REVIEW_REQUIRED",
+                    }
+                    and shot["master_type"] == "dialogue"
+                    and shot.get("state") in {
+                        "OK", "FAILED", "REVIEW_REQUIRED",
+                    }
+                    and shot.get("has_prior_master")
+                )
             job["completed_master_count"] = len(completed_indexes)
+            job["generating_master_count"] = sum(
+                1 for shot in shots if shot.get("state") == "GENERATING"
+            )
+            job["failed_master_count"] = sum(
+                1 for shot in shots if shot.get("state") == "FAILED"
+            )
+            job["review_required_master_count"] = sum(
+                1 for shot in shots if shot.get("manual_review_required")
+            )
+            job["waiting_master_count"] = sum(
+                1 for shot in shots if shot.get("state") == "PENDING"
+            )
             job["remaining_master_count"] = max(
                 0, (len(shots) or len(planned_masters)) - len(completed_indexes)
             )
@@ -1571,10 +2349,63 @@ class ManagementService:
                 and completed_indexes
                 and job["remaining_master_count"]
             )
-            job["resumable"] = bool(
-                job["state"] == "FAILED"
-                and job["remaining_master_count"]
+            failed_shots = [
+                shot for shot in shots if shot.get("state") == "FAILED"
+            ]
+            pending_shots = [
+                shot for shot in shots if shot.get("state") == "PENDING"
+            ]
+            account_shot_failure = bool(
+                failed_shots
+                and all(
+                    shot.get("failure_code") == "account_unavailable"
+                    for shot in failed_shots
+                )
+                and all(
+                    shot.get("state") in {"OK", "FAILED"} for shot in shots
+                )
             )
+            account_anchor_failure = bool(
+                job.get("failure_code") == "account_unavailable"
+                and pending_shots
+                and all(
+                    shot.get("state") in {"OK", "PENDING"} for shot in shots
+                )
+            )
+            structured_failure_codes = {
+                str(job.get("failure_code") or "").strip(),
+                *(
+                    str(shot.get("failure_code") or "").strip()
+                    for shot in failed_shots
+                ),
+            } - {""}
+            provider_recovery_ready = bool(
+                job["state"] in {"FAILED", "PROVIDER_ACTION_REQUIRED"}
+                and not job["unresolved_provider_tasks"]
+                and structured_failure_codes == {"account_unavailable"}
+                and (account_shot_failure or account_anchor_failure)
+                and provider_health.get_status(
+                    self.database, "seedance"
+                )["status"] == provider_health.AVAILABLE
+            )
+            legacy_failed_recovery = bool(
+                job["state"] == "FAILED" and not structured_failure_codes
+            )
+            job["resumable"] = bool(
+                (legacy_failed_recovery or provider_recovery_ready)
+                and (
+                    job["remaining_master_count"]
+                    or (shots and all(shot.get("state") == "OK" for shot in shots))
+                )
+            )
+            job["local_postproduction_resumable"] = bool(
+                job["state"] in {"FAILED", "BGM_OK"}
+                and shots
+                and all(shot.get("state") == "OK" for shot in shots)
+                and not job["unresolved_provider_tasks"]
+            )
+            if job["local_postproduction_resumable"]:
+                job["resumable"] = True
             job["master_count"] = len(shots) or len(planned_masters)
             duration_source = shots or planned_masters
             job["total_master_duration_sec"] = round(sum(
@@ -1587,15 +2418,18 @@ class ManagementService:
                     "SELECT identity_key,state,source_type,asset_uri,video_path,"
                     "video_url,anchor_mode,image_path,image_url,preview_path,"
                     "duration_sec,cost_cents,approval_state,approved_at,"
-                    "review_note,error "
+                    "review_note,generator,model,error "
                     "FROM character_identity_anchors WHERE job_id=?",
                     (job["job_id"],),
                 ).fetchall()
             }
             job["character_makeup_plan"] = []
-            for makeup in character_assets.character_makeup_plan(
-                job["characters"]
-            ):
+            planned_makeup = anchor_generation.apply_character_generator(
+                character_assets.character_makeup_plan(job["characters"]),
+                storyboard,
+                resolution=configured_resolution or "720p",
+            )
+            for makeup in planned_makeup:
                 persisted = makeup_rows.get(makeup["identity_key"])
                 if persisted:
                     makeup["source"] = str(
@@ -1621,6 +2455,13 @@ class ManagementService:
                         persisted.get("anchor_mode")
                         or makeup.get("anchor_mode")
                         or ""
+                    )
+                    makeup["generator"] = str(
+                        persisted.get("generator")
+                        or makeup.get("generator") or ""
+                    )
+                    makeup["model"] = str(
+                        persisted.get("model") or makeup.get("model") or ""
                     )
                     preview = str(persisted.get("preview_path") or "")
                     if preview and Path(preview).is_file():
@@ -1649,7 +2490,7 @@ class ManagementService:
                 for row in self.database.execute(
                     "SELECT anchor_key,description,master_indexes,state,"
                     "image_path,image_url,preview_path,cost_cents,approval_state,"
-                    "approved_at,review_note,error "
+                    "approved_at,review_note,generator,model,video_path,video_url,error "
                     "FROM scene_visual_anchors WHERE job_id=?",
                     (job["job_id"],),
                 ).fetchall()
@@ -1661,6 +2502,10 @@ class ManagementService:
             job["scene_anchor_plan"] = []
             for anchor_key in dict.fromkeys([*scene_specs, *scene_rows]):
                 planned = scene_specs.get(anchor_key, {})
+                planned = anchor_generation.decorate_scene_anchor(
+                    planned, storyboard,
+                    resolution=configured_resolution or "720p",
+                ) if planned else {}
                 persisted = scene_rows.get(anchor_key, {})
                 try:
                     master_indexes = json.loads(
@@ -1687,8 +2532,20 @@ class ManagementService:
                     "review_note": str(persisted.get("review_note") or ""),
                     "cost_cents": int(persisted.get("cost_cents") or 0),
                     "estimated_cost_cents": 29,
+                    "generator": str(
+                        persisted.get("generator")
+                        or planned.get("generator")
+                        or anchor_generation.selected_generator(storyboard, "scene")
+                    ),
+                    "model": str(
+                        persisted.get("model") or planned.get("model") or ""
+                    ),
                     "error": str(persisted.get("error") or ""),
                 }
+                entry["estimated_cost_cents"] = int(
+                    planned.get("estimated_cost_cents")
+                    or entry["cost_cents"] or 0
+                )
                 preview = Path(str(persisted.get("preview_path") or ""))
                 if preview.is_file():
                     entry["preview_url"] = (
@@ -1754,6 +2611,46 @@ class ManagementService:
             else:
                 job["display_state"] = job["state"]
                 job["display_state_label"] = None
+            pause_presentation = {
+                "PRODUCTION_REVIEW_REQUIRED": {
+                    "label": "母片待复核",
+                    "next_action": {
+                        "id": "review_master_candidates",
+                        "label": "预览并处理候选母片",
+                    },
+                },
+                "PROVIDER_ACTION_REQUIRED": {
+                    "label": "模型账号待处理",
+                    "next_action": {
+                        "id": (
+                            "resume_failed_video"
+                            if job["resumable"] else "view_provider_account_guide"
+                        ),
+                        "label": (
+                            "继续生成剩余母片"
+                            if job["resumable"] else "查看账号处理指引"
+                        ),
+                    },
+                },
+                "REJECTED_PENDING_RECONCILIATION": {
+                    "label": "已终止，待成本核对",
+                    "next_action": {
+                        "id": "reconcile_rejected_provider_cost",
+                        "label": "核对终止任务成本",
+                    },
+                },
+            }.get(job["state"])
+            if job["state"] == "BGM_OK" and job["local_postproduction_resumable"]:
+                job["display_state_label"] = "待完成本地合成"
+                job["next_action"] = {
+                    "id": "resume_local_postproduction",
+                    "label": "继续本地合成",
+                }
+            elif pause_presentation:
+                job["display_state_label"] = pause_presentation["label"]
+                job["next_action"] = pause_presentation["next_action"]
+            else:
+                job["next_action"] = None
         return {"jobs": jobs}
 
     def upgrade_director_plan(self, job_id: str) -> dict:
@@ -1826,18 +2723,229 @@ class ManagementService:
             "master_count": len(upgraded.get("masters") or []),
         }
 
-    def resume_failed_video(self, job_id: str) -> dict:
+    def rebuild_failed_director_plan(self, job_id: str) -> dict:
+        """Recompile a stopped job from its approved script before another paid call."""
         job = self.database.execute(
-            "SELECT state FROM jobs WHERE job_id=?", (job_id,)
+            "SELECT state,storyboard,characters_json FROM jobs WHERE job_id=?",
+            (job_id,),
         ).fetchone()
         if not job:
             raise ValueError("视频任务不存在")
-        if job["state"] != "FAILED":
-            raise ValueError("只有失败的视频任务可以继续生成")
+        if job["state"] not in {"FAILED", "BLOCKED"}:
+            raise ValueError("只有失败或已暂停的视频任务可以重建导演方案")
+        self._assert_no_unresolved_provider_tasks(job_id)
+        preserved_master = self.database.execute(
+            "SELECT idx,state,cost_cents,video_path FROM shots WHERE job_id=? "
+            "AND (state='OK' OR cost_cents>0 OR COALESCE(video_path,'')!='') "
+            "ORDER BY idx LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        if preserved_master:
+            raise ValueError(
+                "任务包含成功或已付费母片；为避免删除付费产物，重建已关闭。"
+                "如需追加生成，请显式确认新增成本并使用单条返修。"
+            )
+        draft = self.database.execute(
+            "SELECT draft_id,script_json FROM script_drafts "
+            "WHERE approved_job_id=? AND status='approved' "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        if not draft:
+            raise ValueError("未找到该任务对应的已审核剧本，无法安全重建")
+        try:
+            previous = json.loads(job["storyboard"] or "{}")
+            script = json.loads(draft["script_json"] or "{}")
+            runtime_characters = json.loads(job["characters_json"] or "[]")
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("任务剧本、分镜或角色数据损坏，无法安全重建") from exc
+
+        rebuilt = script_drafts._storyboard(script)
+        rebuilt["production_settings"] = previous.get("production_settings") or {}
+        old_characters = {
+            str(character.get("id")): character
+            for character in (runtime_characters or previous.get("characters") or [])
+            if character.get("id")
+        }
+        rebuilt["characters"] = [
+            {**character, **old_characters.get(str(character.get("id")), {})}
+            for character in rebuilt.get("characters") or []
+        ]
+        scene_assets.apply_continuity_metadata(
+            rebuilt, rebuilt.get("characters") or []
+        )
+        generation_units = rebuilt.get("masters") or rebuilt.get("shots") or []
+        invalidated = int(self.database.execute(
+            "SELECT COUNT(*) FROM shots WHERE job_id=?", (job_id,)
+        ).fetchone()[0] or 0)
+        self.database.execute("DELETE FROM shots WHERE job_id=?", (job_id,))
+        for unit in generation_units:
+            self.database.execute(
+                "INSERT INTO shots(job_id,idx,duration_sec,shot_type,camera,prompt,"
+                "voiceover,subtitle,state,narrative_type,speaker_id,anchor_character) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id, int(unit.get("idx") or 0),
+                    float(unit.get("duration") or unit.get("duration_sec") or 0),
+                    str(unit.get("shot_type") or ""),
+                    str(unit.get("camera") or ""),
+                    str(unit.get("scene") or unit.get("prompt") or ""),
+                    str(unit.get("voiceover") or ""),
+                    str(unit.get("subtitle") or unit.get("voiceover") or ""),
+                    "PENDING", str(unit.get("type") or "dialogue"),
+                    unit.get("speaker"), unit.get("anchor_character"),
+                ),
+            )
+        encoded = json.dumps(rebuilt, ensure_ascii=False)
+        encoded_characters = json.dumps(
+            rebuilt.get("characters") or [], ensure_ascii=False
+        )
+        self.database.execute(
+            "UPDATE jobs SET state='STORYBOARDED',storyboard=?,characters_json=?,"
+            "error=NULL,retries=0,final_path=NULL,updated_at=CURRENT_TIMESTAMP "
+            "WHERE job_id=? AND state IN ('FAILED','BLOCKED')",
+            (encoded, encoded_characters, job_id),
+        )
+        self.database.execute(
+            "UPDATE script_drafts SET storyboard_json=?,updated_at=CURRENT_TIMESTAMP "
+            "WHERE draft_id=?",
+            (encoded, draft["draft_id"]),
+        )
+        self.database.execute("DELETE FROM review_events WHERE job_id=?", (job_id,))
+        self.database.execute(
+            "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+            (
+                job_id, "director_plan_rebuild", "info",
+                "失败任务已按已审核剧本重建可执行导演计划；历史成本保留",
+            ),
+        )
+        self.database.commit()
+        return {
+            "job_id": job_id,
+            "state": "STORYBOARDED",
+            "invalidated_masters": invalidated,
+            "master_count": len(generation_units),
+            "director_plan": rebuilt.get("director_plan") or {},
+        }
+
+    def resume_failed_video(self, job_id: str) -> dict:
+        job = self.database.execute(
+            "SELECT state,bgm_path,failure_code FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if not job:
+            raise ValueError("视频任务不存在")
+        resume_from_state = str(job["state"])
+        if resume_from_state not in {
+            "FAILED", "PROVIDER_ACTION_REQUIRED", "BGM_OK",
+        }:
+            raise ValueError("只有失败或账号处理完成的视频任务可以继续生成")
         shots = self.database.execute(
             "SELECT idx,state,video_qa FROM shots WHERE job_id=? ORDER BY idx",
             (job_id,),
         ).fetchall()
+        if resume_from_state == "BGM_OK":
+            unresolved = provider_tasks.unresolved_task_ids(self.database, job_id)
+            if unresolved:
+                raise ValueError(
+                    "存在尚未核对的远端任务，请先核对 task_id："
+                    + ", ".join(unresolved[:5])
+                )
+            if not shots or any(row["state"] != "OK" for row in shots):
+                raise ValueError("只有全部母片已完成的任务可以继续本地合成")
+            bgm_value = str(job["bgm_path"] or "").strip()
+            bgm = Path(bgm_value).resolve() if bgm_value else None
+            music_provider = self._music_provider()
+            try:
+                if not (bgm and bgm.is_file()):
+                    asyncio.run(s5_bgm.run(job_id, provider=music_provider))
+                asyncio.run(s6_compose.run(job_id))
+                finalize_accepted_candidates(
+                    self.database, self.root / "data" / "assets", job_id
+                )
+            except Exception as exc:
+                self.database.execute(
+                    "UPDATE jobs SET error=?,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE job_id=? AND state='BGM_OK'",
+                    (f"local postproduction failed: {exc}", job_id),
+                )
+                self.database.commit()
+                raise RuntimeError(f"local postproduction failed: {exc}") from exc
+            updated = self.database.execute(
+                "UPDATE jobs SET state='COMPOSED',error=NULL,retries=0,"
+                "updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state='BGM_OK'",
+                (job_id,),
+            )
+            if int(updated.rowcount or 0) != 1:
+                self.database.rollback()
+                raise ValueError("视频任务状态已被并发修改")
+            self.database.execute(
+                "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+                (job_id, "local_postproduction_resume", "info", "本地成片合成已恢复完成"),
+            )
+            self.database.commit()
+            return {
+                "job_id": job_id,
+                "state": "COMPOSED",
+                "preserved_masters": len(shots),
+                "remaining_masters": 0,
+                "manual_review_masters": 0,
+                "local_postproduction": True,
+            }
+        failed_rows = [row for row in shots if row["state"] == "FAILED"]
+        pending_rows = [row for row in shots if row["state"] == "PENDING"]
+        shot_failure_codes: list[str] = []
+        for row in failed_rows:
+            try:
+                qa = json.loads(row["video_qa"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                qa = {}
+            code = str(qa.get("failure_code") or "").strip()
+            if code:
+                shot_failure_codes.append(code)
+        structured_failure_codes = {
+            str(job["failure_code"] or "").strip(), *shot_failure_codes,
+        } - {""}
+        if structured_failure_codes and structured_failure_codes != {
+            "account_unavailable"
+        }:
+            raise ValueError(
+                "该失败任务的稳定 failure code 不可恢复；"
+                "隐私、内容政策、版权及其他 Provider 拒绝禁止重新提交"
+            )
+        if resume_from_state == "PROVIDER_ACTION_REQUIRED" or (
+            structured_failure_codes
+        ):
+            unresolved = provider_tasks.unresolved_task_ids(self.database, job_id)
+            if unresolved:
+                raise ValueError(
+                    "存在尚未核对的远端任务，请先核对 task_id："
+                    + ", ".join(unresolved[:5])
+                )
+        if structured_failure_codes == {"account_unavailable"}:
+            provider_health.assert_available(self.database, "seedance")
+            account_shot_failure = bool(
+                failed_rows
+                and all(
+                    code == "account_unavailable" for code in shot_failure_codes
+                )
+                and len(shot_failure_codes) == len(failed_rows)
+                and all(row["state"] in {"OK", "FAILED"} for row in shots)
+            )
+            account_anchor_failure = bool(
+                str(job["failure_code"] or "") == "account_unavailable"
+                and pending_rows
+                and all(row["state"] in {"OK", "PENDING"} for row in shots)
+            )
+            if not (account_shot_failure or account_anchor_failure):
+                raise ValueError(
+                    "该 Provider 暂停任务的稳定 failure code 不可恢复；"
+                    "仅账号阻断解除后的 account_unavailable 任务可继续生成"
+                )
+        elif resume_from_state == "PROVIDER_ACTION_REQUIRED":
+            raise ValueError(
+                "该 Provider 暂停任务缺少可恢复的稳定 failure code"
+            )
         completed = sum(row["state"] == "OK" for row in shots)
         review_indexes: list[int] = []
         retry_indexes: list[int] = []
@@ -1848,10 +2956,10 @@ class ManagementService:
                 qa = json.loads(row["video_qa"] or "{}")
             except (json.JSONDecodeError, TypeError):
                 qa = {}
-            has_review_artifact = bool(
-                str(qa.get("candidate_path") or "").strip()
-                or str(qa.get("candidate_url") or "").strip()
-            )
+            has_review_artifact = bool(controlled_candidate_path(
+                self.root / "data" / "assets", job_id,
+                qa.get("candidate_path"),
+            ))
             if (
                 qa.get("status") == "manual_review_required"
                 and has_review_artifact
@@ -1860,10 +2968,113 @@ class ManagementService:
             else:
                 retry_indexes.append(int(row["idx"]))
         remaining = len(retry_indexes)
-        if not remaining:
+        unresolved = provider_tasks.unresolved_task_ids(self.database, job_id)
+        if unresolved:
             if review_indexes:
-                raise ValueError("该任务有母片等待人工复核，请先预览候选并处理")
-            raise ValueError("该任务没有需要继续生成的母片")
+                placeholders = ",".join("?" for _ in review_indexes)
+                self.database.execute(
+                    f"UPDATE shots SET state='REVIEW_REQUIRED' "
+                    f"WHERE job_id=? AND idx IN ({placeholders})",
+                    (job_id, *review_indexes),
+                )
+            message = (
+                "存在尚未核对的远端任务，已保留本地候选决定；"
+                "请先核对 task_id：" + ", ".join(unresolved[:5])
+            )
+            updated = self.database.execute(
+                "UPDATE jobs SET state='PROVIDER_ACTION_REQUIRED',error=?,"
+                "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state='FAILED'",
+                (message, job_id),
+            )
+            if int(updated.rowcount or 0) != 1:
+                self.database.rollback()
+                raise ValueError("视频任务状态已被并发修改")
+            self.database.commit()
+            return {
+                "job_id": job_id,
+                "state": "PROVIDER_ACTION_REQUIRED",
+                "preserved_masters": completed,
+                "remaining_masters": remaining,
+                "manual_review_masters": len(review_indexes),
+                "unresolved_provider_tasks": unresolved,
+            }
+        if review_indexes:
+            placeholders = ",".join("?" for _ in review_indexes)
+            self.database.execute(
+                f"UPDATE shots SET state='REVIEW_REQUIRED' "
+                f"WHERE job_id=? AND idx IN ({placeholders})",
+                (job_id, *review_indexes),
+            )
+            self.database.execute(
+                "UPDATE jobs SET state='PRODUCTION_REVIEW_REQUIRED',error=?,"
+                "failure_code=NULL,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state=?",
+                (
+                    f"仍有 {len(review_indexes)} 条母片待人工复核",
+                    job_id, resume_from_state,
+                ),
+            )
+            self.database.commit()
+            return {
+                "job_id": job_id,
+                "state": "PRODUCTION_REVIEW_REQUIRED",
+                "preserved_masters": completed,
+                "remaining_masters": remaining,
+                "manual_review_masters": len(review_indexes),
+            }
+        if not remaining:
+            bgm_value = str(job["bgm_path"] or "").strip()
+            bgm = Path(bgm_value).resolve() if bgm_value else None
+            music_provider = self._music_provider()
+            if (
+                not (bgm and bgm.is_file())
+                and music.may_submit_paid_work(music_provider)
+            ):
+                self._assert_no_unresolved_provider_tasks(job_id)
+            self.database.execute(
+                "UPDATE jobs SET state='SHOTS_OK',error=NULL,"
+                "failure_code=NULL,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state=?",
+                (job_id, resume_from_state),
+            )
+            self.database.commit()
+            try:
+                if not (bgm and bgm.is_file()):
+                    asyncio.run(s5_bgm.run(job_id, provider=music_provider))
+                self.database.execute(
+                    "UPDATE jobs SET state='BGM_OK',error=NULL,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
+                    (job_id,),
+                )
+                self.database.commit()
+                asyncio.run(s6_compose.run(job_id))
+                finalize_accepted_candidates(
+                    self.database, self.root / "data" / "assets", job_id
+                )
+            except Exception as exc:
+                self.database.execute(
+                    "UPDATE jobs SET state='FAILED',error=?,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
+                    (f"local postproduction failed: {exc}", job_id),
+                )
+                self.database.commit()
+                raise RuntimeError(f"local postproduction failed: {exc}") from exc
+            self.database.execute(
+                "UPDATE jobs SET state='COMPOSED',error=NULL,retries=0,"
+                "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
+                (job_id,),
+            )
+            self.database.commit()
+            return {
+                "job_id": job_id,
+                "state": "COMPOSED",
+                "preserved_masters": completed,
+                "remaining_masters": 0,
+                "manual_review_masters": 0,
+                "local_postproduction": True,
+            }
+        self._assert_no_unresolved_provider_tasks(job_id)
         placeholders = ",".join("?" for _ in retry_indexes)
         self.database.execute(
             f"UPDATE shots SET state='PENDING',error=NULL,video_qa=NULL "
@@ -1872,8 +3083,9 @@ class ManagementService:
         )
         self.database.execute(
             "UPDATE jobs SET state='STORYBOARDED',retries=0,error=NULL,"
-            "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND state='FAILED'",
-            (job_id,),
+            "failure_code=NULL,updated_at=CURRENT_TIMESTAMP "
+            "WHERE job_id=? AND state=?",
+            (job_id, resume_from_state),
         )
         self.database.commit()
         return {
@@ -1895,6 +3107,7 @@ class ManagementService:
             raise ValueError("视频任务不存在")
         if job["state"] not in {"COMPOSED", "FAILED", "BLOCKED"}:
             raise ValueError("只有已完成或已停止的视频任务可以返修单个母片")
+        self._assert_no_unresolved_provider_tasks(job_id)
         target = self.database.execute(
             "SELECT idx,state FROM shots WHERE job_id=? AND idx=?",
             (job_id, int(master_idx)),
@@ -1923,6 +3136,19 @@ class ManagementService:
         ), None)
         if master_plan is None:
             raise ValueError("导演计划中不存在该母片")
+        for edit in storyboard.get("shots") or []:
+            audio_idx = int(edit.get(
+                "audio_master_idx", edit.get("video_master_idx", -1)
+            ))
+            if audio_idx != int(master_idx):
+                continue
+            old_cues = edit.get("subtitle_cues") or []
+            if not edit.get("subtitle") and old_cues:
+                edit["subtitle"] = "".join(
+                    str(cue.get("text") or "") for cue in old_cues
+                ).strip()
+            edit["subtitle_cues"] = []
+            edit.pop("speech_timeline_version", None)
         repair_instruction = (
             f"本次返修必须解决：{reason_text}。"
             "严格按返修意见改变场景、动作或表演，不得复刻上一版的问题。"
@@ -1961,10 +3187,15 @@ class ManagementService:
                 )
         encoded_storyboard = json.dumps(storyboard, ensure_ascii=False)
         self.database.execute(
-            "UPDATE shots SET state='PENDING',prompt=?,provider=NULL,"
+            "UPDATE shots SET state='PENDING',prompt=?,duration_sec=?,provider=NULL,"
             "video_model=NULL,native_audio=0,video_qa=NULL,error=NULL "
             "WHERE job_id=? AND idx=?",
-            (master_prompt, job_id, int(master_idx)),
+            (
+                master_prompt,
+                float(master_plan.get("duration") or 0),
+                job_id,
+                int(master_idx),
+            ),
         )
         self.database.execute(
             "UPDATE jobs SET state='STORYBOARDED',storyboard=?,error=NULL,"
@@ -1996,6 +3227,116 @@ class ManagementService:
             "remaining_masters": 1,
         }
 
+    def prepare_master_lip_sync_repair(
+        self, job_id: str, master_idx: int, *, start_sec: float,
+        end_sec: float, reason: str = "",
+    ) -> dict:
+        """Queue a Seedance edit that changes only one master's mouth motion."""
+        job = self.database.execute(
+            "SELECT state,storyboard FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if not job:
+            raise ValueError("视频任务不存在")
+        if job["state"] not in {
+            "COMPOSED", "FAILED", "BLOCKED", "PRODUCTION_REVIEW_REQUIRED",
+        }:
+            raise ValueError("只有已生成或待人工复核的视频任务可以修复口型")
+        self._assert_no_unresolved_provider_tasks(job_id)
+        target = self.database.execute(
+            "SELECT idx,state,duration_sec,video_path,video_qa FROM shots "
+            "WHERE job_id=? AND idx=?",
+            (job_id, int(master_idx)),
+        ).fetchone()
+        if not target:
+            raise ValueError("需要修复的母片不存在")
+        if target["state"] not in {"OK", "FAILED", "REVIEW_REQUIRED"}:
+            raise ValueError("该母片尚未形成可修复的视频")
+        other_incomplete = self.database.execute(
+            "SELECT COUNT(*) FROM shots WHERE job_id=? AND idx!=? AND state!='OK'",
+            (job_id, int(master_idx)),
+        ).fetchone()[0]
+        if other_incomplete:
+            raise ValueError("任务还有其他未完成母片，请先完成或复核后再修复口型")
+
+        try:
+            storyboard = json.loads(job["storyboard"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("视频任务的导演计划无法读取") from exc
+        masters = storyboard.get("masters") or storyboard.get("shots") or []
+        master = next((
+            item for item in masters
+            if int(item.get("idx") or 0) == int(master_idx)
+        ), None)
+        if master is None:
+            raise ValueError("导演计划中不存在该母片")
+        if str(master.get("type") or "dialogue") != "dialogue":
+            raise ValueError("只有包含人物对白的母片可以执行口型局部修复")
+
+        source = controlled_job_asset_path(
+            self.root / "data" / "assets", job_id, target["video_path"],
+            require_file=True,
+        )
+        if source is None:
+            try:
+                qa = json.loads(target["video_qa"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                qa = {}
+            source = controlled_candidate_path(
+                self.root / "data" / "assets", job_id,
+                qa.get("candidate_path"),
+            )
+        if source is None:
+            raise ValueError("原始母片文件不存在，不能执行保留式口型修复")
+
+        duration = max(0.1, float(
+            master.get("duration") or target["duration_sec"] or 0
+        ))
+        start = max(0.0, float(start_sec))
+        end = min(duration, float(end_sec))
+        if end <= start:
+            raise ValueError("口型修复结束时间必须晚于开始时间且位于母片时长内")
+        reason_text = str(reason or "").strip() or "口型与原生语音不同步"
+        master.update({
+            "repair_mode": "seedance_lip_sync_edit",
+            "repair_source_path": str(source),
+            "repair_start_sec": start,
+            "repair_end_sec": end,
+            "repair_direction": reason_text,
+        })
+        repair_prompt = s3_shots._build_lip_sync_edit_prompt({
+            **master,
+            "duration_sec": duration,
+        })
+        self.database.execute(
+            "UPDATE shots SET state='PENDING',prompt=?,provider=NULL,"
+            "video_model=NULL,native_audio=0,error=NULL "
+            "WHERE job_id=? AND idx=?",
+            (repair_prompt, job_id, int(master_idx)),
+        )
+        self.database.execute(
+            "UPDATE jobs SET state='STORYBOARDED',storyboard=?,error=NULL,"
+            "retries=0,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
+            (json.dumps(storyboard, ensure_ascii=False), job_id),
+        )
+        self.database.execute("DELETE FROM review_events WHERE job_id=?", (job_id,))
+        self.database.execute(
+            "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+            (
+                job_id, "master_lip_sync_repair", "info",
+                f"母片 #{int(master_idx)} 已进入 Seedance 2.5 "
+                f"{start:g}-{end:g} 秒口型局部修复",
+            ),
+        )
+        self.database.commit()
+        return {
+            "job_id": job_id,
+            "state": "STORYBOARDED",
+            "repair_kind": "seedance_lip_sync_edit",
+            "repair_master_idx": int(master_idx),
+            "repair_start_sec": start,
+            "repair_end_sec": end,
+        }
+
     def configure_video(self, job_id: str, settings: dict) -> dict:
         row = self.database.execute(
             "SELECT state,storyboard FROM jobs WHERE job_id=?", (job_id,),
@@ -2008,10 +3349,26 @@ class ManagementService:
             storyboard = json.loads(row["storyboard"] or "{}")
         except json.JSONDecodeError:
             storyboard = {}
+        speaker_candidates: list[str] = [
+            str(item.get("id") or "").strip()
+            for item in (storyboard.get("characters") or [])
+            if str(item.get("id") or "").strip()
+        ]
+        for master in storyboard.get("masters") or []:
+            if master.get("type") != "dialogue":
+                continue
+            speaker_candidates.append(str(master.get("speaker") or "").strip())
+            speaker_candidates.extend(
+                str(speaker or "").strip()
+                for speaker in (master.get("speakers") or [])
+            )
+            speaker_candidates.extend(
+                str(beat.get("speaker") or "").strip()
+                for beat in (master.get("performance_beats") or [])
+                if isinstance(beat, dict)
+            )
         speakers = list(dict.fromkeys(
-            str(master.get("speaker") or "").strip()
-            for master in (storyboard.get("masters") or [])
-            if master.get("type") == "dialogue" and str(master.get("speaker") or "").strip()
+            speaker for speaker in speaker_candidates if speaker
         ))
         if not speakers:
             speakers = [
@@ -2045,12 +3402,25 @@ class ManagementService:
             mapped_character_id = character_mappings[speaker]
             script_character = script_characters.get(speaker, {})
             if not mapped_character_id:
+                fallback_look = str(
+                    script_character.get("look")
+                    or script_character.get("image_prompt")
+                    or f"按剧本中“{speaker}”的台词、动作与场景描述生成一致人物形象"
+                ).strip()
                 runtime_characters.append({
                     **script_character,
                     "id": speaker,
                     "name": str(script_character.get("name") or speaker),
                     "script_character_name": str(
                         script_character.get("name") or speaker
+                    ),
+                    "gender": str(
+                        script_character.get("gender") or "unspecified"
+                    ),
+                    "look": fallback_look,
+                    "background_description": str(
+                        script_character.get("background_description")
+                        or fallback_look
                     ),
                     "generation_mode": "ai_generated",
                 })
@@ -2097,6 +3467,11 @@ class ManagementService:
         budget = int(settings.get("budget_cents") or 0)
         if budget <= 0:
             raise ValueError("单任务预算必须大于 0")
+        anchor_review_mode = str(
+            settings.get("anchor_review_mode") or "auto"
+        ).strip().casefold()
+        if anchor_review_mode not in {"auto", "manual"}:
+            raise ValueError("锚点审核方式必须是自动或人工")
         normalized = {
             "character_id": (
                 next(iter(character_mappings.values()), "")
@@ -2108,7 +3483,23 @@ class ManagementService:
             "production_profile": str(settings.get("production_profile") or "standard"),
             "subtitle_style": str(settings.get("subtitle_style") or "clean"),
             "asr_enabled": bool(settings.get("asr_enabled", True)),
+            "audio_mode": normalize_audio_mode(
+                settings.get("audio_mode")
+                or _read_env(self.env_path).get("DIALOGUE_AUDIO_MODE"),
+                strict=True,
+            ),
+            "anchor_review_mode": anchor_review_mode,
             "budget_cents": budget,
+            "character_anchor_generator": anchor_generation.normalize_generator(
+                settings.get("character_anchor_generator")
+                or _read_env(self.env_path).get("CHARACTER_ANCHOR_GENERATOR"),
+                strict=True,
+            ),
+            "scene_anchor_generator": anchor_generation.normalize_generator(
+                settings.get("scene_anchor_generator")
+                or _read_env(self.env_path).get("SCENE_ANCHOR_GENERATOR"),
+                strict=True,
+            ),
         }
         storyboard["production_profile"] = normalized["production_profile"]
         storyboard["production_settings"] = normalized
@@ -2222,6 +3613,10 @@ class ManagementService:
         ).fetchone()
         if not row:
             raise ValueError("视频任务不存在")
+        if row["state"] in {
+            "PROVIDER_ACTION_REQUIRED", "REJECTED_PENDING_RECONCILIATION",
+        }:
+            raise ValueError("任务仍有远端成本待核对，不能删除")
         if row["state"] in {
             "PENDING", "PRODUCTION_QUEUED", "PRODUCTION_RUNNING",
             "SHOTS_OK", "VOICE_OK", "BGM_OK",
@@ -2401,6 +3796,16 @@ class ManagementService:
             raise ValueError("成品文件不存在")
         return path
 
+    def video_cover_file(self, job_id: str) -> Path:
+        """Return the cover extracted from the final timeline's first frame."""
+        final_path = self.video_file(job_id)
+        cover = final_path.parent / "thumbnail.jpg"
+        allowed_root = (self.root / "data" / "assets" / str(job_id)).resolve()
+        resolved = cover.resolve()
+        if not resolved.is_relative_to(allowed_root) or not resolved.is_file():
+            raise ValueError("成片首帧封面不存在")
+        return resolved
+
     def master_candidate_file(self, job_id: str, master_idx: int) -> Path:
         row = self.database.execute(
             "SELECT video_qa FROM shots WHERE job_id=? AND idx=?",
@@ -2415,22 +3820,45 @@ class ManagementService:
         raw_path = str(qa.get("candidate_path") or "").strip()
         if not raw_path:
             raise ValueError("待复核候选母片不存在")
-        path = Path(raw_path).resolve()
-        allowed_root = (
-            self.root / "data" / "assets" / str(job_id)
-        ).resolve()
-        if not path.is_relative_to(allowed_root) or not path.is_file():
+        path = controlled_candidate_path(
+            self.root / "data" / "assets", job_id, raw_path
+        )
+        if path is None:
             raise ValueError("待复核候选母片不存在")
+        return path
+
+    def _controlled_job_asset(
+        self,
+        job_id: str,
+        raw_path: object,
+        *,
+        label: str,
+        require_file: bool = False,
+    ) -> Path | None:
+        value = str(raw_path or "").strip()
+        if not value:
+            return None
+        path = controlled_job_asset_path(
+            self.root / "data" / "assets",
+            job_id,
+            value,
+            require_file=require_file,
+        )
+        if path is None:
+            raise ValueError(f"{label}不在当前任务受控目录或文件不存在")
         return path
 
     def review_master_candidate(
         self, job_id: str, master_idx: int, *, decision: str
     ) -> dict:
         normalized = str(decision or "").strip()
-        if normalized not in {"keep_prior", "accept_candidate"}:
-            raise ValueError("请选择保留旧版或接受候选母片")
+        if normalized not in {
+            "accept_candidate", "regenerate_master", "reject_job", "keep_prior",
+        }:
+            raise ValueError("请选择接受候选、单条重做或终止任务")
         job = self.database.execute(
-            "SELECT state,final_path FROM jobs WHERE job_id=?", (job_id,)
+            "SELECT state,final_path,bgm_path,storyboard FROM jobs WHERE job_id=?",
+            (job_id,),
         ).fetchone()
         shot = self.database.execute(
             "SELECT state,video_path,video_url,video_qa FROM shots "
@@ -2439,84 +3867,652 @@ class ManagementService:
         ).fetchone()
         if not job or not shot:
             raise ValueError("待复核候选母片不存在")
-        if job["state"] != "FAILED" or shot["state"] != "FAILED":
-            raise ValueError("当前母片不在人工复核状态")
-        candidate = self.master_candidate_file(job_id, master_idx)
-        prior_value = str(shot["video_path"] or "").strip()
-        prior = Path(prior_value).resolve() if prior_value else None
-        has_prior = bool(prior and prior.is_file())
         try:
             qa = json.loads(shot["video_qa"] or "{}")
         except (json.JSONDecodeError, TypeError):
             qa = {}
+        existing_operation = qa.get("review_operation")
+        if (
+            isinstance(existing_operation, dict)
+            and existing_operation.get("phase") == "committed"
+        ):
+            committed_decision = str(existing_operation.get("decision") or "")
+            if committed_decision != normalized:
+                raise ValueError("该母片已提交其他复核决定")
+            return {
+                "job_id": job_id,
+                "master_idx": int(master_idx),
+                "decision": normalized,
+                "state": str(job["state"]),
+                "remaining_review_count": int(self.database.execute(
+                    "SELECT COUNT(*) FROM shots WHERE job_id=? "
+                    "AND state IN ('REVIEW_REQUIRED','REVIEW_DECIDING')",
+                    (job_id,),
+                ).fetchone()[0]),
+                "already_committed": True,
+            }
+        legacy_review = bool(
+            job["state"] == "FAILED"
+            and shot["state"] == "FAILED"
+            and qa.get("status") == "manual_review_required"
+        )
+        active_review = bool(
+            job["state"] == "PRODUCTION_REVIEW_REQUIRED"
+            and shot["state"] in {"REVIEW_REQUIRED", "FAILED"}
+            and qa.get("status") == "manual_review_required"
+        )
+        if not (legacy_review or active_review):
+            raise ValueError("当前母片不在人工复核状态")
+        prior_value = str(shot["video_path"] or "").strip()
+        prior = self._controlled_job_asset(
+            job_id, prior_value, label="旧母片", require_file=True
+        ) if prior_value and normalized in {"accept_candidate", "keep_prior"} else None
+        has_prior = prior is not None
+        if normalized == "keep_prior" and not has_prior:
+            raise ValueError("当前母片没有可保留的旧版，请接受候选或单条重做")
+        candidate = (
+            self.master_candidate_file(job_id, master_idx)
+            if normalized in {"accept_candidate", "regenerate_master"}
+            else controlled_candidate_path(
+                self.root / "data" / "assets", job_id,
+                qa.get("candidate_path"),
+            )
+        )
+        final_value = str(job["final_path"] or "").strip()
+        final = self._controlled_job_asset(
+            job_id, final_value, label="历史成片"
+        ) if normalized in {"accept_candidate", "keep_prior"} and final_value else None
+        bgm_value = str(job["bgm_path"] or "").strip()
+        bgm = self._controlled_job_asset(
+            job_id, bgm_value, label="历史配乐"
+        ) if normalized in {"accept_candidate", "keep_prior"} and bgm_value else None
+        if normalized == "regenerate_master":
+            self._assert_no_unresolved_provider_tasks(job_id)
+
+        regeneration_storyboard = None
+        regeneration_duration = None
+        if normalized == "regenerate_master":
+            try:
+                regeneration_storyboard = json.loads(job["storyboard"] or "{}")
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise ValueError("视频任务的导演计划无法读取") from exc
+            regeneration_master = next((
+                item for item in (regeneration_storyboard.get("masters") or [])
+                if int(item.get("idx") or 0) == int(master_idx)
+            ), None)
+            if regeneration_master is not None:
+                regeneration_duration = float(
+                    regeneration_master.get("duration") or 0
+                )
+                for edit in regeneration_storyboard.get("shots") or []:
+                    audio_idx = int(edit.get(
+                        "audio_master_idx",
+                        edit.get("video_master_idx", -1),
+                    ))
+                    if audio_idx != int(master_idx):
+                        continue
+                    old_cues = edit.get("subtitle_cues") or []
+                    if not edit.get("subtitle") and old_cues:
+                        edit["subtitle"] = "".join(
+                            str(cue.get("text") or "") for cue in old_cues
+                        ).strip()
+                    edit["subtitle_cues"] = []
+                    edit.pop("speech_timeline_version", None)
+
+        claimed_state = str(shot["state"])
+        claimed_job_state = str(job["state"])
+        original_video_qa = str(shot["video_qa"] or "") or None
+        operation_id = secrets.token_hex(12)
+        operation_staging = (
+            self.root / "data" / "assets" / job_id / "review" / "staging"
+        ).resolve()
+        candidate_path_value = str(candidate) if candidate else str(
+            qa.get("candidate_path") or ""
+        )
+        operation: dict = {
+            "operation_id": operation_id,
+            "decision": normalized,
+            "phase": "claimed",
+            "candidate_path": candidate_path_value,
+            "candidate_sha256": (
+                _file_sha256(candidate) if candidate and candidate.is_file() else None
+            ),
+        }
+        if normalized == "accept_candidate" and candidate:
+            active_for_operation = (
+                prior if has_prior else
+                candidate.parent.parent / f"{int(master_idx):02d}.mp4"
+            )
+            operation.update({
+                "active_path": str(active_for_operation),
+                "prior_backup_path": str(
+                    operation_staging / f"{int(master_idx):02d}-{operation_id}-prior.mp4"
+                ),
+                "prior_audio_backup_path": str(
+                    operation_staging / f"{int(master_idx):02d}-{operation_id}-prior.wav"
+                ),
+                "prepared_video_path": str(
+                    operation_staging / f"{int(master_idx):02d}-{operation_id}-candidate.mp4"
+                ),
+                "prepared_audio_path": str(
+                    operation_staging / f"{int(master_idx):02d}-{operation_id}-candidate.wav"
+                ),
+            })
+        elif normalized == "regenerate_master" and candidate:
+            operation.update({
+                "archive_path": str(
+                    operation_staging / f"{int(master_idx):02d}-{operation_id}-regenerate.mp4"
+                ),
+                "archive_audio_path": str(
+                    operation_staging / f"{int(master_idx):02d}-{operation_id}-regenerate.wav"
+                ),
+            })
+        claimed_qa = dict(qa)
+        claimed_qa["review_operation"] = operation
+        try:
+            self.database.execute("BEGIN IMMEDIATE")
+            claimed = self.database.execute(
+                "UPDATE shots SET state='REVIEW_DECIDING',video_qa=? "
+                "WHERE job_id=? AND idx=? AND state=? "
+                "AND EXISTS(SELECT 1 FROM jobs WHERE job_id=? AND state=?)",
+                (
+                    json.dumps(claimed_qa, ensure_ascii=False),
+                    job_id, int(master_idx), claimed_state,
+                    job_id, claimed_job_state,
+                ),
+            )
+            if int(claimed.rowcount or 0) != 1:
+                raise ValueError("该母片复核决定已被其他请求处理")
+            leased = self.database.execute(
+                "UPDATE jobs SET updated_at=updated_at "
+                "WHERE job_id=? AND state=?",
+                (job_id, claimed_job_state),
+            )
+            if int(leased.rowcount or 0) != 1:
+                raise ValueError("该视频任务复核决定已被其他请求处理")
+            self.database.commit()
+        except Exception:
+            self.database.rollback()
+            raise
+        qa = claimed_qa
+
+        def restore_claim(*, files_restored: bool = True) -> None:
+            restored_claim = self.database.execute(
+                "UPDATE shots SET state=?,video_qa=? WHERE job_id=? AND idx=? "
+                "AND state='REVIEW_DECIDING'",
+                (
+                    claimed_state, original_video_qa,
+                    job_id, int(master_idx),
+                ),
+            )
+            if int(restored_claim.rowcount or 0) != 1 and files_restored:
+                rejected_shot = self.database.execute(
+                    "SELECT state,video_qa FROM shots WHERE job_id=? AND idx=?",
+                    (job_id, int(master_idx)),
+                ).fetchone()
+                if rejected_shot and rejected_shot["state"] == "FAILED":
+                    try:
+                        rejected_qa = json.loads(
+                            rejected_shot["video_qa"] or "{}"
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        rejected_qa = {}
+                    rejected_operation = rejected_qa.get("review_operation")
+                    if (
+                        rejected_qa.get("human_decision") == "reject_job"
+                        and isinstance(rejected_operation, dict)
+                        and rejected_operation.get("operation_id") == operation_id
+                    ):
+                        rejected_qa.pop("review_operation", None)
+                        self.database.execute(
+                            "UPDATE shots SET video_qa=? WHERE job_id=? AND idx=? "
+                            "AND state='FAILED'",
+                            (
+                                json.dumps(rejected_qa, ensure_ascii=False),
+                                job_id, int(master_idx),
+                            ),
+                        )
+            self.database.commit()
+
+        def persist_review_phase(phase: str, **paths: object) -> None:
+            operation.update({"phase": phase})
+            operation.update({
+                key: str(value) for key, value in paths.items() if value is not None
+            })
+            qa["review_operation"] = operation
+            updated = self.database.execute(
+                "UPDATE shots SET video_qa=? WHERE job_id=? AND idx=? "
+                "AND state='REVIEW_DECIDING'",
+                (
+                    json.dumps(qa, ensure_ascii=False),
+                    job_id, int(master_idx),
+                ),
+            )
+            if int(updated.rowcount or 0) != 1:
+                self.database.rollback()
+                raise ValueError("该母片复核操作已被并发终止")
+            self.database.commit()
+
         reviewed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if normalized == "reject_job":
+            try:
+                unresolved_provider_tasks = provider_tasks.unresolved_task_ids(
+                    self.database, job_id
+                )
+                rejection_state = (
+                    "REJECTED_PENDING_RECONCILIATION"
+                    if unresolved_provider_tasks else "REJECTED"
+                )
+                rejected = self.database.execute(
+                    "UPDATE jobs SET state=?,error=?,"
+                    "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
+                    "WHERE job_id=? AND state=?",
+                    (
+                        rejection_state,
+                        (
+                            "已人工终止，仍有远端成本待核对"
+                            if unresolved_provider_tasks
+                            else "人工终止视频任务；不会自动重试"
+                        ),
+                        job_id, claimed_job_state,
+                    ),
+                )
+                if int(rejected.rowcount or 0) != 1:
+                    raise ValueError("该视频任务复核决定已被其他请求处理")
+                review_rows = self.database.execute(
+                    "SELECT idx,state,video_qa FROM shots WHERE job_id=? ORDER BY idx",
+                    (job_id,),
+                ).fetchall()
+                for review_row in review_rows:
+                    try:
+                        review_qa = json.loads(review_row["video_qa"] or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        review_qa = {}
+                    if not (
+                        review_row["state"] in {"REVIEW_REQUIRED", "REVIEW_DECIDING"}
+                        or (
+                            review_row["state"] == "FAILED"
+                            and review_qa.get("status") == "manual_review_required"
+                        )
+                    ):
+                        continue
+                    review_qa.update({
+                        "status": "job_rejected",
+                        "human_decision": "reject_job",
+                        "reviewed_at": reviewed_at,
+                    })
+                    in_flight_operation = review_qa.get("review_operation")
+                    if not (
+                        review_row["state"] == "REVIEW_DECIDING"
+                        and isinstance(in_flight_operation, dict)
+                        and in_flight_operation.get("decision") in {
+                            "accept_candidate", "regenerate_master",
+                        }
+                    ):
+                        review_qa.pop("review_operation", None)
+                    self.database.execute(
+                        "UPDATE shots SET state='FAILED',video_qa=?,error=? "
+                        "WHERE job_id=? AND idx=?",
+                        (
+                            json.dumps(review_qa, ensure_ascii=False),
+                            "人工终止任务；候选产物已保留",
+                            job_id, int(review_row["idx"]),
+                        ),
+                    )
+                self.database.execute(
+                    "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+                    (
+                        job_id, "master_candidate_review", "info",
+                        f"母片 #{int(master_idx)} 复核时人工终止任务；付费产物保留",
+                    ),
+                )
+                self.database.commit()
+            except Exception:
+                self.database.rollback()
+                restore_claim()
+                raise
+            return {
+                "job_id": job_id,
+                "master_idx": int(master_idx),
+                "decision": normalized,
+                "state": rejection_state,
+                "remaining_review_count": 0,
+            }
+
+        decision_label = (
+            "已接受候选" if normalized == "accept_candidate"
+            else "已退回单条重做" if normalized == "regenerate_master"
+            else "已保留旧版"
+        )
+
+        def commit_decision(shot_sql: str, shot_params: tuple) -> dict:
+            """Linearize the final shot decision and its job state together."""
+            try:
+                self.database.execute("BEGIN IMMEDIATE")
+                live = self.database.execute(
+                    "SELECT state FROM jobs WHERE job_id=?", (job_id,)
+                ).fetchone()
+                if not live or live["state"] != claimed_job_state:
+                    raise ValueError("该视频任务已被人工终止或并发处理")
+                changed = self.database.execute(shot_sql, shot_params)
+                if int(changed.rowcount or 0) != 1:
+                    raise ValueError("该视频任务已被人工终止或并发处理")
+                if regeneration_storyboard is not None:
+                    self.database.execute(
+                        "UPDATE jobs SET storyboard=? WHERE job_id=?",
+                        (
+                            json.dumps(
+                                regeneration_storyboard, ensure_ascii=False
+                            ),
+                            job_id,
+                        ),
+                    )
+                    if regeneration_duration:
+                        self.database.execute(
+                            "UPDATE shots SET duration_sec=? "
+                            "WHERE job_id=? AND idx=?",
+                            (
+                                regeneration_duration,
+                                job_id,
+                                int(master_idx),
+                            ),
+                        )
+
+                review_rows = self.database.execute(
+                    "SELECT idx,state,video_qa FROM shots WHERE job_id=? ORDER BY idx",
+                    (job_id,),
+                ).fetchall()
+                remaining_review_count = 0
+                pending_accepts: list[tuple[sqlite3.Row, dict]] = []
+                for review_row in review_rows:
+                    try:
+                        review_qa = json.loads(review_row["video_qa"] or "{}")
+                    except (json.JSONDecodeError, TypeError):
+                        review_qa = {}
+                    if review_row["state"] in {
+                        "REVIEW_REQUIRED", "REVIEW_DECIDING",
+                    } or (
+                        review_row["state"] == "FAILED"
+                        and review_qa.get("status") == "manual_review_required"
+                    ):
+                        remaining_review_count += 1
+                    if review_qa.get("status") == "candidate_accepted_pending":
+                        pending_accepts.append((review_row, review_qa))
+
+                remaining_generation_count = int(self.database.execute(
+                    "SELECT COUNT(*) FROM shots WHERE job_id=? AND state!='OK'",
+                    (job_id,),
+                ).fetchone()[0])
+                needs_local_compose = False
+                music_provider = None
+                needs_bgm_generation = False
+                error_message = None
+                unresolved = provider_tasks.unresolved_task_ids(
+                    self.database, job_id
+                )
+                if unresolved:
+                    next_state = "PROVIDER_ACTION_REQUIRED"
+                    error_message = (
+                        "已保存本地复核决定，但仍有远端任务待核对；"
+                        "请先核对 task_id：" + ", ".join(unresolved[:5])
+                    )
+                elif remaining_review_count:
+                    next_state = "PRODUCTION_REVIEW_REQUIRED"
+                    error_message = (
+                        f"仍有 {remaining_review_count} 条母片待人工复核"
+                    )
+                elif remaining_generation_count:
+                    try:
+                        self._assert_no_unresolved_provider_tasks(job_id)
+                    except ValueError as exc:
+                        next_state = "PROVIDER_ACTION_REQUIRED"
+                        error_message = str(exc)
+                    else:
+                        next_state = "PRODUCTION_QUEUED"
+                        self.database.execute(
+                            "UPDATE shots SET state='PENDING',error=NULL,video_qa=NULL "
+                            "WHERE job_id=? AND state='FAILED'",
+                            (job_id,),
+                        )
+                else:
+                    needs_local_compose = bool(pending_accepts) or not (
+                        final and final.is_file()
+                    )
+                    if needs_local_compose:
+                        music_provider = self._music_provider()
+                        needs_bgm_generation = bool(
+                            not (bgm and bgm.is_file())
+                            and (
+                                not pending_accepts
+                                or any(
+                                    not pending_qa.get("prior_backup_path")
+                                    for _, pending_qa in pending_accepts
+                                )
+                            )
+                        )
+                        if (
+                            needs_bgm_generation
+                            and music.may_submit_paid_work(music_provider)
+                        ):
+                            try:
+                                self._assert_no_unresolved_provider_tasks(job_id)
+                            except ValueError as exc:
+                                next_state = "PROVIDER_ACTION_REQUIRED"
+                                error_message = str(exc)
+                            else:
+                                next_state = "SHOTS_OK"
+                        else:
+                            next_state = "SHOTS_OK"
+                    else:
+                        next_state = "COMPOSED"
+
+                updated = self.database.execute(
+                    "UPDATE jobs SET state=?,error=?,retries=CASE WHEN ? IN "
+                    "('PRODUCTION_QUEUED','COMPOSED') THEN 0 ELSE retries END,"
+                    "production_worker_pid=CASE WHEN ? IN "
+                    "('PRODUCTION_QUEUED','PROVIDER_ACTION_REQUIRED') "
+                    "THEN NULL ELSE production_worker_pid END,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND state=?",
+                    (
+                        next_state, error_message, next_state, next_state,
+                        job_id, claimed_job_state,
+                    ),
+                )
+                if int(updated.rowcount or 0) != 1:
+                    raise ValueError("该视频任务已被人工终止或并发处理")
+                event_detail = error_message or decision_label
+                self.database.execute(
+                    "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+                    (
+                        job_id, "master_candidate_review", "info",
+                        f"母片 #{int(master_idx)} {decision_label}，{event_detail}",
+                    ),
+                )
+                self.database.commit()
+                return {
+                    "state": next_state,
+                    "remaining_review_count": remaining_review_count,
+                    "remaining_generation_count": remaining_generation_count,
+                    "pending_accepts": pending_accepts,
+                    "needs_local_compose": needs_local_compose,
+                    "music_provider": music_provider,
+                    "needs_bgm_generation": needs_bgm_generation,
+                }
+            except Exception:
+                self.database.rollback()
+                raise
+
+        decision_commit = None
         if normalized == "accept_candidate":
             candidate_url = str(qa.get("candidate_url") or "").strip() or None
             active = (
                 prior if has_prior else
                 candidate.parent.parent / f"{int(master_idx):02d}.mp4"
             )
+            active = self._controlled_job_asset(job_id, active, label="当前母片")
             active.parent.mkdir(parents=True, exist_ok=True)
+            staging_dir = (
+                self.root / "data" / "assets" / job_id / "review" / "staging"
+            ).resolve()
+            staging_dir.mkdir(parents=True, exist_ok=True)
             prior_backup = None
-            if has_prior:
-                prior_backup = active.with_name(
-                    f".{active.stem}.prior-review{active.suffix}"
-                )
-                prior_backup.unlink(missing_ok=True)
-                active.replace(prior_backup)
-                shutil.copy2(candidate, active)
-            else:
-                candidate.replace(active)
-                candidate_audio = candidate.with_suffix(".wav")
+            prior_audio_backup = None
+            active_audio = active.with_suffix(".wav")
+            candidate_audio = candidate.with_suffix(".wav")
+            active_changed = False
+            prepared_video = None
+            prepared_audio = None
+            try:
+                if has_prior:
+                    prior_backup = self._controlled_job_asset(
+                        job_id,
+                        operation["prior_backup_path"],
+                        label="旧母片备份",
+                    )
+                    shutil.copy2(active, prior_backup)
+                    if not _files_have_same_content(active, prior_backup):
+                        raise OSError("旧母片备份校验失败")
+                    if active_audio.is_file():
+                        prior_audio_backup = prior_backup.with_suffix(".wav")
+                        shutil.copy2(active_audio, prior_audio_backup)
+                        if not _files_have_same_content(
+                            active_audio, prior_audio_backup
+                        ):
+                            raise OSError("旧母片音频备份校验失败")
+                prepared_video = Path(operation["prepared_video_path"])
+                shutil.copy2(candidate, prepared_video)
+                prepared_audio = prepared_video.with_suffix(".wav")
                 if candidate_audio.is_file():
-                    candidate_audio.replace(active.with_suffix(".wav"))
-            qa.update({
-                "status": (
-                    "candidate_accepted_pending" if has_prior
-                    else "candidate_accepted"
-                ),
-                "human_decision": "accept_candidate",
-                "reviewed_at": reviewed_at,
-                "prior_backup_path": (
-                    str(prior_backup) if prior_backup else None
-                ),
-                "prior_video_url": shot["video_url"],
-                "candidate_path": (
-                    None if not has_prior else qa.get("candidate_path")
-                ),
-            })
-            self.database.execute(
-                "UPDATE shots SET state='OK',video_path=?,video_url=?,"
-                "video_qa=?,error=NULL WHERE job_id=? AND idx=?",
-                (
-                    str(active), candidate_url,
-                    json.dumps(qa, ensure_ascii=False),
-                    job_id, int(master_idx),
-                ),
-            )
-        else:
-            if not has_prior:
-                candidate.unlink(missing_ok=True)
-                candidate.with_suffix(".wav").unlink(missing_ok=True)
+                    shutil.copy2(candidate_audio, prepared_audio)
+                persist_review_phase(
+                    "prepared",
+                    prior_backup_path=prior_backup,
+                    prior_audio_backup_path=prior_audio_backup,
+                    prepared_video_path=prepared_video,
+                    prepared_audio_path=prepared_audio,
+                )
+                prepared_video.replace(active)
+                active_changed = True
+                persist_review_phase("video_published")
+                if prepared_audio.is_file():
+                    prepared_audio.replace(active_audio)
+                elif active_audio.is_file():
+                    active_audio.unlink()
+                persist_review_phase("audio_published")
                 qa.update({
-                    "status": "candidate_rejected",
-                    "candidate_path": None,
-                    "candidate_url": None,
-                    "human_decision": "keep_prior",
+                    "status": "candidate_accepted_pending",
+                    "human_decision": "accept_candidate",
                     "reviewed_at": reviewed_at,
+                    "prior_backup_path": (
+                        str(prior_backup) if prior_backup else None
+                    ),
+                    "prior_video_url": shot["video_url"],
+                    "candidate_path": qa.get("candidate_path"),
                 })
-                self.database.execute(
-                    "UPDATE shots SET state='FAILED',video_qa=?,error=? "
-                    "WHERE job_id=? AND idx=?",
+                operation["phase"] = "committed"
+                qa["review_operation"] = operation
+                decision_commit = commit_decision(
+                    "UPDATE shots SET state='OK',video_path=?,video_url=?,"
+                    "video_qa=?,error=NULL WHERE job_id=? AND idx=? "
+                    "AND state='REVIEW_DECIDING'",
                     (
+                        str(active), candidate_url,
                         json.dumps(qa, ensure_ascii=False),
-                        "候选已拒绝，请继续生成该母片",
                         job_id, int(master_idx),
                     ),
                 )
-            else:
-                candidate.unlink(missing_ok=True)
-                candidate.with_suffix(".wav").unlink(missing_ok=True)
+            except Exception:
+                restore_error = None
+                restored = not active_changed
+                if active_changed:
+                    try:
+                        if prior_backup and prior_backup.is_file():
+                            shutil.copy2(prior_backup, active)
+                        else:
+                            active.unlink(missing_ok=True)
+                        if prior_audio_backup and prior_audio_backup.is_file():
+                            shutil.copy2(prior_audio_backup, active_audio)
+                        else:
+                            active_audio.unlink(missing_ok=True)
+                        restored = True
+                    except Exception as exc:
+                        restore_error = exc
+                if restored:
+                    for artifact in (
+                        prepared_video, prepared_audio,
+                        prior_backup, prior_audio_backup,
+                    ):
+                        if artifact:
+                            try:
+                                artifact.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                restore_claim(files_restored=restored)
+                if restore_error is not None:
+                    raise RuntimeError(
+                        "候选发布失败且旧母片恢复失败；恢复备份已保留"
+                    ) from restore_error
+                raise
+        elif normalized == "regenerate_master":
+            staging_dir = (
+                self.root / "data" / "assets" / job_id / "review" / "staging"
+            ).resolve()
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            staged_candidate = self._controlled_job_asset(
+                job_id,
+                operation["archive_path"],
+                label="候选归档",
+            )
+            staged_audio = staged_candidate.with_suffix(".wav")
+            candidate_audio = candidate.with_suffix(".wav")
+            try:
+                candidate.replace(staged_candidate)
+                persist_review_phase(
+                    "archived",
+                    archive_path=staged_candidate,
+                    archive_audio_path=staged_audio,
+                )
+                if candidate_audio.is_file():
+                    candidate_audio.replace(staged_audio)
+                    persist_review_phase("audio_archived")
+                operation["phase"] = "committed"
+                qa.update({
+                    "status": "regenerate_committed",
+                    "review_operation": operation,
+                })
+                decision_commit = commit_decision(
+                    "UPDATE shots SET state='PENDING',video_qa=?,error=NULL "
+                    "WHERE job_id=? AND idx=? AND state='REVIEW_DECIDING'",
+                    (
+                        json.dumps(qa, ensure_ascii=False),
+                        job_id, int(master_idx),
+                    ),
+                )
+            except Exception:
+                if staged_candidate.is_file():
+                    staged_candidate.replace(candidate)
+                if staged_audio.is_file():
+                    staged_audio.replace(candidate_audio)
+                restore_claim()
+                raise
+            cleanup_ok = True
+            for artifact in (staged_candidate, staged_audio):
+                try:
+                    artifact.unlink(missing_ok=True)
+                except OSError:
+                    cleanup_ok = False
+            if cleanup_ok:
+                try:
+                    self.database.execute(
+                        "UPDATE shots SET video_qa=NULL WHERE job_id=? AND idx=? "
+                        "AND state='PENDING'",
+                        (job_id, int(master_idx)),
+                    )
+                    self.database.commit()
+                except sqlite3.Error:
+                    self.database.rollback()
+        else:  # keep_prior is a migration-only compatibility action.
+            try:
                 qa.update({
                     "status": "candidate_rejected",
                     "candidate_path": None,
@@ -2524,192 +4520,152 @@ class ManagementService:
                     "human_decision": "keep_prior",
                     "reviewed_at": reviewed_at,
                 })
-                self.database.execute(
-                    "UPDATE shots SET state='OK',video_qa=?,error=NULL "
-                    "WHERE job_id=? AND idx=?",
-                    (json.dumps(qa, ensure_ascii=False), job_id, int(master_idx)),
-                )
-
-        review_rows = self.database.execute(
-            "SELECT idx,state,video_qa FROM shots WHERE job_id=? ORDER BY idx",
-            (job_id,),
-        ).fetchall()
-        remaining_review_count = 0
-        pending_accepts: list[tuple[sqlite3.Row, dict]] = []
-        for review_row in review_rows:
-            try:
-                review_qa = json.loads(review_row["video_qa"] or "{}")
-            except (json.JSONDecodeError, TypeError):
-                review_qa = {}
-            if (
-                review_row["state"] == "FAILED"
-                and review_qa.get("status") == "manual_review_required"
-            ):
-                remaining_review_count += 1
-            if review_qa.get("status") == "candidate_accepted_pending":
-                pending_accepts.append((review_row, review_qa))
-
-        decision_label = (
-            "已接受候选" if normalized == "accept_candidate" else "已保留旧版"
-        )
-        if remaining_review_count:
-            waiting_message = f"仍有 {remaining_review_count} 条母片待人工复核"
-            self.database.execute(
-                "UPDATE jobs SET state='FAILED',error=?,"
-                "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-                (waiting_message, job_id),
-            )
-            self.database.execute(
-                "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
-                (job_id, "master_candidate_review", "info",
-                 f"母片 #{int(master_idx)} {decision_label}，{waiting_message}"),
-            )
-            self.database.commit()
-            return {
-                "job_id": job_id,
-                "master_idx": int(master_idx),
-                "decision": normalized,
-                "state": "FAILED",
-                "remaining_review_count": remaining_review_count,
-            }
-
-        remaining_generation_count = int(self.database.execute(
-            "SELECT COUNT(*) FROM shots WHERE job_id=? AND state!='OK'",
-            (job_id,),
-        ).fetchone()[0])
-        if remaining_generation_count:
-            waiting_message = (
-                f"仍有 {remaining_generation_count} 条母片需要继续生成"
-            )
-            self.database.execute(
-                "UPDATE jobs SET state='FAILED',error=?,"
-                "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-                (waiting_message, job_id),
-            )
-            self.database.execute(
-                "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
-                (
-                    job_id, "master_candidate_review", "info",
-                    f"母片 #{int(master_idx)} {decision_label}，{waiting_message}",
-                ),
-            )
-            self.database.commit()
-            return {
-                "job_id": job_id,
-                "master_idx": int(master_idx),
-                "decision": normalized,
-                "state": "FAILED",
-                "remaining_review_count": 0,
-                "remaining_generation_count": remaining_generation_count,
-            }
-
-        final = Path(str(job["final_path"] or "")).resolve()
-        final_backup = final.with_name(
-            f".{final.stem}.prior-review{final.suffix}"
-        )
-        if pending_accepts:
-            final_backup.unlink(missing_ok=True)
-            if final.is_file():
-                final.replace(final_backup)
-            self.database.execute(
-                "UPDATE jobs SET state='BGM_OK',error=NULL,"
-                "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-                (job_id,),
-            )
-            self.database.commit()
-            try:
-                asyncio.run(s6_compose.run(job_id))
-            except Exception as exc:
-                final.unlink(missing_ok=True)
-                if final_backup.exists():
-                    final_backup.replace(final)
-                for pending_row, pending_qa in pending_accepts:
-                    pending_prior = Path(str(
-                        pending_qa.get("prior_backup_path") or ""
-                    )).resolve()
-                    active_prior = Path(str(
-                        self.database.execute(
-                            "SELECT video_path FROM shots WHERE job_id=? AND idx=?",
-                            (job_id, int(pending_row["idx"])),
-                        ).fetchone()["video_path"]
-                    )).resolve()
-                    active_prior.unlink(missing_ok=True)
-                    if pending_prior.exists():
-                        pending_prior.replace(active_prior)
-                    rolled_back_qa = {
-                        key: value for key, value in pending_qa.items()
-                        if key not in {
-                            "human_decision", "reviewed_at",
-                            "prior_backup_path", "prior_video_url",
-                        }
-                    }
-                    rolled_back_qa["status"] = "manual_review_required"
-                    self.database.execute(
-                        "UPDATE shots SET state='FAILED',video_url=?,video_qa=?,"
-                        "error=? WHERE job_id=? AND idx=?",
-                        (
-                            pending_qa.get("prior_video_url"),
-                            json.dumps(rolled_back_qa, ensure_ascii=False),
-                            f"local recompose failed: {exc}",
-                            job_id, int(pending_row["idx"]),
-                        ),
-                    )
-                self.database.execute(
-                    "UPDATE jobs SET state='FAILED',error=?,"
-                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-                    (f"local recompose failed: {exc}", job_id),
-                )
-                self.database.commit()
-                raise RuntimeError(f"本地重新合成失败：{exc}") from exc
-
-            for pending_row, pending_qa in pending_accepts:
-                Path(str(pending_qa.get("prior_backup_path") or "")).unlink(
-                    missing_ok=True
-                )
-                pending_candidate = Path(str(
-                    pending_qa.get("candidate_path") or ""
-                ))
-                pending_candidate.unlink(missing_ok=True)
-                pending_candidate.with_suffix(".wav").unlink(missing_ok=True)
-                finalized_qa = {
-                    key: value for key, value in pending_qa.items()
-                    if key not in {"prior_backup_path", "prior_video_url"}
-                }
-                finalized_qa.update({
-                    "status": "candidate_accepted",
-                    "candidate_path": None,
+                operation.update({
+                    "phase": "committed",
+                    "candidate_path": str(candidate) if candidate else None,
                 })
-                self.database.execute(
-                    "UPDATE shots SET video_qa=? WHERE job_id=? AND idx=?",
+                qa["review_operation"] = operation
+                decision_commit = commit_decision(
+                    "UPDATE shots SET state='OK',video_qa=?,error=NULL "
+                    "WHERE job_id=? AND idx=? AND state='REVIEW_DECIDING'",
                     (
-                        json.dumps(finalized_qa, ensure_ascii=False),
-                        job_id, int(pending_row["idx"]),
+                        json.dumps(qa, ensure_ascii=False),
+                        job_id, int(master_idx),
                     ),
                 )
-            final_backup.unlink(missing_ok=True)
+            except Exception:
+                restore_claim()
+                raise
+            if candidate:
+                cleanup_ok = True
+                for artifact in (candidate, candidate.with_suffix(".wav")):
+                    try:
+                        artifact.unlink(missing_ok=True)
+                    except OSError:
+                        cleanup_ok = False
+                if cleanup_ok:
+                    qa.pop("review_operation", None)
+                    try:
+                        self.database.execute(
+                            "UPDATE shots SET video_qa=? WHERE job_id=? AND idx=? "
+                            "AND state='OK'",
+                            (
+                                json.dumps(qa, ensure_ascii=False),
+                                job_id, int(master_idx),
+                            ),
+                        )
+                        self.database.commit()
+                    except sqlite3.Error:
+                        self.database.rollback()
 
-        self.database.execute(
-            "UPDATE jobs SET state='COMPOSED',error=NULL,retries=0,"
-            "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-            (job_id,),
-        )
-        event_message = (
-            f"母片 #{int(master_idx)} 已完成复核并完成本地重合成"
-            if pending_accepts
-            else f"母片 #{int(master_idx)} 已保留旧版"
-        )
-        self.database.execute(
-            "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
-            (job_id, "master_candidate_review", "info", event_message),
-        )
-        self.database.commit()
-        return {
+        next_state = decision_commit["state"]
+        if regeneration_storyboard is not None:
+            storyboard_path = (
+                self.root / "data" / "assets" / job_id / "storyboard.json"
+            )
+            try:
+                storyboard_path.parent.mkdir(parents=True, exist_ok=True)
+                storyboard_path.write_text(
+                    json.dumps(
+                        regeneration_storyboard,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+        result = {
             "job_id": job_id,
             "master_idx": int(master_idx),
             "decision": normalized,
-            "state": "COMPOSED",
-            "remaining_review_count": 0,
+            "state": next_state,
+            "remaining_review_count": decision_commit["remaining_review_count"],
         }
+        if decision_commit["remaining_generation_count"]:
+            result["remaining_generation_count"] = decision_commit[
+                "remaining_generation_count"
+            ]
+        if next_state == "PRODUCTION_QUEUED":
+            dispatch = self.dispatch_production_queue()
+            result["dispatched_jobs"] = dispatch["dispatched_jobs"]
+            return result
+        if next_state in {
+            "PRODUCTION_REVIEW_REQUIRED", "PROVIDER_ACTION_REQUIRED", "COMPOSED",
+        }:
+            return result
+
+        pending_accepts = decision_commit["pending_accepts"]
+        needs_bgm_generation = decision_commit["needs_bgm_generation"]
+        music_provider = decision_commit["music_provider"]
+        final_backup = None
+        if final:
+            staging_dir = (
+                self.root / "data" / "assets" / job_id / "review" / "staging"
+            ).resolve()
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            final_backup = self._controlled_job_asset(
+                job_id,
+                staging_dir / f"final-{time.time_ns()}-prior{final.suffix}",
+                label="历史成片备份",
+            )
+            final_backup.unlink(missing_ok=True)
+            if final.is_file():
+                final.replace(final_backup)
+        try:
+            if needs_bgm_generation:
+                asyncio.run(s5_bgm.run(job_id, provider=music_provider))
+            bgm_ok = self.database.execute(
+                "UPDATE jobs SET state='BGM_OK',error=NULL,"
+                "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND state='SHOTS_OK'",
+                (job_id,),
+            )
+            if int(bgm_ok.rowcount or 0) != 1:
+                raise ValueError("本地后期状态已被并发修改")
+            self.database.commit()
+            asyncio.run(s6_compose.run(job_id))
+            finalize_accepted_candidates(
+                self.database, self.root / "data" / "assets", job_id
+            )
+        except Exception as exc:
+            if final:
+                final.unlink(missing_ok=True)
+            if final and final_backup and final_backup.exists():
+                final_backup.replace(final)
+            self.database.execute(
+                "UPDATE jobs SET state='FAILED',error=?,"
+                "updated_at=CURRENT_TIMESTAMP WHERE job_id=? "
+                "AND state IN ('SHOTS_OK','BGM_OK')",
+                (f"local recompose failed: {exc}", job_id),
+            )
+            self.database.commit()
+            raise RuntimeError(f"local recompose failed: {exc}") from exc
+        if final_backup:
+            try:
+                final_backup.unlink(missing_ok=True)
+            except OSError:
+                # The new final and accepted-shot audit are already durable.
+                # A stale backup is safe for later GC and must not turn a
+                # successful production decision into an HTTP 500.
+                pass
+        composed = self.database.execute(
+            "UPDATE jobs SET state='COMPOSED',error=NULL,retries=0,"
+            "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND state='BGM_OK'",
+            (job_id,),
+        )
+        if int(composed.rowcount or 0) != 1:
+            self.database.rollback()
+            raise ValueError("本地后期状态已被并发修改")
+        self.database.execute(
+            "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+            (
+                job_id, "master_candidate_review", "info",
+                f"母片 #{int(master_idx)} 已完成复核并完成本地重合成",
+            ),
+        )
+        self.database.commit()
+        result["state"] = "COMPOSED"
+        return result
 
     def publishing(self) -> dict:
         ready = _rows(self.database.execute(
@@ -2830,9 +4786,14 @@ class ManagementService:
 
     def _readiness(self) -> dict:
         values = _read_env(self.env_path)
+        audio_mode = normalize_audio_mode(values.get("DIALOGUE_AUDIO_MODE"))
         groups = {
             "script": ("ARK_API_KEY",),
-            "video": ("ARK_API_KEY", "VOLC_AK", "VOLC_SK", "TOS_BUCKET"),
+            "video": (
+                "ARK_API_KEY", "VOLC_AK", "VOLC_SK", "TOS_BUCKET",
+                *(("VOLC_TTS_APPID", "VOLC_TTS_API_KEY")
+                  if audio_mode == AUDIO_MODE_FIXED_TTS else ()),
+            ),
         }
         readiness = {
             name: {
@@ -2846,9 +4807,6 @@ class ManagementService:
             _configured(values.get(key))
             for key in ("VOLC_ASR_APPID", "VOLC_ASR_TOKEN")
         )
-        if not asr_ready:
-            readiness["video"]["ready"] = False
-            readiness["video"]["missing"].append("VOLC_ASR_API_KEY")
         douyin_account = self.douyin_account_status()
         channels = {
             "douyin": (
@@ -2887,9 +4845,22 @@ class ManagementService:
                 # Do not surface template placeholders such as <required> as if
                 # they were user-entered values.
                 field["value"] = value if _configured(value) else ""
+            if key in {"CHARACTER_ANCHOR_GENERATOR", "SCENE_ANCHOR_GENERATOR"}:
+                field["value"] = anchor_generation.normalize_generator(value)
+                field["options"] = list(anchor_generation.GENERATOR_OPTIONS)
+            if key == "DIALOGUE_AUDIO_MODE":
+                field["value"] = normalize_audio_mode(value)
+                field["options"] = [
+                    {"value": "seedance_native", "label": "Seedance 原生声线（默认）"},
+                    {"value": "fixed_tts", "label": "固定火山声线"},
+                ]
             fields.append(field)
         fields_by_key = {field["key"]: field for field in fields}
         required_groups = []
+        audio_mode = normalize_audio_mode(
+            current.get("DIALOGUE_AUDIO_MODE")
+            or defaults.get("DIALOGUE_AUDIO_MODE")
+        )
         for group in REQUIRED_CONFIG_GROUPS:
             group_fields = [fields_by_key[key] for key in group["keys"]]
             alternatives = group.get("alternative_keys")
@@ -2901,12 +4872,20 @@ class ManagementService:
                 if alternatives
                 else all(field["configured"] for field in group_fields)
             )
+            applies = not (
+                group["id"] == "tts"
+                and audio_mode != AUDIO_MODE_FIXED_TTS
+            )
+            if not applies:
+                ready = True
             missing = (
                 [] if ready
                 else [field["key"] for field in group_fields if not field["configured"]]
             )
             required_groups.append({
                 **group,
+                "blocking": bool(group["blocking"] and applies),
+                "applies": applies,
                 "keys": list(group["keys"]),
                 "guide": {
                     **group["guide"],
@@ -2919,6 +4898,7 @@ class ManagementService:
         completed = sum(1 for group in required_groups if group["ready"])
         return {
             "fields": fields,
+            "providers": self.provider_statuses()["providers"],
             "required_groups": required_groups,
             "optional_fields": [
                 field for field in fields if field["key"] not in REQUIRED_CONFIG_KEYS
@@ -2952,6 +4932,22 @@ class ManagementService:
             "readiness": self._readiness(),
         }
 
+    def provider_statuses(self) -> dict:
+        return {
+            "providers": [
+                provider_health.get_status(self.database, "seedance")
+            ]
+        }
+
+    def clear_seedance_provider_block(self) -> dict:
+        status = provider_health.clear(self.database, "seedance")
+        return {
+            "provider": status,
+            "message": (
+                "已解除本地阻断；系统不自动检测账号余额，也不自动恢复或续跑历史任务。"
+            ),
+        }
+
     def update_config(self, changes: dict) -> dict:
         current = _read_env(self.env_path)
         updated: list[str] = []
@@ -2959,6 +4955,8 @@ class ManagementService:
             if key not in EDITABLE_CONFIG:
                 continue
             value = str(raw_value or "").strip().replace("\r", "").replace("\n", "")
+            if key in {"CHARACTER_ANCHOR_GENERATOR", "SCENE_ANCHOR_GENERATOR"}:
+                value = anchor_generation.normalize_generator(value, strict=True)
             if key in SECRET_KEYS and not value:
                 continue
             current[key] = value
@@ -3201,6 +5199,9 @@ class ManagementService:
                 binding["character_id"], binding["asset_id"]
             )
             images = self._character_images(binding["character_id"])
+            voice_binding = character_voices.get_binding(
+                self.database, binding["character_id"]
+            )
             binding.update({
                 "preview_url": self._local_character_preview_url(binding["character_id"]),
                 "images": images,
@@ -3208,9 +5209,89 @@ class ManagementService:
                 "usage_count": len(usages),
                 "usages": usages,
                 "deletable": not usages,
+                "voice_binding": voice_binding,
             })
             result.append(binding)
         return {"characters": result, "total": len(result)}
+
+    def _volc_speech_client(self) -> volc_tts.VolcSpeechClient:
+        config = {**_read_env(self.env_path), **os.environ}
+        return volc_tts.VolcSpeechClient(
+            ak=config.get("VOLC_AK") or None,
+            sk=config.get("VOLC_SK") or None,
+            region=config.get("ARK_REGION") or "cn-beijing",
+        )
+
+    def voice_catalog(self) -> dict:
+        client = self._volc_speech_client()
+        try:
+            speakers = client.list_speakers()
+        finally:
+            client.close()
+        return {
+            "voices": [{
+                "voice_type": str(item.get("VoiceType") or ""),
+                "voice_name": str(item.get("Name") or item.get("VoiceType") or ""),
+                "gender": str(item.get("Gender") or ""),
+                "age": str(item.get("Age") or ""),
+                "description": str(item.get("Description") or ""),
+                "labels": [
+                    str(value) for field in (
+                        "Categories", "NormalLabels", "SpecialLabels"
+                    ) for value in (item.get(field) or [])
+                ],
+                "preview_url": str(
+                    item.get("TrialURL") or item.get("ShortTrialURL") or ""
+                ),
+                "resource_id": str(
+                    item.get("ResourceID") or "seed-tts-2.0"
+                ),
+            } for item in speakers if str(item.get("VoiceType") or "").strip()],
+        }
+
+    def _character_voice_profile(self, character_id: str) -> dict:
+        row = self.database.execute(
+            "SELECT character_id,display_name,gender,background_description "
+            "FROM character_asset_bindings WHERE character_id=?",
+            (character_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("角色资产不存在")
+        return {
+            "id": row["character_id"],
+            "name": row["display_name"],
+            "gender": row["gender"],
+            "background_description": row["background_description"],
+            "voice_directive": row["background_description"],
+        }
+
+    def auto_match_character_voice(self, character_id: str) -> dict:
+        profile = self._character_voice_profile(character_id)
+        client = self._volc_speech_client()
+        try:
+            match = character_voices.match_voice(
+                profile, client.list_speakers()
+            )
+        finally:
+            client.close()
+        return character_voices.save_auto_binding(
+            self.database, character=profile, match=match
+        )
+
+    def set_character_voice(
+        self, character_id: str, *, voice_type: str, voice_name: str = "",
+        resource_id: str = "seed-tts-2.0", preview_url: str = "",
+    ) -> dict:
+        profile = self._character_voice_profile(character_id)
+        return character_voices.save_manual_binding(
+            self.database,
+            character_id=character_id,
+            display_name=profile["name"],
+            voice_type=voice_type,
+            voice_name=voice_name,
+            resource_id=resource_id,
+            preview_url=preview_url,
+        )
 
     def _character_images(self, character_id: str) -> list[dict]:
         rows = self.database.execute(
@@ -3301,7 +5382,7 @@ class ManagementService:
             (character_id,),
         ).fetchone()[0]
         if count >= CUSTOM_CHARACTER_IMAGE_MAX_COUNT:
-            raise ValueError("每个自定义角色最多上传 12 张图片")
+            raise ValueError("每个自定义角色最多上传 24 张图片")
         digest = hashlib.sha256(
             character_id.encode("utf-8") + source.read_bytes()
         ).hexdigest()[:16]
@@ -3623,7 +5704,10 @@ class ManagementService:
             shutil.rmtree(custom_root)
         return {"character_id": character_id, "deleted": True}
 
-    def start_video_job(self, job_id: str, *, confirmed: bool) -> dict:
+    def start_video_job(
+        self, job_id: str, *, confirmed: bool,
+        approved_budget_cents: int | None = None,
+    ) -> dict:
         if not confirmed:
             raise ValueError("开始付费生成前必须明确确认预算")
         job = self.database.execute(
@@ -3635,6 +5719,7 @@ class ManagementService:
             raise ValueError("视频生成已经启动，请勿重复提交")
         if job["state"] != "STORYBOARDED":
             raise ValueError("只有已确认剧本的任务才能开始生成")
+        self._assert_no_unresolved_provider_tasks(job_id)
         storyboard_row = self.database.execute(
             "SELECT storyboard,cost_cents FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()
@@ -3700,10 +5785,23 @@ class ManagementService:
             current_cost_cents=int(storyboard_row["cost_cents"] or 0),
         )
         if not preflight["budget_ok"]:
-            raise ValueError(
-                "预计累计成本超过已确认的单任务预算上限；"
-                "请返回制作设置提高预算后再开始生成"
+            try:
+                approved_budget = int(approved_budget_cents or 0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("提高后的任务预算必须是整数分") from exc
+            projected = int(preflight["projected_total_cost_cents"] or 0)
+            if approved_budget < projected:
+                raise ValueError(
+                    "预计累计成本超过当前任务预算；请在预检中明确提高预算后再开始生成"
+                )
+            settings = storyboard.setdefault("production_settings", {})
+            settings["budget_cents"] = approved_budget
+            self.database.execute(
+                "UPDATE jobs SET storyboard=?,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state='STORYBOARDED'",
+                (json.dumps(storyboard, ensure_ascii=False), job_id),
             )
+            self.database.commit()
         claimed = self.database.execute(
             "UPDATE jobs SET state='PRODUCTION_QUEUED',updated_at=CURRENT_TIMESTAMP "
             "WHERE job_id=? AND state='STORYBOARDED'", (job_id,),

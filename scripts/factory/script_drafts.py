@@ -8,17 +8,18 @@ import re
 from copy import deepcopy
 from typing import Callable
 
+from . import script_sources
 from .clients import doubao_llm
 
 
-PROMPT_VERSION = "complete-script-v7-video-reconstruction"
+PROMPT_VERSION = "complete-script-v9-balanced-source-sampling"
 BEAT_ORDER = ("hook", "conflict", "evidence", "reversal", "solution", "cta")
 MAX_PROVIDER_MASTER_DURATION_SEC = 30.0
 
 GENERATION_PREFERENCE_RULES = {
-    "suggested_duration_sec": (15, 72, "建议总时长需在 15–72 秒之间"),
-    "suggested_shot_count": (4, 8, "建议分镜数需在 4–8 个之间"),
-    "suggested_character_count": (1, 6, "建议角色数需在 1–6 人之间"),
+    "suggested_duration_sec": "建议总时长必须是正整数",
+    "suggested_shot_count": "建议分镜数必须是正整数",
+    "suggested_character_count": "建议角色数必须是正整数",
 }
 
 
@@ -32,7 +33,7 @@ def normalize_generation_preferences(raw: dict | None) -> dict:
     if not isinstance(raw, dict):
         raise ValueError("剧本创作建议格式无效")
     normalized: dict[str, int] = {}
-    for field, (minimum, maximum, message) in GENERATION_PREFERENCE_RULES.items():
+    for field, message in GENERATION_PREFERENCE_RULES.items():
         value = raw.get(field)
         if value is None or value == "":
             continue
@@ -42,7 +43,7 @@ def normalize_generation_preferences(raw: dict | None) -> dict:
             numeric = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(message) from exc
-        if not numeric.is_integer() or not minimum <= numeric <= maximum:
+        if not numeric.is_integer() or numeric <= 0:
             raise ValueError(message)
         normalized[field] = int(numeric)
     return normalized
@@ -124,6 +125,23 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
             "source_ids": source_ids,
             "broll_hint": _text(beat.get("broll_hint")),
         }
+        # Continuity metadata is optional.  When present it is a hard
+        # production constraint, not prose for the model to reinterpret.
+        for field in ("continuity_id", "scene_id", "scene", "location", "time_of_day"):
+            value = _text(beat.get(field))
+            if value:
+                normalized[field] = value
+        cast = [
+            _text(item.get("id") if isinstance(item, dict) else item)
+            for item in (beat.get("characters") or beat.get("cast") or [])
+        ]
+        cast = [item for item in cast if item]
+        if cast:
+            normalized["characters"] = list(dict.fromkeys(cast))
+        if beat.get("force_master_break") is True:
+            normalized["force_master_break"] = True
+        if beat.get("broll_required") is True:
+            normalized["broll_required"] = True
         for field in ("speaker", "dialogue", "visual_intent"):
             if not normalized[field]:
                 raise ValueError(f"script beat {beat_label}.{field} is required")
@@ -151,10 +169,21 @@ def normalize_response(raw: dict, *, allowed_source_ids: set[str]) -> dict:
     variants_raw = raw.get("variants") or []
     if not isinstance(variants_raw, list) or not variants_raw:
         raise ValueError("script generation requires at least 1 usable variant")
-    variants = [
-        _normalize_variant(item or {}, allowed_source_ids=allowed_source_ids)
-        for item in variants_raw[:3]
-    ]
+    variants: list[dict] = []
+    variant_errors: list[ValueError] = []
+    for item in variants_raw[:3]:
+        try:
+            variants.append(_normalize_variant(
+                item or {}, allowed_source_ids=allowed_source_ids
+            ))
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError):
+                variant_errors.append(exc)
+            continue
+    if not variants:
+        if variant_errors:
+            raise variant_errors[0]
+        raise ValueError("script generation requires at least 1 usable variant")
     try:
         recommended = int(raw.get("recommended_index"))
     except (TypeError, ValueError):
@@ -330,6 +359,11 @@ def _prompt(
     context: dict, sources: list[dict], preferences: dict | None = None
 ) -> str:
     preferences = normalize_generation_preferences(preferences)
+    prompt_sources = deepcopy(sources)
+    for source in prompt_sources:
+        source["content"] = script_sources.compact_text_for_prompt(
+            source.get("content") or "", max_chars=60000
+        )
     reconstruction = _reconstruction_source(sources)
     reconstruction_guidance = ""
     if reconstruction:
@@ -353,6 +387,10 @@ def _prompt(
                 "duration_sec": 4,
                 "visual_intent": "画面意图",
                 "source_ids": ["SRC-..."],
+                "continuity_id": "same-scene-stable-id",
+                "scene": "具体地点、时段与空间状态",
+                "characters": ["character_id"],
+                "broll_required": False,
                 "broll_hint": "辅助画面建议",
             }],
         }],
@@ -380,6 +418,9 @@ def _prompt(
         "关键物件变化以及景别与运镜；不得只写‘人物讲解’或泛化氛围。"
         "多人剧情不得默认写成办公室站桩口播，必须让人物在剧情场景中行动并由镜头参与叙事；"
         "单人知识讲解才允许使用稳定口播构图。"
+        "每个 beat 必须给出 continuity_id、scene 和 characters：同一地点、时段、人物关系和剧情目标连续时复用同一 continuity_id；"
+        "只有地点或时段跳变、核心出场组合变化、剧情目标切换，或高风险复杂动作需要独立生成时才更换 continuity_id。"
+        "不要按说话人或固定秒数更换 continuity_id。broll_required 仅在证据、实物、流程或环境画面能提供台词之外的有效信息时设为 true。"
         "只允许引用提供的 source_id；不得编造事实、金额、客户、政策或产品能力；"
         "不得照抄竞品台词，只能借鉴抽象结构。目标为 Seedance 2.5 原生母片加本地导演剪辑。"
         "下方创作建议均为软约束：建议总时长用于调节各 beat 的台词密度和节奏，各 beat 秒数之和应尽量接近；"
@@ -393,7 +434,7 @@ def _prompt(
         + "\n\n已批准 Brief：\n"
         + json.dumps(context, ensure_ascii=False)
         + "\n\n可用来源：\n"
-        + json.dumps(sources, ensure_ascii=False)
+        + json.dumps(prompt_sources, ensure_ascii=False)
     )
 
 
@@ -541,7 +582,14 @@ def _broll_plan(beats: list[dict], *, max_duration: float = 12) -> list[tuple[in
         "conflict": 3, "hook": 4, "cta": 5,
     }
     candidates = sorted(
-        enumerate(beats),
+        (
+            (index, beat) for index, beat in enumerate(beats)
+            if beat.get("broll_required") is True
+            or (
+                _text(beat.get("broll_hint"))
+                and _text(beat.get("beat")) in {"evidence", "reversal", "solution"}
+            )
+        ),
         key=lambda item: (priority.get(_text(item[1].get("beat")), 99), item[0]),
     )
     selected: list[tuple[int, dict]] = []
@@ -620,8 +668,156 @@ def _provider_timeline_units(beats: list[dict]) -> list[dict]:
     return units
 
 
+def _explicit_continuity_key(beat: dict) -> str | None:
+    """Return a stable hard-boundary key when the script provides one."""
+    continuity_id = _text(beat.get("continuity_id"))
+    scene_value = _text(
+        beat.get("scene_id") or beat.get("location") or beat.get("scene")
+    ).casefold()
+    if continuity_id:
+        # A model-provided continuity id is useful but cannot override a
+        # declared physical-location change.  Merging two locations into one
+        # paid master makes both character blocking and scene references
+        # impossible to satisfy.
+        key = f"continuity:{continuity_id.casefold()}"
+        return f"{key};scene:{scene_value}" if scene_value else key
+    components = [
+        ("scene", scene_value),
+        ("time", _text(beat.get("time_of_day")).casefold()),
+    ]
+    cast = sorted({
+        _text(item.get("id") if isinstance(item, dict) else item).casefold()
+        for item in (beat.get("characters") or beat.get("cast") or [])
+        if _text(item.get("id") if isinstance(item, dict) else item)
+    })
+    if cast:
+        components.append(("cast", "|".join(cast)))
+    populated = [f"{name}:{value}" for name, value in components if value]
+    return ";".join(populated) or None
+
+
+def _scene_anchor_key(continuity_key: str) -> str:
+    digest = hashlib.sha256(continuity_key.encode("utf-8")).hexdigest()[:12]
+    return f"scene-{digest}"
+
+
+def _scene_description(beats: list[dict]) -> str:
+    values = [
+        _text(beat.get("scene") or beat.get("location"))
+        for beat in beats
+        if _text(beat.get("scene") or beat.get("location"))
+    ]
+    return "；".join(dict.fromkeys(values)) or _text(beats[0].get("visual_intent"))
+
+
+def _continuity_segments(
+    timeline_units: list[dict],
+) -> list[tuple[str, list[tuple[int, dict]]]]:
+    """Group adjacent beats by story continuity, never by speaker identity."""
+    segments: list[tuple[str, list[tuple[int, dict]]]] = []
+    current_key = "continuous:default"
+    current_explicit = False
+    current: list[tuple[int, dict]] = []
+    for unit_index, beat in enumerate(timeline_units):
+        explicit_key = _explicit_continuity_key(beat)
+        force_break = beat.get("force_master_break") is True
+        boundary = bool(current) and (
+            force_break
+            or (
+                explicit_key is not None
+                and current_explicit
+                and explicit_key != current_key
+            )
+            or (explicit_key is not None and not current_explicit)
+        )
+        if boundary:
+            segments.append((current_key, current))
+            current = []
+        if not current:
+            current_key = explicit_key or "continuous:default"
+            current_explicit = explicit_key is not None
+        current.append((unit_index, beat))
+    if current:
+        segments.append((current_key, current))
+    return segments
+
+
+def _balanced_master_groups(
+    indexed_units: list[tuple[int, dict]],
+    *,
+    max_duration: float = MAX_PROVIDER_MASTER_DURATION_SEC,
+) -> list[list[tuple[int, dict]]]:
+    """Partition a continuous segment without producing a greedy short tail."""
+    if not indexed_units:
+        return []
+    durations = [float(beat["duration_sec"]) for _, beat in indexed_units]
+    total = sum(durations)
+    group_count = max(1, math.ceil(total / max_duration))
+    if group_count == 1:
+        return [indexed_units]
+
+    prefix = [0.0]
+    for duration in durations:
+        prefix.append(prefix[-1] + duration)
+
+    # Dynamic programming keeps editorial beat boundaries and minimizes
+    # deviation from an even split.  This turns 36 seconds into 18+18 rather
+    # than a fragile 30+6 paid tail.  If indivisible beats make the theoretical
+    # ceil(total/30) count impossible (20+20+20), increase only to the minimum
+    # feasible count instead of failing the production plan.
+    solution: tuple[float, list[int]] | None = None
+    while group_count <= len(indexed_units) and solution is None:
+        target = total / group_count
+        dp: dict[tuple[int, int], tuple[float, list[int]]] = {
+            (0, 0): (0.0, [])
+        }
+        for groups_used in range(1, group_count + 1):
+            for end in range(groups_used, len(indexed_units) + 1):
+                best: tuple[float, list[int]] | None = None
+                for start in range(groups_used - 1, end):
+                    prior = dp.get((groups_used - 1, start))
+                    if prior is None:
+                        continue
+                    duration = prefix[end] - prefix[start]
+                    if duration > max_duration + 1e-6:
+                        continue
+                    cost = prior[0] + (duration - target) ** 2
+                    candidate = (cost, [*prior[1], end])
+                    if best is None or candidate[0] < best[0]:
+                        best = candidate
+                if best is not None:
+                    dp[(groups_used, end)] = best
+        solution = dp.get((group_count, len(indexed_units)))
+        if solution is None:
+            group_count += 1
+    if solution is None:
+        raise ValueError(
+            "continuous segment cannot be partitioned into provider-safe masters"
+        )
+    groups: list[list[tuple[int, dict]]] = []
+    start = 0
+    for end in solution[1]:
+        groups.append(indexed_units[start:end])
+        start = end
+    return groups
+
+
 def _storyboard(script: dict) -> dict:
-    beats = script["beats"]
+    requested_beats = script["beats"]
+    beats = deepcopy(requested_beats)
+    duration_adjustments = []
+    for index, beat in enumerate(beats):
+        requested_duration = float(beat["duration_sec"])
+        minimum_duration = estimate_dialogue_duration(beat.get("dialogue"))
+        production_duration = max(requested_duration, minimum_duration)
+        beat["duration_sec"] = production_duration
+        if production_duration > requested_duration + 1e-6:
+            duration_adjustments.append({
+                "source_beat_index": index,
+                "requested_duration_sec": requested_duration,
+                "minimum_speech_duration_sec": minimum_duration,
+                "production_duration_sec": production_duration,
+            })
     timeline_units = _provider_timeline_units(beats)
     original_speakers = list(dict.fromkeys(
         _text(beat["speaker"]) for beat in beats
@@ -642,31 +838,36 @@ def _storyboard(script: dict) -> dict:
 
     speakers = list(dict.fromkeys(effective_speaker(beat) for beat in beats))
     cinematic_story = len(speakers) > 1
-    # The finished story may be longer than 30 seconds, but the live Seedance
-    # 2.5 task endpoint accepts at most 30 seconds per paid generation unit.
-    # Split only the provider-facing master, at existing editorial beat
-    # boundaries, so the script and final director timeline remain intact.
-    max_master_duration = MAX_PROVIDER_MASTER_DURATION_SEC
+    # A paid master is a continuous dramatic scene, not a speaker bucket and
+    # not an arbitrary ten-second slice.  Seedance 2.5's 30 seconds is a hard
+    # maximum.  Only explicit continuity changes or the provider limit split
+    # a scene, and long scenes are balanced to avoid wasteful short tails.
     master_groups: list[tuple[str, list[tuple[int, dict]]]] = []
-    for speaker in speakers:
-        current: list[tuple[int, dict]] = []
-        current_duration = 0.0
-        for unit_index, beat in enumerate(timeline_units):
-            if effective_speaker(beat) != speaker:
-                continue
-            beat_duration = float(beat["duration_sec"])
-            if current and current_duration + beat_duration > max_master_duration:
-                master_groups.append((speaker, current))
-                current = []
-                current_duration = 0.0
-            current.append((unit_index, beat))
-            current_duration += beat_duration
-        if current:
-            master_groups.append((speaker, current))
+    for continuity_key, segment in _continuity_segments(timeline_units):
+        for group in _balanced_master_groups(segment):
+            master_groups.append((continuity_key, group))
     masters = []
     master_index_by_unit: dict[int, int] = {}
-    for master_idx, (speaker_id, indexed_group) in enumerate(master_groups, 1):
+    for master_idx, (continuity_key, indexed_group) in enumerate(master_groups, 1):
         group = [beat for _, beat in indexed_group]
+        scene_anchor_key = _scene_anchor_key(continuity_key)
+        scene_anchor_description = _scene_description(group)
+        group_speakers = list(dict.fromkeys(
+            effective_speaker(beat) for beat in group
+        ))
+        group_cast: list[str] = []
+        for beat in group:
+            for character_id in [
+                *(beat.get("characters") or beat.get("cast") or []),
+                effective_speaker(beat),
+            ]:
+                normalized = _text(
+                    character_id.get("id")
+                    if isinstance(character_id, dict) else character_id
+                )
+                if normalized and normalized not in group_cast:
+                    group_cast.append(normalized)
+        speaker_id = group_speakers[0]
         for unit_index, _ in indexed_group:
             master_index_by_unit[unit_index] = master_idx
         voiceover = "".join(_text(beat["dialogue"]) for beat in group)
@@ -676,6 +877,7 @@ def _storyboard(script: dict) -> dict:
             duration = float(beat["duration_sec"])
             performance_beats.append({
                 "beat": beat["beat"],
+                "speaker": effective_speaker(beat),
                 "source_beat_index": beat["_source_beat_index"],
                 "fragment_index": beat["_fragment_index"],
                 "fragment_count": beat["_fragment_count"],
@@ -690,8 +892,10 @@ def _storyboard(script: dict) -> dict:
             render_mode = "cinematic_character"
             shot_type = "电影化连续情境表演"
             camera = (
-                "根据每个剧情节拍切换景别与机位；使用建立镜头、跟拍、环绕、"
-                "动作特写和反应镜头，保持空间方向连续，禁止全程固定胸像"
+                "采用单一连续运动路径：先用建立镜头交代空间，再随剧情缓慢推近、"
+                "跟移或环绕；每个动作只做一次有动机的景别变化，切换机位必须借助"
+                "人物动作、前景遮挡或视线变化，结束前预留稳定画面；保持180度轴线"
+                "和空间方向，禁止无动机跳切、反复推拉及全程固定胸像"
             )
             scene = "；随后转入：".join(
                 item["visual_intent"] for item in performance_beats
@@ -702,13 +906,21 @@ def _storyboard(script: dict) -> dict:
         else:
             render_mode = "presenter"
             shot_type = "中近景连续讲解"
-            camera = "稳定胸像构图，按叙事节奏做轻微推近"
+            camera = (
+                "采用单一连续运动路径：稳定中近景起步，按叙事节奏缓慢推近，"
+                "在观点落点前停止运动并稳定收束，禁止反复推拉或无动机跳切"
+            )
             scene = "明亮现代的设备租赁办公室，背景整洁，无可读文字、数字、商标或水印"
             action = "主讲人面对镜头自然讲解，随钩子、反转和行动号召做克制手势与表情变化"
         masters.append({
             "idx": master_idx,
             "type": "dialogue",
             "speaker": speaker_id,
+            "speakers": group_speakers,
+            "cast": group_cast,
+            "continuity_key": continuity_key,
+            "scene_anchor_key": scene_anchor_key,
+            "scene_anchor_description": scene_anchor_description,
             "render_mode": render_mode,
             "duration": round(sum(
                 float(beat["duration_sec"]) for beat in group
@@ -721,46 +933,80 @@ def _storyboard(script: dict) -> dict:
             "subtitle": _subtitle(voiceover),
             "performance_beats": performance_beats,
         })
-    broll_ranges: dict[int, float] = {}
-    broll_master_idx: int | None = None
-    selected_broll = _broll_plan(beats) if len(masters) < 3 else []
+    broll_ranges: dict[int, tuple[int, float]] = {}
+    broll_master_indexes: list[int] = []
+    selected_broll = _broll_plan(beats)
     if selected_broll:
-        broll_master_idx = len(masters) + 1
-        broll_cursor = 0.0
-        visual_sequences = []
+        broll_groups: list[tuple[str, list[tuple[int, dict]]]] = []
         for beat_index, beat in selected_broll:
-            broll_ranges[beat_index] = round(broll_cursor, 2)
-            broll_cursor += float(beat["duration_sec"])
-            scene_direction = _text(
-                beat.get("broll_hint") or beat.get("visual_intent")
+            key = _explicit_continuity_key(beat) or "continuous:default"
+            if broll_groups and broll_groups[-1][0] == key:
+                broll_groups[-1][1].append((beat_index, beat))
+            else:
+                broll_groups.append((key, [(beat_index, beat)]))
+        for continuity_key, selected_group in broll_groups:
+            broll_master_idx = len(masters) + 1
+            broll_master_indexes.append(broll_master_idx)
+            broll_cursor = 0.0
+            visual_sequences = []
+            group_beats = [beat for _, beat in selected_group]
+            cast: list[str] = []
+            for beat_index, beat in selected_group:
+                broll_ranges[beat_index] = (
+                    broll_master_idx, round(broll_cursor, 2)
+                )
+                broll_cursor += float(beat["duration_sec"])
+                scene_direction = _text(
+                    beat.get("broll_hint") or beat.get("visual_intent")
+                )
+                visual_sequences.append(
+                    f"{beat['beat']}：具体场景要求：{scene_direction}"
+                )
+                for character_id in [
+                    *(beat.get("characters") or beat.get("cast") or []),
+                    beat.get("speaker"),
+                ]:
+                    normalized = _text(
+                        character_id.get("id")
+                        if isinstance(character_id, dict) else character_id
+                    )
+                    if normalized and normalized not in cast:
+                        cast.append(normalized)
+            cast_rule = (
+                f"允许出镜角色仅限：{'、'.join(cast)}；所有角色必须沿用各自定妆身份参考，"
+                "不得生成未列角色、替身或随机路人。"
+                if cast else
+                "画面不得出现可识别人物正脸或随机路人。"
             )
-            visual_sequences.append(
-                f"{beat['beat']}：具体场景要求：{scene_direction}"
+            prompt = (
+                "生成一段无对白、无旁白的电影化 B-roll 连续蒙太奇。"
+                "每个叙事段落先给出完整环境建立镜头，再进入人物动作、关键物件变化、"
+                "技能效果和环境反应；具体行业场景必须清晰可辨。"
+                "严格复现画面意图和辅助画面中的主体、环境与动作，"
+                "禁止仅用无语义的手部特写、通用办公室或西装人物替代具体场景。"
+                "使用建立镜头、跟拍、环绕和动作特写，禁止固定胸像口播；"
+                "同一种景别或同一动作不得连续重复。"
+                f"{cast_rule}"
+                "不出现悬浮文案、可读文字、数字、商标、界面、标识或水印。"
+                + "；随后转入：".join(visual_sequences)
             )
-        prompt = (
-            "生成一段无对白、无旁白的电影化 B-roll 连续蒙太奇。"
-            "每个叙事段落先给出完整环境建立镜头，再进入人物动作、关键物件变化、"
-            "技能效果和环境反应；具体行业场景必须清晰可辨。"
-            "严格复现画面意图和辅助画面中的主体、环境与动作，"
-            "禁止仅用无语义的手部特写、通用办公室或西装人物替代具体场景。"
-            "使用建立镜头、跟拍、环绕和动作特写，禁止固定胸像口播；"
-            "同一种景别或同一动作不得连续重复。"
-            "避免可识别真人正脸，不出现可读文字、数字、商标或水印。"
-            + "；随后转入：".join(visual_sequences)
-        )
-        masters.append({
-            "idx": broll_master_idx,
-            "type": "broll",
-            "duration": round(broll_cursor, 2),
-            "shot_type": "电影化场景与动作蒙太奇",
-            "camera": "建立镜头、跟拍、环绕、动作特写与环境反应镜头",
-            "scene": prompt,
-            "prompt": prompt,
-            "anchor_character": None,
-            "asset_tags": [
-                _text(beat.get("beat")) for _, beat in selected_broll
-            ],
-        })
+            masters.append({
+                "idx": broll_master_idx,
+                "type": "broll",
+                "duration": round(broll_cursor, 2),
+                "shot_type": "电影化场景与动作蒙太奇",
+                "camera": "建立镜头、跟拍、环绕、动作特写与环境反应镜头",
+                "scene": prompt,
+                "prompt": prompt,
+                "continuity_key": continuity_key,
+                "scene_anchor_key": _scene_anchor_key(continuity_key),
+                "scene_anchor_description": _scene_description(group_beats),
+                "cast": cast,
+                "anchor_character": cast[0] if len(cast) == 1 else None,
+                "asset_tags": [
+                    _text(beat.get("beat")) for _, beat in selected_group
+                ],
+            })
     shots = []
     cursors = {
         master["idx"]: 0.0 for master in masters
@@ -773,10 +1019,9 @@ def _storyboard(script: dict) -> dict:
         source_beat_index = beat["_source_beat_index"]
         master_idx = master_index_by_unit[unit_index]
         cursor = cursors[master_idx]
-        broll_start = broll_ranges.get(source_beat_index)
-        video_master_idx = (
-            broll_master_idx if broll_start is not None else master_idx
-        )
+        broll_target = broll_ranges.get(source_beat_index)
+        video_master_idx = broll_target[0] if broll_target else master_idx
+        broll_start = broll_target[1] if broll_target else None
         shots.append({
             "idx": index,
             "beat": beat["beat"],
@@ -794,6 +1039,79 @@ def _storyboard(script: dict) -> dict:
             "source_ids": beat["source_ids"],
         })
         cursors[master_idx] = round(cursor + duration, 2)
+
+    master_by_idx = {int(master["idx"]): master for master in masters}
+    for shot_index, shot in enumerate(shots):
+        shot["transition_duration_sec"] = 0.0
+        shot["preserve_audio_continuity"] = False
+        if shot_index == 0:
+            shot["continuity_relation"] = "opening"
+            shot["transition_type"] = "none"
+            shot["transition_reason"] = "首镜直接进入，不添加无意义转场"
+            continue
+
+        previous = shots[shot_index - 1]
+        current_video_idx = int(shot["video_master_idx"])
+        current_audio_idx = int(shot["audio_master_idx"])
+        previous_video_idx = int(previous["video_master_idx"])
+        previous_audio_idx = int(previous["audio_master_idx"])
+        current_video = master_by_idx.get(current_video_idx, {})
+        previous_video = master_by_idx.get(previous_video_idx, {})
+        current_key = str(current_video.get("continuity_key") or "")
+        previous_key = str(previous_video.get("continuity_key") or "")
+        audio_contiguous = (
+            current_audio_idx == previous_audio_idx
+            and abs(
+                float(shot.get("audio_start") or 0)
+                - (
+                    float(previous.get("audio_start") or 0)
+                    + float(previous["duration"])
+                )
+            ) <= 0.05
+        )
+        picture_is_broll = current_video_idx != current_audio_idx
+        leaving_broll = (
+            previous_video_idx != previous_audio_idx and audio_contiguous
+        )
+        if picture_is_broll or leaving_broll:
+            shot["continuity_relation"] = "audio_bridge"
+            shot["transition_type"] = "cut"
+            shot["transition_reason"] = (
+                "对白音轨连续，用有语义的辅助画面完成视觉切换"
+            )
+            shot["preserve_audio_continuity"] = True
+            continue
+
+        video_contiguous = (
+            current_video_idx == previous_video_idx
+            and abs(
+                float(shot.get("video_start") or 0)
+                - (
+                    float(previous.get("video_start") or 0)
+                    + float(previous["duration"])
+                )
+            ) <= 0.05
+        )
+        if video_contiguous and audio_contiguous:
+            shot["continuity_relation"] = "same_master_continuation"
+            shot["transition_type"] = "cut"
+            shot["transition_reason"] = (
+                "同一母片按时间连续推进，保留原生运镜和表演"
+            )
+            shot["preserve_audio_continuity"] = True
+        elif current_key and current_key == previous_key:
+            shot["continuity_relation"] = "same_scene_angle_change"
+            shot["transition_type"] = "match_cut"
+            shot["transition_reason"] = (
+                "同场景换机位，沿用人物站位、视线和180度轴线"
+            )
+        else:
+            shot["continuity_relation"] = "scene_change"
+            shot["transition_type"] = "dip_to_black"
+            shot["transition_duration_sec"] = 0.12
+            shot["transition_reason"] = (
+                "场景发生变化，用极短暗场建立新空间"
+            )
     return {
         "production_profile": "standard",
         "production_mode": "native_master_local_director",
@@ -807,12 +1125,24 @@ def _storyboard(script: dict) -> dict:
         "masters": masters,
         "shots": shots,
         "director_plan": {
+            "master_grouping": "content_continuity",
+            "provider_max_master_duration_sec": MAX_PROVIDER_MASTER_DURATION_SEC,
             "strategy": (
-                "dialogue_plus_broll" if broll_master_idx is not None
+                "dialogue_plus_broll" if broll_master_indexes
                 else "cinematic_dialogue_only"
             ),
             "dialogue_master_count": len(master_groups),
-            "broll_master_count": 1 if broll_master_idx is not None else 0,
+            "broll_master_count": len(broll_master_indexes),
+            "paid_master_count": len(masters),
+            "local_edit_shot_count": len(timeline_units),
+            "speech_duration_adjusted": bool(duration_adjustments),
+            "speech_duration_adjustments": duration_adjustments,
+            "requested_duration_sec": round(sum(
+                float(beat["duration_sec"]) for beat in requested_beats
+            ), 2),
+            "production_duration_sec": round(sum(
+                float(beat["duration_sec"]) for beat in beats
+            ), 2),
             "broll_beats": [
                 beat["beat"] for _, beat in selected_broll
             ],

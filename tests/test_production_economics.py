@@ -27,6 +27,29 @@ import cli as cli_module  # noqa: E402
 
 
 class MinimumPaidMasterTests(unittest.TestCase):
+    def test_legacy_storyboard_has_no_fixed_shot_or_broll_count_gate(self):
+        storyboard = {
+            "characters": [{
+                "id": "host",
+                "name": "Host",
+                "gender": "female",
+                "look": "A fictional equipment-rental consultant",
+            }],
+            "hook": "A visual evidence montage",
+            "bgm": {"mood": "restrained", "prompt": "light rhythm"},
+            "shots": [
+                {
+                    "idx": idx,
+                    "type": "broll",
+                    "duration": 4,
+                    "prompt": f"Evidence detail {idx}",
+                }
+                for idx in range(1, 14)
+            ],
+        }
+
+        s1_storyboard._validate(storyboard)
+
     def test_single_dialogue_master_is_valid_when_it_covers_the_whole_story(self):
         storyboard = {
             "production_profile": "standard",
@@ -72,7 +95,8 @@ class MinimumPaidMasterTests(unittest.TestCase):
             duration=18,
         )
 
-        self.assertIn("1—3", prompt)
+        self.assertNotIn("1—3 条", prompt)
+        self.assertIn("不设置人为条数或整单总时长上限", prompt)
         self.assertIn("最少", prompt)
         self.assertIn("asset_tags", prompt)
         self.assertIn("素材库", prompt)

@@ -9,6 +9,9 @@ from .db import conn, log
 from .models import TRANSITIONS, TERMINAL_STATES
 
 
+BATCH_EXCLUDED_STATES = TERMINAL_STATES
+
+
 STEP_MODULES = {
     "s1_storyboard": "factory.steps.s1_storyboard",
     "s3_shots":      "factory.steps.s3_shots",
@@ -20,6 +23,17 @@ STEP_MODULES = {
 MAX_CONCURRENT_JOBS  = int(os.getenv("MAX_CONCURRENT_JOBS", "4"))
 MAX_CONCURRENT_SHOTS = int(os.getenv("MAX_CONCURRENT_SHOTS", "3"))
 MAX_RETRIES          = int(os.getenv("MAX_RETRIES", "3"))
+
+STABLE_FAILURE_CODES = {
+    "request_invalid", "input_privacy_rejected",
+    "output_policy_rejected", "output_copyright_rejected",
+    "account_unavailable", "transient_network",
+}
+
+
+def _stable_failure_code(error: BaseException) -> str | None:
+    code = str(getattr(error, "stable_code", "") or "").strip()
+    return code if code in STABLE_FAILURE_CODES else None
 
 
 async def _run_step(job_id: str, step: str):
@@ -58,28 +72,38 @@ async def _process_job(job_id: str, sem: asyncio.Semaphore):
                 await _run_step(job_id, step)
                 db.execute(
                     "UPDATE jobs SET state=?, updated_at=CURRENT_TIMESTAMP, "
-                    "retries=0, error=NULL WHERE job_id=?",
+                    "retries=0, error=NULL, failure_code=NULL WHERE job_id=?",
                     (new_state.value, job_id)
                 )
                 db.commit()
                 log(db, job_id, step, "INFO", f"done {step} → {new_state.value}")
             except Exception as e:
                 tb = traceback.format_exc(limit=4)
+                failure_code = _stable_failure_code(e)
                 pause_state = str(getattr(e, "pause_state", "") or "").strip()
                 if pause_state:
+                    pause_error = (
+                        str(e)[:2000]
+                        if pause_state in {
+                            "PRODUCTION_REVIEW_REQUIRED",
+                            "PROVIDER_ACTION_REQUIRED",
+                        }
+                        else None
+                    )
                     db.execute(
-                        "UPDATE jobs SET state=?,error=NULL,"
+                        "UPDATE jobs SET state=?,error=?,failure_code=?,"
                         "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
                         "WHERE job_id=?",
-                        (pause_state, job_id),
+                        (pause_state, pause_error, failure_code, job_id),
                     )
                     db.commit()
                     log(db, job_id, step, "INFO", f"paused for review: {e}")
                     return
                 if not _should_retry_step(e):
                     db.execute(
-                        "UPDATE jobs SET state='FAILED', error=? WHERE job_id=?",
-                        (f"{step}: {e}", job_id)
+                        "UPDATE jobs SET state='FAILED',error=?,failure_code=? "
+                        "WHERE job_id=?",
+                        (f"{step}: {e}", failure_code, job_id)
                     )
                     db.commit()
                     log(db, job_id, step, "ERROR",
@@ -88,8 +112,9 @@ async def _process_job(job_id: str, sem: asyncio.Semaphore):
                 next_retry = retries + 1
                 if next_retry >= MAX_RETRIES:
                     db.execute(
-                        "UPDATE jobs SET state='FAILED', error=? WHERE job_id=?",
-                        (f"{step}: {e}", job_id)
+                        "UPDATE jobs SET state='FAILED',error=?,failure_code=? "
+                        "WHERE job_id=?",
+                        (f"{step}: {e}", failure_code, job_id)
                     )
                     db.commit()
                     log(db, job_id, step, "ERROR",
@@ -136,11 +161,13 @@ async def run_batch(csv_path: str, batch_id: str | None = None):
     print(f"导入 {n} 条新主题")
 
     db = conn()
-    where = "state NOT IN ('PUBLISHED','FAILED','BLOCKED')"
-    params: tuple = ()
+    excluded = tuple(sorted(BATCH_EXCLUDED_STATES))
+    placeholders = ",".join("?" for _ in excluded)
+    where = f"state NOT IN ({placeholders})"
+    params: tuple = excluded
     if batch_id:
         where += " AND batch_id=?"
-        params = (batch_id,)
+        params = (*params, batch_id)
     pending = db.execute(
         f"SELECT job_id FROM jobs WHERE {where} "
         "ORDER BY priority DESC, created_at ASC",

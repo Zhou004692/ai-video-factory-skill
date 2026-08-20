@@ -20,6 +20,7 @@ VIDEO_KEYS = (
     "VOLC_SK",
     "TOS_BUCKET",
 )
+FIXED_TTS_KEYS = ("VOLC_TTS_APPID", "VOLC_TTS_API_KEY")
 
 
 def _venv_python(root: Path) -> Path:
@@ -48,11 +49,10 @@ def _required_fields(profile: str, config: dict[str, str]) -> tuple[str, ...]:
     if profile == "learning":
         return ()
     if profile == "video":
-        asr_ready = _configured(config.get("VOLC_ASR_API_KEY")) or all(
-            _configured(config.get(key))
-            for key in ("VOLC_ASR_APPID", "VOLC_ASR_TOKEN")
-        )
-        return VIDEO_KEYS if asr_ready else (*VIDEO_KEYS, "VOLC_ASR_API_KEY")
+        audio_mode = str(
+            config.get("DIALOGUE_AUDIO_MODE") or "seedance_native"
+        ).strip().casefold()
+        return VIDEO_KEYS + (FIXED_TTS_KEYS if audio_mode != "seedance_native" else ())
     provider = str(config.get("DEFAULT_LLM_PROVIDER") or "doubao").lower()
     return ("ANTHROPIC_API_KEY",) if provider == "claude" else ("ARK_API_KEY",)
 

@@ -1,18 +1,23 @@
-"""s3: 使用 Seedance 2.5 原生生成画面、语音与口型。
+"""s3: 用固定火山声线驱动 Seedance 2.5 画面与口型。
 
-- presenter dialogue → 虚构真人原生开口，后续镜头复用视频与声线参考
-- scene dialogue → 无人脸场景 + 原生画外音
-- broll → 画面 + 原生环境音，不生成人声
+- presenter dialogue → 角色固定 TTS 音轨 + Seedance 条件画面/口型
+- scene dialogue → 无人脸场景 + 角色固定画外音
+- broll → 仅画面，不生成随机人声
 """
 import asyncio
 from dataclasses import dataclass
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
+import shutil
 
 from .. import (
-    ASSETS_DIR, SKILL_ROOT, asset_library, character_assets, scene_assets,
+    ASSETS_DIR, SKILL_ROOT, anchor_generation, asset_library,
+    character_assets, character_voices, provider_health, provider_tasks,
+    scene_assets, subtitles,
 )
 from ..db import conn
 from ..clients import (
@@ -23,10 +28,15 @@ from ..clients import (
     tos,
     video_qa,
     volc_assets,
+    volc_tts,
 )
 from ..orchestrator import MAX_CONCURRENT_SHOTS
 from ..scene_voiceover import faceless_visual_text, non_text_visual_text
-from ..video_routing import VideoRoute, precision_motion_reason, select_route
+from ..video_routing import (
+    AUDIO_MODE_FIXED_TTS, VideoRoute, normalize_audio_mode,
+    precision_motion_reason, select_route,
+)
+from ..review_candidates import controlled_candidate_path
 
 
 @dataclass(frozen=True)
@@ -62,6 +72,392 @@ class NativeVoiceAnchor:
     audio_path: Path
 
 
+@dataclass(frozen=True)
+class FixedVoiceSegment:
+    """One role-owned line on a master-relative speech timeline."""
+
+    speaker_id: str
+    voice_type: str
+    text: str
+    start_ms: int
+    duration_ms: int
+
+
+@dataclass(frozen=True)
+class FixedVoiceTrack:
+    audio_path: Path
+    transcription: bigasr.Transcription
+    voice_types: tuple[str, ...]
+    duration_sec: float
+
+
+def _fixed_voice_segments(
+    shot: dict, characters: dict[str, dict]
+) -> tuple[FixedVoiceSegment, ...]:
+    """Resolve every spoken beat to an already-persisted fixed voice."""
+    beats = [
+        item for item in (shot.get("performance_beats") or [])
+        if str(item.get("dialogue") or "").strip()
+    ]
+    if not beats:
+        beats = [{
+            "speaker": shot.get("speaker") or shot.get("speaker_id"),
+            "start": 0,
+            "duration": shot.get("duration_sec") or 0,
+            "dialogue": shot.get("voiceover") or "",
+        }]
+    segments: list[FixedVoiceSegment] = []
+    for beat in beats:
+        text = str(beat.get("dialogue") or "").strip()
+        if not text:
+            continue
+        speaker_id = str(
+            beat.get("speaker")
+            or shot.get("speaker")
+            or shot.get("speaker_id")
+            or ""
+        ).strip()
+        character = characters.get(speaker_id) or {}
+        voice_type = str(
+            character.get("voice_type")
+            or (character.get("voice_binding") or {}).get("voice_type")
+            or ""
+        ).strip()
+        if not voice_type:
+            display_name = str(
+                character.get("script_character_name")
+                or character.get("name")
+                or speaker_id
+                or "未命名角色"
+            ).strip()
+            raise character_voices.VoiceBindingRequiredError(
+                f"角色“{display_name}”尚未绑定固定声线，已在 Seedance "
+                "付费调用前停止"
+            )
+        segments.append(FixedVoiceSegment(
+            speaker_id=speaker_id,
+            voice_type=voice_type,
+            text=text,
+            start_ms=max(0, round(float(beat.get("start") or 0) * 1000)),
+            duration_ms=max(
+                0, round(float(beat.get("duration") or 0) * 1000)
+            ),
+        ))
+    if not segments:
+        raise character_voices.VoiceBindingRequiredError(
+            "对白母片没有可合成的角色台词"
+        )
+    return tuple(segments)
+
+
+def _resolve_speaking_voice_bindings(
+    database,
+    characters: list[dict],
+    generation_units: list[dict],
+    *,
+    client=None,
+) -> bool:
+    """Bind every speaking script role once, before any video paid call."""
+    character_by_id = {
+        str(item.get("id") or "").strip(): item for item in characters
+        if str(item.get("id") or "").strip()
+    }
+    speaking_ids: list[str] = []
+    for unit in generation_units:
+        narrative_type = str(
+            unit.get("narrative_type") or unit.get("type") or ""
+        ).casefold()
+        if narrative_type != "dialogue":
+            continue
+        values = list(unit.get("speakers") or [])
+        values.append(unit.get("speaker") or unit.get("speaker_id"))
+        values.extend(
+            beat.get("speaker")
+            for beat in (unit.get("performance_beats") or [])
+            if isinstance(beat, dict)
+        )
+        for value in values:
+            character_id = str(value or "").strip()
+            if character_id and character_id not in speaking_ids:
+                speaking_ids.append(character_id)
+    created_client = None
+    changed = False
+    try:
+        for character_id in speaking_ids:
+            character = character_by_id.get(character_id)
+            if character is None:
+                raise character_voices.VoiceBindingRequiredError(
+                    f"对白角色“{character_id}”不在人物设定中，无法匹配固定声线"
+                )
+            binding = character_voices.get_binding(database, character_id)
+            if binding is None:
+                if client is None:
+                    created_client = created_client or volc_tts.VolcSpeechClient()
+                binding = character_voices.resolve_voice_binding(
+                    database, character, client=client or created_client
+                )
+            new_values = {
+                "voice_type": binding["voice_type"],
+                "voice_name": binding["voice_name"],
+                "voice_resource_id": binding["resource_id"],
+                "voice_preview_url": binding["preview_url"],
+                "voice_binding_source": binding["source"],
+            }
+            if any(character.get(key) != value for key, value in new_values.items()):
+                character.update(new_values)
+                changed = True
+        return changed
+    finally:
+        if created_client is not None:
+            created_client.close()
+
+
+def _timestamp_value(item: dict, *keys: str, default: int = 0) -> int:
+    for key in keys:
+        try:
+            if item.get(key) is not None:
+                return max(0, int(float(item[key])))
+        except (TypeError, ValueError):
+            continue
+    return max(0, int(default))
+
+
+async def _synthesize_fixed_voice_track(
+    database,
+    *,
+    job_id: str,
+    shot: dict,
+    characters: dict[str, dict],
+    paid_batch_id: str | None = None,
+) -> FixedVoiceTrack:
+    """Create and audit the one exact soundtrack Seedance must follow."""
+    segments = _fixed_voice_segments(shot, characters)
+    root = ASSETS_DIR / job_id / "voices" / f"master-{int(shot['idx']):02d}"
+    root.mkdir(parents=True, exist_ok=True)
+    track_path = root / "fixed-voice.wav"
+    metadata_path = root / "fixed-voice.json"
+    if track_path.is_file() and metadata_path.is_file():
+        cached = json.loads(metadata_path.read_text(encoding="utf-8"))
+        utterances = tuple(
+            bigasr.TimedUtterance(
+                str(item["text"]), int(item["start_ms"]), int(item["end_ms"])
+            )
+            for item in (cached.get("utterances") or [])
+        )
+        return FixedVoiceTrack(
+            track_path,
+            bigasr.Transcription(
+                str(cached.get("text") or ""),
+                min((item.start_ms for item in utterances), default=None),
+                max((item.end_ms for item in utterances), default=None),
+                utterances,
+            ),
+            tuple(cached.get("voice_types") or ()),
+            float(cached.get("duration_sec") or shot.get("duration_sec") or 0),
+        )
+
+    clips: list[tuple[Path, int]] = []
+    utterances: list[bigasr.TimedUtterance] = []
+    voice_types: list[str] = []
+    speech_end_ms = 0
+    for index, segment in enumerate(segments, 1):
+        character = characters.get(segment.speaker_id) or {}
+        intent = f"fixed_voice_tts:{index}"
+        safe_speaker = re.sub(
+            r"[^A-Za-z0-9_.-]+", "-", segment.speaker_id
+        ).strip("-") or "role"
+        clip_path = root / f"{index:02d}-{safe_speaker}.mp3"
+        segment_metadata_path = root / f"{index:02d}-{safe_speaker}.json"
+        reservation_id = ""
+        result = None
+        try:
+            segment_metadata = None
+            if clip_path.is_file() and segment_metadata_path.is_file():
+                segment_metadata = json.loads(
+                    segment_metadata_path.read_text(encoding="utf-8")
+                )
+                actual_hash = hashlib.sha256(clip_path.read_bytes()).hexdigest()
+                expected_identity = {
+                    "speaker_id": segment.speaker_id,
+                    "voice_type": segment.voice_type,
+                    "text": segment.text,
+                    "start_ms": segment.start_ms,
+                }
+                if (
+                    any(
+                        segment_metadata.get(key) != value
+                        for key, value in expected_identity.items()
+                    )
+                    or segment_metadata.get("audio_sha256") != actual_hash
+                    or int(segment_metadata.get("audio_bytes") or 0)
+                    != clip_path.stat().st_size
+                    or not clip_path.stat().st_size
+                ):
+                    raise volc_tts.VolcTTSResponseError(
+                        "固定声线片段的本地审计证据不一致，已阻止自动重发"
+                    )
+                reservation_id = str(
+                    segment_metadata.get("provider_task_id") or ""
+                ).strip()
+                if not reservation_id:
+                    raise volc_tts.VolcTTSResponseError(
+                        "固定声线片段缺少计费任务标识，已阻止自动重发"
+                    )
+                result = volc_tts.TTSResult(
+                    b"",
+                    int(segment_metadata.get("duration_ms") or 0),
+                    tuple(segment_metadata.get("timestamps") or ()),
+                    str(segment_metadata.get("provider_request_id") or ""),
+                    dict(segment_metadata.get("usage") or {}),
+                )
+            else:
+                reservation_id = provider_tasks.reserve_paid_submit(
+                    database,
+                    job_id=job_id,
+                    shot_idx=int(shot["idx"]),
+                    provider="volc_tts",
+                    intent=intent,
+                    authorized_batch_id=paid_batch_id,
+                    estimated_cost_cents=volc_tts.estimate_cost_cents(
+                        segment.text
+                    ),
+                    budget_limit_cents=0,
+                )
+                result = await volc_tts.synthesize(
+                    text=segment.text,
+                    voice_type=segment.voice_type,
+                    resource_id=str(
+                        character.get("voice_resource_id") or "seed-tts-2.0"
+                    ),
+                    voice_instruction=str(
+                        character.get("voice_directive") or ""
+                    ),
+                )
+                temporary = clip_path.with_suffix(".tmp")
+                temporary.write_bytes(result.audio)
+                temporary.replace(clip_path)
+                segment_metadata = {
+                    "speaker_id": segment.speaker_id,
+                    "voice_type": segment.voice_type,
+                    "text": segment.text,
+                    "start_ms": segment.start_ms,
+                    "duration_ms": result.duration_ms,
+                    "timestamps": list(result.timestamps),
+                    "provider_task_id": reservation_id,
+                    "provider_request_id": result.request_id,
+                    "usage": _safe_provider_usage(result.usage),
+                    "audio_bytes": clip_path.stat().st_size,
+                    "audio_sha256": hashlib.sha256(
+                        clip_path.read_bytes()
+                    ).hexdigest(),
+                }
+                metadata_temporary = segment_metadata_path.with_suffix(".tmp")
+                metadata_temporary.write_text(
+                    json.dumps(segment_metadata, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                metadata_temporary.replace(segment_metadata_path)
+            clips.append((clip_path, segment.start_ms))
+            voice_types.append(segment.voice_type)
+            timestamps = list(result.timestamps)
+            if not timestamps:
+                timestamps = [{
+                    "text": segment.text,
+                    "start_time": 0,
+                    "end_time": result.duration_ms or segment.duration_ms,
+                }]
+            for item in timestamps:
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                start_ms = segment.start_ms + _timestamp_value(
+                    item, "start_time", "start_ms", "start"
+                )
+                end_ms = segment.start_ms + _timestamp_value(
+                    item,
+                    "end_time", "end_ms", "end",
+                    default=result.duration_ms or segment.duration_ms,
+                )
+                if end_ms <= start_ms:
+                    end_ms = start_ms + max(
+                        1, result.duration_ms or segment.duration_ms
+                    )
+                utterances.append(
+                    bigasr.TimedUtterance(text, start_ms, end_ms)
+                )
+                speech_end_ms = max(speech_end_ms, end_ms)
+            usage = {
+                **_safe_provider_usage(result.usage),
+                "provider_request_id": result.request_id,
+                "voice_type": segment.voice_type,
+                "text_chars": len(segment.text),
+            }
+            delta = provider_tasks.upsert_final_call(
+                database,
+                task_id=reservation_id,
+                job_id=job_id,
+                shot_idx=int(shot["idx"]),
+                provider="volc_tts",
+                intent=intent,
+                status="completed",
+                usage=usage,
+                cost_cents=volc_tts.estimate_cost_cents(segment.text),
+            )
+            database.execute(
+                "UPDATE shots SET cost_cents=cost_cents+? "
+                "WHERE job_id=? AND idx=?",
+                (delta, job_id, int(shot["idx"])),
+            )
+            database.execute(
+                "UPDATE jobs SET cost_cents=cost_cents+? WHERE job_id=?",
+                (delta, job_id),
+            )
+            database.commit()
+        except BaseException as exc:
+            if reservation_id and (
+                result is not None or isinstance(exc, asyncio.CancelledError) or bool(
+                getattr(exc, "submit_result_unknown", False)
+                )
+            ):
+                provider_tasks.mark_action_required(
+                    database, reservation_id, message=str(exc)
+                )
+            elif reservation_id:
+                provider_tasks.release_reservation(database, reservation_id)
+            raise
+
+    duration_sec = max(
+        float(shot.get("duration_sec") or 0),
+        speech_end_ms / 1000 + 0.25,
+    )
+    await ffmpeg.assemble_timed_audio(
+        clips, track_path, duration_sec=duration_sec
+    )
+    utterances.sort(key=lambda item: (item.start_ms, item.end_ms))
+    transcription = bigasr.Transcription(
+        "".join(item.text for item in utterances),
+        min((item.start_ms for item in utterances), default=None),
+        max((item.end_ms for item in utterances), default=None),
+        tuple(utterances),
+    )
+    metadata = {
+        "text": transcription.text,
+        "utterances": [
+            {"text": item.text, "start_ms": item.start_ms,
+             "end_ms": item.end_ms}
+            for item in utterances
+        ],
+        "voice_types": voice_types,
+        "duration_sec": duration_sec,
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return FixedVoiceTrack(
+        track_path, transcription, tuple(voice_types), duration_sec
+    )
+
+
 class SeedanceQualityError(RuntimeError):
     """A failed quality gate that still carries billable provider usage."""
 
@@ -78,6 +474,8 @@ class SeedanceQualityError(RuntimeError):
         self.reasons = reasons
         self.candidate_path = candidate_path
         self.candidate_url = candidate_url
+        if candidate_path is not None and Path(candidate_path).is_file():
+            self.pause_state = "PRODUCTION_REVIEW_REQUIRED"
 
 
 class SeedanceBudgetError(RuntimeError):
@@ -90,6 +488,7 @@ class SeedanceManualReviewPendingError(RuntimeError):
     """An already-paid candidate is waiting for a human decision."""
 
     non_retryable = True
+    pause_state = "PRODUCTION_REVIEW_REQUIRED"
 
 
 class ContinuityAnchorReviewPendingError(RuntimeError):
@@ -115,6 +514,29 @@ def _assert_continuity_anchors_approved(database, job_id: str) -> None:
     raise ContinuityAnchorReviewPendingError(
         "人物与场景锚点等待审核：" + "、".join(labels)
     )
+
+
+def _apply_anchor_review_mode(database, job_id: str, mode: str) -> int:
+    """Auto-approve generated READY anchors or retain the manual review gate."""
+    normalized = str(mode or "auto").strip().casefold()
+    if normalized not in {"auto", "manual"}:
+        raise ValueError("anchor_review_mode must be auto or manual")
+    if normalized == "manual":
+        return 0
+    character = database.execute(
+        "UPDATE character_identity_anchors SET approval_state='APPROVED',"
+        "approved_at=CURRENT_TIMESTAMP WHERE job_id=? AND state='READY' "
+        "AND approval_state!='APPROVED'",
+        (job_id,),
+    )
+    scene = database.execute(
+        "UPDATE scene_visual_anchors SET approval_state='APPROVED',"
+        "approved_at=CURRENT_TIMESTAMP WHERE job_id=? AND state='READY' "
+        "AND approval_state!='APPROVED'",
+        (job_id,),
+    )
+    database.commit()
+    return int(character.rowcount or 0) + int(scene.rowcount or 0)
 
 
 def _is_manual_review_pending(shot: dict) -> bool:
@@ -173,6 +595,7 @@ _HARD_RETRY_REASONS = frozenset({
     "low_confidence",
     "unexpected_speech",
     "transcript_mismatch",
+    "lip_sync_mismatch",
     "unexpected_person",
     "unexpected_readable_text",
     "qa_error",
@@ -188,48 +611,9 @@ def _apply_master_transcription(
         storyboard: dict, master_idx: int,
         transcription: bigasr.Transcription) -> bool:
     """Replace estimated edit subtitles with master-relative ASR cues."""
-    if storyboard.get("production_mode") != "native_master_local_director":
-        return False
-
-    timed = list(transcription.utterances)
-    if (not timed and transcription.text
-            and transcription.speech_start_ms is not None
-            and transcription.speech_end_ms is not None):
-        timed = [bigasr.TimedUtterance(
-            transcription.text,
-            transcription.speech_start_ms,
-            transcription.speech_end_ms,
-        )]
-    if not timed:
-        return False
-
-    changed = False
-    for edit in storyboard.get("shots") or []:
-        audio_idx = int(edit.get("audio_master_idx",
-                                 edit.get("video_master_idx", -1)))
-        if audio_idx != int(master_idx):
-            continue
-        edit_start = float(edit.get("audio_start") or 0)
-        duration = float(edit.get("duration") or 0)
-        edit_end = edit_start + duration
-        cues: list[dict] = []
-        for utterance in timed:
-            cue_start = utterance.start_ms / 1000.0
-            cue_end = utterance.end_ms / 1000.0
-            overlap_start = max(edit_start, cue_start)
-            overlap_end = min(edit_end, cue_end)
-            if overlap_end <= overlap_start:
-                continue
-            cues.append({
-                "start": round(overlap_start - edit_start, 3),
-                "end": round(overlap_end - edit_start, 3),
-                "text": utterance.text,
-            })
-        if cues:
-            edit["subtitle"] = None
-            edit["subtitle_cues"] = cues
-            changed = True
-    return changed
+    return subtitles.apply_master_transcription(
+        storyboard, master_idx, transcription
+    )
 
 
 def _persist_master_transcription(
@@ -268,9 +652,16 @@ def _env_nonnegative_int(name: str, default: int) -> int:
 
 def _estimated_request_cost_cents(request_kwargs: dict) -> int:
     """Conservative pre-submit estimate from measured Seedance 2.5 calls."""
-    duration = seedance.normalize_generation_duration(
-        request_kwargs.get("duration")
-    )
+    if str(request_kwargs.get("task_intent") or "generate") == "edit":
+        duration = max(
+            1, int(math.ceil(float(
+                request_kwargs.get("reference_video_duration_sec") or 30
+            )))
+        )
+    else:
+        duration = seedance.normalize_generation_duration(
+            request_kwargs.get("duration")
+        )
     resolution = str(request_kwargs.get("resolution") or "720p").lower()
     cents_per_second = {
         "480p": 68,
@@ -348,13 +739,56 @@ def _aggregate_shot_failures(
     if any(bool(getattr(error, "non_retryable", False))
            for _, error in failed):
         aggregate.non_retryable = True
+    stable_codes = {
+        str(getattr(error, "stable_code", "") or "").strip()
+        for _, error in failed
+    } - {""}
+    if len(stable_codes) == 1:
+        aggregate.stable_code = next(iter(stable_codes))
+    pause_states = [
+        str(getattr(error, "pause_state", "") or "")
+        for _, error in failed
+    ]
+    if "PROVIDER_ACTION_REQUIRED" in pause_states:
+        aggregate.pause_state = "PROVIDER_ACTION_REQUIRED"
+    elif pause_states and all(
+        state == "PRODUCTION_REVIEW_REQUIRED" for state in pause_states
+    ):
+        aggregate.pause_state = "PRODUCTION_REVIEW_REQUIRED"
     return aggregate
+
+
+def _attach_provider_usage(exc: BaseException, *, cost_cents: int,
+                           provider_calls: list[dict]) -> None:
+    """Carry already-paid usage across any exception leaving generation."""
+    if not hasattr(exc, "cost_cents"):
+        exc.cost_cents = max(0, int(cost_cents or 0))
+    if not hasattr(exc, "provider_calls"):
+        exc.provider_calls = tuple(provider_calls)
+
+
+def _safe_provider_usage(usage: object) -> dict:
+    """Keep billing counters while dropping provider-controlled payload data."""
+    if not isinstance(usage, dict):
+        return {}
+    allowed = {
+        "completion_tokens", "total_tokens", "input_tokens", "output_tokens",
+        "duration", "duration_sec", "cost_cents",
+    }
+    return {
+        str(key): value
+        for key, value in usage.items()
+        if str(key) in allowed
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    }
 
 
 def _record_provider_calls(db, job_id: str, idx: int, provider: str,
                            provider_calls: tuple[dict, ...],
                            *, fallback_cost_cents: int = 0) -> int:
-    """Return only newly billable cost, deduplicated by provider task id."""
+    """Upsert pending/final provider usage and return only the cost delta."""
     if not provider_calls:
         return max(0, int(fallback_cost_cents or 0))
 
@@ -366,53 +800,161 @@ def _record_provider_calls(db, job_id: str, idx: int, provider: str,
             # Pre-task failures and test doubles have no stable provider id.
             new_cost += cost
             continue
-        cursor = db.execute(
-            "INSERT OR IGNORE INTO provider_calls("
-            "task_id, job_id, shot_idx, provider, intent, cost_cents, "
-            "usage_json) VALUES(?,?,?,?,?,?,?)",
-            (
-                task_id, job_id, idx, provider, call.get("intent"), cost,
-                json.dumps(call.get("usage") or {}, ensure_ascii=False),
-            ),
+        usage = call.get("usage") or {}
+        new_cost += provider_tasks.upsert_final_call(
+            db,
+            task_id=task_id,
+            job_id=job_id,
+            shot_idx=idx,
+            provider=provider,
+            intent=call.get("intent"),
+            status=str(usage.get("status") or "completed"),
+            usage=usage,
+            cost_cents=cost,
         )
-        if cursor.rowcount == 1:
-            new_cost += cost
     return new_cost
+
+
+def _mark_shot_generating(job_id: str, idx: int,
+                          provider: str = "seedance") -> None:
+    """Expose the active provider call instead of leaving the shot pending."""
+    database = conn()
+    database.execute(
+        "UPDATE shots SET state='GENERATING',provider=?,error=NULL,"
+        "video_qa=NULL WHERE job_id=? AND idx=?",
+        (provider, job_id, idx),
+    )
+    database.execute(
+        "UPDATE jobs SET updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
+        (job_id,),
+    )
+    database.commit()
 
 
 def _record_failed_generation(db, job_id: str, idx: int,
                               exc: BaseException) -> None:
     error = f"{type(exc).__name__}: {str(exc)[:900]}"
-    if isinstance(exc, SeedanceQualityError):
+    provider_calls = tuple(getattr(exc, "provider_calls", ()) or ())
+    fallback_cost_cents = max(0, int(getattr(exc, "cost_cents", 0) or 0))
+    cost = 0
+    if provider_calls or fallback_cost_cents:
         cost = _record_provider_calls(
-            db, job_id, idx, "seedance", exc.provider_calls,
-            fallback_cost_cents=exc.cost_cents,
+            db, job_id, idx, "seedance", provider_calls,
+            fallback_cost_cents=fallback_cost_cents,
         )
+    cost += max(
+        0, int(getattr(exc, "pre_recorded_provider_cost_cents", 0) or 0)
+    )
+    candidate_path = controlled_candidate_path(
+        ASSETS_DIR, job_id, getattr(exc, "candidate_path", None)
+    )
+    candidate_url = str(getattr(exc, "candidate_url", None) or "").strip()
+    has_candidate = candidate_path is not None
+    if isinstance(exc, SeedanceQualityError) and not has_candidate:
+        try:
+            delattr(exc, "pause_state")
+        except AttributeError:
+            pass
+    if isinstance(exc, SeedanceQualityError) and has_candidate:
         qa_note = json.dumps({
             "status": "manual_review_required",
             "reason": str(exc),
             "reasons": exc.reasons,
             "candidate_path": (
-                str(exc.candidate_path) if exc.candidate_path else None
+                str(candidate_path) if candidate_path else None
             ),
-            "candidate_url": exc.candidate_url,
+            "candidate_url": candidate_url or None,
             "provider_calls": exc.provider_calls,
         }, ensure_ascii=False)
         db.execute(
-            "UPDATE shots SET state='FAILED', error=?, provider='seedance', "
+            "UPDATE shots SET state='REVIEW_REQUIRED', error=?, provider='seedance', "
             "video_qa=?, cost_cents=cost_cents+? WHERE job_id=? AND idx=?",
             (error, qa_note, cost, job_id, idx),
         )
         db.execute(
-            "UPDATE jobs SET cost_cents=cost_cents+? WHERE job_id=?",
+            "UPDATE jobs SET cost_cents=cost_cents+?,"
+            "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
             (cost, job_id),
         )
     else:
+        stable_code = str(getattr(exc, "stable_code", "") or "").strip()
+        if stable_code not in {
+            "request_invalid", "input_privacy_rejected",
+            "output_policy_rejected", "output_copyright_rejected",
+            "account_unavailable", "transient_network",
+        }:
+            stable_code = ""
+        failure_note = (
+            json.dumps({
+                "status": "generation_failed", "failure_code": stable_code,
+            }, ensure_ascii=False)
+            if stable_code else None
+        )
         db.execute(
-            "UPDATE shots SET state='FAILED', error=? WHERE job_id=? AND idx=?",
-            (error, job_id, idx),
+            "UPDATE shots SET state='FAILED', error=?, video_qa=?, "
+            "cost_cents=cost_cents+? WHERE job_id=? AND idx=?",
+            (error, failure_note, cost, job_id, idx),
+        )
+        db.execute(
+            "UPDATE jobs SET cost_cents=cost_cents+?,"
+            "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
+            (cost, job_id),
         )
     db.commit()
+
+
+def _commit_generated_shot(
+    job_id: str,
+    idx: int,
+    result: SeedanceGenerationResult,
+) -> None:
+    """Atomically finalize provider, shot, and job cost, then close the writer."""
+    database = conn()
+    try:
+        cost = _record_provider_calls(
+            database,
+            job_id,
+            idx,
+            "seedance",
+            result.provider_calls,
+            fallback_cost_cents=result.cost_cents,
+        )
+        database.execute(
+            "UPDATE shots SET video_path=?, video_url=?, state='OK', "
+            "provider='seedance', video_model=?, native_audio=?, "
+            "video_qa=?, cost_cents=cost_cents+?, error=NULL "
+            "WHERE job_id=? AND idx=?",
+            (
+                str(result.video_path), result.video_url, result.model,
+                int(result.native_audio), result.qa_note, cost, job_id, idx,
+            ),
+        )
+        database.execute(
+            "UPDATE jobs SET cost_cents=cost_cents+?,"
+            "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
+            (cost, job_id),
+        )
+        database.commit()
+    except BaseException:
+        database.rollback()
+        raise
+    finally:
+        database.close()
+
+
+def _record_failed_generation_independently(
+    job_id: str,
+    idx: int,
+    exc: BaseException,
+) -> None:
+    database = conn()
+    try:
+        _record_failed_generation(database, job_id, idx, exc)
+    except BaseException:
+        database.rollback()
+        raise
+    finally:
+        database.close()
 
 
 def _identity_anchor_prompt(character: dict) -> str:
@@ -490,21 +1032,132 @@ def _assert_fixed_cost_within_job_budget(
         )
 
 
+async def _submit_paid_image(
+    database,
+    *,
+    job_id: str,
+    shot_idx: int,
+    provider: str,
+    intent: str,
+    task_id: str,
+    prompt: str,
+    resolution: str,
+    model: str,
+    usage: dict,
+    cost_cents: int,
+) -> tuple[bytes, str]:
+    """Gate one paid image POST and leave its bytes in recoverable staging."""
+    provider_health.assert_available(database, "seedance")
+    reservation_id = provider_tasks.reserve_paid_submit(
+        database,
+        job_id=job_id,
+        shot_idx=shot_idx,
+        provider=provider,
+        intent=intent,
+    )
+    try:
+        image = await seedance.text_to_image(
+            prompt,
+            resolution=resolution,
+            model=model,
+        )
+    except BaseException as exc:
+        submit_is_uncertain = (
+            isinstance(exc, asyncio.CancelledError)
+            or (
+                isinstance(exc, seedance.SeedanceSubmissionUnknownError)
+                and bool(getattr(exc, "submit_result_unknown", True))
+            )
+        )
+        if submit_is_uncertain:
+            provider_tasks.mark_action_required(
+                database, reservation_id, message=str(exc)
+            )
+        else:
+            provider_tasks.release_reservation(database, reservation_id)
+        if isinstance(exc, seedance.SeedanceAccountUnavailableError):
+            provider_health.block(
+                database,
+                "seedance",
+                "account_unavailable",
+                "Seedance 账号不可用，请处理账号问题后人工解除本地阻断。",
+            )
+        raise
+    provider_tasks.mark_action_required(
+        database,
+        reservation_id,
+        message="image response received; local asset commit pending",
+    )
+    return image, reservation_id
+
+
+def _finalize_paid_image(
+    database,
+    *,
+    reservation_id: str,
+    task_id: str,
+    job_id: str,
+    shot_idx: int,
+    provider: str,
+    intent: str,
+    model: str,
+    usage: dict,
+    cost_cents: int,
+    persist_cost,
+) -> int:
+    """Atomically commit image billing with its owning anchor/job rows."""
+    try:
+        delta = provider_tasks.upsert_final_call(
+            database,
+            task_id=task_id,
+            job_id=job_id,
+            shot_idx=shot_idx,
+            provider=provider,
+            intent=intent,
+            status="completed",
+            usage={"model": model, **dict(usage or {})},
+            cost_cents=cost_cents,
+        )
+        persist_cost(delta)
+        provider_tasks.release_reservation(database, reservation_id)
+        return delta
+    except BaseException as exc:
+        database.rollback()
+        provider_tasks.mark_action_required(
+            database, reservation_id, message=f"local asset commit failed: {exc}"
+        )
+        raise
+
+
 async def _ensure_character_identity_anchors(
     job_id: str,
     characters: list[dict],
+    *,
+    storyboard: dict | None = None,
 ) -> dict[str, DialogueAnchor]:
     """Prepare every non-Volc character before any paid scene generation.
 
     Authorized real/virtual portrait-library assets are already identity
-    anchors. AI-created roles default to one Seedream 5.0 static casting
-    portrait. Local custom roles retain the privacy-safe dynamic Seedance
-    identity-master route. The table makes this stage resumable and prevents a
-    second purchase after a worker restart.
+    anchors. AI-created roles use the task-snapshotted Seedream 5.0 static
+    portrait or Seedance 2.5 dynamic identity route. Local custom roles retain
+    the privacy-safe dynamic Seedance route. The table makes this stage
+    resumable and prevents a second purchase after a worker restart.
     """
     database = conn()
     anchors: dict[str, DialogueAnchor] = {}
-    makeup_plan = character_assets.character_makeup_plan(characters)
+    if storyboard is None:
+        row = database.execute(
+            "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        try:
+            storyboard = json.loads(row["storyboard"] or "{}") if row else {}
+        except json.JSONDecodeError:
+            storyboard = {}
+    makeup_plan = anchor_generation.apply_character_generator(
+        character_assets.character_makeup_plan(characters),
+        storyboard,
+        resolution=os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
+    )
     characters_by_id = {
         str(character.get("id") or ""): character
         for character in characters
@@ -518,7 +1171,20 @@ async def _ensure_character_identity_anchors(
             "WHERE job_id=? AND identity_key=?",
             (job_id, identity_key),
         ).fetchone()
-        if existing and existing["state"] == "READY":
+        existing_generator = str(existing["generator"] or "") if existing else ""
+        if not existing_generator and existing:
+            existing_generator = (
+                anchor_generation.SEEDREAM_5
+                if str(existing["source_type"]).startswith("seedream")
+                else anchor_generation.SEEDANCE_25
+                if str(existing["source_type"]).startswith("seedance")
+                else "volc_asset"
+            )
+        generator_matches = (
+            not entry["requires_paid_call"]
+            or existing_generator == entry["generator"]
+        )
+        if existing and existing["state"] == "READY" and generator_matches:
             if (
                 existing["anchor_mode"] == "static_image"
                 and existing["image_url"]
@@ -580,6 +1246,12 @@ async def _ensure_character_identity_anchors(
             ),
         )
         database.commit()
+        database.execute(
+            "UPDATE character_identity_anchors SET generator=?,model=? "
+            "WHERE job_id=? AND identity_key=?",
+            (entry["generator"], entry["model"], job_id, identity_key),
+        )
+        database.commit()
 
         anchor_dir = (
             ASSETS_DIR / job_id / "character_identity"
@@ -592,6 +1264,7 @@ async def _ensure_character_identity_anchors(
             try:
                 reusable_image = bool(
                     existing
+                    and existing_generator == entry["generator"]
                     and existing["anchor_mode"] == "static_image"
                     and existing["image_path"]
                     and Path(existing["image_path"]).is_file()
@@ -605,50 +1278,60 @@ async def _ensure_character_identity_anchors(
                         "ARK_IDENTITY_IMAGE_MODEL",
                         "doubao-seedream-5-0-260128",
                     )
-                    image = await seedance.text_to_image(
-                        _identity_portrait_prompt(character),
+                    image, reservation_id = await _submit_paid_image(
+                        database,
+                        job_id=job_id,
+                        shot_idx=-1000 - ordinal,
+                        provider="seedream_identity",
+                        intent="character_identity_anchor",
+                        task_id=(
+                            f"seedream-identity:{job_id}:"
+                            f"{entry['identity_token']}"
+                        ),
+                        prompt=_identity_portrait_prompt(character),
                         resolution=os.getenv(
                             "ARK_IDENTITY_IMAGE_SIZE", "1440x2560"
                         ),
                         model=identity_image_model,
+                        usage={"anchor_mode": "static_image"},
+                        cost_cents=image_cost,
                     )
                     out_path.write_bytes(image)
-                    cost = _record_provider_calls(
-                        database,
-                        job_id,
-                        -1000 - ordinal,
-                        "seedream_identity",
-                        ({
-                            "task_id": (
-                                f"seedream-identity:{job_id}:"
-                                f"{entry['identity_token']}"
+
+                    def persist_identity_cost(delta: int) -> None:
+                        database.execute(
+                            "UPDATE character_identity_anchors SET "
+                            "anchor_mode='static_image',image_path=?,"
+                            "preview_path=?,duration_sec=0,"
+                            "cost_cents=cost_cents+?,error=NULL,"
+                            "updated_at=CURRENT_TIMESTAMP "
+                            "WHERE job_id=? AND identity_key=?",
+                            (
+                                str(out_path), str(out_path), delta,
+                                job_id, identity_key,
                             ),
-                            "intent": "character_identity_anchor",
-                            "usage": {
-                                "model": identity_image_model,
-                                "anchor_mode": "static_image",
-                            },
-                            "cost_cents": image_cost,
-                        },),
-                        fallback_cost_cents=image_cost,
-                    )
-                    database.execute(
-                        "UPDATE character_identity_anchors SET "
-                        "anchor_mode='static_image',image_path=?,"
-                        "preview_path=?,duration_sec=0,"
-                        "cost_cents=cost_cents+?,error=NULL,"
-                        "updated_at=CURRENT_TIMESTAMP "
-                        "WHERE job_id=? AND identity_key=?",
-                        (
-                            str(out_path), str(out_path), cost,
-                            job_id, identity_key,
+                        )
+                        database.execute(
+                            "UPDATE jobs SET cost_cents=cost_cents+? WHERE job_id=?",
+                            (delta, job_id),
+                        )
+
+                    _finalize_paid_image(
+                        database,
+                        reservation_id=reservation_id,
+                        task_id=(
+                            f"seedream-identity:{job_id}:"
+                            f"{entry['identity_token']}"
                         ),
+                        job_id=job_id,
+                        shot_idx=-1000 - ordinal,
+                        provider="seedream_identity",
+                        intent="character_identity_anchor",
+                        model=identity_image_model,
+                        usage={"anchor_mode": "static_image"},
+                        cost_cents=image_cost,
+                        persist_cost=persist_identity_cost,
                     )
-                    database.execute(
-                        "UPDATE jobs SET cost_cents=cost_cents+? WHERE job_id=?",
-                        (cost, job_id),
-                    )
-                    database.commit()
                 image_url = tos.upload(
                     out_path,
                     key_hint=f"{job_id}-identity-{entry['identity_token']}",
@@ -658,11 +1341,12 @@ async def _ensure_character_identity_anchors(
                     "anchor_mode='static_image',image_path=?,image_url=?,"
                     "preview_path=?,video_path=NULL,video_url=NULL,"
                     "duration_sec=0,error=NULL,"
+                    "generator=?,model=?,"
                     "updated_at=CURRENT_TIMESTAMP "
                     "WHERE job_id=? AND identity_key=?",
                     (
                         str(out_path), image_url, str(out_path),
-                        job_id, identity_key,
+                        entry["generator"], entry["model"], job_id, identity_key,
                     ),
                 )
                 database.commit()
@@ -705,6 +1389,8 @@ async def _ensure_character_identity_anchors(
                 out_path=out_path,
                 key_hint=f"{job_id}-identity-{entry['identity_token']}",
                 job_id=job_id,
+                shot_idx=-1000 - ordinal,
+                billing_provider="seedance_identity",
                 expected_text=None,
             )
             cost = _record_provider_calls(
@@ -718,11 +1404,12 @@ async def _ensure_character_identity_anchors(
             database.execute(
                 "UPDATE character_identity_anchors SET state='READY',"
                 "video_path=?,video_url=?,preview_path=NULL,duration_sec=4,"
-                "cost_cents=cost_cents+?,error=NULL,updated_at=CURRENT_TIMESTAMP "
+                "cost_cents=cost_cents+?,generator=?,model=?,error=NULL,"
+                "updated_at=CURRENT_TIMESTAMP "
                 "WHERE job_id=? AND identity_key=?",
                 (
                     str(result.video_path), result.video_url, cost,
-                    job_id, identity_key,
+                    entry["generator"], result.model, job_id, identity_key,
                 ),
             )
             database.execute(
@@ -822,6 +1509,8 @@ async def _fallback_static_identity_anchors(
                 out_path=out_path,
                 key_hint=f"{job_id}-identity-fallback-{token}",
                 job_id=job_id,
+                shot_idx=-2000 - ordinal,
+                billing_provider="seedance_identity_fallback",
                 expected_text=None,
             )
             cost = _record_provider_calls(
@@ -890,22 +1579,32 @@ async def _ensure_scene_visual_anchors(
     job_id: str,
     storyboard: dict,
 ) -> dict[str, str]:
-    """Generate one empty-location image for each explicitly repeated scene."""
+    """Generate one empty-location anchor for each explicitly repeated scene.
+
+    Seedream returns the image directly. Seedance creates a four-second silent
+    location clip and the canonical image contract uses its extracted frame.
+    """
     database = conn()
     resolved: dict[str, str] = {}
-    image_model = os.getenv(
-        "ARK_SCENE_IMAGE_MODEL", "doubao-seedream-5-0-260128"
-    )
     for ordinal, spec in enumerate(
         scene_assets.recurring_scene_anchors(storyboard), start=1
     ):
+        spec = anchor_generation.decorate_scene_anchor(
+            spec,
+            storyboard,
+            resolution=os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
+        )
         key = spec["anchor_key"]
         existing = database.execute(
             "SELECT * FROM scene_visual_anchors WHERE job_id=? AND anchor_key=?",
             (job_id, key),
         ).fetchone()
+        existing_generator = str(existing["generator"] or "") if existing else ""
+        if not existing_generator and existing:
+            existing_generator = anchor_generation.SEEDREAM_5
         if (
             existing and existing["state"] == "READY"
+            and existing_generator == spec["generator"]
             and existing["image_url"] and existing["image_path"]
             and Path(existing["image_path"]).is_file()
         ):
@@ -925,54 +1624,128 @@ async def _ensure_scene_visual_anchors(
             ),
         )
         database.commit()
+        database.execute(
+            "UPDATE scene_visual_anchors SET generator=?,model=? "
+            "WHERE job_id=? AND anchor_key=?",
+            (spec["generator"], spec["model"], job_id, key),
+        )
+        database.commit()
         anchor_dir = ASSETS_DIR / job_id / "scene_identity"
         anchor_dir.mkdir(parents=True, exist_ok=True)
         out_path = anchor_dir / f"{scene_assets.anchor_token(key)}.png"
-        image_cost = seedream_45.estimate_cost_cents()
+        anchor_cost = spec["estimated_cost_cents"]
         try:
             reusable = bool(
                 existing and existing["image_path"]
+                and existing_generator == spec["generator"]
                 and Path(existing["image_path"]).is_file()
                 and int(existing["cost_cents"] or 0) > 0
             )
             if reusable:
                 out_path = Path(existing["image_path"])
-            else:
-                _assert_fixed_cost_within_job_budget(job_id, image_cost)
-                image = await seedance.text_to_image(
-                    scene_assets.scene_anchor_prompt(spec),
-                    resolution=os.getenv("ARK_SCENE_IMAGE_SIZE", "1440x2560"),
-                    model=image_model,
+            elif spec["generator"] == anchor_generation.SEEDANCE_25:
+                video_path = anchor_dir / f"{scene_assets.anchor_token(key)}.mp4"
+                result = await _generate_seedance_video(
+                    prompt=scene_assets.scene_anchor_prompt(spec),
+                    route=VideoRoute(
+                        model=spec["model"], tier="seedance25",
+                        generate_audio=False, qa_required=False,
+                        fallback_model=None,
+                    ),
+                    request_kwargs={
+                        "duration": 4,
+                        "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
+                        "ratio": "9:16", "camera_fixed": True,
+                        "motion_strength": 0.1,
+                    },
+                    out_path=video_path,
+                    key_hint=f"{job_id}-scene-video-{scene_assets.anchor_token(key)}",
+                    job_id=job_id,
+                    shot_idx=-2000 - ordinal,
+                    billing_provider="seedance_scene",
+                    forbid_people=True,
+                    expected_text=None,
                 )
-                out_path.write_bytes(image)
+                frames = await ffmpeg.extract_frames(
+                    result.video_path, anchor_dir / f"{scene_assets.anchor_token(key)}-preview",
+                    [1.0],
+                )
+                if not frames:
+                    raise RuntimeError("Seedance 场景锚点母片未能提取稳定参考帧")
+                out_path = Path(frames[0])
                 cost = _record_provider_calls(
-                    database, job_id, -2000 - ordinal, "seedream_scene",
-                    ({
-                        "task_id": f"seedream-scene:{job_id}:{key}",
-                        "intent": "scene_visual_anchor",
-                        "usage": {"model": image_model, "anchor_key": key},
-                        "cost_cents": image_cost,
-                    },), fallback_cost_cents=image_cost,
+                    database, job_id, -2000 - ordinal, "seedance_scene",
+                    result.provider_calls, fallback_cost_cents=result.cost_cents,
                 )
                 database.execute(
-                    "UPDATE scene_visual_anchors SET image_path=?,preview_path=?,"
-                    "cost_cents=cost_cents+? WHERE job_id=? AND anchor_key=?",
-                    (str(out_path), str(out_path), cost, job_id, key),
+                    "UPDATE scene_visual_anchors SET video_path=?,video_url=?,"
+                    "image_path=?,preview_path=?,cost_cents=cost_cents+?,"
+                    "generator=?,model=? WHERE job_id=? AND anchor_key=?",
+                    (
+                        str(result.video_path), result.video_url,
+                        str(out_path), str(out_path), cost,
+                        spec["generator"], result.model, job_id, key,
+                    ),
                 )
                 database.execute(
                     "UPDATE jobs SET cost_cents=cost_cents+? WHERE job_id=?",
                     (cost, job_id),
                 )
                 database.commit()
+            else:
+                _assert_fixed_cost_within_job_budget(job_id, anchor_cost)
+                image, reservation_id = await _submit_paid_image(
+                    database,
+                    job_id=job_id,
+                    shot_idx=-2000 - ordinal,
+                    provider="seedream_scene",
+                    intent="scene_visual_anchor",
+                    task_id=f"seedream-scene:{job_id}:{key}",
+                    prompt=scene_assets.scene_anchor_prompt(spec),
+                    resolution=os.getenv("ARK_SCENE_IMAGE_SIZE", "1440x2560"),
+                    model=spec["model"],
+                    usage={"anchor_key": key},
+                    cost_cents=anchor_cost,
+                )
+                out_path.write_bytes(image)
+
+                def persist_scene_cost(delta: int) -> None:
+                    database.execute(
+                        "UPDATE scene_visual_anchors SET image_path=?,preview_path=?,"
+                        "cost_cents=cost_cents+? WHERE job_id=? AND anchor_key=?",
+                        (str(out_path), str(out_path), delta, job_id, key),
+                    )
+                    database.execute(
+                        "UPDATE jobs SET cost_cents=cost_cents+? WHERE job_id=?",
+                        (delta, job_id),
+                    )
+
+                _finalize_paid_image(
+                    database,
+                    reservation_id=reservation_id,
+                    task_id=f"seedream-scene:{job_id}:{key}",
+                    job_id=job_id,
+                    shot_idx=-2000 - ordinal,
+                    provider="seedream_scene",
+                    intent="scene_visual_anchor",
+                    model=spec["model"],
+                    usage={"anchor_key": key},
+                    cost_cents=anchor_cost,
+                    persist_cost=persist_scene_cost,
+                )
             image_url = tos.upload(
                 out_path,
                 key_hint=f"{job_id}-scene-{scene_assets.anchor_token(key)}",
             )
             database.execute(
                 "UPDATE scene_visual_anchors SET state='READY',image_path=?,"
-                "image_url=?,preview_path=?,error=NULL,updated_at=CURRENT_TIMESTAMP "
+                "image_url=?,preview_path=?,generator=?,model=?,error=NULL,"
+                "updated_at=CURRENT_TIMESTAMP "
                 "WHERE job_id=? AND anchor_key=?",
-                (str(out_path), image_url, str(out_path), job_id, key),
+                (
+                    str(out_path), image_url, str(out_path), spec["generator"],
+                    spec["model"], job_id, key,
+                ),
             )
             database.commit()
             resolved[key] = image_url
@@ -991,6 +1764,7 @@ def _dialogue_request_kwargs(
     shot: dict,
     anchor: DialogueAnchor | None,
     *,
+    fixed_voice_audio: Path | None = None,
     character: dict | None = None,
     cast_characters: list[dict] | None = None,
     identity_anchors: dict[str, DialogueAnchor] | None = None,
@@ -1006,6 +1780,8 @@ def _dialogue_request_kwargs(
         "camera_fixed": False,
         "motion_strength": 0.4,
     }
+    if fixed_voice_audio is not None:
+        request["reference_audios"] = [str(fixed_voice_audio)]
     video_references: list[DialogueAnchor] = []
     asset_references: list[str] = []
     identity_anchors = identity_anchors or {}
@@ -1357,25 +2133,131 @@ def _scene_voiceover_request_kwargs(
     return request
 
 
-def _broll_request_kwargs(shot: dict) -> dict:
-    return {
+def _broll_request_kwargs(
+    shot: dict,
+    *,
+    cast_characters: list[dict] | None = None,
+    identity_anchors: dict[str, DialogueAnchor] | None = None,
+    scene_reference: str | None = None,
+) -> dict:
+    request = {
         "duration": seedance.normalize_generation_duration(
             shot["duration_sec"]
         ),
         "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
         "ratio": "9:16",
     }
+    image_references: list[str] = []
+    video_references: list[DialogueAnchor] = []
+    if scene_reference:
+        image_references.append(scene_reference)
+    for character in cast_characters or []:
+        anchor = (identity_anchors or {}).get(
+            character_assets.character_identity_key(character)
+        )
+        if anchor is not None:
+            if anchor.image_reference:
+                image_references.append(anchor.image_reference)
+            elif anchor.video_url:
+                video_references.append(anchor)
+            continue
+        asset_uri = str(
+            character.get("seedance_asset_uri")
+            or character.get("asset_uri")
+            or ""
+        ).strip()
+        if asset_uri.startswith("asset://"):
+            image_references.append(asset_uri)
+    deduped_videos: list[DialogueAnchor] = []
+    seen_videos: set[str] = set()
+    for anchor in video_references:
+        if anchor.video_url and anchor.video_url not in seen_videos:
+            seen_videos.add(anchor.video_url)
+            deduped_videos.append(anchor)
+    if len(deduped_videos) > 3:
+        raise SeedanceIdentityAuthorizationError(
+            "one B-roll scene contains more than three generated identities; "
+            "split the scene before paid generation"
+        )
+    if deduped_videos:
+        request["reference_videos"] = [
+            anchor.video_url for anchor in deduped_videos
+        ]
+        request["reference_video_duration_sec"] = sum(
+            anchor.duration_sec for anchor in deduped_videos
+        )
+    if image_references:
+        request["references"] = list(dict.fromkeys(image_references))
+    return request
+
+
+def _lip_sync_edit_request_kwargs(shot: dict) -> dict:
+    """Build a Seedance 2.5 edit request around one existing paid master."""
+    source = str(shot.get("repair_source_path") or "").strip()
+    if not source:
+        raise ValueError("口型局部修复缺少原始母片")
+    duration = max(0.1, float(shot.get("duration_sec") or 0))
+    return {
+        "duration": -1,
+        "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
+        "ratio": "adaptive",
+        "task_intent": "edit",
+        "output_format": "mp4",
+        "reference_videos": [source],
+        "reference_video_duration_sec": duration,
+    }
+
+
+def _display_second(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:.1f}"
+
+
+def _build_lip_sync_edit_prompt(shot: dict) -> str:
+    """Preserve a cinematic master while editing only one lip-sync interval."""
+    duration = max(0.1, float(shot.get("duration_sec") or 0))
+    start = max(0.0, float(shot.get("repair_start_sec") or 0))
+    end = min(duration, float(shot.get("repair_end_sec") or duration))
+    if end <= start:
+        raise ValueError("口型修复结束时间必须晚于开始时间")
+    dialogue = str(shot.get("voiceover") or "").strip()
+    if not dialogue:
+        raise ValueError("口型局部修复缺少目标台词")
+    reason = str(shot.get("repair_direction") or "口型与原生语音不同步").strip()
+    return "\n".join([
+        f"仅编辑视频1中{_display_second(start)}-{_display_second(end)}秒的人物嘴部动作。",
+        f"目标台词只用于口型校准：{{台词：{dialogue}}}",
+        "嘴唇、牙齿、舌位和下颌必须与视频1现有原生中文语音逐字同步，句末自然闭嘴。",
+        "保留视频1的原始声音、音色、语速、表情、身体动作、运镜、人物身份、"
+        "服装、场景、灯光、构图、时长和镜头切换，其余均保持不变。",
+        "不得重新配音，不得改变人物走位或摄影机运动，不得新增字幕、文字、人物或声音。",
+        f"修复原因：{reason}。",
+    ])
 
 
 def _native_audio_prompt(prompt: str, enabled: bool,
                          expected_text: str | None = None) -> str:
-    if not enabled:
-        return prompt
-    if expected_text:
+    visual_contract = (
+        "\n\n画面文字通道关闭：画面中不得生成黄色或其他颜色的悬浮文案、"
+        "字幕、标题、贴纸、标牌、数字、字母、界面或水印；"
+        "所有台词只进入原生音轨，任何可读文字都属于失败结果。"
+    )
+    hardened_prompt = f"{prompt}{visual_contract}"
+    if not enabled or expected_text:
+        return hardened_prompt
+    return (
+        f"{hardened_prompt}\n\n音频要求：只生成与画面动作匹配的环境音和物件音效；"
+        "不得出现任何人声、对白、旁白、哼唱或背景音乐。"
+    )
+
+
+def _quality_retry_prompt(prompt: str, reasons: tuple[str, ...]) -> str:
+    if "unexpected_readable_text" not in set(reasons):
         return prompt
     return (
-        f"{prompt}\n\n音频要求：只生成与画面动作匹配的环境音和物件音效；"
-        "不得出现任何人声、对白、旁白、哼唱或背景音乐。"
+        f"{prompt}\n\n定向返修：上一次画面出现了不应存在的可读文字。"
+        "本次必须移除全部悬浮字幕、黄色文案、标题、标牌、数字、字母、"
+        "水印与界面元素；相关区域改为纯色无字或符合场景的自然纹理，"
+        "不要通过模糊、遮挡或变形文字规避。台词仅保留在音轨中。"
     )
 
 
@@ -1384,32 +2266,76 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                                     out_path: Path,
                                     key_hint: str,
                                     job_id: str | None = None,
+                                    shot_idx: int = 0,
+                                    database=None,
+                                    billing_provider: str = "seedance",
                                     forbid_people: bool = False,
                                     expected_text: str | None = None,
                                     require_broll_semantics: bool = False,
                                     continuity_context: dict | None = None,
+                                    paid_batch_id: str | None = None,
+                                    asr_enabled: bool = True,
+                                    fixed_audio_path: Path | None = None,
+                                    fixed_transcription: bigasr.Transcription | None = None,
                                     ) -> SeedanceGenerationResult:
     """Generate, upload and gate a Seedance shot.
 
-    Native audio and visuals fail closed. A failed 2.5 generation is retried
-    once on the same model; the production path never falls back to external
-    speech synthesis or another digital-human model.
+    Visuals fail closed. Dialogue uses one pre-generated fixed Volcengine TTS
+    track both as Seedance reference audio and as the final muxed soundtrack;
+    Seedance is never allowed to choose the role's voice.
     """
     spent_cost_cents = 0
+    pre_recorded_cost_cents = 0
     provider_calls: list[dict] = []
+    health_database = database or (conn() if job_id else None)
     candidate_path = out_path.with_name(
         f".{out_path.stem}.candidate{out_path.suffix}"
     )
+
+    def update_staged_artifact(task_id: str, artifact_path: Path) -> None:
+        if health_database is None or not task_id:
+            return
+        row = health_database.execute(
+            "SELECT usage_json FROM provider_calls WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        raw_usage = row["usage_json"] if hasattr(row, "keys") else row[0]
+        try:
+            usage = json.loads(raw_usage or "{}")
+        except (json.JSONDecodeError, TypeError):
+            usage = {}
+        if str(usage.get("status") or "").casefold() != "staged":
+            return
+        usage["artifact_path"] = str(artifact_path)
+        health_database.execute(
+            "UPDATE provider_calls SET usage_json=? WHERE task_id=?",
+            (json.dumps(usage, ensure_ascii=False), task_id),
+        )
+        health_database.commit()
+
+    def latest_task_id() -> str:
+        return next((
+            str(call.get("task_id") or "")
+            for call in reversed(provider_calls)
+            if call.get("task_id")
+        ), "")
 
     def commit_candidate(
         video_path: Path, audio_path: Path | None
     ) -> tuple[Path, Path | None]:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         video_path.replace(out_path)
+        update_staged_artifact(latest_task_id(), out_path)
         if audio_path is None:
             return out_path, None
         final_audio = out_path.with_suffix(".wav")
-        if audio_path.exists():
+        if audio_path.resolve() == final_audio.resolve():
+            return out_path, final_audio
+        if audio_path.exists() and fixed_audio_path is not None:
+            shutil.copy2(audio_path, final_audio)
+        elif audio_path.exists():
             audio_path.replace(final_audio)
         return out_path, final_audio
 
@@ -1423,12 +2349,31 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         review_path = review_dir / f"{out_path.stem}-candidate{out_path.suffix}"
         review_path.unlink(missing_ok=True)
         candidate_path.replace(review_path)
+        update_staged_artifact(latest_task_id(), review_path)
         candidate_audio = candidate_path.with_suffix(".wav")
         if candidate_audio.exists():
             review_audio = review_path.with_suffix(".wav")
             review_audio.unlink(missing_ok=True)
             candidate_audio.replace(review_audio)
         return review_path
+
+    def preserve_retry_attempt() -> Path:
+        task_id = latest_task_id()
+        token = re.sub(r"[^A-Za-z0-9_.-]+", "-", task_id).strip("-")
+        attempt_dir = out_path.parent / "review" / "attempts"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        attempt_path = attempt_dir / (
+            f"{out_path.stem}-{token or 'attempt'}{out_path.suffix}"
+        )
+        attempt_path.unlink(missing_ok=True)
+        candidate_path.replace(attempt_path)
+        candidate_audio = candidate_path.with_suffix(".wav")
+        if candidate_audio.exists():
+            attempt_audio = attempt_path.with_suffix(".wav")
+            attempt_audio.unlink(missing_ok=True)
+            candidate_audio.replace(attempt_audio)
+        update_staged_artifact(task_id, attempt_path)
+        return attempt_path
 
     async def generate(
         model: str,
@@ -1439,7 +2384,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         target_path: Path = candidate_path,
         upload_hint: str = key_hint,
     ) -> tuple[bytes, Path, str, Path | None]:
-        nonlocal spent_cost_cents
+        nonlocal spent_cost_cents, pre_recorded_cost_cents
         metadata: dict = {}
         call_kwargs = dict(generation_kwargs or request_kwargs)
         _assert_paid_call_within_job_budget(
@@ -1447,44 +2392,308 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             spent_cost_cents=spent_cost_cents,
             request_kwargs=call_kwargs,
         )
+        if health_database is not None:
+            provider_health.assert_available(health_database, "seedance")
         provider_kwargs = dict(call_kwargs)
         provider_kwargs.pop("reference_video_duration_sec", None)
-        video = await seedance.text_to_video(
-            prompt=_native_audio_prompt(
-                generation_prompt, generate_audio, expected_text
-            ),
-            model=model,
-            generate_audio=generate_audio,
-            metadata_out=metadata,
-            **provider_kwargs,
-        )
-        call_cost = seedance.usage_cost_cents(metadata.get("usage") or {})
-        if not call_cost:
-            fallback_duration = float(request_kwargs.get("duration") or 0)
-            call_cost = seedance.estimate_cost_cents(
-                fallback_duration,
-                request_kwargs.get("resolution", "720p"),
+        intent = call_kwargs.get("task_intent", "generate")
+        deferred_completed: tuple[str, str, dict] | None = None
+        attempt_task_ids: set[str] = {
+            str(call.get("task_id"))
+            for call in provider_calls
+            if call.get("task_id")
+        }
+
+        def persist_pending_task(task_id: str) -> None:
+            nonlocal reservation_id
+            pending_call = {
+                "task_id": task_id,
+                "intent": intent,
+                "usage": {"status": "pending"},
+                "cost_cents": 0,
+            }
+            provider_calls.append(pending_call)
+            if health_database is not None and job_id:
+                if reservation_id:
+                    provider_tasks.persist_remote_task_id(
+                        health_database,
+                        reservation_id,
+                        remote_task_id=task_id,
+                        provider=billing_provider,
+                        intent=str(intent),
+                    )
+                    provider_tasks.promote_reservation(
+                        health_database,
+                        reservation_id,
+                        task_id=task_id,
+                        job_id=job_id,
+                        shot_idx=shot_idx,
+                        provider=billing_provider,
+                        intent=str(intent),
+                    )
+                    reservation_id = None
+                else:
+                    _record_provider_calls(
+                        health_database,
+                        job_id,
+                        shot_idx,
+                        billing_provider,
+                        (pending_call,),
+                    )
+                    health_database.commit()
+            attempt_task_ids.add(task_id)
+
+        def _persist_task_state(task_id: str, status: str, data: dict) -> None:
+            nonlocal spent_cost_cents, pre_recorded_cost_cents
+            raw_usage = data.get("usage") if isinstance(data, dict) else {}
+            usage = _safe_provider_usage(raw_usage)
+            usage["status"] = status
+            if status == "staged" and isinstance(data, dict):
+                usage.update({
+                    "remote_status": "completed",
+                    "artifact_path": str(data.get("artifact_path") or ""),
+                    "artifact_url": str(data.get("artifact_url") or ""),
+                })
+            reported_cost = seedance.usage_cost_cents(usage)
+            for source in (data, raw_usage):
+                if not isinstance(source, dict):
+                    continue
+                try:
+                    reported_cost = max(
+                        reported_cost, int(source.get("cost_cents") or 0)
+                    )
+                except (TypeError, ValueError):
+                    continue
+            state_call = {
+                "task_id": task_id,
+                "intent": intent,
+                "usage": usage,
+                "cost_cents": max(0, reported_cost),
+            }
+            if status != "staged":
+                existing = next((
+                    call for call in reversed(provider_calls)
+                    if call.get("task_id") == task_id
+                ), None)
+                if existing is None:
+                    provider_calls.append(state_call)
+                else:
+                    existing.update(state_call)
+            if health_database is not None and job_id:
+                database_call = state_call
+                if status in {"completed", "staged"}:
+                    database_call = {**state_call, "cost_cents": 0}
+                delta = _record_provider_calls(
+                    health_database,
+                    job_id,
+                    shot_idx,
+                    billing_provider,
+                    (database_call,),
+                )
+                health_database.commit()
+                if status != "completed":
+                    spent_cost_cents += delta
+                pre_recorded_cost_cents += delta
+
+        def persist_task_state(task_id: str, status: str, data: dict) -> None:
+            nonlocal deferred_completed
+            if status == "completed":
+                deferred_completed = (task_id, status, data)
+                return
+            _persist_task_state(task_id, status, data)
+
+        reservation_id: str | None = None
+        if health_database is not None and job_id:
+            budget_row = health_database.execute(
+                "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            budget_limit = _job_budget_cents(json.loads(
+                budget_row[0] or "{}"
+            )) if budget_row else 0
+            try:
+                reservation_id = provider_tasks.reserve_paid_submit(
+                    health_database,
+                    job_id=job_id,
+                    shot_idx=shot_idx,
+                    provider=billing_provider,
+                    intent=str(intent),
+                    authorized_task_ids=tuple(attempt_task_ids),
+                    authorized_batch_id=paid_batch_id,
+                    estimated_cost_cents=_estimated_request_cost_cents(
+                        call_kwargs
+                    ),
+                    budget_limit_cents=budget_limit,
+                )
+            except provider_tasks.ProviderTaskBudgetError as exc:
+                raise SeedanceBudgetError(str(exc)) from exc
+        try:
+            video = await seedance.text_to_video(
+                prompt=_native_audio_prompt(
+                    generation_prompt, generate_audio, expected_text
+                ),
+                model=model,
+                generate_audio=generate_audio,
+                metadata_out=metadata,
+                on_task_created=persist_pending_task,
+                on_task_updated=persist_task_state,
+                **provider_kwargs,
             )
-        spent_cost_cents += call_cost
-        provider_calls.append({
-            "task_id": metadata.get("task_id"),
-            "intent": call_kwargs.get("task_intent", "generate"),
-            "usage": metadata.get("usage") or {},
-            "cost_cents": call_cost,
-        })
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(video)
-        url = tos.upload(target_path, key_hint=upload_hint)
-        audio_path = None
-        if generate_audio:
-            audio_path = target_path.with_suffix(".wav")
-            await ffmpeg.extract_audio_wav(target_path, audio_path)
-        return video, target_path, url, audio_path
+            if reservation_id:
+                remote_task_id = str(metadata.get("task_id") or "").strip()
+                if remote_task_id:
+                    provider_tasks.promote_reservation(
+                        health_database,
+                        reservation_id,
+                        task_id=remote_task_id,
+                        job_id=job_id,
+                        shot_idx=shot_idx,
+                        provider=billing_provider,
+                        intent=str(intent),
+                    )
+                else:
+                    provider_tasks.release_reservation(
+                        health_database, reservation_id
+                    )
+                reservation_id = None
+            call_cost = seedance.usage_cost_cents(metadata.get("usage") or {})
+            if not call_cost:
+                fallback_duration = float(
+                    request_kwargs.get("reference_video_duration_sec")
+                    if str(request_kwargs.get("task_intent") or "generate") == "edit"
+                    else request_kwargs.get("duration") or 0
+                )
+                call_cost = seedance.estimate_cost_cents(
+                    fallback_duration,
+                    request_kwargs.get("resolution", "720p"),
+                )
+            spent_cost_cents += call_cost
+            final_call = {
+                "task_id": metadata.get("task_id"),
+                "intent": intent,
+                "usage": {
+                    **_safe_provider_usage(metadata.get("usage") or {}),
+                    "status": "completed",
+                },
+                "cost_cents": call_cost,
+            }
+            pending_call = None
+            if final_call["task_id"]:
+                pending_call = next(
+                    (
+                        call for call in reversed(provider_calls)
+                        if call.get("task_id") == final_call["task_id"]
+                        and (call.get("usage") or {}).get("status") == "pending"
+                    ),
+                    None,
+                )
+            if pending_call is None:
+                provider_calls.append(final_call)
+            else:
+                pending_call.update(final_call)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(video)
+            audio_path = fixed_audio_path
+            if fixed_audio_path is not None:
+                visual_path = target_path.with_name(
+                    f".{target_path.stem}.visual{target_path.suffix}"
+                )
+                visual_path.unlink(missing_ok=True)
+                target_path.replace(visual_path)
+                try:
+                    await ffmpeg.mux_video_audio(
+                        visual_path, fixed_audio_path, target_path
+                    )
+                finally:
+                    visual_path.unlink(missing_ok=True)
+                video = target_path.read_bytes()
+            elif generate_audio:
+                audio_path = target_path.with_suffix(".wav")
+                await ffmpeg.extract_audio_wav(target_path, audio_path)
+            url = tos.upload(target_path, key_hint=upload_hint)
+            if deferred_completed is not None:
+                completed_task_id, _status, completed_data = deferred_completed
+                _persist_task_state(
+                    completed_task_id,
+                    "staged",
+                    {
+                        **completed_data,
+                        "artifact_path": str(target_path),
+                        "artifact_url": url,
+                    },
+                )
+            elif final_call["task_id"]:
+                _persist_task_state(
+                    str(final_call["task_id"]),
+                    "staged",
+                    {
+                        "usage": metadata.get("usage") or {},
+                        "artifact_path": str(target_path),
+                        "artifact_url": url,
+                    },
+                )
+            return video, target_path, url, audio_path
+        except BaseException as exc:
+            if reservation_id and health_database is not None:
+                submit_is_uncertain = (
+                    isinstance(exc, asyncio.CancelledError)
+                    or (
+                        isinstance(exc, seedance.SeedanceSubmissionUnknownError)
+                        and bool(getattr(exc, "submit_result_unknown", True))
+                    )
+                )
+                if submit_is_uncertain:
+                    provider_tasks.mark_action_required(
+                        health_database, reservation_id, message=str(exc)
+                    )
+                else:
+                    provider_tasks.release_reservation(
+                        health_database, reservation_id
+                    )
+            elif health_database is not None:
+                remote_task_id = str(metadata.get("task_id") or "").strip()
+                if remote_task_id:
+                    remote_row = health_database.execute(
+                        "SELECT usage_json FROM provider_calls WHERE task_id=?",
+                        (remote_task_id,),
+                    ).fetchone()
+                    try:
+                        raw_remote_usage = (
+                            remote_row["usage_json"]
+                            if remote_row is not None and hasattr(remote_row, "keys")
+                            else remote_row[0] if remote_row else "{}"
+                        )
+                        remote_status = str(json.loads(
+                            raw_remote_usage
+                        ).get("status") or "").casefold()
+                    except (json.JSONDecodeError, TypeError):
+                        remote_status = "action_required"
+                    if remote_status in provider_tasks.UNRESOLVED_STATUSES:
+                        provider_tasks.mark_action_required(
+                            health_database, remote_task_id, message=str(exc)
+                        )
+            if (
+                health_database is not None
+                and isinstance(exc, seedance.SeedanceAccountUnavailableError)
+            ):
+                provider_health.block(
+                    health_database,
+                    "seedance",
+                    "account_unavailable",
+                    "Seedance 账号不可用，请处理账号问题后人工解除本地阻断。",
+                )
+            _attach_provider_usage(
+                exc,
+                cost_cents=spent_cost_cents,
+                provider_calls=provider_calls,
+            )
+            if pre_recorded_cost_cents:
+                exc.pre_recorded_provider_cost_cents = pre_recorded_cost_cents
+            raise
 
     async def assess(url: str, audio_path: Path | None
                      ) -> tuple[dict, video_qa.QADecision,
                                 bigasr.Transcription]:
-        transcription = bigasr.Transcription("")
+        transcription = fixed_transcription or bigasr.Transcription("")
         try:
             raw, _ = await asyncio.to_thread(
                 video_qa.analyze,
@@ -1495,8 +2704,12 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 forbid_readable_text=True,
                 require_broll_semantics=require_broll_semantics,
             )
-            transcript = ""
-            if audio_path is not None:
+            transcript = transcription.text
+            if (
+                fixed_transcription is None
+                and audio_path is not None
+                and asr_enabled
+            ):
                 transcription = await asyncio.to_thread(
                     bigasr.transcribe_detailed, audio_path
                 )
@@ -1505,8 +2718,8 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             raw["confidence"] = 1.0
             decision = video_qa.evaluate(
                 raw,
-                expect_speech=bool(expected_text),
-                expected_text=expected_text,
+                expect_speech=bool(expected_text) and asr_enabled,
+                expected_text=expected_text if asr_enabled else None,
                 expected_visual=prompt,
                 forbid_people=forbid_people,
                 forbid_readable_text=True,
@@ -1555,7 +2768,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 "provider_calls": provider_calls,
             }, ensure_ascii=False),
             route.generate_audio, route.model, audio_path, spent_cost_cents,
-            tuple(provider_calls),
+            tuple(provider_calls), fixed_transcription or bigasr.Transcription(""),
         )
 
     raw, decision, transcription = await assess(video_url, audio_path)
@@ -1632,13 +2845,27 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             candidate_url=video_url,
         )
 
+    preserve_retry_attempt()
     video, video_path, video_url, audio_path = await generate(
-        route.model, route.generate_audio
+        route.model,
+        route.generate_audio,
+        generation_prompt=_quality_retry_prompt(prompt, decision.reasons),
     )
     retry_raw, retry_decision, retry_transcription = await assess(
         video_url, audio_path
     )
     if not retry_decision.passed:
+        if not (_HARD_RETRY_REASONS & set(retry_decision.reasons)):
+            review_path = preserve_candidate()
+            raise SeedanceQualityError(
+                "Seedance 2.5 quality gate requires manual review after retry; "
+                f"reasons={','.join(retry_decision.reasons)}",
+                cost_cents=spent_cost_cents,
+                provider_calls=tuple(provider_calls),
+                reasons=retry_decision.reasons,
+                candidate_path=review_path,
+                candidate_url=video_url,
+            )
         discard_candidate()
         raise SeedanceQualityError(
             "Seedance 2.5 quality gate failed after retry: "
@@ -1670,19 +2897,29 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                         sem: asyncio.Semaphore,
                         anchor: DialogueAnchor | None = None,
                         *,
+                        fixed_voice_track: FixedVoiceTrack | None = None,
                         cast_characters: list[dict] | None = None,
                         identity_anchors: dict[str, DialogueAnchor] | None = None,
                         scene_reference: str | None = None,
                         scene_video_anchor: DialogueAnchor | None = None,
+                        paid_batch_id: str | None = None,
+                        asr_enabled: bool = True,
                         ) -> tuple[int, Exception | None,
                                    DialogueAnchor | None]:
-    """Generate one verified native-speaking Seedance 2.5 shot."""
+    """Generate one dialogue shot using the task-selected audio strategy."""
     async with sem:
         try:
+            _mark_shot_generating(job_id, shot["idx"])
             combined = {**shot, **sb_shot}
             combined["voiceover"] = (
                 sb_shot.get("voiceover") or shot.get("voiceover") or ""
             )
+            lip_sync_edit = (
+                str(combined.get("repair_mode") or "")
+                == "seedance_lip_sync_edit"
+            )
+            if fixed_voice_track and not lip_sync_edit:
+                combined["duration_sec"] = fixed_voice_track.duration_sec
             speaker_anchor = _incremental_anchor(anchor)
             previous_scene_anchor = _incremental_anchor(scene_video_anchor)
             continuity_context = _continuity_qa_context(
@@ -1696,34 +2933,55 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
             )
             route = select_route(shot, sb_shot)
             out_path = ASSETS_DIR / job_id / "shots" / f"{shot['idx']:02d}.mp4"
-            prompt = _build_native_dialogue_prompt(
-                combined,
-                char,
-                anchored=(
-                    speaker_anchor is not None
-                    or character_assets.character_identity_key(char)
-                    in (identity_anchors or {})
-                ),
-                scene_anchored=bool(scene_reference),
-                previous_scene_anchored=previous_scene_anchor is not None,
-            )
+            if lip_sync_edit:
+                prompt = _build_lip_sync_edit_prompt(combined)
+                request_kwargs = _lip_sync_edit_request_kwargs(combined)
+            else:
+                prompt = _build_native_dialogue_prompt(
+                    combined,
+                    char,
+                    anchored=(
+                        speaker_anchor is not None
+                        or character_assets.character_identity_key(char)
+                        in (identity_anchors or {})
+                    ),
+                    scene_anchored=bool(scene_reference),
+                    previous_scene_anchored=previous_scene_anchor is not None,
+                )
+                request_kwargs = _dialogue_request_kwargs(
+                    combined, speaker_anchor,
+                    fixed_voice_audio=(
+                        fixed_voice_track.audio_path
+                        if fixed_voice_track else None
+                    ),
+                    character=char,
+                    cast_characters=cast_characters,
+                    identity_anchors=identity_anchors,
+                    scene_reference=scene_reference,
+                    scene_video_anchor=previous_scene_anchor,
+                )
 
             async def generate_scene() -> SeedanceGenerationResult:
                 return await _generate_seedance_video(
                     prompt=prompt,
                     route=route,
-                    request_kwargs=_dialogue_request_kwargs(
-                        shot, speaker_anchor, character=char,
-                        cast_characters=cast_characters,
-                        identity_anchors=identity_anchors,
-                        scene_reference=scene_reference,
-                        scene_video_anchor=previous_scene_anchor,
-                    ),
+                    request_kwargs=request_kwargs,
                     out_path=out_path,
                     key_hint=f"{job_id}-dialogue-{shot['idx']:02d}",
                     job_id=job_id,
+                    shot_idx=shot["idx"],
                     expected_text=combined["voiceover"],
                     continuity_context=continuity_context,
+                    paid_batch_id=paid_batch_id,
+                    asr_enabled=asr_enabled,
+                    fixed_audio_path=(
+                        fixed_voice_track.audio_path
+                        if fixed_voice_track and not lip_sync_edit else None
+                    ),
+                    fixed_transcription=(
+                        fixed_voice_track.transcription
+                        if fixed_voice_track and not lip_sync_edit else None
+                    ),
                 )
 
             try:
@@ -1736,41 +2994,53 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                     [char, *(cast_characters or [])],
                     identity_anchors,
                 )
+                if not lip_sync_edit:
+                    continuity_context = _continuity_qa_context(
+                        combined,
+                        char,
+                        cast_characters=cast_characters,
+                        identity_anchors=identity_anchors,
+                        scene_reference=scene_reference,
+                        scene_video_anchor=previous_scene_anchor,
+                        speaker_anchor=speaker_anchor,
+                    )
+                    prompt = _build_native_dialogue_prompt(
+                        combined,
+                        char,
+                        anchored=True,
+                        scene_anchored=bool(scene_reference),
+                        previous_scene_anchored=(
+                            previous_scene_anchor is not None
+                        ),
+                    )
+                    request_kwargs = _dialogue_request_kwargs(
+                        combined,
+                        speaker_anchor,
+                        fixed_voice_audio=(
+                            fixed_voice_track.audio_path
+                            if fixed_voice_track else None
+                        ),
+                        character=char,
+                        cast_characters=cast_characters,
+                        identity_anchors=identity_anchors,
+                        scene_reference=scene_reference,
+                        scene_video_anchor=previous_scene_anchor,
+                    )
                 result = await generate_scene()
             if result.audio_path is None:
-                raise RuntimeError("Seedance 2.5 returned no native audio")
+                raise RuntimeError("固定声线音轨未写入 Seedance 成片")
 
             _persist_master_transcription(
                 job_id, shot["idx"], result.transcription
             )
 
-            db = conn()
-            cost = _record_provider_calls(
-                db, job_id, shot["idx"], "seedance",
-                result.provider_calls,
-                fallback_cost_cents=result.cost_cents,
-            )
-            db.execute(
-                "UPDATE shots SET video_path=?, video_url=?, state='OK', "
-                "provider='seedance', video_model=?, native_audio=1, "
-                "video_qa=?, cost_cents=cost_cents+?, error=NULL "
-                "WHERE job_id=? AND idx=?",
-                (
-                    str(result.video_path), result.video_url, result.model,
-                    result.qa_note, cost, job_id, shot["idx"],
-                ),
-            )
-            db.execute(
-                "UPDATE jobs SET cost_cents=cost_cents+? WHERE job_id=?",
-                (cost, job_id),
-            )
-            db.commit()
+            _commit_generated_shot(job_id, shot["idx"], result)
             return (
                 shot["idx"], None,
                 DialogueAnchor(
                     result.video_url,
                     seedance.normalize_generation_duration(
-                        shot["duration_sec"]
+                        combined["duration_sec"]
                     ),
                     chain_depth=max(
                         speaker_anchor.chain_depth if speaker_anchor else 0,
@@ -1782,9 +3052,10 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
             )
         except BaseException as exc:
             try:
-                db = conn()
-                _record_failed_generation(db, job_id, shot["idx"], exc)
-            except Exception:
+                _record_failed_generation_independently(
+                    job_id, shot["idx"], exc
+                )
+            except BaseException:
                 pass
             if isinstance(exc, Exception):
                 return shot["idx"], exc, None
@@ -1814,6 +3085,74 @@ def _director_time_beats(duration: float, *, dialogue: str,
             f"{speech_end:.1f}-{duration:.1f}秒：保持无新人声的自然动作和环境连续，供本地剪辑裁切。"
         )
     return beats
+
+
+def _cinematic_director_time_beats(
+        shot: dict, *, duration: float, editorial_duration: float) -> list[str]:
+    """Compile one continuous integer-second cinematic dialogue timeline."""
+    total_seconds = max(1, int(round(float(duration))))
+    raw_beats = list(shot.get("performance_beats") or [])
+    if not raw_beats:
+        raw_beats = [{
+            "speaker": shot.get("speaker"),
+            "duration": editorial_duration,
+            "dialogue": shot.get("voiceover") or "",
+            "visual_intent": shot.get("action") or shot.get("scene") or "",
+        }]
+
+    weights = [max(0.1, float(beat.get("duration") or 0.1)) for beat in raw_beats]
+    count = len(raw_beats)
+    if count <= total_seconds:
+        allocated = [1] * count
+        remaining = total_seconds - count
+        total_weight = sum(weights)
+        shares = [remaining * weight / total_weight for weight in weights]
+        extras = [int(math.floor(value)) for value in shares]
+        for index, value in enumerate(extras):
+            allocated[index] += value
+        leftover = remaining - sum(extras)
+        order = sorted(
+            range(count),
+            key=lambda index: (shares[index] - extras[index], -index),
+            reverse=True,
+        )
+        for index in order[:leftover]:
+            allocated[index] += 1
+    else:
+        allocated = [1] * count
+
+    camera = non_text_visual_text(shot.get("camera") or "").strip(" ；;，,")
+    cursor = 0
+    lines: list[str] = []
+    for index, beat in enumerate(raw_beats):
+        start = cursor
+        end = total_seconds if index == count - 1 else min(
+            total_seconds, cursor + allocated[index]
+        )
+        cursor = end
+        visual = non_text_visual_text(
+            beat.get("visual_intent") or beat.get("broll_hint")
+            or shot.get("action") or ""
+        ).strip(" ；;，,")
+        speaker = str(
+            beat.get("speaker") or shot.get("speaker") or "当前人物"
+        ).strip()
+        dialogue = str(beat.get("dialogue") or "").strip()
+        clauses = [f"{start}-{end}秒"]
+        if visual:
+            clauses.append(f"画面与动作：{visual}")
+        if camera:
+            clauses.append(f"运镜：{camera}")
+        if dialogue:
+            clauses.extend([
+                f"角色 {speaker} 说出 {{台词：{dialogue}}}",
+                "说话者面部与嘴部保持清晰可见，表演和运镜服务剧情，"
+                "不得在本句中途切离说话者或遮挡嘴部",
+            ])
+        else:
+            clauses.append("无台词，人物只完成动作与无声反应")
+        lines.append("；".join(clauses) + "。")
+    return lines
 
 
 def _sound_design_for(shot: dict) -> str:
@@ -1949,6 +3288,11 @@ def _build_native_dialogue_prompt(
         str(shot.get("render_mode") or "presenter").lower()
         == "cinematic_character"
     )
+    master_speakers = [
+        str(item).strip() for item in (shot.get("speakers") or [])
+        if str(item).strip()
+    ] or [str(shot.get("speaker") or character.get("id") or "").strip()]
+    multi_speaker = len(master_speakers) > 1
     creative_intent = (
         "创作意图：生成一段电影叙事情境表演，人物在真实剧情空间中完成动作、"
         "技能展示与原生对白，镜头主动参与叙事。"
@@ -1956,8 +3300,11 @@ def _build_native_dialogue_prompt(
         "创作意图：生成一段可信、克制、可直接交付的真人讲解镜头，画面表演与原生对白同步完成。"
     )
     timeline = (
-        [] if cinematic else
-        _director_time_beats(
+        _cinematic_director_time_beats(
+            shot,
+            duration=duration,
+            editorial_duration=editorial_duration,
+        ) if cinematic else _director_time_beats(
             duration,
             dialogue=voiceover,
             editorial_duration=editorial_duration,
@@ -1982,14 +3329,33 @@ def _build_native_dialogue_prompt(
         f"动作：{action}",
         f"表情变化：{shot.get('expression_arc') or shot.get('dramatic_keywords') or ''}",
         f"声音与语气：{shot.get('voice_directive') or '自然、专业、清晰的中国成年人普通话'}",
-        "时间轴：",
+        "连续整数秒导演时间轴：" if cinematic else "时间轴：",
         *timeline,
-        f"人物完整说出且只能说出 {{台词：{voiceover}}}",
+        (
+            "多人对白必须严格按照下方剧情节拍中的角色、顺序和台词轮流说出，"
+            "不得串词、抢词、改写或让错误角色开口。"
+            if multi_speaker else
+            (
+                "人物只能说出上方连续整数秒导演时间轴中标注的台词，"
+                "不得在时间轴外增加或复述任何人声。"
+                if cinematic else
+                f"人物完整说出且只能说出 {{台词：{voiceover}}}"
+            )
+        ),
         f"<环境音：{sound_design}>；无 BGM，不要字幕。",
-        "不得改写、增删、重复台词，不得加入旁白、第二个人声或背景音乐。",
+        (
+            "不得改写、增删、重复台词，不得加入旁白、未列出的第三人声或背景音乐。"
+            if multi_speaker else
+            "不得改写、增删、重复台词，不得加入旁白、第二个人声或背景音乐。"
+        ),
         "嘴唇、牙齿、舌位和下颌逐字同步，句末自然闭嘴。",
-        "人物身份、五官、发型、服装、背景和光线全程稳定。",
-        "不要字幕、可读文字、品牌、标识或水印。",
+        "说台词期间，说话者嘴部必须持续清晰可见，保持正面或四分之三中近景；"
+        "禁止侧背面、口部遮挡、快速甩镜、切到他人或切到远景。",
+        "其他同场人物全程闭嘴，只做无声反应；明显的走位、环绕、推拉和动作变化"
+        "优先安排在台词开始前或结束后。",
+        "人物身份、五官、发型、背景和光线全程稳定；服装与职业装备严格服从本镜场景，并在本镜内保持一致。",
+        "安全帽、反光背心、工服、工程机械、设备铭牌、工牌、文件、屏幕和背景标牌一律纯色无字，或通过背面、遮挡、裁切、浅景深使其不可辨认。",
+        "禁止企业名称、品牌、设备编号、车牌、字母、数字、二维码、字幕、标识或水印。",
     ]
     if scene_anchored:
         parts[1:1] = [
@@ -2011,24 +3377,6 @@ def _build_native_dialogue_prompt(
             "人物身份仍以定妆照或授权角色资产为准，不得沿用前序视频中的脸部漂移。",
         ]
     if cinematic:
-        performance_lines = []
-        for index, beat in enumerate(shot.get("performance_beats") or [], 1):
-            start = float(beat.get("start") or 0)
-            duration = float(beat.get("duration") or 0)
-            end = start + duration
-            visual_intent = non_text_visual_text(
-                beat.get("visual_intent") or beat.get("broll_hint") or ""
-            ).strip(" ；;，,")
-            performance_lines.append(
-                f"剧情节拍{index}（{start:.1f}-{end:.1f}秒）："
-                f"{visual_intent}；"
-                f"在该动作中自然说出 {{台词：{beat.get('dialogue') or ''}}}"
-            )
-        if editorial_duration < duration:
-            performance_lines.append(
-                f"补足段（{editorial_duration:.1f}-{duration:.1f}秒）："
-                "台词已经结束，保持无新人声的自然动作与场景连续，供本地剪辑裁切。"
-            )
         cast_lines = []
         for member in (shot.get("cast") or []):
             member_name, member_look, member_background = (
@@ -2042,19 +3390,24 @@ def _build_native_dialogue_prompt(
             "表演方式：人物必须在场景中走位、观察、交互、闪避或施展动作，"
             "不得持续正对镜头站桩讲解，不得使用直播口播式构图。",
             "摄影方式：执行下述镜头设计，允许有动机的跟拍、横移、环绕、推拉、"
-            "低机位与动作特写；运镜服务剧情且保持主体清晰。",
-            *(performance_lines or [
-                "剧情节拍：严格根据场景与动作完成连续电影化表演。"
-            ]),
+            "低机位与动作特写；运镜服务剧情且保持主体清晰；"
+            "对白区间不得用运镜破坏口型可见性。",
             *(["同场人物设定：", *cast_lines] if cast_lines else []),
-            f"对白约束：只有{character_name or '当前主角'}说出台词；"
-            "其他同场人物只能做动作和反应，不得开口、旁白或发出可辨识人声。",
+            (
+                "对白约束：仅剧情节拍中当前标注的角色可以在对应时间段开口；"
+                "其他同场人物只能做动作和反应，不得抢词、串词或增加台词。"
+                if multi_speaker else
+                f"对白约束：只有{character_name or '当前主角'}说出台词；"
+                "其他同场人物只能做动作和反应，不得开口、旁白或发出可辨识人声。"
+            ),
         ]
     if anchored:
         parts[1:1] = [
             "素材职责：",
-            "身份参考图只锁定人物外貌，包括五官、年龄、发型、体型与服装；"
-            "不得照搬定妆照的背景或站姿。",
+            "身份参考图只锁定人物外貌中的不可变身份特征，包括五官、年龄、发型、肤色与体型；"
+            "不得照搬定妆照的背景、站姿或服装。",
+            "服装、PPE、防护装备和职业状态严格服从本镜场景设定，"
+            "并在同一场景后续母片中保持一致。",
             "前序视频只延续原生声线、空间连续性与基础表演；"
             "不得照搬其镜头构图或动作。",
             "不得复述参考素材中的旧台词，只说本镜新台词。",
@@ -2082,10 +3435,16 @@ async def _gen_broll(job_id: str, shot: dict,
                      sem: asyncio.Semaphore,
                      scene_voiceover: bool = False,
                      voice_anchor: NativeVoiceAnchor | None = None,
-                     scene_reference: str | None = None,
+                     fixed_voice_track: FixedVoiceTrack | None = None,
+                      scene_reference: str | None = None,
+                      cast_characters: list[dict] | None = None,
+                      identity_anchors: dict[str, DialogueAnchor] | None = None,
+                     paid_batch_id: str | None = None,
+                     asr_enabled: bool = True,
                      ) -> tuple[int, Exception | None]:
     async with sem:
         try:
+            _mark_shot_generating(job_id, shot["idx"])
             precision_reason = precision_motion_reason(sb_shot)
             if precision_reason:
                 raise RuntimeError(
@@ -2134,14 +3493,32 @@ async def _gen_broll(job_id: str, shot: dict,
             out_path = ASSETS_DIR / job_id / "shots" / f"{shot['idx']:02d}.mp4"
             request_kwargs = (
                 _scene_voiceover_request_kwargs(shot, voice_anchor)
-                if scene_voiceover else _broll_request_kwargs(shot)
+                if scene_voiceover else _broll_request_kwargs(
+                    shot,
+                    cast_characters=cast_characters,
+                    identity_anchors=identity_anchors,
+                    scene_reference=scene_reference,
+                )
             )
+            if scene_voiceover and fixed_voice_track is not None:
+                request_kwargs["duration"] = seedance.normalize_generation_duration(
+                    fixed_voice_track.duration_sec
+                )
+                request_kwargs["reference_audios"] = [
+                    str(fixed_voice_track.audio_path)
+                ]
+            if not scene_voiceover and (
+                request_kwargs.get("reference_videos")
+                or request_kwargs.get("references")
+            ):
+                keyframe = None
+                last_frame = None
             request_kwargs.update({
                 "first_frame": keyframe,
                 "last_frame": last_frame,
                 "references": (
-                    [scene_reference]
-                    if scene_reference and not keyframe else extra_refs
+                    request_kwargs.get("references")
+                    if not keyframe else extra_refs
                 ) or None,
                 "camera_fixed": bool(camera_fixed),
                 "motion_strength": float(motion_strength),
@@ -2153,6 +3530,7 @@ async def _gen_broll(job_id: str, shot: dict,
                 out_path=out_path,
                 key_hint=f"{job_id}-shot-{shot['idx']:02d}",
                 job_id=job_id,
+                shot_idx=shot["idx"],
                 forbid_people=scene_voiceover,
                 expected_text=(
                     sb_shot.get("voiceover") or shot.get("voiceover")
@@ -2168,6 +3546,16 @@ async def _gen_broll(job_id: str, shot: dict,
                     }
                     if scene_reference else None
                 ),
+                paid_batch_id=paid_batch_id,
+                asr_enabled=asr_enabled,
+                fixed_audio_path=(
+                    fixed_voice_track.audio_path
+                    if fixed_voice_track else None
+                ),
+                fixed_transcription=(
+                    fixed_voice_track.transcription
+                    if fixed_voice_track else None
+                ),
             )
 
             if scene_voiceover:
@@ -2175,33 +3563,18 @@ async def _gen_broll(job_id: str, shot: dict,
                     job_id, shot["idx"], result.transcription
                 )
 
-            db = conn()
-            cost = _record_provider_calls(
-                db, job_id, shot["idx"], "seedance",
-                result.provider_calls,
-                fallback_cost_cents=result.cost_cents,
-            )
-            db.execute(
-                "UPDATE shots SET video_path=?, video_url=?, state='OK', "
-                "provider='seedance', video_model=?, native_audio=?, "
-                "video_qa=?, cost_cents=cost_cents+?, error=NULL "
-                "WHERE job_id=? AND idx=?",
-                (
-                    str(result.video_path), result.video_url, result.model,
-                    int(result.native_audio), result.qa_note, cost,
-                    job_id, shot["idx"],
-                )
-            )
-            db.execute(
-                "UPDATE jobs SET cost_cents=cost_cents+? WHERE job_id=?",
-                (cost, job_id)
-            )
-            db.commit()
+            _commit_generated_shot(job_id, shot["idx"], result)
             return shot["idx"], None
-        except Exception as e:
-            db = conn()
-            _record_failed_generation(db, job_id, shot["idx"], e)
-            return shot["idx"], e
+        except BaseException as e:
+            try:
+                _record_failed_generation_independently(
+                    job_id, shot["idx"], e
+                )
+            except BaseException:
+                pass
+            if isinstance(e, Exception):
+                return shot["idx"], e
+            raise
 
 
 async def run(job_id: str) -> None:
@@ -2210,10 +3583,20 @@ async def run(job_id: str) -> None:
     sb = json.loads(job["storyboard"])
     chars = {c["id"]: c for c in json.loads(job["characters_json"])}
     characters = list(chars.values())
+    generation_units = sb.get("masters") or sb["shots"]
+    audio_mode = normalize_audio_mode(
+        (sb.get("production_settings") or {}).get("audio_mode")
+        or os.getenv("DIALOGUE_AUDIO_MODE")
+    )
     bindings_changed = character_assets.apply_cached_bindings(db, characters)
     bindings_changed = (
         _resolve_real_person_bindings(db, characters) or bindings_changed
     )
+    if audio_mode == AUDIO_MODE_FIXED_TTS:
+        bindings_changed = (
+            _resolve_speaking_voice_bindings(db, characters, generation_units)
+            or bindings_changed
+        )
     continuity_changed = scene_assets.apply_continuity_metadata(
         sb, characters
     )
@@ -2227,7 +3610,6 @@ async def run(job_id: str) -> None:
             ),
         )
         db.commit()
-    generation_units = sb.get("masters") or sb["shots"]
     sb_shots = {s["idx"]: s for s in generation_units}
 
     # Resolve deterministic, reviewed local footage before any stochastic
@@ -2251,16 +3633,28 @@ async def run(job_id: str) -> None:
     if not rows and not review_rows:
         return
 
-    sem = asyncio.Semaphore(MAX_CONCURRENT_SHOTS)
+    configured_concurrency = max(1, int(MAX_CONCURRENT_SHOTS))
+    model_concurrency = max(1, _env_nonnegative_int(
+        "SEEDANCE_MAX_CONCURRENT_MASTERS", configured_concurrency
+    ))
+    sem = asyncio.Semaphore(min(configured_concurrency, model_concurrency))
     results: list[tuple[int, Exception | None]] = []
     identity_anchors = (
-        await _ensure_character_identity_anchors(job_id, characters)
+        await _ensure_character_identity_anchors(
+            job_id, characters, storyboard=sb
+        )
         if rows else {}
     )
     scene_anchors = (
         await _ensure_scene_visual_anchors(job_id, sb) if rows else {}
     )
     if rows:
+        _apply_anchor_review_mode(
+            conn(), job_id,
+            (sb.get("production_settings") or {}).get(
+                "anchor_review_mode", "auto"
+            ),
+        )
         _assert_continuity_anchors_approved(conn(), job_id)
     dialogue_anchors: dict[str, DialogueAnchor] = {}
     voice_anchors: dict[str, NativeVoiceAnchor] = {}
@@ -2309,7 +3703,61 @@ async def run(job_id: str) -> None:
     scene_video_anchors: dict[str, DialogueAnchor] = {}
     for _, scene_key, completed_anchor in completed_scene_anchors:
         scene_video_anchors[scene_key] = completed_anchor
-    for r in rows:
+
+    def dependency_keys(row) -> frozenset[str]:
+        shot = dict(row)
+        sb_shot = sb_shots.get(shot["idx"], {})
+        keys: set[str] = set()
+        scene_key = str(
+            sb_shot.get("scene_anchor_key") or ""
+        ).strip().casefold()
+        if scene_key:
+            keys.add(f"scene:{scene_key}")
+
+        def add_identity(character_id: object) -> None:
+            raw_id = str(character_id or "").strip()
+            if not raw_id:
+                return
+            character = chars.get(raw_id)
+            identity_key = (
+                character_assets.character_identity_key(character)
+                if character else raw_id
+            )
+            keys.add(f"identity:{identity_key}")
+
+        if shot["narrative_type"] != "dialogue":
+            add_identity(
+                shot.get("anchor_character")
+                or sb_shot.get("anchor_character")
+            )
+            for cast_character in _scene_cast_characters(
+                sb_shot, chars, ""
+            ):
+                add_identity(cast_character.get("id"))
+            return frozenset(keys)
+        speaker_id = str(shot.get("speaker_id") or "").strip()
+        speaker = chars.get(speaker_id)
+        identity_key = (
+            character_assets.character_identity_key(speaker)
+            if speaker else speaker_id
+        )
+        if identity_key:
+            keys.add(f"identity:{identity_key}")
+        render_mode = str(
+            sb_shot.get("render_mode") or "presenter"
+        ).casefold()
+        if render_mode == "cinematic_character":
+            for cast_character in _scene_cast_characters(
+                sb_shot, chars, speaker_id
+            ):
+                keys.add(
+                    "identity:"
+                    + character_assets.character_identity_key(cast_character)
+                )
+        return frozenset(keys)
+
+    async def generate_row(row, paid_batch_id: str):
+        r = row
         shot = dict(r)
         sb_shot = sb_shots.get(shot["idx"], {})
         scene_key = str(
@@ -2364,28 +3812,49 @@ async def run(job_id: str) -> None:
                     dialogue_anchors[identity_key] = max(
                         earlier, key=lambda item: item[0]
                     )[2]
+            fixed_voice_track = None
+            if audio_mode == AUDIO_MODE_FIXED_TTS:
+                voice_database = conn()
+                try:
+                    fixed_voice_track = await _synthesize_fixed_voice_track(
+                        voice_database,
+                        job_id=job_id,
+                        shot={
+                            **shot, **sb_shot,
+                            "duration_sec": shot["duration_sec"],
+                        },
+                        characters=chars,
+                        paid_batch_id=paid_batch_id,
+                    )
+                finally:
+                    if voice_database is not db:
+                        voice_database.close()
             idx, error, next_anchor = await _gen_dialogue(
-                job_id, shot, char, sb_shot, sem,
+                job_id, shot, char, {**sb_shot, "audio_mode": audio_mode}, sem,
                 dialogue_anchors.get(identity_key),
+                fixed_voice_track=fixed_voice_track,
                 cast_characters=cast_characters,
                 identity_anchors=identity_anchors,
                 scene_reference=scene_anchors.get(
                     scene_key
                 ),
                 scene_video_anchor=scene_video_anchors.get(scene_key),
+                paid_batch_id=paid_batch_id,
+                asr_enabled=(sb.get("production_settings") or {}).get(
+                    "asr_enabled", True
+                ) is not False,
             )
-            results.append((idx, error))
+            generated_voice = None
             if next_anchor is not None:
-                dialogue_anchors[identity_key] = next_anchor
-                if scene_key:
-                    scene_video_anchors[scene_key] = next_anchor
                 generated_voice = _voice_anchor_from_completed_shot({
                     "video_path": str(
                         ASSETS_DIR / job_id / "shots" / f"{shot['idx']:02d}.mp4"
                     )
                 })
-                if generated_voice is not None:
-                    voice_anchors[identity_key] = generated_voice
+            return (
+                idx, error, identity_key, scene_key,
+                next_anchor, generated_voice,
+            )
         elif shot["narrative_type"] == "dialogue" and render_mode == "scene":
             speaker_id = shot["speaker_id"]
             scene_character = chars.get(speaker_id)
@@ -2402,13 +3871,37 @@ async def run(job_id: str) -> None:
                     voice_anchors[voice_key] = max(
                         earlier_voice, key=lambda item: item[0]
                     )[2]
-            results.append(await _gen_broll(
-                job_id, shot, None, sb_shot, sem, scene_voiceover=True,
+            fixed_voice_track = None
+            if audio_mode == AUDIO_MODE_FIXED_TTS:
+                voice_database = conn()
+                try:
+                    fixed_voice_track = await _synthesize_fixed_voice_track(
+                        voice_database,
+                        job_id=job_id,
+                        shot={
+                            **shot, **sb_shot,
+                            "duration_sec": shot["duration_sec"],
+                        },
+                        characters=chars,
+                        paid_batch_id=paid_batch_id,
+                    )
+                finally:
+                    if voice_database is not db:
+                        voice_database.close()
+            idx, error = await _gen_broll(
+                job_id, shot, None, {**sb_shot, "audio_mode": audio_mode},
+                sem, scene_voiceover=True,
                 voice_anchor=voice_anchors.get(voice_key),
+                fixed_voice_track=fixed_voice_track,
                 scene_reference=scene_anchors.get(
                     str(sb_shot.get("scene_anchor_key") or "").casefold()
                 ),
-            ))
+                paid_batch_id=paid_batch_id,
+                asr_enabled=(sb.get("production_settings") or {}).get(
+                    "asr_enabled", True
+                ) is not False,
+            )
+            return idx, error, None, None, None, None
         else:
             anchor_id = shot.get("anchor_character")
             anchor_path = None
@@ -2420,12 +3913,66 @@ async def run(job_id: str) -> None:
                         f"{anchor_id} not in characters"
                     )
                 anchor_path = anchor_char.get("image_path")
-            results.append(await _gen_broll(
-                job_id, shot, anchor_path, sb_shot, sem,
+            broll_cast = _scene_cast_characters(sb_shot, chars, "")
+            idx, error = await _gen_broll(
+                job_id, shot, anchor_path,
+                {**sb_shot, "audio_mode": audio_mode}, sem,
                 scene_reference=scene_anchors.get(
                     str(sb_shot.get("scene_anchor_key") or "").casefold()
                 ),
-            ))
+                cast_characters=broll_cast,
+                identity_anchors=identity_anchors,
+                paid_batch_id=paid_batch_id,
+                asr_enabled=(sb.get("production_settings") or {}).get(
+                    "asr_enabled", True
+                ) is not False,
+            )
+            return idx, error, None, None, None, None
+
+    pending_rows = list(rows)
+    while pending_rows:
+        occupied: set[str] = set()
+        wave = []
+        deferred = []
+        for row in pending_rows:
+            keys = dependency_keys(row)
+            if keys & occupied:
+                deferred.append(row)
+                continue
+            wave.append(row)
+            occupied.update(keys)
+        pending_rows = deferred
+        paid_batch_id = provider_tasks.begin_paid_submit_batch(db, job_id)
+        wave_results = await asyncio.gather(
+            *(generate_row(row, paid_batch_id) for row in wave),
+            return_exceptions=True,
+        )
+        fatal: BaseException | None = None
+        wave_failed = False
+        for row, outcome in zip(wave, wave_results):
+            if isinstance(outcome, BaseException):
+                wave_failed = True
+                if isinstance(outcome, Exception):
+                    results.append((int(row["idx"]), outcome))
+                elif fatal is None:
+                    fatal = outcome
+                continue
+            (
+                idx, error, identity_key, scene_key,
+                next_anchor, generated_voice,
+            ) = outcome
+            results.append((idx, error))
+            wave_failed = wave_failed or error is not None
+            if next_anchor is not None and identity_key:
+                dialogue_anchors[identity_key] = next_anchor
+                if scene_key:
+                    scene_video_anchors[scene_key] = next_anchor
+                if generated_voice is not None:
+                    voice_anchors[identity_key] = generated_voice
+        if fatal is not None:
+            raise fatal
+        if wave_failed:
+            break
 
     failed = [(i, e) for i, e in results if e is not None]
     failed.extend((

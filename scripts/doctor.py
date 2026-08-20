@@ -17,6 +17,7 @@ REQUIRED_PACKAGES = ("click", "dotenv", "httpx", "yaml", "tos")
 VIDEO_KEYS = (
     "ARK_API_KEY", "VOLC_AK", "VOLC_SK", "TOS_BUCKET",
 )
+FIXED_TTS_KEYS = ("VOLC_TTS_APPID", "VOLC_TTS_API_KEY")
 
 
 def _configured(value: object) -> bool:
@@ -33,11 +34,12 @@ def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
     elif profile == "script":
         required = ("ANTHROPIC_API_KEY",) if provider == "claude" else ("ARK_API_KEY",)
     else:
-        required = VIDEO_KEYS
-    asr_ready = _configured(config.get("VOLC_ASR_API_KEY")) or all(
-        _configured(config.get(key))
-        for key in ("VOLC_ASR_APPID", "VOLC_ASR_TOKEN")
-    )
+        audio_mode = str(
+            config.get("DIALOGUE_AUDIO_MODE") or "seedance_native"
+        ).strip().casefold()
+        required = VIDEO_KEYS + (
+            FIXED_TTS_KEYS if audio_mode != "seedance_native" else ()
+        )
     checks = {
         "python": {"ok": sys.version_info >= (3, 11), "detail": sys.version.split()[0]},
         "packages": {
@@ -46,12 +48,10 @@ def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
         },
         "environment_file": {"ok": env_path.is_file(), "detail": str(env_path)},
         "credentials": {
-            "ok": all(_configured(config.get(key)) for key in required)
-            and (profile != "video" or asr_ready),
+            "ok": all(_configured(config.get(key)) for key in required),
             "detail": {
                 "provider": provider,
                 **{key: _configured(config.get(key)) for key in required},
-                **({"VOLC_ASR": asr_ready} if profile == "video" else {}),
             },
         },
         "data_directory": {

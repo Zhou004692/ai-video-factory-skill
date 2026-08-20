@@ -14,8 +14,8 @@ PENDING → STORYBOARDED → SHOTS_OK → BGM_OK → COMPOSED → PUBLISHED
 
 | 步骤 | 输入 | 产物 | 主要能力 |
 |---|---|---|---|
-| `s1_storyboard` | 主题、赛道、受众、目标时长 | `storyboard.json`、母片任务入库 | 生成 2—3 条付费母片和 4—8 段本地导演时间线；合规和结构校验 |
-| `s3_shots` | 母片、角色定妆计划、前序锚点 | `character_identity/*`、`shots/01.mp4...`、更新后的 `storyboard.json` | AI 角色先生成 Seedream 5.0 静态定妆照，自定义角色按需生成动态身份母片，再生成 Seedance 2.5 原生剧情母片；BigASR 与视频 QA；按真实逐句时间重建 `subtitle_cues` |
+| `s1_storyboard` | 主题、赛道、受众、目标时长 | `storyboard.json`、母片任务入库 | 按内容生成最少必要付费母片和本地导演时间线；合规和结构校验 |
+| `s3_shots` | 母片、角色定妆、任务声音方案、前序锚点 | `character_identity/*`、可选 `voices/master-*`、`shots/01.mp4...`、更新后的 `storyboard.json` | `fixed_tts` 先固化火山声线并用精确音轨约束画面/口型；`seedance_native` 由 Seedance 直接合成人声；BigASR 仅做复核，视频 QA 必选 |
 | `s5_bgm` | `storyboard.bgm` | `bgm.mp3` 或静音策略 | 本地音乐库 |
 | `s6_compose` | 已验收母片、导演时间线、字幕、BGM | `concat.mp4`、`final.mp4` | 从母片分别取画面/原生音频，本地裁切、B-roll 覆画、字幕、混音和 CTA |
 | `s7_publish` | `final.mp4` | 发布记录 | 默认人工预审并手工发布 |
@@ -26,10 +26,10 @@ PENDING → STORYBOARDED → SHOTS_OK → BGM_OK → COMPOSED → PUBLISHED
 
 ## Seedance 镜头路由
 
-标准版默认采用“原生母片生成 + 本地导演剪辑”，不是把 4—8 个成片镜头全部送去生成：
+标准版默认采用“原生母片生成 + 本地导演剪辑”，不是把所有成片镜头逐条送去生成：
 
-1. 生成 2—3 条母片：钩子真人、主体真人长母片、可选 B-roll 母片；付费母片总时长不超过 36 秒。
-2. 成片时间线由 4—8 个本地剪辑段组成，每段分别用 `video_master_idx` 和 `audio_master_idx` 选择画面与音频来源。
+1. 按叙事场景、人物连续性和音画需求生成最少必要母片；单次 Seedance 调用遵循 4—30 秒模型边界，整单不设置人为总时长上限。
+2. 成片时间线按内容拆解，每段分别用 `video_master_idx` 和 `audio_master_idx` 选择画面与音频来源。
 3. B-roll 段只替换画面，音频继续按时间顺序取自主体真人母片；对白母片必须从 0 秒开始连续消费到结尾，不允许漏词、重叠或重排。
 4. 字幕、hook、CTA 和 BGM 全部后期合成，不要求生成模型产出文字。
 
@@ -39,7 +39,7 @@ PENDING → STORYBOARDED → SHOTS_OK → BGM_OK → COMPOSED → PUBLISHED
 2. AI 自动角色在任何剧情母片前先生成一张 Seedream 5.0 Full 静态定妆照；后续所有母片复用同一张图。若静态图触发 Seedance 隐私策略，则自动生成 4 秒动态身份母片并重试一次。
 3. 自定义角色不把本地真人照片作为普通图片参考提交 Seedance，继续使用动态身份母片；失败时不进入付费场景生成。
 4. 每条电影化剧情母片只解析场景文字或结构化 `cast` 中实际出现的人物，并同时携带这些人物的身份引用；不再把全剧人物注入每条镜头。
-5. 同一人物后续对白保留静态身份锚点，同时引用最近一个已完成剧情母片延续声线；动态模式优先沿用最近母片。每条请求最多使用 Seedance 2.5 支持的 3 段视频引用，超出时必须先拆分场景。
+5. 同一人物后续对白保留静态身份锚点，同时引用最近一个已完成剧情母片延续视觉表演。`fixed_tts` 下每条对白携带该角色已固化的 TTS 音轨；`seedance_native` 下由 Seedance 直接生成对白。每条请求最多使用 Seedance 2.5 支持的 3 段视频引用，超出时必须先拆分场景。
 6. 重复出现的核心空间才按需生成 Seedream 场景锚点；一次性场景不预生成，避免无效成本和构图锁死。
 7. 独立 B-roll 母片不带人物/声线锚点。身份图、动态母片和引用输入的费用都进入零付费预检与 provider 调用台账。
 
@@ -52,7 +52,7 @@ PENDING → STORYBOARDED → SHOTS_OK → BGM_OK → COMPOSED → PUBLISHED
 - 台词不匹配、意外人声/人物、可读文字或 QA 异常属于硬缺陷，可在预算内同模型整镜重生一次。
 - 只有 `visual_mismatch` 属于软偏差：保存候选并转人工复核，不自动产生第二次费用。
 - `SEEDANCE_AUTO_RETRY_BUDGET_CENTS` 默认限制单次自动重试不超过 ¥8；`SEEDANCE_JOB_BUDGET_CENTS` 是单任务成本提醒值，超过后仍可经人工确认继续生成，不再作为整单硬上限。
-- 生产流允许无新增模型费用的本地导演剪辑，但不回退到 TTS、外部数字人或外部口型模型。
+- 对白声音由 `DIALOGUE_AUDIO_MODE` 设置全局默认，并可被单任务覆盖。产品默认 `seedance_native`；固定角色或连续母片需要稳定音色时可改为 `fixed_tts`。两者都不使用外部数字人或第三方口型模型。
 
 ## 长镜头
 
