@@ -237,7 +237,7 @@ async def _refresh_director_speech_timeline(
             "audio_master_idx", edit.get("video_master_idx", -1)
         ))
         if (
-            int(edit.get("speech_timeline_version") or 0) < 2
+            _speech_timeline_needs_refresh(edit)
             and (
                 edit.get("subtitle")
                 or edit.get("subtitle_cues")
@@ -304,8 +304,10 @@ async def _refresh_director_speech_timeline(
             storyboard, master_idx, transcription
         ) or changed
         for edit in related:
-            if int(edit.get("speech_timeline_version") or 0) != 2:
-                edit["speech_timeline_version"] = 2
+            if _speech_timeline_needs_refresh(edit):
+                edit["speech_timeline_version"] = (
+                    subtitles.SPEECH_TIMELINE_VERSION
+                )
                 changed = True
 
     changed = _synchronize_master_contract_durations(storyboard) or changed
@@ -324,6 +326,12 @@ async def _refresh_director_speech_timeline(
             encoding="utf-8",
         )
     return changed
+
+
+def _speech_timeline_needs_refresh(edit: dict) -> bool:
+    return int(edit.get("speech_timeline_version") or 0) < (
+        subtitles.SPEECH_TIMELINE_VERSION
+    )
 
 
 async def _prep_director_segment(segment: dict, prep_dir: Path,
@@ -345,6 +353,24 @@ async def _prep_director_segment(segment: dict, prep_dir: Path,
     return out
 
 
+def _in_video_hook_text(storyboard: dict) -> str | None:
+    """Return an opening overlay only when the job explicitly opts in.
+
+    The script hook remains available for marketing thumbnails.  Burning it
+    into the master by default duplicates the subtitle channel and creates the
+    floating yellow copy users observed in otherwise clean cinematic footage.
+    """
+    enabled = (storyboard.get("production_settings") or {}).get(
+        "hook_overlay_enabled", False
+    )
+    if not (
+        enabled is True
+        or str(enabled).strip().lower() in {"1", "true", "yes", "on"}
+    ):
+        return None
+    return str(storyboard.get("hook") or "").strip() or None
+
+
 async def run(job_id: str) -> None:
     base = ASSETS_DIR / job_id
     db = conn()
@@ -353,6 +379,7 @@ async def run(job_id: str) -> None:
     sb = json.loads(job["storyboard"]) if job and job["storyboard"] else {}
     sb_shots = {s["idx"]: s for s in sb.get("shots", [])}
     hook_text = sb.get("hook", "")
+    in_video_hook = _in_video_hook_text(sb)
 
     rows = db.execute(
         "SELECT idx, video_path "
@@ -378,7 +405,7 @@ async def run(job_id: str) -> None:
             _prep_director_segment(
                 segment,
                 prep_dir,
-                hook=hook_text if segment["idx"] == first_idx else None,
+                hook=in_video_hook if segment["idx"] == first_idx else None,
             )
             for segment in segments
         ])
@@ -388,7 +415,7 @@ async def run(job_id: str) -> None:
             _prep_shot(
                 r, prep_dir,
                 subtitle=sb_shots.get(r["idx"], {}).get("subtitle"),
-                hook=hook_text if r["idx"] == first_idx else None,
+                hook=in_video_hook if r["idx"] == first_idx else None,
             )
             for r in rows
         ])

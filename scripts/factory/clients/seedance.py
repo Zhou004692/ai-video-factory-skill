@@ -6,15 +6,13 @@ reference 模式 + native audio + motion control + first/last frame 锁定等能
 本 client 暴露 2.x role 模式:
   first_frame         单图 i2v(1.0 已有,兼容老调用)
   last_frame          2.0 新:尾帧锁定
-  reference_image     2.0 新:多张参考图(最多 9 张,角色/物件保持)
-  reference_video     2.0 新:视频参考(最多 3 段,控运镜风格)
-  reference_audio     2.0 新:音频参考(最多 3 段,控节奏/情绪)
+  reference_image     参考图(2.5 最多 30 张,角色/物件保持)
+  reference_video     视频参考(2.5 最多 10 段,控运镜/连续动作)
+  reference_audio     音频参考(2.5 最多 10 段,控音色/节奏/情绪)
 
 文档:
-  https://www.volcengine.com/docs/82379       (火山方舟主入口)
-  https://www.volcengine.com/docs/82379/1520757 (1.0 Pro 接口)
-  https://www.volcengine.com/docs/82379/2298881 (2.0 SDK 示例)
-  https://blog.laozhang.ai/en/posts/seedance-2-api (字段说明实测)
+  https://docs.volcengine.com/docs/82379/2607688?lang=zh (2.5 教程)
+  https://docs.volcengine.com/docs/82379/2607689?lang=zh (2.5 提示词)
 
 环境变量:
   ARK_API_KEY             火山方舟 API Key
@@ -37,6 +35,30 @@ from . import provider_downloads
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 SEEDANCE_25_MIN_GENERATION_DURATION_SEC = 4
 SEEDANCE_25_MAX_GENERATION_DURATION_SEC = 30
+SEEDANCE_25_CAPABILITIES = {
+    "resolutions": frozenset({"480p", "720p", "1080p"}),
+    "reference_limits": {
+        "reference_image": 30,
+        "reference_video": 10,
+        "reference_audio": 10,
+    },
+    "task_types": frozenset({"auto", "edit", "extend"}),
+}
+
+
+def capability_profile(model: str) -> dict:
+    """Return the single provider capability contract used by every layer."""
+    if "seedance-2-5" in str(model or "").lower():
+        return SEEDANCE_25_CAPABILITIES
+    return {
+        "resolutions": frozenset({"480p", "720p", "1080p"}),
+        "reference_limits": {
+            "reference_image": 9,
+            "reference_video": 3,
+            "reference_audio": 3,
+        },
+        "task_types": frozenset({"auto"}),
+    }
 
 
 class SeedanceParameterError(ValueError):
@@ -430,8 +452,10 @@ def _video_task_payload(*, model: str, content: list, duration: float,
     """Build one Seedance task payload using official API field names."""
     if output_format not in {"mp4", "mov"}:
         raise SeedanceParameterError("output_format must be 'mp4' or 'mov'")
-    if task_intent not in {"generate", "edit"}:
-        raise SeedanceParameterError("task_intent must be 'generate' or 'edit'")
+    if task_intent not in {"generate", "edit", "extend"}:
+        raise SeedanceParameterError(
+            "task_intent must be 'generate', 'edit', or 'extend'"
+        )
     roles = {item.get("role") for item in content if item.get("role")}
     if task_intent == "edit":
         if ratio != "adaptive":
@@ -444,13 +468,25 @@ def _video_task_payload(*, model: str, content: list, duration: float,
             raise SeedanceParameterError(
                 "Seedance edit tasks require reference_video or reference_audio"
             )
+    profile = capability_profile(model)
     if "seedance-2-5" in model.lower():
-        if resolution not in {"480p", "720p"}:
+        if resolution not in profile["resolutions"]:
             raise SeedanceParameterError(
-                "Seedance 2.5 resolution must be 480p or 720p"
+                "Seedance 2.5 resolution must be 480p, 720p, or 1080p"
             )
         if task_intent == "generate":
             duration = normalize_generation_duration(duration)
+        if task_intent == "extend":
+            if ratio != "adaptive":
+                raise SeedanceParameterError(
+                    "Seedance extend tasks require ratio='adaptive'"
+                )
+            if not ({"reference_video"} & roles):
+                raise SeedanceParameterError(
+                    "Seedance extend tasks require reference_video"
+                )
+            if duration != -1:
+                duration = normalize_generation_duration(duration)
 
     payload = {
         "model": model,
@@ -459,6 +495,10 @@ def _video_task_payload(*, model: str, content: list, duration: float,
         "resolution": resolution,
         "output_format": output_format,
     }
+    if "seedance-2-5" in model.lower():
+        payload["omni_reference_task_type"] = (
+            "auto" if task_intent == "generate" else task_intent
+        )
     if not ({"first_frame", "last_frame"} & roles):
         payload["ratio"] = ratio
     # Seedance 2.x rejects camera_fixed in both T2V and I2V (including when
@@ -468,7 +508,10 @@ def _video_task_payload(*, model: str, content: list, duration: float,
         payload["camera_fixed"] = camera_fixed
     if seed is not None:
         payload["seed"] = seed
-    if motion_strength is not None:
+    # motion_strength is not part of the published Seedance 2.5 API contract.
+    # Keep it only for older/experimental model families that explicitly
+    # accepted the field, so production 2.5 requests remain fail-closed.
+    if motion_strength is not None and "seedance-2-5" not in model.lower():
         payload["motion_strength"] = motion_strength
     if generate_audio:
         payload["generate_audio"] = True
@@ -483,10 +526,7 @@ def _validate_reference_limits(
     audio_count: int,
 ) -> None:
     """Validate model-specific multimodal reference limits before submission."""
-    if "seedance-2-5" in model.lower():
-        limits = {"reference_image": 30, "reference_video": 10, "reference_audio": 10}
-    else:
-        limits = {"reference_image": 9, "reference_video": 3, "reference_audio": 3}
+    limits = capability_profile(model)["reference_limits"]
 
     counts = {
         "reference_image": image_count,
@@ -509,9 +549,9 @@ async def text_to_video(
     # 2.0 全 role:
     first_frame: str | None = None,
     last_frame: str | None = None,
-    references: list[str] | None = None,           # reference_image[] 最多 9 张
-    reference_videos: list[str] | None = None,     # 最多 3 段
-    reference_audios: list[str] | None = None,     # 最多 3 段
+    references: list[str] | None = None,           # 2.5 最多 30 张
+    reference_videos: list[str] | None = None,     # 2.5 最多 10 段
+    reference_audios: list[str] | None = None,     # 2.5 最多 10 段
     # 基本控制
     duration: float = 10.0,
     resolution: str = "720p",
@@ -520,7 +560,7 @@ async def text_to_video(
     model: str | None = None,
     # 2.0 运动控制
     camera_fixed: bool = False,
-    motion_strength: float | None = None,          # 0.0-1.0 实测可调
+    motion_strength: float | None = None,          # 仅旧/实验模型兼容
     # native audio(2.0 新):让视频自带音轨(对话/音效/环境音/BGM)
     generate_audio: bool = False,
     audio_output: bool | None = None,
@@ -797,6 +837,7 @@ async def text_to_image(prompt: str, resolution: str = "1024x1536",
         "model": model,
         "prompt": prompt,
         "size": resolution,
+        "watermark": False,
     }
     if seed is not None:
         payload["seed"] = seed

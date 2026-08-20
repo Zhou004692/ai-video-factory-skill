@@ -260,7 +260,11 @@ class SceneVoiceoverVideoTests(unittest.TestCase):
             {"prompt": "自然工地现场，保留真实环境色"},
         )
 
-        self.assertEqual(prompt, "自然工地现场，保留真实环境色")
+        self.assertIn("场景：自然工地现场，保留真实环境色", prompt)
+        self.assertIn("动作：自然工地现场，保留真实环境色", prompt)
+        self.assertIn("连续整数秒导演时间轴", prompt)
+        self.assertIn("无对白、无人声、无旁白", prompt)
+        self.assertIn("禁止任何可读文字", prompt)
 
 
 if __name__ == "__main__":

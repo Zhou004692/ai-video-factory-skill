@@ -5,8 +5,9 @@ import re
 from typing import Any
 
 
-_BOUNDARY = re.compile(r"(?<=[，,；;。！？!?])")
-_TRAILING_PLAIN_PUNCTUATION = "，,；;。．."
+SPEECH_TIMELINE_VERSION = 3
+_BOUNDARY = re.compile(r"(?<=[，,、；;。！？!?])")
+_TRAILING_PLAIN_PUNCTUATION = "，,、；;。．."
 
 
 def _display_text(text: str) -> str:
@@ -14,7 +15,12 @@ def _display_text(text: str) -> str:
 
 
 def split_phrases(text: str, *, max_chars: int = 14) -> list[str]:
-    """Split narration at semantic pauses, then cap visual line length."""
+    """Split narration at semantic pauses without cutting Chinese words.
+
+    One timed cue may occupy two balanced visual lines.  Rendering is already
+    responsible for that line wrap, so the timing layer only falls back to a
+    hard split when a punctuation-free clause exceeds two visual lines.
+    """
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     if not normalized:
         return []
@@ -22,9 +28,10 @@ def split_phrases(text: str, *, max_chars: int = 14) -> list[str]:
     result: list[str] = []
     for clause in clauses:
         display = _display_text(clause)
-        while len(display) > max_chars:
-            result.append(display[:max_chars])
-            display = display[max_chars:]
+        max_phrase_chars = max(1, int(max_chars)) * 2
+        while len(display) > max_phrase_chars:
+            result.append(display[:max_phrase_chars])
+            display = display[max_phrase_chars:]
         if display:
             result.append(display)
     return result

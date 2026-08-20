@@ -26,6 +26,7 @@ from factory import (  # noqa: E402
     production_planner,
     prompts,
     scene_assets,
+    subtitles,
     video_routing,
 )
 from factory.clients import bigasr, ffmpeg, music, seedance, video_qa  # noqa: E402
@@ -1010,20 +1011,38 @@ class MusicFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["duration"], 8)
 
-    def test_seedance25_rejects_unsupported_1080p_output(self):
-        with self.assertRaisesRegex(ValueError, "480p or 720p"):
-            seedance._video_task_payload(
-                model="doubao-seedance-2-5-260628",
-                content=[{"type": "text", "text": "test"}],
-                duration=8,
-                resolution="1080p",
-                ratio="9:16",
-                camera_fixed=False,
-                last_frame=None,
-                seed=None,
-                motion_strength=None,
-                generate_audio=True,
-            )
+    def test_seedance25_accepts_official_1080p_output(self):
+        payload = seedance._video_task_payload(
+            model="doubao-seedance-2-5-260628",
+            content=[{"type": "text", "text": "test"}],
+            duration=8,
+            resolution="1080p",
+            ratio="9:16",
+            camera_fixed=False,
+            last_frame=None,
+            seed=None,
+            motion_strength=None,
+            generate_audio=True,
+        )
+
+        self.assertEqual(payload["resolution"], "1080p")
+
+    def test_seedance25_uses_explicit_official_task_type_and_omits_experimental_motion(self):
+        payload = seedance._video_task_payload(
+            model="doubao-seedance-2-5-260628",
+            content=[{"type": "text", "text": "test"}],
+            duration=8,
+            resolution="720p",
+            ratio="9:16",
+            camera_fixed=False,
+            last_frame=None,
+            seed=None,
+            motion_strength=0.4,
+            generate_audio=True,
+        )
+
+        self.assertEqual(payload["omni_reference_task_type"], "auto")
+        self.assertNotIn("motion_strength", payload)
 
     def test_local_image_accepts_path_objects(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -2084,7 +2103,7 @@ class Seedance25DialogueTests(unittest.TestCase):
         )
         self.assertEqual(request["reference_video_duration_sec"], 8)
 
-    def test_dialogue_request_reuses_static_identity_with_previous_master(self):
+    def test_dialogue_request_keeps_static_identity_without_cross_scene_video(self):
         primary = {
             "id": "customer",
             "name": "Customer",
@@ -2111,11 +2130,7 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertEqual(
             request["references"], ["https://cdn/customer-identity.png"]
         )
-        self.assertEqual(
-            request["reference_videos"],
-            ["https://cdn/previous-master.mp4"],
-        )
-        self.assertEqual(request["reference_video_duration_sec"], 8)
+        self.assertNotIn("reference_videos", request)
 
     def test_scene_cast_is_limited_to_characters_named_in_the_scene(self):
         characters = {
@@ -2948,12 +2963,53 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertEqual(prompt.count(dialogue), 1)
         self.assertIn("{台词：两小时内安排设备到场。}", prompt)
 
+    def test_cinematic_prompt_protects_lips_only_inside_speech_windows(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "duration_sec": 12,
+                "render_mode": "cinematic_character",
+                "scene": "暴雨中的高空抢修现场",
+                "camera": "跟拍人物穿过设备区后推近",
+                "action": "林夏快步检查设备并转身汇报",
+                "voiceover": "设备已经恢复运行。",
+                "performance_beats": [
+                    {"duration_sec": 5, "action": "快步检查设备"},
+                    {"duration_sec": 4, "dialogue": "设备已经恢复运行。"},
+                    {"duration_sec": 3, "action": "转身示意同伴"},
+                ],
+            },
+            {"id": "linxia", "name": "林夏", "look": "年轻工程师"},
+        )
+
+        self.assertIn("只在台词所在的关键音节时间窗", prompt)
+        self.assertIn("非台词时间窗允许", prompt)
+        self.assertNotIn("明显的走位、环绕、推拉和动作变化优先安排", prompt)
+
+    def test_broll_prompt_has_structured_timeline_and_canonical_audio_policy(self):
+        prompt = s3_shots._build_broll_video_prompt({
+            "idx": 2,
+            "duration_sec": 8,
+            "prompt": "暴雨中的高空作业车展开支腿",
+            "scene": "抢修现场",
+            "action": "作业车展开支腿并升起臂架",
+            "camera": "低机位跟移后缓慢推近",
+        })
+
+        self.assertIn("连续整数秒导演时间轴", prompt)
+        self.assertIn("0-8秒", prompt)
+        self.assertIn("无对白、无人声、无旁白", prompt)
+        self.assertIn("无 BGM", prompt)
+        self.assertIn("禁止任何可读文字", prompt)
+
     def test_lip_sync_edit_uses_original_master_and_preserves_cinematic_dimensions(self):
         shot = {
             "idx": 3,
             "duration_sec": 20,
             "voiceover": "我选一台二十八米级曲臂高空作业平台。",
+            "repair_dialogue": "二十八米级曲臂高空作业平台。",
             "repair_source_path": "C:/jobs/J-1/shots/03.mp4",
+            "repair_audio_path": "C:/jobs/J-1/shots/03.wav",
             "repair_start_sec": 3,
             "repair_end_sec": 15,
         }
@@ -2967,14 +3023,17 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertEqual(
             request["reference_videos"], ["C:/jobs/J-1/shots/03.mp4"]
         )
+        self.assertEqual(
+            request["reference_audios"], ["C:/jobs/J-1/shots/03.wav"]
+        )
+        self.assertEqual(request["output_format"], "mp4")
         self.assertEqual(request["reference_video_duration_sec"], 20)
         self.assertIn("仅编辑视频1中3-15秒", prompt)
         self.assertIn("嘴部动作", prompt)
         self.assertIn("原始声音、音色、语速、表情、身体动作、运镜", prompt)
         self.assertIn("其余均保持不变", prompt)
-        self.assertEqual(
-            prompt.count("我选一台二十八米级曲臂高空作业平台。"), 1
-        )
+        self.assertEqual(prompt.count("二十八米级曲臂高空作业平台。"), 1)
+        self.assertNotIn("我选一台", prompt)
 
     def test_lip_sync_edit_never_remuxes_a_new_fixed_voice_track(self):
         source = inspect.getsource(s3_shots._gen_dialogue)
@@ -3086,7 +3145,7 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         self.assertIn("由“纸页被风轻轻带动”产生的轻微环境声与物件声", prompt)
 
-    def test_anchored_dialogue_uses_video_for_identity_and_native_voice(self):
+    def test_anchored_dialogue_assigns_orthogonal_reference_duties(self):
         prompt = s3_shots._build_native_dialogue_prompt(
             {
                 "idx": 2,
@@ -3096,11 +3155,12 @@ class Seedance25DialogueTests(unittest.TestCase):
             },
             {"name": "老周", "look": "虚构的中年工程师"},
             anchored=True,
+            voice_anchored=True,
         )
 
         self.assertIn("素材职责：", prompt)
-        self.assertIn("身份参考图只锁定人物外貌", prompt)
-        self.assertIn("前序视频只延续原生声线", prompt)
+        self.assertIn("身份参考只负责锁定人物身份", prompt)
+        self.assertIn("音频参考只负责延续原生声线", prompt)
         self.assertIn("不得复述参考素材中的旧台词", prompt)
         self.assertNotIn("音频1", prompt)
 
@@ -3124,9 +3184,25 @@ class Seedance25DialogueTests(unittest.TestCase):
             anchored=True,
         )
 
-        self.assertIn("身份参考图只锁定人物外貌中的不可变身份特征", prompt)
+        self.assertIn("身份参考只负责锁定人物身份中的不可变特征", prompt)
         self.assertIn("服装、PPE、防护装备和职业状态严格服从本镜场景设定", prompt)
         self.assertNotIn("体型与服装", prompt)
+
+    def test_identity_only_prompt_does_not_claim_missing_audio_reference(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "duration_sec": 8,
+                "scene": "设备停车场",
+                "voiceover": "现在开始检查。",
+            },
+            {"name": "林夏", "look": "年轻工程师"},
+            anchored=True,
+            voice_anchored=False,
+        )
+
+        self.assertIn("身份参考只负责锁定人物身份", prompt)
+        self.assertNotIn("音频参考只负责延续原生声线", prompt)
 
     def test_dialogue_prompt_blocks_text_on_equipment_and_ppe(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -3347,18 +3423,40 @@ class Seedance25DialogueTests(unittest.TestCase):
             "asset://asset-authorized-example",
         )
 
-    def test_followup_dialogue_reuses_native_video_only(self):
+    def test_cross_scene_followup_reuses_voice_audio_not_previous_character_video(self):
         shot = {"duration_sec": 8}
         anchor = s3_shots.DialogueAnchor(
             video_url="https://cdn/anchor.mp4",
             duration_sec=30,
         )
+        voice = s3_shots.NativeVoiceAnchor(Path("C:/jobs/J-1/shots/01.wav"))
 
-        request = s3_shots._dialogue_request_kwargs(shot, anchor)
+        request = s3_shots._dialogue_request_kwargs(
+            shot, anchor, native_voice_anchor=voice
+        )
 
-        self.assertEqual(request["reference_videos"], [anchor.video_url])
-        self.assertEqual(request["reference_video_duration_sec"], 30)
-        self.assertNotIn("reference_audios", request)
+        self.assertNotIn("reference_videos", request)
+        self.assertEqual(request["reference_audios"], [str(voice.audio_path)])
+
+    def test_same_scene_followup_uses_scene_video_and_voice_as_orthogonal_references(self):
+        speaker_history = s3_shots.DialogueAnchor(
+            video_url="https://cdn/old-scene-speaker.mp4", duration_sec=12,
+        )
+        scene_history = s3_shots.DialogueAnchor(
+            video_url="https://cdn/current-scene.mp4", duration_sec=10,
+        )
+        voice = s3_shots.NativeVoiceAnchor(Path("C:/jobs/J-1/shots/01.wav"))
+
+        request = s3_shots._dialogue_request_kwargs(
+            {"duration_sec": 8},
+            speaker_history,
+            native_voice_anchor=voice,
+            scene_video_anchor=scene_history,
+        )
+
+        self.assertEqual(request["reference_videos"], [scene_history.video_url])
+        self.assertEqual(request["reference_video_duration_sec"], 10)
+        self.assertEqual(request["reference_audios"], [str(voice.audio_path)])
 
     def test_reference_video_cost_includes_input_and_output_duration(self):
         estimate = s3_shots._estimated_request_cost_cents({
@@ -6429,6 +6527,19 @@ class Seedance25StateMachineTests(unittest.TestCase):
 
 
 class HookOverlaySizingTests(unittest.TestCase):
+    def test_in_video_hook_overlay_is_opt_in(self):
+        storyboard = {
+            "hook": "暴雨夜抢修为什么不能只看高度",
+            "production_settings": {},
+        }
+
+        self.assertIsNone(s6_compose._in_video_hook_text(storyboard))
+        storyboard["production_settings"]["hook_overlay_enabled"] = True
+        self.assertEqual(
+            s6_compose._in_video_hook_text(storyboard),
+            "暴雨夜抢修为什么不能只看高度",
+        )
+
     def test_long_hook_font_size_fits_single_line(self):
         hook = "设备租赁？狗都不干！狗不干，我干。"
         size = ffmpeg._hook_font_size(hook, 1080)
@@ -6453,6 +6564,37 @@ class HookOverlaySizingTests(unittest.TestCase):
         self.assertEqual(
             ffmpeg._thumbnail_hook_font_size("我干", 720),
             int(720 * 0.13),
+        )
+
+
+class SubtitleSemanticChunkingTests(unittest.TestCase):
+    def test_v2_timeline_is_refreshed_after_semantic_chunking_upgrade(self):
+        self.assertGreater(subtitles.SPEECH_TIMELINE_VERSION, 2)
+        self.assertTrue(s6_compose._speech_timeline_needs_refresh({
+            "speech_timeline_version": 2,
+        }))
+        self.assertFalse(s6_compose._speech_timeline_needs_refresh({
+            "speech_timeline_version": subtitles.SPEECH_TIMELINE_VERSION,
+        }))
+
+    def test_medium_clause_stays_intact_for_balanced_visual_wrapping(self):
+        phrases = subtitles.split_phrases(
+            "我选了一台28米级曲臂高空作业平台。", max_chars=14
+        )
+
+        self.assertEqual(phrases, ["我选了一台28米级曲臂高空作业平台"])
+        self.assertFalse(any(
+            left.endswith("作") and right.startswith("业")
+            for left, right in zip(phrases, phrases[1:])
+        ))
+
+    def test_enumeration_pause_is_a_subtitle_boundary(self):
+        self.assertEqual(
+            subtitles.split_phrases(
+                "但进场前要再确认支腿区域、风速和高空坠落防护。",
+                max_chars=14,
+            ),
+            ["但进场前要再确认支腿区域", "风速和高空坠落防护"],
         )
 
 
@@ -6532,6 +6674,11 @@ class ThumbnailEncodingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
+    def test_generated_anchor_review_defaults_to_manual(self):
+        self.assertEqual(s3_shots.normalize_anchor_review_mode(None), "manual")
+        self.assertEqual(s3_shots.normalize_anchor_review_mode(""), "manual")
+        self.assertEqual(s3_shots.normalize_anchor_review_mode("auto"), "auto")
+
     def test_auto_review_mode_approves_ready_generated_anchors(self):
         database = sqlite3.connect(":memory:")
         database.row_factory = sqlite3.Row
@@ -6915,12 +7062,9 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             request["reference_videos"],
-            [
-                "https://cdn/scene-previous.mp4",
-                "https://cdn/speaker-previous.mp4",
-            ],
+            ["https://cdn/scene-previous.mp4"],
         )
-        self.assertEqual(request["reference_video_duration_sec"], 12)
+        self.assertEqual(request["reference_video_duration_sec"], 8)
 
     def test_dialogue_prompt_contains_locked_scene_blocking_contract(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -6950,6 +7094,42 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("screen-right", prompt)
         self.assertIn("180", prompt)
         self.assertIn("人物身份仍以定妆照或授权角色资产为准", prompt)
+
+    def test_reference_video_budget_is_a_product_attention_guard(self):
+        self.assertEqual(
+            seedance.capability_profile(seedance.DEFAULT_MODEL)[
+                "reference_limits"
+            ]["reference_video"],
+            10,
+        )
+        with patch.dict(
+            os.environ,
+            {"SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET": "3"},
+        ):
+            self.assertEqual(
+                s3_shots.production_reference_video_budget(), 3
+            )
+
+    def test_dialogue_prompt_separates_identity_voice_and_scene_duties(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 2,
+                "duration_sec": 8,
+                "voiceover": "我们继续检查现场。",
+                "scene": "暴雨抢修现场",
+                "action": "工程师沿设备侧面移动检查",
+            },
+            {"id": "linxia", "name": "林夏"},
+            anchored=True,
+            voice_anchored=True,
+            scene_anchored=True,
+            previous_scene_anchored=True,
+        )
+
+        self.assertIn("身份参考只负责锁定人物身份", prompt)
+        self.assertIn("音频参考只负责延续原生声线", prompt)
+        self.assertIn("前序同场景视频只负责延续空间", prompt)
+        self.assertNotIn("前序视频只延续原生声线", prompt)
 
     def test_dialogue_prompt_serializes_structured_continuity_contract(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -7241,9 +7421,9 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
             {"id": "林夏", "generation_mode": "ai_generated"},
         )
 
-        self.assertIn("说台词期间", prompt)
-        self.assertIn("嘴部必须持续清晰可见", prompt)
-        self.assertIn("其他同场人物全程闭嘴", prompt)
+        self.assertIn("关键音节时间窗", prompt)
+        self.assertIn("保护口型可见性", prompt)
+        self.assertIn("其他同场人物始终闭嘴", prompt)
 
     async def test_successful_compose_finalizes_pending_candidate_audit_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -546,8 +546,17 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertNotIn("VOLC_ASR_TOKEN", visible_keys)
         self.assertIn("ARK_VIDEO_RESOLUTION", optional_keys)
         self.assertIn("SEEDANCE_JOB_BUDGET_CENTS", optional_keys)
+        self.assertIn(
+            "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET", optional_keys
+        )
         self.assertTrue(all(group["guide"]["steps"] for group in status["required_groups"]))
         self.assertTrue(all(group["guide"]["url"].startswith("https://") for group in status["required_groups"]))
+
+    def test_reference_attention_budget_must_stay_inside_provider_capability(self):
+        with self.assertRaisesRegex(ValueError, "1 到 10"):
+            self.service.update_config({
+                "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET": "11",
+            })
 
     def test_script_readiness_only_needs_ark_group(self):
         status = self.service.config_status()
@@ -2114,6 +2123,8 @@ class ManagementServiceTests(unittest.TestCase):
         master_path = self.root / "data" / "assets" / "J-LIP" / "shots" / "03.mp4"
         master_path.parent.mkdir(parents=True, exist_ok=True)
         master_path.write_bytes(b"original cinematic master")
+        master_audio = master_path.with_suffix(".wav")
+        master_audio.write_bytes(b"original native audio")
         storyboard = {
             "masters": [{
                 "idx": 3,
@@ -2183,6 +2194,13 @@ class ManagementServiceTests(unittest.TestCase):
         )
         self.assertEqual(master["repair_start_sec"], 3.0)
         self.assertEqual(master["repair_end_sec"], 15.0)
+        self.assertEqual(
+            Path(master["repair_audio_path"]).resolve(), master_audio.resolve()
+        )
+        self.assertEqual(
+            master["repair_dialogue"],
+            "我选一台二十八米级曲臂高空作业平台",
+        )
         self.assertEqual(edit["speech_timeline_version"], 2)
         self.assertEqual(edit["subtitle_cues"][0]["start"], 3.0)
 
@@ -7676,6 +7694,8 @@ class ManagementUiContractTests(unittest.TestCase):
 
         self.assertIn("setting-anchor-review-mode", js)
         self.assertIn("自动验收锚点", js)
+        self.assertIn("生成后人工确认（推荐）", js)
+        self.assertIn("current.anchor_review_mode||'manual'", js)
         self.assertIn("ASR 未配置时自动使用估算字幕", js)
         self.assertIn("approved_budget_cents", js)
         self.assertIn("确认新预算并开始生成", js)
@@ -7820,6 +7840,16 @@ class ManagementUiContractTests(unittest.TestCase):
             "character_anchor_generator", "scene_anchor_generator",
         ):
             self.assertIn(capability, js)
+
+    def test_reference_attention_budget_is_visible_in_configuration(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET", js
+        )
+        self.assertIn("参考视频注意力预算", js)
 
     def test_script_editor_can_auto_reestimate_durations_with_manual_override(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(

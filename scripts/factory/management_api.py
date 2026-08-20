@@ -84,6 +84,7 @@ EDITABLE_CONFIG = {
     "SEEDANCE_MAX_AUTO_RETRIES",
     "SEEDANCE_AUTO_RETRY_BUDGET_CENTS",
     "SEEDANCE_JOB_BUDGET_CENTS",
+    "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET",
     "CHARACTER_ANCHOR_GENERATOR",
     "SCENE_ANCHOR_GENERATOR",
     "VOLC_ASR_API_KEY",
@@ -3296,13 +3297,33 @@ class ManagementService:
         if end <= start:
             raise ValueError("口型修复结束时间必须晚于开始时间且位于母片时长内")
         reason_text = str(reason or "").strip() or "口型与原生语音不同步"
+        interval_dialogue: list[str] = []
+        for edit in storyboard.get("shots") or []:
+            if int(edit.get("audio_master_idx") or 0) != int(master_idx):
+                continue
+            audio_start = float(edit.get("audio_start") or 0)
+            for cue in edit.get("subtitle_cues") or []:
+                cue_start = audio_start + float(cue.get("start") or 0)
+                cue_end = audio_start + float(cue.get("end") or cue_start)
+                if cue_end <= start or cue_start >= end:
+                    continue
+                text = str(cue.get("text") or "").strip()
+                if text and text not in interval_dialogue:
+                    interval_dialogue.append(text)
+        repair_dialogue = "，".join(interval_dialogue).strip() or str(
+            master.get("voiceover") or ""
+        ).strip()
+        native_audio = source.with_suffix(".wav")
         master.update({
             "repair_mode": "seedance_lip_sync_edit",
             "repair_source_path": str(source),
             "repair_start_sec": start,
             "repair_end_sec": end,
+            "repair_dialogue": repair_dialogue,
             "repair_direction": reason_text,
         })
+        if native_audio.is_file():
+            master["repair_audio_path"] = str(native_audio)
         repair_prompt = s3_shots._build_lip_sync_edit_prompt({
             **master,
             "duration_sec": duration,
@@ -3467,11 +3488,12 @@ class ManagementService:
         budget = int(settings.get("budget_cents") or 0)
         if budget <= 0:
             raise ValueError("单任务预算必须大于 0")
-        anchor_review_mode = str(
-            settings.get("anchor_review_mode") or "auto"
-        ).strip().casefold()
-        if anchor_review_mode not in {"auto", "manual"}:
-            raise ValueError("锚点审核方式必须是自动或人工")
+        try:
+            anchor_review_mode = s3_shots.normalize_anchor_review_mode(
+                settings.get("anchor_review_mode")
+            )
+        except ValueError as exc:
+            raise ValueError("锚点审核方式必须是自动或人工") from exc
         normalized = {
             "character_id": (
                 next(iter(character_mappings.values()), "")
@@ -4957,6 +4979,21 @@ class ManagementService:
             value = str(raw_value or "").strip().replace("\r", "").replace("\n", "")
             if key in {"CHARACTER_ANCHOR_GENERATOR", "SCENE_ANCHOR_GENERATOR"}:
                 value = anchor_generation.normalize_generator(value, strict=True)
+            if key == "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET":
+                try:
+                    reference_budget = int(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("参考视频注意力预算必须是 1 到 10") from exc
+                provider_limit = int(
+                    seedance.capability_profile(seedance.DEFAULT_MODEL)[
+                        "reference_limits"
+                    ]["reference_video"]
+                )
+                if not 1 <= reference_budget <= provider_limit:
+                    raise ValueError(
+                        f"参考视频注意力预算必须是 1 到 {provider_limit}"
+                    )
+                value = str(reference_budget)
             if key in SECRET_KEYS and not value:
                 continue
             current[key] = value

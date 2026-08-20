@@ -2634,6 +2634,32 @@ class SeedancePaidCallAmbiguityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SeedanceLocalValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_public_image_fallback_disables_visible_watermark(self):
+        captured = {}
+
+        def submit(request):
+            captured.update(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                200,
+                json={"data": [{"url": "https://cdn.example/identity.png"}]},
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(submit))
+        with (
+            patch.dict(os.environ, {"ARK_API_KEY": "test-key"}),
+            patch.object(seedance.httpx, "AsyncClient", return_value=client),
+            patch.object(
+                seedance.provider_downloads,
+                "download_bytes",
+                new=AsyncMock(return_value=(b"png", "https://cdn.example/identity.png")),
+            ),
+        ):
+            result = await seedance.text_to_image("clean identity portrait")
+
+        self.assertEqual(result, b"png")
+        self.assertIn("watermark", captured)
+        self.assertIs(captured["watermark"], False)
+
     def test_invalid_reference_role_uses_request_invalid(self):
         caught = None
         try:

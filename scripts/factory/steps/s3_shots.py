@@ -518,9 +518,7 @@ def _assert_continuity_anchors_approved(database, job_id: str) -> None:
 
 def _apply_anchor_review_mode(database, job_id: str, mode: str) -> int:
     """Auto-approve generated READY anchors or retain the manual review gate."""
-    normalized = str(mode or "auto").strip().casefold()
-    if normalized not in {"auto", "manual"}:
-        raise ValueError("anchor_review_mode must be auto or manual")
+    normalized = normalize_anchor_review_mode(mode)
     if normalized == "manual":
         return 0
     character = database.execute(
@@ -537,6 +535,14 @@ def _apply_anchor_review_mode(database, job_id: str, mode: str) -> int:
     )
     database.commit()
     return int(character.rowcount or 0) + int(scene.rowcount or 0)
+
+
+def normalize_anchor_review_mode(value: object) -> str:
+    """Default generated continuity anchors to explicit human confirmation."""
+    normalized = str(value or "manual").strip().casefold()
+    if normalized not in {"auto", "manual"}:
+        raise ValueError("anchor_review_mode must be auto or manual")
+    return normalized
 
 
 def _is_manual_review_pending(shot: dict) -> bool:
@@ -1765,6 +1771,7 @@ def _dialogue_request_kwargs(
     anchor: DialogueAnchor | None,
     *,
     fixed_voice_audio: Path | None = None,
+    native_voice_anchor: NativeVoiceAnchor | None = None,
     character: dict | None = None,
     cast_characters: list[dict] | None = None,
     identity_anchors: dict[str, DialogueAnchor] | None = None,
@@ -1780,8 +1787,13 @@ def _dialogue_request_kwargs(
         "camera_fixed": False,
         "motion_strength": 0.4,
     }
-    if fixed_voice_audio is not None:
-        request["reference_audios"] = [str(fixed_voice_audio)]
+    voice_reference = (
+        fixed_voice_audio
+        if fixed_voice_audio is not None
+        else native_voice_anchor.audio_path if native_voice_anchor else None
+    )
+    if voice_reference is not None:
+        request["reference_audios"] = [str(voice_reference)]
     video_references: list[DialogueAnchor] = []
     asset_references: list[str] = []
     identity_anchors = identity_anchors or {}
@@ -1791,9 +1803,6 @@ def _dialogue_request_kwargs(
     if scene_video_anchor is not None:
         video_references.append(scene_video_anchor)
 
-    if anchor is not None:
-        video_references.append(anchor)
-
     if character:
         identity_anchor = identity_anchors.get(
             character_assets.character_identity_key(character)
@@ -1801,7 +1810,7 @@ def _dialogue_request_kwargs(
         if identity_anchor is not None:
             if identity_anchor.image_reference:
                 asset_references.append(identity_anchor.image_reference)
-            elif anchor is None and identity_anchor.video_url:
+            elif identity_anchor.video_url:
                 video_references.append(identity_anchor)
         elif character.get("generation_mode") == "ai_generated":
             pass
@@ -1856,11 +1865,13 @@ def _dialogue_request_kwargs(
         seen_video_urls.add(reference.video_url)
         deduped_videos.append(reference)
     if deduped_videos:
-        if len(deduped_videos) > 3:
+        reference_budget = production_reference_video_budget()
+        if len(deduped_videos) > reference_budget:
             raise SeedanceIdentityAuthorizationError(
-                "one scene contains more than three generated identities; "
-                "Seedance 2.5 accepts at most three reference videos, so the "
-                "scene must be split before any paid generation"
+                "one scene exceeds the product attention budget of "
+                f"{reference_budget} reference videos; Seedance 2.5 supports "
+                "a higher provider limit, but this scene must be split to "
+                "avoid identity and continuity dilution before paid generation"
             )
         request["reference_videos"] = [
             reference.video_url for reference in deduped_videos
@@ -1871,7 +1882,7 @@ def _dialogue_request_kwargs(
     if asset_references:
         request["references"] = list(dict.fromkeys(asset_references))
 
-    if anchor is None and character and not (
+    if character and not (
         request.get("reference_videos") or request.get("references")
     ):
         if character.get("generation_mode") == "ai_generated":
@@ -2133,6 +2144,33 @@ def _scene_voiceover_request_kwargs(
     return request
 
 
+def production_reference_video_budget() -> int:
+    """Return the product attention budget, capped by provider capability.
+
+    Seedance 2.5 accepts up to ten reference videos.  That provider maximum is
+    not a recommended prompt size: identity, voice, scene and camera references
+    compete for attention.  Production keeps a smaller configurable guard and
+    reports it honestly as a product budget.
+    """
+    raw = os.getenv("SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET", "3")
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET must be an integer"
+        ) from exc
+    if requested <= 0:
+        raise ValueError(
+            "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET must be positive"
+        )
+    provider_limit = int(
+        seedance.capability_profile(seedance.DEFAULT_MODEL)[
+            "reference_limits"
+        ]["reference_video"]
+    )
+    return min(requested, provider_limit)
+
+
 def _broll_request_kwargs(
     shot: dict,
     *,
@@ -2174,10 +2212,12 @@ def _broll_request_kwargs(
         if anchor.video_url and anchor.video_url not in seen_videos:
             seen_videos.add(anchor.video_url)
             deduped_videos.append(anchor)
-    if len(deduped_videos) > 3:
+    reference_budget = production_reference_video_budget()
+    if len(deduped_videos) > reference_budget:
         raise SeedanceIdentityAuthorizationError(
-            "one B-roll scene contains more than three generated identities; "
-            "split the scene before paid generation"
+            "one B-roll scene exceeds the product attention budget of "
+            f"{reference_budget} reference videos; split the scene before "
+            "paid generation"
         )
     if deduped_videos:
         request["reference_videos"] = [
@@ -2197,15 +2237,22 @@ def _lip_sync_edit_request_kwargs(shot: dict) -> dict:
     if not source:
         raise ValueError("口型局部修复缺少原始母片")
     duration = max(0.1, float(shot.get("duration_sec") or 0))
-    return {
+    request = {
         "duration": -1,
         "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
         "ratio": "adaptive",
         "task_intent": "edit",
+        # The managed pipeline stores and previews masters as MP4.  Keep the
+        # provider container aligned with the controlled target path; MOV is
+        # only safe after a dedicated MOV -> browser MP4 conversion exists.
         "output_format": "mp4",
         "reference_videos": [source],
         "reference_video_duration_sec": duration,
     }
+    audio = str(shot.get("repair_audio_path") or "").strip()
+    if audio:
+        request["reference_audios"] = [audio]
+    return request
 
 
 def _display_second(value: float) -> str:
@@ -2219,7 +2266,9 @@ def _build_lip_sync_edit_prompt(shot: dict) -> str:
     end = min(duration, float(shot.get("repair_end_sec") or duration))
     if end <= start:
         raise ValueError("口型修复结束时间必须晚于开始时间")
-    dialogue = str(shot.get("voiceover") or "").strip()
+    dialogue = str(
+        shot.get("repair_dialogue") or shot.get("voiceover") or ""
+    ).strip()
     if not dialogue:
         raise ValueError("口型局部修复缺少目标台词")
     reason = str(shot.get("repair_direction") or "口型与原生语音不同步").strip()
@@ -2898,6 +2947,7 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                         anchor: DialogueAnchor | None = None,
                         *,
                         fixed_voice_track: FixedVoiceTrack | None = None,
+                        native_voice_anchor: NativeVoiceAnchor | None = None,
                         cast_characters: list[dict] | None = None,
                         identity_anchors: dict[str, DialogueAnchor] | None = None,
                         scene_reference: str | None = None,
@@ -2945,6 +2995,9 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                         or character_assets.character_identity_key(char)
                         in (identity_anchors or {})
                     ),
+                    voice_anchored=bool(
+                        fixed_voice_track or native_voice_anchor
+                    ),
                     scene_anchored=bool(scene_reference),
                     previous_scene_anchored=previous_scene_anchor is not None,
                 )
@@ -2954,6 +3007,7 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                         fixed_voice_track.audio_path
                         if fixed_voice_track else None
                     ),
+                    native_voice_anchor=native_voice_anchor,
                     character=char,
                     cast_characters=cast_characters,
                     identity_anchors=identity_anchors,
@@ -3008,6 +3062,9 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                         combined,
                         char,
                         anchored=True,
+                        voice_anchored=bool(
+                            fixed_voice_track or native_voice_anchor
+                        ),
                         scene_anchored=bool(scene_reference),
                         previous_scene_anchored=(
                             previous_scene_anchor is not None
@@ -3020,6 +3077,7 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                             fixed_voice_track.audio_path
                             if fixed_voice_track else None
                         ),
+                        native_voice_anchor=native_voice_anchor,
                         character=char,
                         cast_characters=cast_characters,
                         identity_anchors=identity_anchors,
@@ -3257,6 +3315,7 @@ def _continuity_contract_text(contract: dict | None) -> str:
 
 def _build_native_dialogue_prompt(
         shot: dict, character: dict, *, anchored: bool = False,
+        voice_anchored: bool = False,
         scene_anchored: bool = False,
         previous_scene_anchored: bool = False) -> str:
     """Build one exact native-speaking Seedance 2.5 presenter prompt."""
@@ -3349,10 +3408,10 @@ def _build_native_dialogue_prompt(
             "不得改写、增删、重复台词，不得加入旁白、第二个人声或背景音乐。"
         ),
         "嘴唇、牙齿、舌位和下颌逐字同步，句末自然闭嘴。",
-        "说台词期间，说话者嘴部必须持续清晰可见，保持正面或四分之三中近景；"
-        "禁止侧背面、口部遮挡、快速甩镜、切到他人或切到远景。",
-        "其他同场人物全程闭嘴，只做无声反应；明显的走位、环绕、推拉和动作变化"
-        "优先安排在台词开始前或结束后。",
+        "只在台词所在的关键音节时间窗保护口型可见性：说话者保持正面或四分之三"
+        "中近景，禁止口部遮挡、快速甩镜或在句中切离说话者。",
+        "非台词时间窗允许有动机的走位、环绕、推拉、反应镜头和动作特写；"
+        "其他同场人物始终闭嘴，只做无声表演。",
         "人物身份、五官、发型、背景和光线全程稳定；服装与职业装备严格服从本镜场景，并在本镜内保持一致。",
         "安全帽、反光背心、工服、工程机械、设备铭牌、工牌、文件、屏幕和背景标牌一律纯色无字，或通过背面、遮挡、裁切、浅景深使其不可辨认。",
         "禁止企业名称、品牌、设备编号、车牌、字母、数字、二维码、字幕、标识或水印。",
@@ -3373,7 +3432,7 @@ def _build_native_dialogue_prompt(
         ]
     if previous_scene_anchored:
         parts[1:1] = [
-            "前序同场景视频用于继承空间布局、人物站位、视线方向和镜头轴线；"
+            "前序同场景视频只负责延续空间布局、人物站位、视线方向和镜头轴线；"
             "人物身份仍以定妆照或授权角色资产为准，不得沿用前序视频中的脸部漂移。",
         ]
     if cinematic:
@@ -3404,20 +3463,42 @@ def _build_native_dialogue_prompt(
     if anchored:
         parts[1:1] = [
             "素材职责：",
-            "身份参考图只锁定人物外貌中的不可变身份特征，包括五官、年龄、发型、肤色与体型；"
+            "身份参考只负责锁定人物身份中的不可变特征，包括五官、年龄、发型、肤色与体型；"
             "不得照搬定妆照的背景、站姿或服装。",
+            *(
+                ["音频参考只负责延续原生声线、语速和情绪，不负责人物身份、场景或镜头构图。"]
+                if voice_anchored else []
+            ),
             "服装、PPE、防护装备和职业状态严格服从本镜场景设定，"
             "并在同一场景后续母片中保持一致。",
-            "前序视频只延续原生声线、空间连续性与基础表演；"
-            "不得照搬其镜头构图或动作。",
             "不得复述参考素材中的旧台词，只说本镜新台词。",
         ]
     return "\n".join(parts)
 
 
 def _build_broll_video_prompt(shot: dict) -> str:
-    """Use only the shot-level visual direction."""
-    return shot["prompt"]
+    """Build a bounded cinematic B-roll request with canonical local mixing."""
+    duration = seedance.normalize_generation_duration(
+        shot.get("duration_sec") or shot.get("duration") or 4
+    )
+    visual = non_text_visual_text(
+        shot.get("prompt") or shot.get("scene") or ""
+    ).strip()
+    scene = non_text_visual_text(shot.get("scene") or visual).strip()
+    action = non_text_visual_text(shot.get("action") or visual).strip()
+    camera = non_text_visual_text(
+        shot.get("camera") or "稳定电影感跟拍"
+    ).strip()
+    return "\n".join([
+        "创作意图：生成服务叙事证据的电影化 B-roll，不生成口播画面。",
+        f"场景：{scene}",
+        f"动作：{action}",
+        f"运镜：{camera}",
+        "连续整数秒导演时间轴：",
+        f"0-{duration}秒；画面与动作：{visual or action}；运镜：{camera}。",
+        "无对白、无人声、无旁白；只保留与动作同步的环境音和物件音；无 BGM。",
+        "禁止任何可读文字、字幕、品牌、设备编号、车牌、字母、数字、二维码或水印。",
+    ])
 
 
 def _safe_scene_voiceover_keyframe(shot: dict) -> str | None:
@@ -3651,8 +3732,8 @@ async def run(job_id: str) -> None:
     if rows:
         _apply_anchor_review_mode(
             conn(), job_id,
-            (sb.get("production_settings") or {}).get(
-                "anchor_review_mode", "auto"
+            normalize_anchor_review_mode(
+                (sb.get("production_settings") or {}).get("anchor_review_mode")
             ),
         )
         _assert_continuity_anchors_approved(conn(), job_id)
@@ -3812,6 +3893,15 @@ async def run(job_id: str) -> None:
                     dialogue_anchors[identity_key] = max(
                         earlier, key=lambda item: item[0]
                     )[2]
+            if identity_key not in voice_anchors:
+                earlier_voice = [
+                    item for item in completed_voice_anchors
+                    if item[1] == identity_key and item[0] < shot["idx"]
+                ]
+                if earlier_voice:
+                    voice_anchors[identity_key] = max(
+                        earlier_voice, key=lambda item: item[0]
+                    )[2]
             fixed_voice_track = None
             if audio_mode == AUDIO_MODE_FIXED_TTS:
                 voice_database = conn()
@@ -3833,6 +3923,10 @@ async def run(job_id: str) -> None:
                 job_id, shot, char, {**sb_shot, "audio_mode": audio_mode}, sem,
                 dialogue_anchors.get(identity_key),
                 fixed_voice_track=fixed_voice_track,
+                native_voice_anchor=(
+                    voice_anchors.get(identity_key)
+                    if audio_mode != AUDIO_MODE_FIXED_TTS else None
+                ),
                 cast_characters=cast_characters,
                 identity_anchors=identity_anchors,
                 scene_reference=scene_anchors.get(
