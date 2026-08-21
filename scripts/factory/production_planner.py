@@ -255,6 +255,7 @@ def analyze_storyboard(
                 f"母片 #{idx} 的编辑时长 {editorial_duration:g} 秒无法提交：{exc}"
             ) from exc
         master_type = master.get("type") or "unknown"
+        repair_mode = str(master.get("repair_mode") or "").strip()
         render_mode = str(master.get("render_mode") or "presenter").lower()
         speaker_id = str(
             master.get("speaker_id") or master.get("speaker") or ""
@@ -379,7 +380,24 @@ def analyze_storyboard(
             elif anchor_mode in {"static_image", "volc_asset"}:
                 reference_kinds.add("image")
                 plan_reference("image", "supporting_identity", identity_key)
-        if master_type == "dialogue" and audio_mode != "seedance_native":
+        if repair_mode == "seedance_lip_sync_edit":
+            # The edit request uses the existing master as its only visual
+            # continuity source.  Provider-side budget protection prices both
+            # the generated duration and the referenced input-video duration;
+            # preflight must use the same contract instead of a normal
+            # text-to-video estimate.
+            reference_duration = generation_duration
+            reference_kinds = {"video"}
+            planned_reference_manifest = []
+            plan_reference("video", "scene_continuity")
+            if str(master.get("repair_audio_path") or "").strip():
+                reference_kinds.add("audio")
+                plan_reference("audio", "voice_continuity", speaker_identity)
+        if (
+            repair_mode != "seedance_lip_sync_edit"
+            and master_type == "dialogue"
+            and audio_mode != "seedance_native"
+        ):
             reference_kinds.add("audio")
             plan_reference("audio", "voice_continuity", speaker_identity)
         if idx in completed:

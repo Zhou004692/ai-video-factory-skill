@@ -3477,6 +3477,33 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertEqual(prompt.count("二十八米级曲臂高空作业平台。"), 1)
         self.assertNotIn("我选一台", prompt)
 
+    def test_lip_sync_edit_preflight_prices_output_and_source_video(self):
+        memory_db = sqlite3.connect(":memory:")
+        memory_db.row_factory = sqlite3.Row
+        memory_db.executescript(db.DDL)
+        storyboard = {
+            "production_settings": {"resolution": "720p"},
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": 8,
+                "speaker": "林夏",
+                "voiceover": "暴雨再大，也不能让客户停工。",
+                "repair_mode": "seedance_lip_sync_edit",
+                "repair_source_path": "C:/jobs/J-1/review/candidate.mp4",
+            }],
+        }
+
+        plan = production_planner.analyze_storyboard(
+            memory_db, storyboard, budget_cents=5000, resolution="720p"
+        )
+
+        paid_master = plan["paid_masters"][0]
+        expected = seedance.estimate_cost_cents(16, "720p")
+        self.assertEqual(paid_master.get("reference_duration_sec"), 8)
+        self.assertEqual(paid_master["estimated_cost_cents"], expected)
+        self.assertEqual(plan["estimated_cost_cents"], expected)
+
     def test_managed_mov_edit_transcodes_to_browser_safe_mp4_atomically(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "candidate.mov"

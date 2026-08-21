@@ -2642,6 +2642,94 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual(edit["speech_timeline_version"], 2)
         self.assertEqual(edit["subtitle_cues"][0]["start"], 3.0)
 
+    def test_review_candidate_with_only_lip_sync_mismatch_can_enter_edit_without_accepting(self):
+        candidate_path = (
+            self.root / "data" / "assets" / "J-LIP-CANDIDATE" / "shots"
+            / "review" / "01-original-candidate.mp4"
+        )
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        candidate_path.write_bytes(b"original review candidate")
+        storyboard = {
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": 8,
+                "speaker": "林夏",
+                "voiceover": "暴雨再大，也不能让客户停工。",
+            }],
+            "shots": [{
+                "idx": 1,
+                "video_master_idx": 1,
+                "audio_master_idx": 1,
+                "duration": 8,
+                "subtitle_cues": [{
+                    "start": 1.2,
+                    "end": 6.8,
+                    "text": "暴雨再大，也不能让客户停工",
+                }],
+            }],
+            "production_settings": {"budget_cents": 5000},
+        }
+        qa = {
+            "status": "manual_review_required",
+            "reasons": ["lip_sync_mismatch"],
+            "candidate_path": str(candidate_path),
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-LIP-CANDIDATE','T-1','候选口型修复',"
+            "'PRODUCTION_REVIEW_REQUIRED',?,1216)",
+            (json.dumps(storyboard, ensure_ascii=False),),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,duration_sec,state,provider,cost_cents,"
+            "video_qa) VALUES('J-LIP-CANDIDATE',1,8,'REVIEW_REQUIRED',"
+            "'seedance',944,?)",
+            (json.dumps(qa, ensure_ascii=False),),
+        )
+        self.database.commit()
+
+        visible_job = next(
+            job for job in self.service.videos()["jobs"]
+            if job["job_id"] == "J-LIP-CANDIDATE"
+        )
+        visible_shot = visible_job["shots"][0]
+        self.assertFalse(visible_shot["has_prior_master"])
+        self.assertIsNotNone(visible_shot["candidate_preview_url"])
+        self.assertTrue(visible_shot["lip_sync_repair_eligible"])
+        self.assertEqual(
+            visible_shot["lip_sync_repair_suggestion"]["start_sec"], 1.2
+        )
+        self.assertEqual(
+            visible_shot["lip_sync_repair_suggestion"]["end_sec"], 6.8
+        )
+
+        result = self.service.prepare_master_lip_sync_repair(
+            "J-LIP-CANDIDATE", 1, start_sec=1.2, end_sec=6.8,
+            reason="嘴型比原生语音慢",
+        )
+
+        persisted = self.database.execute(
+            "SELECT state,storyboard,cost_cents FROM jobs "
+            "WHERE job_id='J-LIP-CANDIDATE'"
+        ).fetchone()
+        repaired = json.loads(persisted["storyboard"])
+        repaired_master = repaired["masters"][0]
+        persisted_qa = json.loads(self.database.execute(
+            "SELECT video_qa FROM shots WHERE job_id='J-LIP-CANDIDATE' AND idx=1"
+        ).fetchone()[0])
+        self.assertEqual(result["repair_source_kind"], "review_candidate")
+        self.assertEqual(persisted["state"], "STORYBOARDED")
+        self.assertEqual(persisted["cost_cents"], 1216)
+        self.assertEqual(
+            Path(repaired_master["repair_source_path"]).resolve(),
+            candidate_path.resolve(),
+        )
+        self.assertEqual(
+            persisted_qa["candidate_path"], str(candidate_path)
+        )
+        self.assertEqual(candidate_path.read_bytes(), b"original review candidate")
+
     def test_master_extension_preserves_prior_and_queues_managed_mov_candidate(self):
         asset_root = self.root / "data" / "assets" / "J-EXTEND" / "shots"
         asset_root.mkdir(parents=True)
@@ -8565,6 +8653,8 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("AI 建议区间", js)
         self.assertIn("suggestion.start_sec", js)
         self.assertIn("suggestion.end_sec", js)
+        self.assertIn("data-candidate-lip-sync-repair", js)
+        self.assertIn("无需先接受口型不合格候选", js)
 
     def test_ui_exposes_managed_master_extension_as_review_candidate(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(

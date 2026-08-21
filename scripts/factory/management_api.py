@@ -2841,7 +2841,14 @@ class ManagementService:
                     and shot.get("state") in {
                         "OK", "FAILED", "REVIEW_REQUIRED",
                     }
-                    and shot.get("has_prior_master")
+                    and (
+                        shot.get("has_prior_master")
+                        or (
+                            shot.get("candidate_preview_url")
+                            and set(shot["quality_reasons"])
+                            == {"lip_sync_mismatch"}
+                        )
+                    )
                 )
                 shot["extension_eligible"] = bool(
                     job["state"] in {
@@ -3935,6 +3942,7 @@ class ManagementService:
             self.root / "data" / "assets", job_id, target["video_path"],
             require_file=True,
         )
+        source_kind = "active_master"
         if source is None:
             try:
                 qa = json.loads(target["video_qa"] or "{}")
@@ -3944,6 +3952,7 @@ class ManagementService:
                 self.root / "data" / "assets", job_id,
                 qa.get("candidate_path"),
             )
+            source_kind = "review_candidate"
         if source is None:
             raise ValueError("原始母片文件不存在，不能执行保留式口型修复")
 
@@ -4011,6 +4020,7 @@ class ManagementService:
             "job_id": job_id,
             "state": "STORYBOARDED",
             "repair_kind": "seedance_lip_sync_edit",
+            "repair_source_kind": source_kind,
             "repair_master_idx": int(master_idx),
             "repair_start_sec": start,
             "repair_end_sec": end,
