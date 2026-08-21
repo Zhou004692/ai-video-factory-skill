@@ -3449,6 +3449,7 @@ class Seedance25DialogueTests(unittest.TestCase):
             "voiceover": "我选一台二十八米级曲臂高空作业平台。",
             "repair_dialogue": "二十八米级曲臂高空作业平台。",
             "repair_source_path": "C:/jobs/J-1/shots/03.mp4",
+            "repair_source_url": "https://cdn.example/jobs/J-1/shots/03.mp4",
             "repair_audio_path": "C:/jobs/J-1/shots/03.wav",
             "repair_start_sec": 3,
             "repair_end_sec": 15,
@@ -3461,18 +3462,16 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertEqual(request["duration"], -1)
         self.assertEqual(request["ratio"], "adaptive")
         self.assertEqual(
-            request["reference_videos"], ["C:/jobs/J-1/shots/03.mp4"]
+            request["reference_videos"],
+            ["https://cdn.example/jobs/J-1/shots/03.mp4"],
         )
-        self.assertEqual(
-            request["reference_audios"], ["C:/jobs/J-1/shots/03.wav"]
-        )
+        self.assertNotIn("reference_audios", request)
         self.assertEqual(request["output_format"], "mov")
         self.assertEqual(request["reference_video_duration_sec"], 20)
-        self.assertIn("仅编辑视频1中3-15秒", prompt)
+        self.assertIn("仅编辑@视频1中3-15秒", prompt)
         self.assertIn("嘴部动作", prompt)
         self.assertIn("原始声音、音色、语速、表情、身体动作、运镜", prompt)
-        self.assertIn("视频1只负责原画面", prompt)
-        self.assertIn("音频1是唯一口型时间基准", prompt)
+        self.assertIn("@视频1同时提供原画面与唯一原声音轨", prompt)
         self.assertIn("其余均保持不变", prompt)
         self.assertEqual(prompt.count("二十八米级曲臂高空作业平台。"), 1)
         self.assertNotIn("我选一台", prompt)

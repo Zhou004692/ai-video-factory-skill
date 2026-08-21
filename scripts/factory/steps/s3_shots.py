@@ -2440,6 +2440,8 @@ def _lip_sync_edit_request_kwargs(shot: dict) -> dict:
     source = str(shot.get("repair_source_path") or "").strip()
     if not source:
         raise ValueError("口型局部修复缺少原始母片")
+    source_url = str(shot.get("repair_source_url") or "").strip()
+    reference = source_url if source_url.startswith("https://") else source
     duration = max(0.1, float(shot.get("duration_sec") or 0))
     snapshot = production_config.snapshot_from_unit(shot) or {}
     request = {
@@ -2452,12 +2454,9 @@ def _lip_sync_edit_request_kwargs(shot: dict) -> dict:
         # Seedance recommends MOV for edit/extend continuity. The managed
         # pipeline converts it to a browser-safe MP4 before QA and preview.
         "output_format": "mov",
-        "reference_videos": [source],
+        "reference_videos": [reference],
         "reference_video_duration_sec": duration,
     }
-    audio = str(shot.get("repair_audio_path") or "").strip()
-    if audio:
-        request["reference_audios"] = [audio]
     return request
 
 
@@ -2528,17 +2527,14 @@ def _build_lip_sync_edit_prompt(shot: dict) -> str:
         raise ValueError("口型局部修复缺少目标台词")
     reason = str(shot.get("repair_direction") or "口型与原生语音不同步").strip()
     material_duties = (
-        "素材职责：视频1只负责原画面、人物表演、运镜和剪辑；"
-        "音频1是唯一口型时间基准，必须完整保留音频1的音色、语速、节奏和内容。"
-        if shot.get("repair_audio_path") else
-        "素材职责：视频1同时提供原画面与唯一原声音轨，禁止替换或重构声音。"
+        "素材职责：@视频1同时提供原画面与唯一原声音轨，禁止替换或重构声音。"
     )
     return "\n".join([
-        f"仅编辑视频1中{_display_second(start)}-{_display_second(end)}秒的人物嘴部动作。",
+        f"仅编辑@视频1中{_display_second(start)}-{_display_second(end)}秒的人物嘴部动作。",
         material_duties,
         f"目标台词只用于口型校准：{{台词：{dialogue}}}",
         "嘴唇、牙齿、舌位和下颌必须与唯一时间基准中的中文语音逐字同步，句末自然闭嘴。",
-        "保留视频1的原始声音、音色、语速、表情、身体动作、运镜、人物身份、"
+        "保留@视频1的原始声音、音色、语速、表情、身体动作、运镜、人物身份、"
         "服装、场景、灯光、构图、时长和镜头切换，其余均保持不变。",
         "不得重新配音，不得改变人物走位或摄影机运动，不得新增字幕、文字、人物或声音。",
         f"修复原因：{reason}。",

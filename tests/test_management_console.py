@@ -2674,6 +2674,7 @@ class ManagementServiceTests(unittest.TestCase):
             "status": "manual_review_required",
             "reasons": ["lip_sync_mismatch"],
             "candidate_path": str(candidate_path),
+            "candidate_url": "https://cdn.example/J-LIP-CANDIDATE/01.mp4",
         }
         self.database.execute(
             "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
@@ -2726,9 +2727,70 @@ class ManagementServiceTests(unittest.TestCase):
             candidate_path.resolve(),
         )
         self.assertEqual(
+            repaired_master.get("repair_source_url"),
+            "https://cdn.example/J-LIP-CANDIDATE/01.mp4",
+        )
+        self.assertEqual(
             persisted_qa["candidate_path"], str(candidate_path)
         )
         self.assertEqual(candidate_path.read_bytes(), b"original review candidate")
+
+    def test_failed_lip_sync_edit_can_be_prepared_again_from_controlled_source(self):
+        candidate_path = (
+            self.root / "data" / "assets" / "J-LIP-RETRY" / "shots"
+            / "review" / "01-candidate.mp4"
+        )
+        candidate_path.parent.mkdir(parents=True, exist_ok=True)
+        candidate_path.write_bytes(b"preserved review candidate")
+        storyboard = {
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": 8,
+                "speaker": "lin_xia",
+                "voiceover": "暴雨再大，也不能让客户停工。",
+                "repair_mode": "seedance_lip_sync_edit",
+                "repair_source_path": str(candidate_path),
+            }],
+            "shots": [],
+            "production_settings": {"budget_cents": 1500},
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-LIP-RETRY','T-1','口型修复重试','FAILED',?,0)",
+            (json.dumps(storyboard, ensure_ascii=False),),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,duration_sec,state,cost_cents,video_qa) "
+            "VALUES('J-LIP-RETRY',1,8,'FAILED',0,?)",
+            (json.dumps({
+                "status": "generation_failed",
+                "failure_code": "request_invalid",
+            }),),
+        )
+        self.database.commit()
+
+        try:
+            result = self.service.prepare_master_lip_sync_repair(
+                "J-LIP-RETRY", 1, start_sec=0, end_sec=8,
+                reason="使用修正后的官方 edit 合同再次提交",
+            )
+        except ValueError:
+            result = {"repair_source_kind": "missing"}
+
+        persisted = self.database.execute(
+            "SELECT state,storyboard FROM jobs WHERE job_id='J-LIP-RETRY'"
+        ).fetchone()
+        self.assertEqual(result["repair_source_kind"], "persisted_repair_source")
+        repaired = json.loads(persisted["storyboard"])
+        self.assertEqual(persisted["state"], "STORYBOARDED")
+        self.assertEqual(
+            Path(repaired["masters"][0]["repair_source_path"]).resolve(),
+            candidate_path.resolve(),
+        )
+        self.assertEqual(
+            candidate_path.read_bytes(), b"preserved review candidate"
+        )
 
     def test_master_extension_preserves_prior_and_queues_managed_mov_candidate(self):
         asset_root = self.root / "data" / "assets" / "J-EXTEND" / "shots"
@@ -6635,6 +6697,53 @@ class ManagementServiceTests(unittest.TestCase):
                 "SELECT state FROM jobs WHERE job_id='J-CLAIM'"
             ).fetchone()["state"],
             "PRODUCTION_RUNNING",
+        )
+
+    def test_start_video_job_can_queue_a_new_attempt_with_the_same_spec(self):
+        storyboard = {
+            "production_settings": {"budget_cents": 5000},
+            "masters": [{"idx": 1, "type": "broll", "duration": 5}],
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-RETRY-SAME-SPEC','T-1','retry same spec','STORYBOARDED',?)",
+            (json.dumps(storyboard),),
+        )
+        self.database.commit()
+
+        dispatch_result = {
+            "dispatched_jobs": [], "queued_jobs": ["J-RETRY-SAME-SPEC"],
+        }
+        with mock.patch.object(
+            self.service, "dispatch_production_queue",
+            return_value=dispatch_result,
+        ):
+            first = self.service.start_video_job(
+                "J-RETRY-SAME-SPEC", confirmed=True
+            )
+            self.database.execute(
+                "UPDATE jobs SET state='STORYBOARDED' "
+                "WHERE job_id='J-RETRY-SAME-SPEC'"
+            )
+            self.database.commit()
+            second = self.service.start_video_job(
+                "J-RETRY-SAME-SPEC", confirmed=True
+            )
+
+        self.assertEqual(first["status"], "queued")
+        self.assertEqual(second["status"], "queued")
+        self.assertEqual(
+            self.database.execute(
+                "SELECT state FROM jobs WHERE job_id='J-RETRY-SAME-SPEC'"
+            ).fetchone()["state"],
+            "PRODUCTION_QUEUED",
+        )
+        self.assertEqual(
+            self.database.execute(
+                "SELECT COUNT(*) FROM job_transitions "
+                "WHERE job_id='J-RETRY-SAME-SPEC' AND event='queued'"
+            ).fetchone()[0],
+            2,
         )
 
     def test_start_video_job_rolls_back_claim_when_worker_spawn_fails(self):

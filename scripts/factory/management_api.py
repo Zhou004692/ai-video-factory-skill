@@ -3909,7 +3909,7 @@ class ManagementService:
             raise ValueError("只有已生成或待人工复核的视频任务可以修复口型")
         self._assert_no_unresolved_provider_tasks(job_id)
         target = self.database.execute(
-            "SELECT idx,state,duration_sec,video_path,video_qa FROM shots "
+            "SELECT idx,state,duration_sec,video_path,video_url,video_qa FROM shots "
             "WHERE job_id=? AND idx=?",
             (job_id, int(master_idx)),
         ).fetchone()
@@ -3943,6 +3943,7 @@ class ManagementService:
             require_file=True,
         )
         source_kind = "active_master"
+        source_url = str(target["video_url"] or "").strip()
         if source is None:
             try:
                 qa = json.loads(target["video_qa"] or "{}")
@@ -3953,6 +3954,18 @@ class ManagementService:
                 qa.get("candidate_path"),
             )
             source_kind = "review_candidate"
+            source_url = str(qa.get("candidate_url") or "").strip()
+        if (
+            source is None
+            and str(master.get("repair_mode") or "")
+            == "seedance_lip_sync_edit"
+        ):
+            source = controlled_job_asset_path(
+                self.root / "data" / "assets", job_id,
+                master.get("repair_source_path"), require_file=True,
+            )
+            source_kind = "persisted_repair_source"
+            source_url = str(master.get("repair_source_url") or "").strip()
         if source is None:
             raise ValueError("原始母片文件不存在，不能执行保留式口型修复")
 
@@ -3989,6 +4002,10 @@ class ManagementService:
             "repair_dialogue": repair_dialogue,
             "repair_direction": reason_text,
         })
+        if source_url.startswith("https://"):
+            master["repair_source_url"] = source_url
+        else:
+            master.pop("repair_source_url", None)
         if native_audio.is_file():
             master["repair_audio_path"] = str(native_audio)
         repair_prompt = s3_shots._build_lip_sync_edit_prompt({
@@ -6748,7 +6765,10 @@ class ManagementService:
             self.database,
             job_id,
             "queued",
-            event_id=f"{job_id}:queued:{final_contract.spec.spec_hash}",
+            event_id=(
+                f"{job_id}:queued:{final_contract.spec.spec_hash}:"
+                f"{secrets.token_hex(8)}"
+            ),
             updates={
                 "storyboard": json.dumps(storyboard, ensure_ascii=False),
                 "error": None,
