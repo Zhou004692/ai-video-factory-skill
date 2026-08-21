@@ -2675,6 +2675,31 @@ class ManagementServiceTests(unittest.TestCase):
             "reasons": ["lip_sync_mismatch"],
             "candidate_path": str(candidate_path),
             "candidate_url": "https://cdn.example/J-LIP-CANDIDATE/01.mp4",
+            "result": {
+                "lip_sync_evidence": {
+                    "overall_alignment": 0.73,
+                    "confidence": 0.93,
+                    "segments": [{
+                        "start_sec": 2.6,
+                        "end_sec": 4.4,
+                        "alignment": 0.52,
+                        "confidence": 0.94,
+                        "offset_ms": 280,
+                        "dialogue": "也不能让客户停工",
+                        "reason": "嘴型晚于语音",
+                        "severity": "high",
+                    }, {
+                        "start_sec": 20.0,
+                        "end_sec": 22.0,
+                        "alignment": 0.2,
+                        "confidence": 0.99,
+                        "offset_ms": 600,
+                        "dialogue": "无效越界证据",
+                        "reason": "模型越界输出",
+                        "severity": "high",
+                    }],
+                },
+            },
         }
         self.database.execute(
             "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
@@ -2699,10 +2724,25 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertIsNotNone(visible_shot["candidate_preview_url"])
         self.assertTrue(visible_shot["lip_sync_repair_eligible"])
         self.assertEqual(
-            visible_shot["lip_sync_repair_suggestion"]["start_sec"], 1.2
+            visible_shot["lip_sync_evidence"]["overall_alignment"], 0.73
         )
         self.assertEqual(
-            visible_shot["lip_sync_repair_suggestion"]["end_sec"], 6.8
+            visible_shot["lip_sync_evidence"]["segments"][0]["offset_ms"],
+            280,
+        )
+        self.assertEqual(
+            visible_shot["lip_sync_repair_suggestion"]["start_sec"], 2.35
+        )
+        self.assertEqual(
+            visible_shot["lip_sync_repair_suggestion"]["end_sec"], 4.65
+        )
+        self.assertEqual(
+            visible_shot["lip_sync_repair_suggestion"]["source"],
+            "lip_sync_evidence",
+        )
+        self.assertIn(
+            "280ms",
+            visible_shot["lip_sync_repair_suggestion"]["reason"],
         )
 
         result = self.service.prepare_master_lip_sync_repair(
@@ -8764,6 +8804,9 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("suggestion.end_sec", js)
         self.assertIn("data-candidate-lip-sync-repair", js)
         self.assertIn("无需先接受口型不合格候选", js)
+        self.assertIn("口型定位证据", js)
+        self.assertIn("overall_alignment", js)
+        self.assertIn("offset_ms", js)
 
     def test_ui_exposes_managed_master_extension_as_review_candidate(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(

@@ -8216,6 +8216,114 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.passed)
         self.assertIn("lip_sync_mismatch", decision.reasons)
 
+    def test_video_qa_rejects_a_located_low_alignment_interval(self):
+        raw = {
+            "transcript": "林夏立即启动应急调度",
+            "confidence": 1.0,
+            "lip_sync": True,
+            "lip_sync_evidence": {
+                "overall_alignment": 0.86,
+                "confidence": 0.91,
+                "segments": [{
+                    "start_sec": 2.6,
+                    "end_sec": 4.4,
+                    "alignment": 0.52,
+                    "confidence": 0.94,
+                    "offset_ms": 280,
+                    "dialogue": "启动应急调度",
+                    "reason": "嘴型晚于语音",
+                }],
+            },
+        }
+
+        decision = video_qa.evaluate(
+            raw,
+            expect_speech=True,
+            expected_text="林夏立即启动应急调度",
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertIn("lip_sync_mismatch", decision.reasons)
+        self.assertEqual(
+            raw["lip_sync_evidence"]["segments"][0]["offset_ms"], 280
+        )
+        self.assertEqual(
+            raw["lip_sync_evidence"]["segments"][0]["severity"], "high"
+        )
+
+    def test_video_qa_ignores_low_confidence_lip_sync_guess(self):
+        raw = {
+            "transcript": "林夏立即启动应急调度",
+            "confidence": 1.0,
+            "lip_sync": True,
+            "lip_sync_evidence": {
+                "overall_alignment": 0.48,
+                "confidence": 0.31,
+                "segments": [{
+                    "start_sec": 2.6,
+                    "end_sec": 4.4,
+                    "alignment": 0.42,
+                    "confidence": 0.31,
+                    "offset_ms": 300,
+                }],
+            },
+        }
+
+        decision = video_qa.evaluate(
+            raw,
+            expect_speech=True,
+            expected_text="林夏立即启动应急调度",
+        )
+
+        self.assertTrue(decision.passed)
+        self.assertEqual(decision.reasons, ())
+
+    async def test_dialogue_quality_analysis_requests_lip_sync_evidence(self):
+        route = video_routing.VideoRoute(
+            model="seedance25", tier="seedance25",
+            generate_audio=True, qa_required=True,
+        )
+        analyze = Mock(return_value=({
+            "lip_sync": True,
+            "visual_comparison": {"alignment": 1.0},
+            "lip_sync_evidence": {
+                "overall_alignment": 0.96,
+                "confidence": 0.93,
+                "segments": [],
+            },
+        }, video_qa.QADecision(True, ())))
+
+        async def generated(**kwargs):
+            kwargs["metadata_out"].update({
+                "task_id": "task-lip-evidence",
+                "usage": {"completion_tokens": 1000},
+            })
+            return b"video"
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            s3_shots.seedance, "text_to_video",
+            new=AsyncMock(side_effect=generated),
+        ), patch.object(
+            s3_shots.tos, "upload", return_value="https://qa/dialogue",
+        ), patch.object(
+            s3_shots.video_qa, "analyze", new=analyze,
+        ), patch.object(
+            s3_shots.ffmpeg, "extract_audio_wav", new=AsyncMock(),
+        ):
+            await s3_shots._generate_seedance_video(
+                prompt="林夏面对镜头说话",
+                route=route,
+                request_kwargs={"duration": 8, "resolution": "480p"},
+                out_path=Path(tmp) / "dialogue.mp4",
+                key_hint="lip-evidence-dialogue",
+                expected_text="立即启动应急调度",
+                fixed_transcription=bigasr.Transcription(
+                    "立即启动应急调度"
+                ),
+            )
+
+        self.assertTrue(analyze.call_args.kwargs["expect_speech"])
+
     def test_cinematic_dialogue_prompt_keeps_speaker_mouth_visible(self):
         prompt = s3_shots._build_native_dialogue_prompt(
             {

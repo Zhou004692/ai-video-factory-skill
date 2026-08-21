@@ -74,6 +74,62 @@ def _normalized_text(value: object) -> str:
     return normalize_transcript_text(value)
 
 
+def normalize_lip_sync_evidence(result: dict) -> dict:
+    """Normalize model observations into reviewable lip-sync intervals."""
+    source = result.get("lip_sync_evidence") or {}
+    if not isinstance(source, dict):
+        source = {}
+
+    def score(value: object, default: float = 0.0) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return default
+
+    segments = []
+    for item in source.get("segments") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = max(0.0, float(item.get("start_sec") or 0))
+            end = max(0.0, float(item.get("end_sec") or 0))
+            offset = int(round(float(item.get("offset_ms") or 0)))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        alignment = score(item.get("alignment"), 1.0)
+        confidence = score(item.get("confidence"), 0.0)
+        absolute_offset = abs(offset)
+        if alignment < 0.60 or absolute_offset >= 250:
+            severity = "high"
+        elif alignment < 0.75 or absolute_offset >= 160:
+            severity = "medium"
+        else:
+            severity = "low"
+        segments.append({
+            "start_sec": round(start, 3),
+            "end_sec": round(end, 3),
+            "alignment": round(alignment, 4),
+            "confidence": round(confidence, 4),
+            "offset_ms": offset,
+            "dialogue": str(item.get("dialogue") or "").strip(),
+            "reason": str(item.get("reason") or "").strip(),
+            "severity": severity,
+        })
+    normalized = {
+        "overall_alignment": round(
+            score(source.get("overall_alignment"), 1.0), 4
+        ),
+        "confidence": round(score(source.get("confidence"), 0.0), 4),
+        "segments": sorted(segments, key=lambda item: (
+            item["start_sec"], item["end_sec"]
+        )),
+    }
+    result["lip_sync_evidence"] = normalized
+    return normalized
+
+
 def _visual_comparison_prompt(expected: str, observed: str) -> str:
     """Build a text-only, second-stage semantic comparison prompt."""
     return (
@@ -116,7 +172,21 @@ def evaluate(result: dict, *, expect_speech: bool,
         similarity = SequenceMatcher(None, expected, transcript).ratio()
         if similarity < min_transcript_similarity:
             reasons.append("transcript_mismatch")
-    if expect_speech and result.get("lip_sync") is False:
+    lip_sync_evidence = normalize_lip_sync_evidence(result)
+    located_mismatch = bool(
+        lip_sync_evidence["confidence"] >= 0.65
+        and lip_sync_evidence["overall_alignment"] < 0.78
+    ) or any(
+        segment["confidence"] >= 0.65
+        and (
+            segment["alignment"] < 0.75
+            or abs(segment["offset_ms"]) >= 160
+        )
+        for segment in lip_sync_evidence["segments"]
+    )
+    if expect_speech and (
+        result.get("lip_sync") is False or located_mismatch
+    ):
         reasons.append("lip_sync_mismatch")
     if expected_visual:
         comparison = result.get("visual_comparison") or {}
@@ -276,6 +346,10 @@ def analyze(video_url: str, *, expect_speech: bool,
         '{"transcript":"逐字转写，无人声则为空字符串",'
         '"extra_audio":"实际听到的环境音和音效",'
         '"lip_sync":true,"confidence":0.0,'
+        '"lip_sync_evidence":{"overall_alignment":1.0,"confidence":0.0,'
+        '"segments":[{"start_sec":0.0,"end_sec":0.0,'
+        '"alignment":1.0,"confidence":0.0,"offset_ms":0,'
+        '"dialogue":"","reason":""}]},'
         '"observed_visual":"客观、具体描述实际画面",'
         '"has_visible_person":false,"has_readable_text":false,'
         '"notes":"其他观察"}。'
@@ -289,6 +363,13 @@ def analyze(video_url: str, *, expect_speech: bool,
             "dominant_subject 只能填 equipment/environment/person/hands/fingers/object/other；"
             "hand_closeup_ratio 为手或手指特写占整个视频时长的比例 0 到 1。"
             "不要因为单帧短暂出现设备就判定主体已出现。"
+        )
+    if expect_speech:
+        prompt += (
+            "\n口型证据必须覆盖整段视频后再判断。overall_alignment、alignment 和 "
+            "confidence 范围为 0 到 1；offset_ms 为嘴部动作相对语音的有符号毫秒偏差。"
+            "segments 只列出可明确定位的异常时间段；无法确认时 confidence 必须低于 "
+            "0.65，不得猜测异常区间。"
         )
     payload = {
         "model": model,

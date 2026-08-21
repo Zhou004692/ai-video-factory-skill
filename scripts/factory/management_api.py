@@ -23,7 +23,7 @@ from . import (
     anchor_generation, character_assets, character_voices, error_registry, master_dependencies, media_sources, performance_feedback, production_metrics, production_planner, quality_canary,
     production_config, provider_capacity, provider_health, provider_tasks, recovery_controller, scene_assets, script_drafts, script_sources, source_analysis, source_scheduler, state_machine, topic_briefs,
 )
-from .clients import douyin, music, seedance, volc_assets, volc_tts
+from .clients import douyin, music, seedance, video_qa, volc_assets, volc_tts
 from .video_routing import AUDIO_MODE_FIXED_TTS, normalize_audio_mode
 from .review_candidates import (
     controlled_candidate_path, controlled_job_asset_path,
@@ -247,9 +247,40 @@ def _file_sha256(path: Path) -> str:
 
 def _lip_sync_repair_suggestion(
     storyboard: dict, master: dict, master_idx: int, duration_sec: float,
+    qa: dict | None = None,
 ) -> dict:
     """Locate the smallest speech interval backed by the edited subtitle cues."""
     duration = max(0.1, float(duration_sec or master.get("duration") or 0.1))
+    evidence = video_qa.normalize_lip_sync_evidence(
+        dict((qa or {}).get("result") or {})
+    )
+    located = [
+        segment for segment in evidence.get("segments") or []
+        if segment.get("confidence", 0) >= 0.65
+        and segment.get("severity") in {"high", "medium"}
+        and float(segment.get("start_sec") or 0) < duration
+        and float(segment.get("end_sec") or 0) > 0
+    ]
+    if located:
+        target = min(located, key=lambda item: (
+            item.get("alignment", 1),
+            -item.get("confidence", 0),
+            item.get("start_sec", 0),
+        ))
+        start = max(0.0, float(target["start_sec"]) - 0.25)
+        end = min(duration, float(target["end_sec"]) + 0.25)
+        offset = int(target.get("offset_ms") or 0)
+        confidence = round(float(target.get("confidence") or 0) * 100)
+        return {
+            "start_sec": round(start, 3),
+            "end_sec": round(end, 3),
+            "dialogue": str(target.get("dialogue") or "").strip(),
+            "reason": (
+                f"自动质检定位 {target['start_sec']}–{target['end_sec']} 秒，"
+                f"口型偏移 {offset}ms，置信度 {confidence}%"
+            ),
+            "source": "lip_sync_evidence",
+        }
     intervals: list[tuple[float, float]] = []
     dialogue: list[str] = []
     for edit in storyboard.get("shots") or []:
@@ -2746,6 +2777,13 @@ class ManagementService:
                 )
                 shot["quality_reasons"] = list(qa.get("reasons") or [])
                 shot["quality_status"] = str(qa.get("status") or "")
+                shot["lip_sync_evidence"] = (
+                    video_qa.normalize_lip_sync_evidence(
+                        dict(qa.get("result") or {})
+                    )
+                    if "lip_sync_mismatch" in shot["quality_reasons"]
+                    else None
+                )
                 shot["failure_code"] = str(qa.get("failure_code") or "")
                 shot["human_decision"] = str(
                     qa.get("human_decision") or ""
@@ -2875,6 +2913,7 @@ class ManagementService:
                                 or shot.get("duration_sec")
                                 or 0
                             ),
+                            qa,
                         )
                     )
             job["completed_master_count"] = len(completed_indexes)

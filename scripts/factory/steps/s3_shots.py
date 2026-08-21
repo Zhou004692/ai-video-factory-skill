@@ -3053,7 +3053,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             raw, _ = await asyncio.to_thread(
                 video_qa.analyze,
                 url,
-                expect_speech=False,
+                expect_speech=bool(expected_text),
                 expected_visual=prompt,
                 forbid_people=forbid_people,
                 forbid_readable_text=True,
