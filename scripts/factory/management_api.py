@@ -1701,6 +1701,26 @@ class ManagementService:
                 json.dumps(characters, ensure_ascii=False),
             ),
         )
+        for master in storyboard.get("masters") or []:
+            self.database.execute(
+                "INSERT INTO shots(job_id,idx,duration_sec,shot_type,camera,prompt,"
+                "voiceover,subtitle,state,narrative_type,speaker_id,anchor_character) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    int(master.get("idx") or 0),
+                    float(master.get("duration") or 0),
+                    str(master.get("shot_type") or ""),
+                    str(master.get("camera") or ""),
+                    str(master.get("scene") or master.get("prompt") or ""),
+                    str(master.get("voiceover") or ""),
+                    str(master.get("subtitle") or master.get("voiceover") or ""),
+                    "PENDING",
+                    str(master.get("type") or "dialogue"),
+                    master.get("speaker"),
+                    master.get("anchor_character"),
+                ),
+            )
         self.database.execute(
             "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
             (
@@ -4431,6 +4451,9 @@ class ManagementService:
         )
         self.database.execute("DELETE FROM shots WHERE job_id=?", (job_id,))
         self.database.execute("DELETE FROM events WHERE job_id=?", (job_id,))
+        self.database.execute(
+            "DELETE FROM job_transitions WHERE job_id=?", (job_id,)
+        )
         self.database.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
         self.database.commit()
         self._repair_dangling_job_links()
@@ -4478,6 +4501,20 @@ class ManagementService:
             if returncode is None or not isinstance(returncode, int):
                 continue
             self._production_workers.pop(job_id, None)
+            current = self.database.execute(
+                "SELECT state FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            worker_owned_states = {
+                "PRODUCTION_RUNNING", "SHOTS_OK", "VOICE_OK", "BGM_OK",
+            }
+            if current and str(current["state"]) not in worker_owned_states:
+                self.database.execute(
+                    "UPDATE jobs SET production_worker_pid=NULL "
+                    "WHERE job_id=?",
+                    (job_id,),
+                )
+                self.database.commit()
+                continue
             try:
                 state_machine.transition(
                     self.database,

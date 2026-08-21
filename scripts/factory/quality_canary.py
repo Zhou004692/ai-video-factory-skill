@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from . import SKILL_ROOT
+from . import SKILL_ROOT, production_config
 
 
 PROFILE_PATH = SKILL_ROOT / "references" / "quality_canary_scripts.json"
@@ -132,10 +132,33 @@ def build_isolated_storyboard(profile_id: str, contract: Mapping[str, Any]) -> d
             "subtitle": dialogue,
         })
     primary = dialogue_blocks[0]["speaker"]
+    production_settings = {
+        "budget_cents": int(contract["confirmed_budget_cents"]),
+        "max_auto_retries": int(contract["max_auto_retries"]),
+        "auto_retry_budget_cents": 0,
+        "max_concurrent_masters": 1,
+        "audio_mode": "seedance_native",
+    }
+    generation_snapshot = production_config.freeze_generation_snapshot(
+        production_settings
+    )
+    generation_snapshot.update({
+        "quality_canary_profile_id": profile_id,
+        "quality_canary_frozen_input": deepcopy(
+            contract["quality_canary_frozen_input"]
+        ),
+        "quality_canary_contract_sha256": str(
+            contract["quality_canary_contract_sha256"]
+        ),
+    })
+    production_settings[production_config.GENERATION_SNAPSHOT_KEY] = (
+        generation_snapshot
+    )
     return {
         "production_profile": "standard",
         "production_mode": "native_master_local_director",
         "quality_canary": deepcopy(dict(contract)),
+        "production_settings": production_settings,
         "characters": characters,
         "hook": "固定短剧本真实 Provider 质量金丝雀",
         "masters": [{

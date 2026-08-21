@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 from factory import (  # noqa: E402
-    db, production_config, provider_capacity, provider_tasks,
+    db, production_config, production_planner, provider_capacity, provider_tasks,
     review_candidates, scene_assets,
 )
 from factory.clients import music, seedance  # noqa: E402
@@ -129,11 +129,40 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual(row["state"], "STORYBOARDED")
         self.assertEqual(storyboard["quality_canary"]["launch_mode"], "manual_confirmed")
         self.assertFalse(storyboard["quality_canary"]["scheduler_allowed"])
+        settings = storyboard["production_settings"]
+        snapshot = settings["generation_snapshot"]
+        self.assertEqual(settings["budget_cents"], 2000)
+        self.assertEqual(snapshot["job_budget_cents"], 2000)
+        self.assertEqual(snapshot["max_auto_retries"], 0)
+        self.assertEqual(snapshot["auto_retry_budget_cents"], 0)
+        self.assertEqual(
+            snapshot["quality_canary_profile_id"], "single-speaker-8s-v1"
+        )
+        self.assertEqual(
+            snapshot["quality_canary_frozen_input"],
+            storyboard["quality_canary"]["quality_canary_frozen_input"],
+        )
+        self.assertEqual(
+            snapshot["quality_canary_contract_sha256"],
+            storyboard["quality_canary"]["quality_canary_contract_sha256"],
+        )
         self.assertTrue(all(
             character["identity_type"] == "custom"
             and not character.get("seedance_asset_uri")
             for character in storyboard["characters"]
         ))
+        shots = self.database.execute(
+            "SELECT idx,state FROM shots WHERE job_id=? ORDER BY idx",
+            (result["job_id"],),
+        ).fetchall()
+        self.assertEqual(
+            [(int(shot["idx"]), str(shot["state"])) for shot in shots],
+            [(1, "PENDING")],
+        )
+        compiled = production_planner.compile_job_spec(
+            self.database, result["job_id"], self.root, persist=False,
+        )
+        self.assertEqual(compiled.spec.budget_cents, 2000)
         self.assertEqual(
             self.database.execute("SELECT COUNT(*) FROM provider_calls").fetchone()[0],
             0,
@@ -6563,6 +6592,11 @@ class ManagementServiceTests(unittest.TestCase):
                 ("J-QUEUE-NEW", "T-Q2", "new", "PRODUCTION_QUEUED", "{}", "2026-01-01 00:02:00"),
             ],
         )
+        self.database.execute(
+            "INSERT INTO job_transitions(event_id,job_id,event,from_state,to_state) "
+            "VALUES('J-FAILED-DELETE:failed','J-FAILED-DELETE','failed',"
+            "'PRODUCTION_RUNNING','FAILED')"
+        )
         self.database.commit()
 
         result = self.service.delete_video("J-FAILED-DELETE")
@@ -6571,6 +6605,13 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual(
             self.database.execute(
                 "SELECT COUNT(*) FROM character_identity_anchors "
+                "WHERE job_id='J-FAILED-DELETE'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.database.execute(
+                "SELECT COUNT(*) FROM job_transitions "
                 "WHERE job_id='J-FAILED-DELETE'"
             ).fetchone()[0],
             0,
@@ -6763,6 +6804,53 @@ class ManagementServiceTests(unittest.TestCase):
             ).fetchone()["state"],
             "PRODUCTION_RUNNING",
         )
+
+    @mock.patch("factory.management_api.subprocess.Popen")
+    def test_exited_worker_preserves_business_pause_and_dispatches_next_job(self, popen):
+        (self.root / ".env").write_text(
+            "ARK_API_KEY=secret-value\nMAX_CONCURRENT_JOBS=1\n",
+            encoding="utf-8",
+        )
+        exited = mock.Mock()
+        exited.poll.return_value = 0
+        running = mock.Mock()
+        running.poll.return_value = None
+        popen.side_effect = [exited, running]
+        self.database.executemany(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            [
+                (
+                    "J-REVIEW-EXIT", "T-REVIEW", "review pause",
+                    "PRODUCTION_QUEUED", "{}", "2026-01-01 00:00:00",
+                ),
+                (
+                    "J-REVIEW-NEXT", "T-NEXT", "next",
+                    "PRODUCTION_QUEUED", "{}", "2026-01-01 00:01:00",
+                ),
+            ],
+        )
+        self.database.commit()
+
+        first = self.service.dispatch_production_queue()
+        self.database.execute(
+            "UPDATE jobs SET state='PRODUCTION_REVIEW_REQUIRED',"
+            "error='candidate requires human review' WHERE job_id='J-REVIEW-EXIT'"
+        )
+        self.database.commit()
+        second = self.service.dispatch_production_queue()
+
+        self.assertEqual(first["dispatched_jobs"], ["J-REVIEW-EXIT"])
+        self.assertEqual(second["dispatched_jobs"], ["J-REVIEW-NEXT"])
+        paused = self.database.execute(
+            "SELECT state,error,failure_code,production_worker_pid FROM jobs "
+            "WHERE job_id='J-REVIEW-EXIT'"
+        ).fetchone()
+        self.assertEqual(paused["state"], "PRODUCTION_REVIEW_REQUIRED")
+        self.assertEqual(paused["error"], "candidate requires human review")
+        self.assertIsNone(paused["failure_code"])
+        self.assertIsNone(paused["production_worker_pid"])
+        self.assertNotIn("J-REVIEW-EXIT", second["failed_workers"])
 
     def test_production_health_reports_business_queue_state(self):
         self.database.executemany(

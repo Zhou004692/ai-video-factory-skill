@@ -160,14 +160,23 @@ def analyze_storyboard(
 ) -> dict:
     """Estimate paid Seedance work without submitting or mutating anything."""
     masters = list(storyboard.get("masters") or [])
+    settings = storyboard.get("production_settings") or {}
+    frozen_snapshot = settings.get(production_config.GENERATION_SNAPSHOT_KEY)
+    configured_budget = settings.get(
+        "budget_cents", settings.get("job_budget_cents")
+    )
+    if configured_budget is None and isinstance(frozen_snapshot, dict):
+        configured_budget = frozen_snapshot.get("job_budget_cents")
     resolved_budget = _nonnegative_int(
         budget_cents
         if budget_cents is not None
-        else os.getenv("SEEDANCE_JOB_BUDGET_CENTS"),
+        else (
+            configured_budget
+            if configured_budget is not None
+            else os.getenv("SEEDANCE_JOB_BUDGET_CENTS")
+        ),
         2500,
     )
-    settings = storyboard.get("production_settings") or {}
-    frozen_snapshot = settings.get(production_config.GENERATION_SNAPSHOT_KEY)
     if frozen_snapshot:
         snapshot = production_config.generation_snapshot(storyboard)
     else:
