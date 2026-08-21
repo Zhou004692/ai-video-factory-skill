@@ -21,6 +21,14 @@ from ..clients import bigasr, ffmpeg
 from ..review_candidates import finalize_accepted_candidates
 
 
+def _safe_status_print(message: str) -> None:
+    """Best-effort status output must never fail an otherwise valid render."""
+    try:
+        print(message, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 async def _prep_shot(shot_row, prep_dir: Path,
                      subtitle: str | None, hook: str | None) -> Path:
     """准备单个 shot,返回归一化后(含字幕/hook/fade)的路径。"""
@@ -442,16 +450,18 @@ async def run(job_id: str) -> None:
         thumb = base / "thumbnail.jpg"
         try:
             await ffmpeg.generate_continuity_cover(final, thumb)
-            print(f"[s6] continuity cover -> {thumb}", flush=True)
+            _safe_status_print(f"[s6] continuity cover -> {thumb}")
         except Exception as e:
-            print(f"[s6] continuity cover failed (非致命): {e}", flush=True)
+            _safe_status_print(f"[s6] continuity cover failed (非致命): {e}")
     if os.getenv("GEN_MARKETING_THUMBNAIL", "true").lower() == "true":
         marketing_thumb = base / "marketing_thumbnail.jpg"
         try:
             await ffmpeg.generate_thumbnail(final, hook_text, marketing_thumb)
-            print(f"[s6] marketing thumbnail -> {marketing_thumb}", flush=True)
+            _safe_status_print(f"[s6] marketing thumbnail -> {marketing_thumb}")
         except Exception as e:
-            print(f"[s6] marketing thumbnail failed (非致命): {e}", flush=True)
+            _safe_status_print(
+                f"[s6] marketing thumbnail failed (非致命): {e}"
+            )
 
     db.execute("UPDATE jobs SET final_path=? WHERE job_id=?",
                (str(final), job_id))

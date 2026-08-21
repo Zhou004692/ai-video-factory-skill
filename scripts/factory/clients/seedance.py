@@ -134,6 +134,16 @@ class SeedanceAccountUnavailableError(RuntimeError):
     stable_code = code
 
 
+class SeedanceRateLimitError(RuntimeError):
+    """A definite pre-task 429 that is safe to use for capacity learning."""
+
+    non_retryable = True
+    retryable = False
+    code = "rate_limited"
+    error_code = code
+    stable_code = code
+
+
 def _classified(error: Exception, code: str, *, retryable: bool) -> Exception:
     error.code = code
     error.error_code = code
@@ -160,6 +170,11 @@ def _provider_error(
     """Map submit and terminal poll failures into one stable taxonomy."""
     detail = f"{provider_code} {provider_message}".casefold()
     task = f"任务 {task_id} " if task_id else ""
+    if status_code == 429 or "ratelimit" in detail or "too many requests" in detail:
+        return SeedanceRateLimitError(
+            "Seedance 并发额度已满，系统已自动降低有效并发；"
+            "请等待冷却后继续，已完成母片不会重做。"
+        )
     if (
         "inputimagesensitivecontentdetected" in detail
         or "inputimagessensitivecontentdetected" in detail
@@ -495,7 +510,11 @@ def _video_task_payload(*, model: str, content: list, duration: float,
         "resolution": resolution,
         "output_format": output_format,
     }
-    if "seedance-2-5" in model.lower():
+    # omni_reference_task_type is a reference-task discriminator.  Sending it
+    # on pure text-to-video requests makes the provider validate a reference
+    # task that has no reference input and is rejected synchronously.  Keep it
+    # for actual multimodal/edit/extend requests only.
+    if "seedance-2-5" in model.lower() and roles:
         payload["omni_reference_task_type"] = (
             "auto" if task_intent == "generate" else task_intent
         )
@@ -874,10 +893,23 @@ async def text_to_image(prompt: str, resolution: str = "1024x1536",
         return img
 
 
+ESTIMATION_PRICING_VERSION = "seedance25-area-v1"
+
+
+def estimated_cost_rate_cents_per_second(resolution: str = "720p") -> int:
+    """Conservative Seedance 2.5 rate calibrated by output pixel area."""
+    return {
+        "480p": 68,
+        "720p": 153,
+        "1080p": 344,
+    }.get(str(resolution or "720p").lower(), 153)
+
+
 def estimate_cost_cents(duration: float, resolution: str = "720p") -> int:
     """Conservative Seedance 2.5 estimate derived from measured token bills."""
-    rate = {"480p": 68, "720p": 102, "1080p": 136}.get(resolution, 102)
-    return int(rate * duration)
+    return int(
+        estimated_cost_rate_cents_per_second(resolution) * duration
+    )
 
 
 def usage_cost_cents(

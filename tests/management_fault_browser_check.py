@@ -30,6 +30,7 @@ UI_ROOT = PROJECT_ROOT / "scripts" / "management_ui"
 UNIT_RELEASE_GATE_TESTS = (
     "tests.test_script_drafts",
     "tests.test_production_failure_matrix",
+    "tests.test_incident_replays",
     "tests.test_video_upgrade.MusicFallbackTests."
     "test_explicit_library_missing_fails_closed_with_actionable_error",
     "tests.test_video_upgrade.MusicFallbackTests."
@@ -83,12 +84,16 @@ def _preview_data_uri() -> str:
 
 def base_job(job_id: str, state: str, *, title: str, error: str = "") -> dict:
     labels = {
+        "PRODUCTION_RUNNING": "生成中",
         "PRODUCTION_REVIEW_REQUIRED": "母片待复核",
         "PROVIDER_ACTION_REQUIRED": "模型账号待处理",
         "REJECTED_PENDING_RECONCILIATION": "已终止，待成本核对",
         "FAILED": "失败",
     }
     actions = {
+        "PRODUCTION_RUNNING": {
+            "id": "view_progress", "label": "查看生产进度",
+        },
         "PRODUCTION_REVIEW_REQUIRED": {
             "id": "review_master_candidates", "label": "预览并处理候选母片",
         },
@@ -207,6 +212,46 @@ def failed_job() -> dict:
     job["planned_masters"] = [{"idx": 1, "duration": 36, "type": "dialogue"}]
     job["master_count"] = 1
     job["total_master_duration_sec"] = 36
+    job["failure_code"] = "request_invalid"
+    job["status_reason"] = {
+        "code": "request_invalid",
+        "message": "生产参数与模型能力不匹配，请重新编译生产规格",
+    }
+    job["next_action"] = {
+        "id": "recompile_production_spec", "label": "重新编译生产规格",
+    }
+    return job
+
+
+def anchor_generation_job() -> dict:
+    job = base_job(
+        "J-BROWSER-ANCHORS", "PRODUCTION_RUNNING",
+        title="锚点生成进度", error="",
+    )
+    preview = _preview_data_uri()
+    job.update({
+        "character_makeup_plan": [
+            {
+                "identity_key": "lead", "display_name": "林夏",
+                "preview_url": preview, "status": "ready",
+                "approval_state": "APPROVED", "source": "seedance_identity",
+            },
+            {
+                "identity_key": "engineer", "display_name": "周工",
+                "preview_url": preview, "status": "ready",
+                "approval_state": "APPROVED", "source": "volc_asset",
+            },
+        ],
+        "scene_anchor_plan": [{
+            "anchor_key": "storm-site", "description": "暴雨抢修现场",
+            "master_indexes": [1, 2], "preview_url": None,
+            "status": "generating", "approval_state": "PENDING",
+        }],
+        "characters": [
+            {"id": "lead", "name": "林夏"},
+            {"id": "engineer", "name": "周工"},
+        ],
+    })
     return job
 
 
@@ -323,7 +368,7 @@ def assert_clean(page, errors: list[str], bad_responses: list[str]) -> None:
 def run_review_decision(browser, base_url: str, decision: str) -> None:
     page, posts, errors, bad = scenario_page(browser, base_url, review_job())
     page.locator('[data-video-id="J-BROWSER-REVIEW"]').click()
-    page.locator("#drawer-business-pause-action").click()
+    page.locator("#drawer-next-action").click()
     assert page.get_by_text("候选与要求的差异", exact=True).is_visible()
     assert page.get_by_text("人物定妆", exact=True).is_visible()
     assert page.get_by_text("场景锚点", exact=True).is_visible()
@@ -343,7 +388,7 @@ def run_provider_reconcile(browser, base_url: str, *, rejected: bool) -> None:
     job = provider_job(reconcilable=True, rejected=rejected)
     page, posts, errors, bad = scenario_page(browser, base_url, job)
     page.locator(f'[data-video-id="{job["job_id"]}"]').click()
-    page.locator("#drawer-business-pause-action").click()
+    page.locator("#drawer-next-action").click()
     task = job["unresolved_provider_tasks"][0]["task_id"]
     page.locator(f'[data-provider-task="{task}"]').click()
     page.wait_for_timeout(150)
@@ -358,7 +403,7 @@ def run_provider_manual_only(browser, base_url: str) -> None:
     job = provider_job(reconcilable=False)
     page, posts, errors, bad = scenario_page(browser, base_url, job)
     page.locator(f'[data-video-id="{job["job_id"]}"]').click()
-    page.locator("#drawer-business-pause-action").click()
+    page.locator("#drawer-next-action").click()
     manual = page.locator(".provider-task-manual")
     assert manual.is_visible()
     assert "人工处置" in manual.inner_text()
@@ -373,7 +418,7 @@ def run_provider_recovery_ready(browser, base_url: str) -> None:
     job = provider_recovery_ready_job()
     page, posts, errors, bad = scenario_page(browser, base_url, job)
     page.locator(f'[data-video-id="{job["job_id"]}"]').click()
-    assert page.locator("#drawer-resume-video").count() == 1
+    assert page.locator("#drawer-next-action").count() == 1
     assert page.locator("#drawer-business-pause-action").count() == 0
     assert page.locator("#drawer .drawer-footer").get_by_text(
         "继续生成剩余母片", exact=True
@@ -381,7 +426,7 @@ def run_provider_recovery_ready(browser, base_url: str) -> None:
     duplicate_ids = page.evaluate("""() => [...document.querySelectorAll('[id]')]
         .map(node => node.id).filter((id, index, ids) => ids.indexOf(id) !== index)""")
     assert duplicate_ids == [], duplicate_ids
-    page.locator("#drawer-resume-video").click()
+    page.locator("#drawer-next-action").click()
     page.wait_for_timeout(150)
     assert posts == [{
         "path": "/api/videos/J-BROWSER-PROVIDER-RECOVER/resume", "body": {},
@@ -395,10 +440,10 @@ def run_failed_details(browser, base_url: str) -> None:
     job = failed_job()
     page, posts, errors, bad = scenario_page(browser, base_url, job)
     row = page.locator(f'[data-video-id="{job["job_id"]}"]')
-    assert "查看失败原因" in row.inner_text()
+    assert "重新编译生产规格" in row.inner_text()
     row.click()
     assert page.get_by_text(
-        "任务存在异常，先查看原因再决定是否重试", exact=True
+        "生产参数与模型能力不匹配，请重新编译生产规格", exact=True
     ).is_visible()
     assert page.locator("#drawer .error-callout > p").filter(
         has_text="视频模型调用失败，请查看技术详情"
@@ -412,6 +457,24 @@ def run_failed_details(browser, base_url: str) -> None:
     assert technical == job["error"]
     assert "Traceback" not in technical
     assert "Authorization" not in technical
+    assert posts == [], posts
+    assert_clean(page, errors, bad)
+
+
+def run_anchor_generation_waiting(browser, base_url: str) -> None:
+    job = anchor_generation_job()
+    page, posts, errors, bad = scenario_page(browser, base_url, job)
+    page.locator(f'[data-video-id="{job["job_id"]}"]').click()
+    panel = page.locator("#anchor-generation-status")
+    assert panel.is_visible()
+    assert "人物 2/2" in panel.inner_text()
+    assert "场景 0/1" in panel.inner_text()
+    assert page.locator("#approve-continuity-anchors").count() == 0
+    waiting = page.locator("#drawer-next-action")
+    assert waiting.count() == 1
+    assert waiting.inner_text() == "查看生产进度"
+    waiting.click()
+    page.wait_for_timeout(100)
     assert posts == [], posts
     assert_clean(page, errors, bad)
 
@@ -438,6 +501,7 @@ def run_browser_gate() -> None:
             run_provider_recovery_ready(browser, base_url)
             run_provider_reconcile(browser, base_url, rejected=True)
             run_failed_details(browser, base_url)
+            run_anchor_generation_waiting(browser, base_url)
         finally:
             browser.close()
 
@@ -459,7 +523,7 @@ def main() -> None:
     if args.release_gate:
         run_unit_gate()
     run_browser_gate()
-    print("management production-fault browser check: PASS (8 scenarios)")
+    print("management production-fault browser check: PASS (9 scenarios)")
 
 
 if __name__ == "__main__":

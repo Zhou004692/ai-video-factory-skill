@@ -18,12 +18,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 
-from factory import db, provider_tasks, review_candidates, scene_assets  # noqa: E402
-from factory.clients import music  # noqa: E402
+from factory import (  # noqa: E402
+    db, production_config, provider_capacity, provider_tasks,
+    review_candidates, scene_assets,
+)
+from factory.clients import music, seedance  # noqa: E402
 from factory.management_api import ManagementService  # noqa: E402
 from management_server import (  # noqa: E402
     ConsoleHandler, MEDIA_UPLOAD_MAX_BYTES, parse_byte_range,
-    run_queue_supervisor, validate_local_bind_host,
+    run_provider_reconcile_sweeper, run_queue_supervisor,
+    validate_local_bind_host,
 )
 from http.server import ThreadingHTTPServer  # noqa: E402
 import management_server  # noqa: E402
@@ -38,6 +42,12 @@ def _database() -> sqlite3.Connection:
 
 class ManagementServiceTests(unittest.TestCase):
     def setUp(self):
+        # Config-save tests intentionally update the live process environment so
+        # the running console reacts immediately.  Keep those mutations local
+        # to each test instead of leaking provider/model choices into later
+        # modules in the full release suite.
+        self.environment = mock.patch.dict(os.environ, {}, clear=False)
+        self.environment.start()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         (self.root / "data").mkdir()
@@ -59,6 +69,7 @@ class ManagementServiceTests(unittest.TestCase):
     def tearDown(self):
         self.database.close()
         self.temp.cleanup()
+        self.environment.stop()
 
     def test_overview_uses_real_pipeline_counts(self):
         self.database.execute(
@@ -81,6 +92,52 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual(overview["videos"]["jobs"], 1)
         self.assertEqual(overview["videos"]["cost_cents"], 1234)
         self.assertEqual(overview["publishing"]["mapped"], 1)
+
+    def test_overview_exposes_structured_reliability_windows_and_release_gate(self):
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,cost_cents,created_at,updated_at) "
+            "VALUES('J-METRIC','T-METRIC','可靠性样本','COMPOSED',120,"
+            "CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+        )
+        self.database.commit()
+
+        reliability = self.service.overview()["reliability"]
+
+        self.assertEqual(set(reliability["windows"]), {"7d", "30d"})
+        self.assertEqual(len(reliability["daily"]), 30)
+        self.assertIn(
+            reliability["release_gate"]["status"],
+            {"pass", "freeze", "insufficient_data"},
+        )
+        for window in reliability["windows"].values():
+            self.assertIn("first_round_progression_rate", window)
+            self.assertIn("duplicate_paid_submissions", window)
+            self.assertIn("duration_seconds", window)
+
+    def test_explicit_canary_entry_creates_isolated_storyboard_without_provider_call(self):
+        result = self.service.create_quality_canary({
+            "profile_id": "single-speaker-8s-v1",
+            "confirmed": True,
+            "budget_cents": 2000,
+        })
+
+        row = self.database.execute(
+            "SELECT state,storyboard FROM jobs WHERE job_id=?",
+            (result["job_id"],),
+        ).fetchone()
+        storyboard = json.loads(row["storyboard"])
+        self.assertEqual(row["state"], "STORYBOARDED")
+        self.assertEqual(storyboard["quality_canary"]["launch_mode"], "manual_confirmed")
+        self.assertFalse(storyboard["quality_canary"]["scheduler_allowed"])
+        self.assertTrue(all(
+            character["identity_type"] == "custom"
+            and not character.get("seedance_asset_uri")
+            for character in storyboard["characters"]
+        ))
+        self.assertEqual(
+            self.database.execute("SELECT COUNT(*) FROM provider_calls").fetchone()[0],
+            0,
+        )
 
     def test_video_cover_file_prefers_timeline_continuity_cover(self):
         asset_dir = self.root / "data" / "assets" / "J-COVER"
@@ -254,6 +311,62 @@ class ManagementServiceTests(unittest.TestCase):
             "label": "查看账号处理指引",
         })
 
+    def test_each_nonterminal_video_exposes_exactly_one_allowed_next_action(self):
+        expected = {
+            "PENDING": "view_progress",
+            "STORYBOARDED": "confirm_budget",
+            "PRODUCTION_QUEUED": "view_progress",
+            "PRODUCTION_RUNNING": "view_progress",
+            "ANCHOR_REVIEW_REQUIRED": "review_continuity_anchors",
+            "SHOTS_OK": "resume_local_postproduction",
+            "BGM_OK": "resume_local_postproduction",
+            "COMPOSED": "review_final_video",
+            "READY_TO_PUBLISH": "publish_video",
+            "FAILED": "resume_failed_video",
+            "RECOVERY_REQUIRED": "preserve_and_diagnose",
+        }
+        self.database.executemany(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES(?,?,?,?, '{}')",
+            [
+                (f"J-ACTION-{state}", f"T-{index}", state, state)
+                for index, state in enumerate(expected, 1)
+            ],
+        )
+        self.database.executemany(
+            "INSERT INTO shots(job_id,idx,state,cost_cents) VALUES(?,1,?,0)",
+            [
+                (
+                    f"J-ACTION-{state}",
+                    "OK" if state in {
+                        "SHOTS_OK", "BGM_OK", "COMPOSED", "READY_TO_PUBLISH",
+                    } else "PENDING",
+                )
+                for state in expected
+            ],
+        )
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-ACTION-REJECTED','T-TERMINAL','terminal','REJECTED','{}')"
+        )
+        self.database.commit()
+
+        jobs = {
+            job["state"]: job
+            for job in self.service.videos()["jobs"]
+            if job["job_id"].startswith("J-ACTION-")
+        }
+
+        for state, action_id in expected.items():
+            with self.subTest(state=state):
+                job = jobs[state]
+                self.assertEqual(job["next_action"]["id"], action_id)
+                self.assertEqual(job["allowed_actions"], [job["next_action"]])
+                self.assertEqual(job["status_reason"]["code"], state.lower())
+                self.assertTrue(job["status_reason"]["message"])
+        self.assertIsNone(jobs["REJECTED"]["next_action"])
+        self.assertEqual(jobs["REJECTED"]["allowed_actions"], [])
+
     def test_cost_reconciliation_separates_tracked_calls_from_legacy_total(self):
         self.database.execute(
             "INSERT INTO jobs(job_id,topic_id,title,state,cost_cents) "
@@ -275,6 +388,166 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual(job["tracked_call_cost_cents"], 800)
         self.assertEqual(job["unallocated_cost_cents"], 400)
         self.assertEqual(job["cost_reconciliation_status"], "partial")
+
+    def test_overview_cost_calibration_uses_only_completed_confirmed_snapshots(self):
+        def storyboard(estimate):
+            return json.dumps({
+                "production_settings": {
+                    "confirmed_cost_estimate": {
+                        "projected_total_cost_cents": estimate,
+                        "pricing_version": "seedance25-area-v1",
+                    },
+                },
+            })
+
+        self.database.executemany(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES(?,?,?,?,?,?)",
+            [
+                ("J-CAL-1", "T-1", "under", "COMPOSED", storyboard(1000), 900),
+                ("J-CAL-2", "T-2", "over", "READY_TO_PUBLISH", storyboard(1000), 1100),
+                ("J-CAL-3", "T-3", "drift", "PUBLISHED", storyboard(2000), 2400),
+                ("J-CAL-ACTIVE", "T-4", "active", "STORYBOARDED", storyboard(5000), 0),
+                ("J-CAL-LEGACY", "T-5", "legacy", "COMPOSED", "{}", 500),
+            ],
+        )
+        self.database.commit()
+
+        calibration = self.service.overview()["videos"]["cost_estimation"]
+
+        self.assertEqual(calibration, {
+            "sample_count": 3,
+            "estimated_cost_cents": 4000,
+            "actual_cost_cents": 4400,
+            "variance_cents": 400,
+            "variance_percent": 10.0,
+            "mean_absolute_percentage_error": 13.3,
+            "status": "drift",
+            "pricing_versions": ["seedance25-area-v1"],
+            "segments": {
+                "resolution": [],
+                "duration_bucket": [],
+                "reference_type": [],
+            },
+        })
+
+    def test_overview_cost_calibration_marks_small_samples_as_calibrating(self):
+        storyboard = json.dumps({
+            "production_settings": {
+                "confirmed_cost_estimate": {
+                    "projected_total_cost_cents": 1224,
+                    "pricing_version": "seedance25-area-v1",
+                },
+            },
+        })
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-CAL-ONE','T-1','one','COMPOSED',?,1216)",
+            (storyboard,),
+        )
+        self.database.commit()
+
+        calibration = self.service.overview()["videos"]["cost_estimation"]
+
+        self.assertEqual(calibration["sample_count"], 1)
+        self.assertEqual(calibration["status"], "calibrating")
+        self.assertEqual(calibration["variance_percent"], -0.7)
+        self.assertEqual(calibration["mean_absolute_percentage_error"], 0.7)
+
+    def test_overview_cost_calibration_ignores_malformed_estimate_snapshots(self):
+        malformed_snapshots = [
+            "not-json",
+            json.dumps({"production_settings": {"confirmed_cost_estimate": "bad"}}),
+            json.dumps({
+                "production_settings": {
+                    "confirmed_cost_estimate": {
+                        "projected_total_cost_cents": "not-a-number",
+                        "pricing_version": "seedance25-area-v1",
+                    },
+                },
+            }),
+            json.dumps({
+                "production_settings": {
+                    "confirmed_cost_estimate": {
+                        "projected_total_cost_cents": 0,
+                        "pricing_version": "seedance25-area-v1",
+                    },
+                },
+            }),
+        ]
+        self.database.executemany(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES(?,?,?,?,?,?)",
+            [
+                (f"J-CAL-BAD-{idx}", f"T-{idx}", "bad", "COMPOSED", snapshot, 100)
+                for idx, snapshot in enumerate(malformed_snapshots)
+            ],
+        )
+        self.database.commit()
+
+        calibration = self.service.overview()["videos"]["cost_estimation"]
+
+        self.assertEqual(calibration["sample_count"], 0)
+        self.assertEqual(calibration["status"], "no_data")
+        self.assertIsNone(calibration["variance_percent"])
+        self.assertIsNone(calibration["mean_absolute_percentage_error"])
+
+    def test_overview_cost_calibration_groups_completed_paid_masters(self):
+        def storyboard(job_masters):
+            return json.dumps({
+                "production_settings": {
+                    "confirmed_cost_estimate": {
+                        "projected_total_cost_cents": sum(
+                            item["estimated_cost_cents"] for item in job_masters
+                        ),
+                        "pricing_version": "seedance25-area-v1",
+                        "paid_masters": job_masters,
+                    },
+                },
+            })
+
+        self.database.executemany(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES(?,?,?,?,?,?)",
+            [
+                ("J-SEG-1", "T-1", "one", "COMPOSED", storyboard([{
+                    "master_idx": 1, "resolution": "720p",
+                    "duration_bucket": "4-12s", "reference_type": "image",
+                    "estimated_cost_cents": 1000,
+                }]), 1100),
+                ("J-SEG-2", "T-2", "two", "PUBLISHED", storyboard([{
+                    "master_idx": 2, "resolution": "720p",
+                    "duration_bucket": "13-24s", "reference_type": "video",
+                    "estimated_cost_cents": 2000,
+                }]), 1800),
+            ],
+        )
+        self.database.executemany(
+            "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,"
+            "cost_cents,usage_json) VALUES(?,?,?,?,?,?,?)",
+            [
+                ("CALL-SEG-1", "J-SEG-1", 1, "seedance", "generate", 1100, "{}"),
+                ("CALL-SEG-2", "J-SEG-2", 2, "seedance", "generate", 1800, "{}"),
+            ],
+        )
+        self.database.commit()
+
+        segments = self.service.overview()["videos"]["cost_estimation"]["segments"]
+
+        self.assertEqual(segments["resolution"], [{
+            "key": "720p", "sample_count": 2,
+            "estimated_cost_cents": 3000, "actual_cost_cents": 2900,
+            "variance_cents": -100, "variance_percent": -3.3,
+            "mean_absolute_percentage_error": 10.0, "status": "calibrating",
+        }])
+        self.assertEqual(
+            [item["key"] for item in segments["duration_bucket"]],
+            ["4-12s", "13-24s"],
+        )
+        self.assertEqual(
+            [item["key"] for item in segments["reference_type"]],
+            ["image", "video"],
+        )
 
     def test_content_stage_placeholder_is_not_a_video_task(self):
         self.database.execute(
@@ -1252,6 +1525,92 @@ class ManagementServiceTests(unittest.TestCase):
         )
         self.assertEqual(self.service.videos()["jobs"][0]["preflight"]["budget_cents"], 1800)
 
+    def test_generation_snapshot_keeps_preflight_stable_after_global_config_changes(self):
+        self.root.joinpath(".env").write_text(
+            "ARK_API_KEY=secret-value\n"
+            "ARK_VIDEO_PRIMARY_MODEL=doubao-seedance-2-5-260628\n"
+            "ARK_VIDEO_RESOLUTION=1080p\n"
+            "ARK_VIDEO_OUTPUT_FORMAT=mp4\n"
+            "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET=4\n"
+            "SEEDANCE_MAX_CONCURRENT_MASTERS=2\n"
+            "SEEDANCE_AUTO_RETRY_BUDGET_CENTS=900\n"
+            "SEEDANCE_MAX_AUTO_RETRIES=1\n",
+            encoding="utf-8",
+        )
+        storyboard = {
+            "production_mode": "native_master_local_director",
+            "masters": [{
+                "idx": 1, "type": "broll", "duration": 4,
+                "scene": "night equipment yard", "asset_tags": [],
+            }],
+            "characters": [],
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-SNAPSHOT','T-SNAPSHOT','snapshot','STORYBOARDED',?)",
+            (json.dumps(storyboard),),
+        )
+        self.database.commit()
+
+        configured = self.service.configure_video("J-SNAPSHOT", {
+            "character_mappings": {}, "orientation": "9:16",
+            "production_profile": "standard", "subtitle_style": "clean",
+            "audio_mode": "seedance_native", "asr_enabled": True,
+            "budget_cents": 5000,
+        })
+        snapshot = configured["production_settings"][
+            production_config.GENERATION_SNAPSHOT_KEY
+        ]
+        self.assertEqual(configured["master_dependency_graph"]["waves"], [[1]])
+        self.assertEqual(snapshot, {
+            "version": 1,
+            "model": "doubao-seedance-2-5-260628",
+            "resolution": "1080p",
+            "output_format": "mp4",
+            "ratio": "9:16",
+            "audio_mode": "seedance_native",
+            "reference_video_budget": 4,
+            "max_concurrent_masters": 2,
+            "qa_enabled": True,
+            "max_auto_retries": 1,
+            "auto_retry_budget_cents": 900,
+            "job_budget_cents": 5000,
+        })
+
+        self.root.joinpath(".env").write_text(
+            "ARK_API_KEY=secret-value\n"
+            "ARK_VIDEO_RESOLUTION=480p\n"
+            "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET=1\n"
+            "SEEDANCE_MAX_CONCURRENT_MASTERS=1\n",
+            encoding="utf-8",
+        )
+        job = next(
+            item for item in self.service.videos()["jobs"]
+            if item["job_id"] == "J-SNAPSHOT"
+        )
+        self.assertEqual(job["preflight"]["generation_snapshot"], snapshot)
+        self.assertEqual(
+            job["preflight"]["paid_masters"][0]["estimated_cost_cents"],
+            1376,
+        )
+
+    def test_generation_snapshot_rejects_mov_until_managed_conversion_exists(self):
+        with self.assertRaisesRegex(ValueError, "managed pipeline only supports mp4"):
+            production_config.freeze_generation_snapshot({
+                "output_format": "mov",
+            })
+
+    def test_generation_snapshot_rejects_explicit_nonpositive_limits(self):
+        cases = (
+            ("reference_video_budget", 0),
+            ("max_concurrent_masters", 0),
+            ("budget_cents", 0),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "must be positive"):
+                    production_config.freeze_generation_snapshot({field: value})
+
     def test_anchor_generators_are_snapshotted_per_video_job(self):
         storyboard = {
             "characters": [{
@@ -1309,9 +1668,9 @@ class ManagementServiceTests(unittest.TestCase):
             video["scene_anchor_plan"][0]["generator"], "seedance_2_5"
         )
         self.assertEqual(
-            video["preflight"]["identity_anchor_cost_cents"], 408
+            video["preflight"]["identity_anchor_cost_cents"], 612
         )
-        self.assertEqual(video["preflight"]["scene_anchor_cost_cents"], 408)
+        self.assertEqual(video["preflight"]["scene_anchor_cost_cents"], 612)
 
     def test_anchor_generator_rejects_unknown_value(self):
         self.database.execute(
@@ -1334,7 +1693,7 @@ class ManagementServiceTests(unittest.TestCase):
         fields = {field["key"]: field for field in config["fields"]}
 
         for key in ("CHARACTER_ANCHOR_GENERATOR", "SCENE_ANCHOR_GENERATOR"):
-            self.assertEqual(fields[key]["value"], "seedream_5_0")
+            self.assertEqual(fields[key]["value"], "seedance_2_5")
             self.assertEqual(
                 [option["value"] for option in fields[key]["options"]],
                 ["seedream_5_0", "seedance_2_5"],
@@ -1490,12 +1849,12 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual(len(makeup), 2)
         ai_makeup = next(
             item for item in makeup
-            if item["source"] == "seedream_identity_image"
+            if item["source"] == "seedance_identity_anchor"
         )
         self.assertEqual(ai_makeup["status"], "pending")
-        self.assertEqual(ai_makeup["estimated_cost_cents"], 29)
+        self.assertEqual(ai_makeup["estimated_cost_cents"], 612)
         self.assertEqual(video["preflight"]["paid_identity_anchor_count"], 1)
-        self.assertEqual(video["preflight"]["identity_anchor_cost_cents"], 29)
+        self.assertEqual(video["preflight"]["identity_anchor_cost_cents"], 612)
 
     def test_single_dialogue_master_keeps_every_structured_speaker_on_configure(self):
         self.database.execute(
@@ -1742,6 +2101,43 @@ class ManagementServiceTests(unittest.TestCase):
             ),
             preview,
         )
+
+    def test_video_exposes_project_site_anchor_scope(self):
+        storyboard = {
+            "characters": [],
+            "masters": [
+                {
+                    "idx": 1, "type": "dialogue", "duration": 4,
+                    "scene_anchor_key": "loading-yard-night",
+                    "site_anchor_key": "coastal-factory-site",
+                    "site_anchor_description": "沿海城市工厂项目现场",
+                },
+                {
+                    "idx": 2, "type": "dialogue", "duration": 4,
+                    "scene_anchor_key": "production-line-evening",
+                    "site_anchor_key": "coastal-factory-site",
+                    "site_anchor_description": "沿海城市工厂项目现场",
+                },
+            ],
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES(?,?,?,?,?)",
+            ("J-SITE-UI", "T-SITE-UI", "项目现场锚点", "STORYBOARDED",
+             json.dumps(storyboard, ensure_ascii=False)),
+        )
+        self.database.commit()
+
+        video = next(
+            item for item in self.service.videos()["jobs"]
+            if item["job_id"] == "J-SITE-UI"
+        )
+        anchor = video["scene_anchor_plan"][0]
+
+        self.assertEqual(anchor["anchor_key"], "coastal-factory-site")
+        self.assertEqual(anchor["anchor_scope"], "site")
+        self.assertEqual(anchor["master_indexes"], [1, 2])
+        self.assertEqual(anchor["blocking_anchor"], {})
 
     def test_approve_continuity_anchors_queues_job_after_every_anchor_is_ready(self):
         self.database.execute(
@@ -2154,9 +2550,13 @@ class ManagementServiceTests(unittest.TestCase):
             (json.dumps(storyboard, ensure_ascii=False),),
         )
         self.database.execute(
-            "INSERT INTO shots(job_id,idx,duration_sec,state,provider,cost_cents,video_path) "
-            "VALUES('J-LIP',3,20,'OK','seedance',1600,?)",
-            (str(master_path),),
+            "INSERT INTO shots(job_id,idx,duration_sec,state,provider,cost_cents,"
+            "video_path,video_qa) "
+            "VALUES('J-LIP',3,20,'OK','seedance',1600,?,?)",
+            (
+                str(master_path),
+                json.dumps({"reasons": ["lip_sync_mismatch"]}),
+            ),
         )
         self.database.commit()
 
@@ -2165,6 +2565,15 @@ class ManagementServiceTests(unittest.TestCase):
             if job["job_id"] == "J-LIP"
         )
         self.assertTrue(visible_job["shots"][0]["lip_sync_repair_eligible"])
+        self.assertEqual(
+            visible_job["shots"][0]["lip_sync_repair_suggestion"],
+            {
+                "start_sec": 3.0,
+                "end_sec": 15.0,
+                "dialogue": "我选一台二十八米级曲臂高空作业平台",
+                "reason": "自动根据字幕时间轴定位口型偏差区间",
+            },
+        )
 
         result = self.service.prepare_master_lip_sync_repair(
             "J-LIP", 3, start_sec=3, end_sec=15,
@@ -2203,6 +2612,63 @@ class ManagementServiceTests(unittest.TestCase):
         )
         self.assertEqual(edit["speech_timeline_version"], 2)
         self.assertEqual(edit["subtitle_cues"][0]["start"], 3.0)
+
+    def test_master_extension_preserves_prior_and_queues_managed_mov_candidate(self):
+        asset_root = self.root / "data" / "assets" / "J-EXTEND" / "shots"
+        asset_root.mkdir(parents=True)
+        master_path = asset_root / "02.mp4"
+        master_path.write_bytes(b"prior-master")
+        storyboard = {
+            "masters": [{
+                "idx": 2, "type": "broll", "duration": 18,
+                "scene": "暴雨抢修现场", "action": "工程师走向控制台",
+            }],
+            "shots": [],
+            "production_settings": {"budget_cents": 5000},
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-EXTEND','T-1','母片延长','COMPOSED',?,900)",
+            (json.dumps(storyboard, ensure_ascii=False),),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,duration_sec,state,provider,cost_cents,"
+            "video_path) VALUES('J-EXTEND',2,18,'OK','seedance',700,?)",
+            (str(master_path),),
+        )
+        self.database.commit()
+
+        visible = next(
+            job for job in self.service.videos()["jobs"]
+            if job["job_id"] == "J-EXTEND"
+        )
+        self.assertTrue(visible["shots"][0]["extension_eligible"])
+
+        result = self.service.prepare_master_extension(
+            "J-EXTEND", 2, extension_sec=8,
+            direction="镜头继续跟随工程师走向控制台并自然收束",
+        )
+
+        job = self.database.execute(
+            "SELECT state,storyboard,cost_cents FROM jobs WHERE job_id='J-EXTEND'"
+        ).fetchone()
+        shot = self.database.execute(
+            "SELECT state,video_path,cost_cents FROM shots "
+            "WHERE job_id='J-EXTEND' AND idx=2"
+        ).fetchone()
+        master = json.loads(job["storyboard"])["masters"][0]
+        self.assertEqual(result["repair_kind"], "seedance_extend")
+        self.assertEqual(job["state"], "STORYBOARDED")
+        self.assertEqual(job["cost_cents"], 900)
+        self.assertEqual(shot["state"], "PENDING")
+        self.assertEqual(shot["video_path"], str(master_path))
+        self.assertEqual(shot["cost_cents"], 700)
+        self.assertEqual(master["repair_mode"], "seedance_extend")
+        self.assertEqual(master["extend_duration_sec"], 8.0)
+        self.assertIn("自然收束", master["extend_direction"])
+        self.assertEqual(
+            Path(master["repair_source_path"]).resolve(), master_path.resolve()
+        )
 
     def test_failed_job_can_rebuild_safe_director_plan_without_losing_cost_history(self):
         self._insert_editable_content(approved=True, script_approved=True)
@@ -2409,6 +2875,48 @@ class ManagementServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "确认"):
             self.service.start_video_job("J-READY", confirmed=False)
 
+    def test_high_risk_long_master_requires_separate_confirmation(self):
+        storyboard = {
+            "production_settings": {"budget_cents": 10000},
+            "masters": [{
+                "idx": 1,
+                "type": "broll",
+                "duration": 26,
+                "dialogue_blocks": [
+                    {"speaker": "a", "text": "先断电"},
+                    {"speaker": "b", "text": "收到"},
+                    {"speaker": "c", "text": "开始救援"},
+                ],
+                "performance_beats": ["奔跑", "拉闸", "攀爬", "固定", "回望"],
+                "scene_change_markers": ["楼顶", "吊篮"],
+            }],
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-RISK','T-1','risk','STORYBOARDED',?)",
+            (json.dumps(storyboard),),
+        )
+        self.database.commit()
+
+        with mock.patch(
+            "factory.production_planner.seedance.estimate_cost_cents",
+            return_value=900,
+        ), mock.patch.object(
+            self.service, "dispatch_production_queue",
+            return_value={"dispatched_jobs": []},
+        ) as dispatch:
+            view = self.service.videos()["jobs"][0]
+            with self.assertRaisesRegex(ValueError, "高风险"):
+                self.service.start_video_job("J-RISK", confirmed=True)
+            result = self.service.start_video_job(
+                "J-RISK", confirmed=True, high_risk_confirmed=True
+            )
+
+        self.assertTrue(view["preflight"]["requires_long_master_confirmation"])
+        self.assertEqual(view["preflight"]["high_risk_master_indexes"], [1])
+        self.assertEqual(result["status"], "queued")
+        dispatch.assert_called_once()
+
     def test_storyboarded_video_exposes_side_effect_free_cost_preflight(self):
         (self.root / ".env").write_text(
             "ARK_API_KEY=secret-value\n"
@@ -2514,6 +3022,70 @@ class ManagementServiceTests(unittest.TestCase):
             json.loads(row["storyboard"])["production_settings"]["budget_cents"],
             900,
         )
+        confirmed = json.loads(row["storyboard"])["production_settings"][
+            "confirmed_cost_estimate"
+        ]
+        self.assertEqual(confirmed["estimated_additional_cost_cents"], 900)
+        self.assertEqual(confirmed["projected_total_cost_cents"], 900)
+        self.assertEqual(confirmed["current_cost_cents"], 0)
+        self.assertEqual(confirmed["budget_cents"], 900)
+        self.assertEqual(confirmed["pricing_version"], "seedance25-area-v1")
+
+    def test_completed_video_exposes_confirmed_cost_variance_without_reestimating(self):
+        storyboard = {
+            "production_settings": {
+                "budget_cents": 2500,
+                "confirmed_cost_estimate": {
+                    "estimated_additional_cost_cents": 1224,
+                    "projected_total_cost_cents": 1224,
+                    "current_cost_cents": 0,
+                    "budget_cents": 2500,
+                    "pricing_version": "seedance25-area-v1",
+                },
+            },
+            "masters": [{"idx": 1, "type": "dialogue", "duration": 8}],
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-COST-OBS','T-1','cost observed','COMPOSED',?,1216)",
+            (json.dumps(storyboard),),
+        )
+        self.database.commit()
+
+        with mock.patch(
+            "factory.production_planner.analyze_storyboard",
+            side_effect=AssertionError("completed jobs must not be re-estimated"),
+        ):
+            job = next(
+                item for item in self.service.videos()["jobs"]
+                if item["job_id"] == "J-COST-OBS"
+            )
+
+        self.assertEqual(job["cost_observation"], {
+            "estimated_cost_cents": 1224,
+            "actual_cost_cents": 1216,
+            "variance_cents": -8,
+            "variance_percent": -0.7,
+            "status": "within_estimate",
+            "is_final": True,
+            "pricing_version": "seedance25-area-v1",
+        })
+
+    def test_historical_video_without_confirmed_estimate_is_not_backfilled(self):
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-COST-LEGACY','T-1','legacy','COMPOSED','{}',500)"
+        )
+        self.database.commit()
+
+        job = next(
+            item for item in self.service.videos()["jobs"]
+            if item["job_id"] == "J-COST-LEGACY"
+        )
+
+        self.assertEqual(job["cost_observation"]["status"], "unavailable")
+        self.assertIsNone(job["cost_observation"]["estimated_cost_cents"])
+        self.assertEqual(job["cost_observation"]["actual_cost_cents"], 500)
 
     def test_resume_failed_video_preserves_completed_masters(self):
         self.database.execute(
@@ -3732,7 +4304,10 @@ class ManagementServiceTests(unittest.TestCase):
             "WHERE job_id='J-FIRST-COMPOSE-FAIL'"
         ).fetchone()
         self.assertEqual(job["state"], "FAILED")
-        self.assertIn("ffmpeg failed", job["error"])
+        self.assertEqual(
+            job["error"],
+            "生产过程出现未识别异常，已保留现场，请重新诊断",
+        )
         self.assertEqual(shot["state"], "OK")
         self.assertIsNone(shot["error"])
         self.assertTrue(Path(shot["video_path"]).is_file())
@@ -4296,7 +4871,10 @@ class ManagementServiceTests(unittest.TestCase):
             "SELECT state,error FROM jobs WHERE job_id='J-CANDIDATE-ROLLBACK'"
         ).fetchone()
         self.assertEqual(job["state"], "FAILED")
-        self.assertIn("ffmpeg failed", job["error"])
+        self.assertEqual(
+            job["error"],
+            "生产过程出现未识别异常，已保留现场，请重新诊断",
+        )
         self.assertEqual(shot["state"], "OK")
         self.assertEqual(shot["video_url"], "https://cdn/candidate.mp4")
         self.assertEqual(old_master.read_bytes(), b"candidate-that-failed-compose")
@@ -5640,6 +6218,96 @@ class ManagementServiceTests(unittest.TestCase):
 
         self.assertTrue(job["resumable"])
 
+    def test_request_invalid_identity_anchor_can_be_reset_after_client_fix(self):
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents,"
+            "error,failure_code) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                "J-ANCHOR-PARAM-RETRY", "T-ANCHOR", "anchor parameter retry",
+                "FAILED", "{}", 0, "request invalid", "request_invalid",
+            ),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,state,cost_cents) VALUES(?,?,?,?)",
+            ("J-ANCHOR-PARAM-RETRY", 1, "PENDING", 0),
+        )
+        self.database.execute(
+            "INSERT INTO character_identity_anchors("
+            "job_id,identity_key,character_id,display_name,source_type,state,"
+            "anchor_mode,duration_sec,cost_cents,error) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "J-ANCHOR-PARAM-RETRY", "script:engineer", "engineer",
+                "Engineer", "seedance_identity_anchor", "FAILED",
+                "dynamic_video", 4, 0, "request invalid",
+            ),
+        )
+        self.database.commit()
+
+        job = next(
+            item for item in self.service.videos()["jobs"]
+            if item["job_id"] == "J-ANCHOR-PARAM-RETRY"
+        )
+        self.assertTrue(job["resumable"])
+        self.assertEqual(job["next_action"]["id"], "retry_identity_anchor")
+
+        result = self.service.resume_failed_video("J-ANCHOR-PARAM-RETRY")
+
+        self.assertEqual(result["state"], "STORYBOARDED")
+        anchor = self.database.execute(
+            "SELECT state,error,cost_cents FROM character_identity_anchors "
+            "WHERE job_id='J-ANCHOR-PARAM-RETRY'"
+        ).fetchone()
+        self.assertEqual(anchor[:], ("PENDING", None, 0))
+        persisted = self.database.execute(
+            "SELECT state,error,failure_code,cost_cents FROM jobs "
+            "WHERE job_id='J-ANCHOR-PARAM-RETRY'"
+        ).fetchone()
+        self.assertEqual(persisted[:], ("STORYBOARDED", None, None, 0))
+
+    def test_request_invalid_anchor_with_provider_evidence_stays_fail_closed(self):
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents,"
+            "error,failure_code) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                "J-ANCHOR-PARAM-PAID", "T-ANCHOR", "paid anchor parameter",
+                "FAILED", "{}", 29, "request invalid", "request_invalid",
+            ),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,state,cost_cents) VALUES(?,?,?,?)",
+            ("J-ANCHOR-PARAM-PAID", 1, "PENDING", 0),
+        )
+        self.database.execute(
+            "INSERT INTO character_identity_anchors("
+            "job_id,identity_key,character_id,display_name,source_type,state,"
+            "anchor_mode,duration_sec,cost_cents,error) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "J-ANCHOR-PARAM-PAID", "script:engineer", "engineer",
+                "Engineer", "seedance_identity_anchor", "FAILED",
+                "dynamic_video", 4, 0, "request invalid",
+            ),
+        )
+        self.database.execute(
+            "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,"
+            "cost_cents,usage_json) VALUES(?,?,?,?,?,?,?)",
+            (
+                "remote-anchor-task", "J-ANCHOR-PARAM-PAID", -1001,
+                "seedance_identity", "generate", 29,
+                json.dumps({"status": "completed"}),
+            ),
+        )
+        self.database.commit()
+
+        job = next(
+            item for item in self.service.videos()["jobs"]
+            if item["job_id"] == "J-ANCHOR-PARAM-PAID"
+        )
+        self.assertFalse(job["resumable"])
+        with self.assertRaises(ValueError):
+            self.service.resume_failed_video("J-ANCHOR-PARAM-PAID")
+
     def test_partially_completed_storyboard_is_displayed_as_paused_production(self):
         storyboard = {
             "masters": [
@@ -6086,7 +6754,9 @@ class ManagementServiceTests(unittest.TestCase):
             "SELECT state,error FROM jobs WHERE job_id='J-WORKER-EXIT'"
         ).fetchone()
         self.assertEqual(failed["state"], "FAILED")
-        self.assertIn("worker exited", failed["error"])
+        self.assertEqual(
+            failed["error"], "本地生产进程意外退出，任务现场已保留"
+        )
         self.assertEqual(
             self.database.execute(
                 "SELECT state FROM jobs WHERE job_id='J-WORKER-NEXT'"
@@ -6130,6 +6800,8 @@ class ManagementServiceTests(unittest.TestCase):
                 "queued",
                 "orphaned_recovered",
                 "last_error",
+                "master_capacity",
+                "provider_recovery",
             },
         )
         self.assertFalse(payload["supervisor_alive"])
@@ -6138,6 +6810,101 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual([item["job_id"] for item in payload["queued"]], ["J-HEALTH-QUEUE"])
         self.assertEqual(payload["orphaned_recovered"], 1)
         self.assertEqual(payload["last_error"], "queue db locked")
+        self.assertEqual(payload["master_capacity"]["configured_limit"], 3)
+        self.assertEqual(payload["master_capacity"]["effective_limit"], 3)
+
+    def test_production_health_exposes_learned_master_capacity(self):
+        provider_capacity.status(
+            self.database, "seedance", configured_limit=3
+        )
+        provider_capacity.record_rate_limit(
+            self.database, "seedance", configured_limit=3,
+            cooldown_seconds=0,
+        )
+
+        payload = self.service.production_health(supervisor_alive=True)
+
+        self.assertEqual(payload["master_capacity"]["configured_limit"], 3)
+        self.assertEqual(payload["master_capacity"]["learned_limit"], 2)
+        self.assertEqual(payload["master_capacity"]["effective_limit"], 2)
+        self.assertEqual(
+            payload["master_capacity"]["last_reason"],
+            "definite_rate_limit",
+        )
+
+    def test_provider_reconcile_sweep_is_bounded_get_only_and_continues_after_failure(self):
+        self.database.executemany(
+            "INSERT INTO jobs(job_id,topic_id,title,state) VALUES(?,?,?,?)",
+            [
+                ("J-SWEEP-1", "T-1", "核对一", "PROVIDER_ACTION_REQUIRED"),
+                ("J-SWEEP-2", "T-2", "核对二", "PROVIDER_ACTION_REQUIRED"),
+                ("J-SWEEP-3", "T-3", "核对三", "PROVIDER_ACTION_REQUIRED"),
+            ],
+        )
+        self.database.executemany(
+            "INSERT INTO shots(job_id,idx,state) VALUES(?,1,'FAILED')",
+            [("J-SWEEP-1",), ("J-SWEEP-2",), ("J-SWEEP-3",)],
+        )
+        self.database.executemany(
+            "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,"
+            "usage_json,cost_cents) VALUES(?,?,1,'seedance','generate',?,0)",
+            [
+                ("task-sweep-1", "J-SWEEP-1", json.dumps({"status": "pending"})),
+                ("task-sweep-2", "J-SWEEP-2", json.dumps({"status": "action_required"})),
+                ("task-sweep-3", "J-SWEEP-3", json.dumps({"status": "pending"})),
+            ],
+        )
+        self.database.commit()
+
+        async def inspect(task_id):
+            if task_id == "task-sweep-1":
+                raise RuntimeError("temporary GET failure")
+            return {"status": "running"}
+
+        with mock.patch.object(
+            seedance, "inspect_task", new=mock.AsyncMock(side_effect=inspect)
+        ) as inspect_task, mock.patch.object(
+            seedance, "text_to_video", new=mock.AsyncMock()
+        ) as submit:
+            report = self.service.reconcile_provider_tasks(limit=2)
+
+        self.assertEqual(report["checked"], 2)
+        self.assertEqual(report["failed"], 1)
+        self.assertEqual(report["pending"], 1)
+        self.assertEqual(report["completed"], 0)
+        self.assertEqual(inspect_task.await_count, 2)
+        self.assertEqual(submit.await_count, 0)
+        self.assertEqual(
+            [item["task_id"] for item in report["items"]],
+            ["task-sweep-1", "task-sweep-2"],
+        )
+
+    def test_provider_reconcile_sweeper_thread_stops_cleanly(self):
+        service = mock.Mock()
+        stop = threading.Event()
+        service.reconcile_provider_tasks.side_effect = lambda limit: stop.set()
+
+        run_provider_reconcile_sweeper(
+            service, threading.RLock(), stop, interval_sec=0, limit=7
+        )
+
+        service.reconcile_provider_tasks.assert_called_once_with(limit=7)
+
+    def test_production_health_exposes_last_provider_reconcile_sweep(self):
+        self.service._last_provider_sweep = {
+            "last_sweep_at": "2026-08-20T01:02:03Z",
+            "checked": 3,
+            "completed": 1,
+            "pending": 1,
+            "failed": 1,
+            "skipped": 0,
+            "items": [],
+        }
+
+        payload = self.service.production_health(supervisor_alive=True)
+
+        self.assertEqual(payload["provider_recovery"]["checked"], 3)
+        self.assertEqual(payload["provider_recovery"]["completed"], 1)
 
     def test_queued_or_running_video_cannot_be_deleted(self):
         for state in ("PRODUCTION_QUEUED", "PRODUCTION_RUNNING"):
@@ -7673,6 +8440,26 @@ class ManagementServiceTests(unittest.TestCase):
 
 
 class ManagementUiContractTests(unittest.TestCase):
+    def test_video_drawer_consumes_backend_next_action_as_its_only_primary_action(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "const videoNextActionLabel=job=>job.next_action?.label||'查看任务详情'",
+            js,
+        )
+        self.assertIn('id="drawer-next-action"', js)
+        self.assertIn("function runVideoNextAction(job)", js)
+        self.assertIn("action==='configure_music_provider'", js)
+        self.assertIn("pendingMusicResumeJobId", js)
+        self.assertIn("音乐配置已生效，本地成片已完成", js)
+        self.assertNotIn('id="drawer-resume-video"', js)
+        self.assertNotIn('id="drawer-produce"', js)
+        self.assertNotIn('id="drawer-review-approve"', js)
+        self.assertNotIn('id="drawer-submit-publish"', js)
+        self.assertNotIn('id="drawer-business-pause-action"', js)
+
     def test_ui_exposes_seedance_lip_sync_repair_without_sacrificing_performance(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
@@ -7686,6 +8473,56 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("保留原生语音、人物表演和镜头运动", js)
         self.assertIn("repair_start_sec", js)
         self.assertIn("repair_end_sec", js)
+        self.assertIn("lip_sync_repair_suggestion", js)
+        self.assertIn("AI 建议区间", js)
+        self.assertIn("suggestion.start_sec", js)
+        self.assertIn("suggestion.end_sec", js)
+
+    def test_ui_exposes_managed_master_extension_as_review_candidate(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("extension_eligible", js)
+        self.assertIn("data-extend-master", js)
+        self.assertIn("confirmMasterExtension", js)
+        self.assertIn("/extend", js)
+        self.assertIn("延长 4–30 秒", js)
+        self.assertIn("原母片保持不变", js)
+        self.assertIn("extension_sec", js)
+        self.assertIn("direction", js)
+
+    def test_ui_exposes_configured_and_learned_master_capacity(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("master_capacity", js)
+        self.assertIn("effective_limit", js)
+        self.assertIn("configured_limit", js)
+        self.assertIn("母片并发", js)
+        self.assertIn("限流后自动降档", js)
+
+    def test_ui_exposes_get_only_provider_recovery_status_and_manual_sweep(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("provider_recovery", js)
+        self.assertIn("/api/production/reconcile", js)
+        self.assertIn("run-provider-reconcile", js)
+        self.assertIn("checked", js)
+        self.assertIn("pending", js)
+
+    def test_ui_requires_explicit_confirmation_for_high_risk_long_masters(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("requires_long_master_confirmation", js)
+        self.assertIn("high-risk-master-confirm", js)
+        self.assertIn("high_risk_confirmed", js)
+        self.assertIn("长母片质量风险", js)
 
     def test_optimized_non_concurrency_controls_are_exposed_inline(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -7704,6 +8541,15 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("1–24 张", js)
         self.assertNotIn("建议总时长需在 15–72 秒之间", js)
         self.assertNotIn("建议分镜数需在 4–8 个之间", js)
+    def test_preflight_exposes_the_frozen_master_dependency_plan(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("master_dependency_graph", js)
+        self.assertIn("母片依赖调度", js)
+        self.assertIn("并发波次", js)
+
     def test_non_reconcilable_provider_task_has_no_posting_button(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
@@ -7754,19 +8600,13 @@ class ManagementUiContractTests(unittest.TestCase):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )
-
-        self.assertIn("PRODUCTION_REVIEW_REQUIRED:'母片待复核'", js)
-        self.assertIn("PROVIDER_ACTION_REQUIRED:'模型账号待处理'", js)
-        self.assertIn("预览并处理候选母片", js)
-        self.assertIn("查看账号处理指引", js)
+        self.assertIn("review_master_candidates", js)
+        self.assertIn("view_provider_account_guide", js)
+        self.assertIn("filter==='REVIEW_REQUIRED'?jobNeedsManualReview(job)", js)
+        self.assertIn("job.state==='PRODUCTION_REVIEW_REQUIRED'", js)
         self.assertIn(
-            "filter==='REVIEW_REQUIRED'?jobNeedsManualReview(job)", js
-        )
-        self.assertIn(
-            "job.state==='PRODUCTION_REVIEW_REQUIRED'", js
-        )
-        self.assertIn(
-            "const exceptionalVideoStates=new Set(['FAILED','BLOCKED','REJECTED'])", js
+            "const exceptionalVideoStates=new Set(['FAILED','BLOCKED','REJECTED'])",
+            js,
         )
         active_line = next(
             line for line in js.splitlines()
@@ -7792,9 +8632,8 @@ class ManagementUiContractTests(unittest.TestCase):
         server = (ROOT / "scripts" / "management_server.py").read_text(
             encoding="utf-8"
         )
-
         for capability in (
-            "ANCHOR_REVIEW_REQUIRED", "锚点待确认", "确认锚点并继续生成",
+            "ANCHOR_REVIEW_REQUIRED", "review_continuity_anchors",
             "/anchors/approve", "approval_state",
         ):
             self.assertIn(capability, js)
@@ -7814,10 +8653,13 @@ class ManagementUiContractTests(unittest.TestCase):
         for capability in (
             "sceneAnchorCards", "场景连续性锚点", "关联母片",
             "scene_anchor_plan", "paid_scene_anchor_count",
-            "本任务没有跨母片重复的核心空间",
+            "本任务没有跨母片重复的同一物理场景",
+            "人物一致性仍由角色定妆锚点保障",
+            "项目现场连续性锚点",
             "固定站位",
         ):
             self.assertIn(capability, js)
+        self.assertNotIn("本任务没有跨母片重复的核心空间", js)
         self.assertGreaterEqual(js.count("sceneAnchorCards(job)"), 2)
         self.assertIn("scene-anchor-card", css)
         self.assertIn("scene-blocking-stage", js)
@@ -7840,6 +8682,12 @@ class ManagementUiContractTests(unittest.TestCase):
             "character_anchor_generator", "scene_anchor_generator",
         ):
             self.assertIn(capability, js)
+        self.assertIn(
+            "configValue('CHARACTER_ANCHOR_GENERATOR')||'seedance_2_5'", js
+        )
+        self.assertIn(
+            "configValue('SCENE_ANCHOR_GENERATOR')||'seedance_2_5'", js
+        )
 
     def test_reference_attention_budget_is_visible_in_configuration(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -8320,11 +9168,8 @@ class ManagementUiContractTests(unittest.TestCase):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )
-
-        self.assertIn(
-            "job.next_action?.label||'继续生成剩余母片'",
-            js,
-        )
+        self.assertIn('id="drawer-next-action"', js)
+        self.assertIn("function runVideoNextAction(job)", js)
 
     def test_partial_production_is_in_progress_and_resumes_without_reconfiguration(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -8672,6 +9517,33 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertNotIn("command-panel", html)
         self.assertNotIn("Ctrl+K", html)
         self.assertNotIn('id="quick-create"', html)
+
+    def test_video_drawer_exposes_confirmed_actual_and_variance_costs(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("确认预估", js)
+        self.assertIn("实际累计", js)
+        self.assertIn("成本偏差", js)
+        self.assertIn("历史任务未保存确认预估", js)
+        self.assertIn("job.cost_observation", js)
+
+    def test_overview_exposes_cost_estimation_calibration_without_auto_repricing(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("o.videos.cost_estimation", js)
+        self.assertIn("估算样本", js)
+        self.assertIn("总体偏差", js)
+        self.assertIn("平均绝对偏差", js)
+        self.assertIn("样本不足，仅积累数据", js)
+        self.assertIn("分辨率校准", js)
+        self.assertIn("时长校准", js)
+        self.assertIn("参考素材校准", js)
+        self.assertIn("calibration.segments", js)
+        self.assertNotIn("autoReprice", js)
 
     def test_unified_todo_no_longer_consumes_project_workbench_space(self):
         ui_root = ROOT / "scripts" / "management_ui"
@@ -9211,6 +10083,31 @@ class ManagementMediaServerTests(unittest.TestCase):
         self.assertTrue(payload["supervisor_alive"])
         service.production_health.assert_called_once_with(supervisor_alive=True)
 
+    def test_manual_provider_reconcile_endpoint_is_bounded(self):
+        service = mock.Mock()
+        service.reconcile_provider_tasks.return_value = {
+            "checked": 4, "completed": 2, "pending": 2, "failed": 0,
+        }
+        ConsoleHandler.service = service
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            response = request.urlopen(request.Request(
+                f"http://127.0.0.1:{server.server_port}/api/production/reconcile",
+                data=json.dumps({"limit": 4}).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            ))
+            payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(payload["checked"], 4)
+        service.reconcile_provider_tasks.assert_called_once_with(limit=4)
+
     def test_performance_snapshot_endpoint_delegates_to_publication_service(self):
         service = mock.Mock()
         service.record_performance_snapshot.return_value = {
@@ -9344,6 +10241,42 @@ class ManagementMediaServerTests(unittest.TestCase):
         service.prepare_master_lip_sync_repair.assert_called_once_with(
             "J-LIP", 3, start_sec=3.0, end_sec=15.0,
             reason="林夏嘴型比原生语音慢",
+        )
+
+    def test_master_extension_endpoint_delegates_duration_and_direction(self):
+        service = mock.Mock()
+        service.prepare_master_extension.return_value = {
+            "job_id": "J-EXTEND", "master_idx": 2,
+            "repair_kind": "seedance_extend", "state": "STORYBOARDED",
+        }
+        ConsoleHandler.service = service
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = (
+                f"http://127.0.0.1:{server.server_port}"
+                "/api/videos/J-EXTEND/masters/2/extend"
+            )
+            response = request.urlopen(request.Request(
+                url,
+                data=json.dumps({
+                    "extension_sec": 8,
+                    "direction": "继续跟随工程师走向控制台",
+                }).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            ))
+            payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(payload["repair_kind"], "seedance_extend")
+        service.prepare_master_extension.assert_called_once_with(
+            "J-EXTEND", 2, extension_sec=8.0,
+            direction="继续跟随工程师走向控制台",
         )
 
     def test_master_candidate_preview_endpoint_streams_review_video(self):

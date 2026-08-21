@@ -16,6 +16,8 @@ from xml.etree import ElementTree
 
 import httpx
 
+from . import script_sources
+
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
@@ -56,11 +58,26 @@ class _PublicFeedConnector:
         headers = {"User-Agent": "OB-AI-VIDEO/1.0 public-feed-collector"}
         if cursor:
             headers["If-None-Match"] = cursor
-        if self._client is not None:
-            response = self._client.get(self.endpoint, headers=headers)
-        else:
-            with httpx.Client(timeout=20, follow_redirects=True) as client:
-                response = client.get(self.endpoint, headers=headers)
+        current_url = script_sources.validate_public_url(self.endpoint)
+        owned_client = self._client is None
+        client = self._client or httpx.Client(
+            timeout=20, follow_redirects=False, trust_env=False
+        )
+        try:
+            for _hop in range(6):
+                script_sources._validate_resolved_host(current_url)
+                response = client.get(current_url, headers=headers)
+                if response.is_redirect:
+                    current_url = script_sources.redirect_target(
+                        current_url, response.headers.get("location", "")
+                    )
+                    continue
+                break
+            else:
+                raise ValueError("source feed has too many redirects")
+        finally:
+            if owned_client:
+                client.close()
         if response.status_code == 304:
             return [], cursor
         response.raise_for_status()

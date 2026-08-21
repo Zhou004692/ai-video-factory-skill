@@ -1,0 +1,23 @@
+{
+  "incident_id": "provider-task-owner-conflict",
+  "kind": "provider_owner",
+  "input": {
+    "original": {
+      "task_id": "task-shared",
+      "job_id": "J-OWNER-A",
+      "shot_idx": 1,
+      "provider": "seedance",
+      "intent": "generate"
+    },
+    "conflict": {
+      "task_id": "task-shared",
+      "job_id": "J-OWNER-B",
+      "shot_idx": 2,
+      "provider": "seedance_identity",
+      "intent": "identity"
+    }
+  },
+  "expected": {
+    "conflict": true
+  }
+}

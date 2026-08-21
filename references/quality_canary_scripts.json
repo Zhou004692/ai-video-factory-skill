@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "model": "doubao-seedance-2-5-260628",
+  "profiles": [
+    {
+      "id": "single-speaker-8s-v1",
+      "duration_sec": 8,
+      "budget_cents": 1500,
+      "max_auto_retries": 0,
+      "requires_explicit_authorization": true,
+      "characters": ["林夏"],
+      "scene": "设备租赁服务中心的明亮接待区，单一连续空间",
+      "script": [
+        {
+          "time": "0-8",
+          "speaker": "林夏",
+          "dialogue": "设备不是租出去就结束，真正的服务，是让客户每一分钟都放心",
+          "performance": "林夏从设备巡检表抬眼看向镜头，自然走近半步，语气坚定，结尾轻点头"
+        }
+      ]
+    },
+    {
+      "id": "two-person-continuous-18s-v1",
+      "duration_sec": 18,
+      "budget_cents": 3000,
+      "max_auto_retries": 0,
+      "requires_explicit_authorization": true,
+      "characters": ["林夏", "周工"],
+      "scene": "同一设备停放场，人物站位、设备和光线连续",
+      "script": [
+        {
+          "time": "0-6",
+          "speaker": "周工",
+          "dialogue": "客户今晚就要开工，这台高空车能准时到吗",
+          "performance": "周工指向待检设备，快步走到林夏身侧"
+        },
+        {
+          "time": "6-13",
+          "speaker": "林夏",
+          "dialogue": "调度、验机和运输已经并行，交付时间提前了四十分钟",
+          "performance": "林夏展示平板上的调度状态，两人并肩向设备移动"
+        },
+        {
+          "time": "13-18",
+          "speaker": "周工",
+          "dialogue": "好，现场等的就是这个确定性",
+          "performance": "周工确认屏幕信息，与林夏对视点头"
+        }
+      ]
+    },
+    {
+      "id": "multi-person-cinematic-26s-v1",
+      "duration_sec": 26,
+      "budget_cents": 4500,
+      "max_auto_retries": 0,
+      "requires_explicit_authorization": true,
+      "characters": ["林夏", "周工", "Malik"],
+      "scene": "暴雨后的沿海工厂抢修现场，连续空间、固定设备方位和人物站位轴线",
+      "script": [
+        {
+          "time": "0-7",
+          "speaker": "Malik",
+          "dialogue": "主塔停机每一分钟，整条产线都在损失",
+          "performance": "Malik穿过积水指向停机区域，远处警示灯闪烁"
+        },
+        {
+          "time": "7-16",
+          "speaker": "林夏",
+          "dialogue": "设备、工程师和备件已经到位，我们按同一套方案同步推进",
+          "performance": "林夏展开现场图，镜头沿图纸推进到真实设备，三人形成稳定三角站位"
+        },
+        {
+          "time": "16-22",
+          "speaker": "周工",
+          "dialogue": "高空平台升起后，我先处理主电缆，再恢复控制系统",
+          "performance": "周工扣紧安全带登上平台，平台平稳升起"
+        },
+        {
+          "time": "22-26",
+          "speaker": "Malik",
+          "dialogue": "这就是我们要的抢修效率",
+          "performance": "设备恢复运转，三人在同一现场回望亮起的产线"
+        }
+      ]
+    }
+  ]
+}

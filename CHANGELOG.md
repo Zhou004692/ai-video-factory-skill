@@ -6,14 +6,18 @@ All notable changes to AI Video Factory are documented here.
 
 ### Added
 
+- Added the automatic topic discovery MVP for authorized RSS, Atom and JSON Feed hotspot/competitor sources, including per-source schedules, cross-feed deduplication, traceable candidate review and conversion into content projects.
 - Added bounded parallel generation for independent Seedance masters while preserving scene, character and continuity dependencies.
 - Added configurable reference-video attention budgets and task-first recovery evidence for paid provider calls.
+- Added cross-platform runtime profiles, external data-directory support, FFmpeg discovery, CJK font discovery and recoverable upgrade snapshots.
 
 ### Changed
 
+- Changed character and recurring-scene anchor defaults to Seedance 2.5 dynamic anchors while keeping Seedream 5.0 as an explicit per-task option.
 - Improved Seedance 2.5 prompts, duration planning, native speech timelines and continuity reference selection around longer cinematic masters.
 - Improved management-console recovery guidance for provider account failures and policy-rejected jobs.
 - Improved subtitle segmentation so captions follow semantic speech phrases instead of splitting words at fixed character counts.
+- Versioned distributable archives and added desktop runtime/storage/media diagnostics without exposing credential values.
 
 ### Fixed
 

@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 import sqlite3
-from . import DATA_DIR
+from . import DATA_DIR, SKILL_ROOT
 
 DDL = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     retries         INTEGER DEFAULT 0,
     production_worker_pid INTEGER,
     production_started_at TIMESTAMP,
+    production_heartbeat_at TEXT,
+    worker_lease_id TEXT,
+    recovery_attempts INTEGER NOT NULL DEFAULT 0,
+    production_spec_json TEXT,
+    production_spec_hash TEXT,
+    production_spec_version INTEGER NOT NULL DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -87,6 +93,31 @@ CREATE TABLE IF NOT EXISTS provider_runtime (
     reason_message TEXT,
     blocked_at     TIMESTAMP,
     cleared_at     TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS job_transitions (
+    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id       TEXT NOT NULL UNIQUE,
+    job_id         TEXT NOT NULL,
+    event          TEXT NOT NULL,
+    from_state     TEXT NOT NULL,
+    to_state       TEXT NOT NULL,
+    payload_json   TEXT NOT NULL DEFAULT '{}',
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_transitions_job
+    ON job_transitions(job_id, transition_id);
+
+CREATE TABLE IF NOT EXISTS provider_capacity (
+    provider         TEXT PRIMARY KEY,
+    configured_limit INTEGER NOT NULL DEFAULT 1,
+    learned_limit    INTEGER NOT NULL DEFAULT 1,
+    success_streak   INTEGER NOT NULL DEFAULT 0,
+    cooldown_until   TEXT,
+    last_reason      TEXT,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS character_asset_bindings (
@@ -558,6 +589,12 @@ def database_path() -> Path:
     override = os.environ.get("FACTORY_DB_PATH", "").strip()
     if override:
         return Path(override).expanduser().resolve()
+    runtime_data = os.environ.get("FACTORY_DATA_DIR", "").strip()
+    if runtime_data:
+        data_dir = Path(runtime_data).expanduser()
+        if not data_dir.is_absolute():
+            data_dir = SKILL_ROOT / data_dir
+        return (data_dir / "factory.db").resolve()
     return Path(_DB_PATH)
 
 
@@ -576,6 +613,12 @@ def conn() -> sqlite3.Connection:
         ("failure_code", "TEXT"),
         ("production_worker_pid", "INTEGER"),
         ("production_started_at", "TIMESTAMP"),
+        ("production_heartbeat_at", "TEXT"),
+        ("worker_lease_id", "TEXT"),
+        ("recovery_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("production_spec_json", "TEXT"),
+        ("production_spec_hash", "TEXT"),
+        ("production_spec_version", "INTEGER NOT NULL DEFAULT 0"),
     ])
     _add_cols_if_missing(db, "character_asset_bindings", [
         ("identity_type", "TEXT NOT NULL DEFAULT 'real_person'"),

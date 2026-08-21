@@ -18,19 +18,374 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 
 from factory import (  # noqa: E402
+    anchor_generation,
     character_assets,
     db,
+    master_dependencies,
     models,
     orchestrator,
+    provider_capacity,
     provider_tasks,
     production_planner,
     prompts,
+    reference_attention,
     scene_assets,
     subtitles,
     video_routing,
 )
 from factory.clients import bigasr, ffmpeg, music, seedance, video_qa  # noqa: E402
 from factory.steps import s1_storyboard, s3_shots, s5_bgm, s6_compose  # noqa: E402
+
+
+_PROVIDER_ENV_KEYS = (
+    "ARK_API_KEY",
+    "VOLC_AK",
+    "VOLC_SK",
+    "TOS_BUCKET",
+    "TOS_ENDPOINT",
+    "SUNO_API_KEY",
+    "DEFAULT_MUSIC_PROVIDER",
+    "CHARACTER_ANCHOR_GENERATOR",
+    "SCENE_ANCHOR_GENERATOR",
+)
+_PROVIDER_ENV_SNAPSHOT: dict[str, str] = {}
+
+
+class AnchorGeneratorDefaultTests(unittest.TestCase):
+    def test_unconfigured_character_and_scene_anchors_default_to_seedance_25(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CHARACTER_ANCHOR_GENERATOR": "",
+                "SCENE_ANCHOR_GENERATOR": "",
+            },
+        ):
+            self.assertEqual(
+                anchor_generation.normalize_generator(None),
+                anchor_generation.SEEDANCE_25,
+            )
+            self.assertEqual(
+                anchor_generation.selected_generator({}, "character"),
+                anchor_generation.SEEDANCE_25,
+            )
+            self.assertEqual(
+                anchor_generation.selected_generator({}, "scene"),
+                anchor_generation.SEEDANCE_25,
+            )
+
+    def test_explicit_seedream_override_remains_supported(self):
+        storyboard = {
+            "production_settings": {
+                "character_anchor_generator": "seedream_5_0",
+                "scene_anchor_generator": "seedream_5_0",
+            }
+        }
+
+        self.assertEqual(
+            anchor_generation.selected_generator(storyboard, "character"),
+            anchor_generation.SEEDREAM_5,
+        )
+        self.assertEqual(
+            anchor_generation.selected_generator(storyboard, "scene"),
+            anchor_generation.SEEDREAM_5,
+        )
+
+
+def setUpModule():
+    """Keep full-suite discovery from importing the user's live .env into tests."""
+    global _PROVIDER_ENV_SNAPSHOT
+    _PROVIDER_ENV_SNAPSHOT = {
+        key: os.environ[key] for key in _PROVIDER_ENV_KEYS if key in os.environ
+    }
+    for key in _PROVIDER_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def tearDownModule():
+    for key in _PROVIDER_ENV_KEYS:
+        os.environ.pop(key, None)
+    os.environ.update(_PROVIDER_ENV_SNAPSHOT)
+
+
+class ReferenceAttentionTests(unittest.TestCase):
+    def test_selector_orders_duties_and_deduplicates_without_reordering(self):
+        manifest = reference_attention.select_manifest([
+            reference_attention.candidate(
+                "https://cdn/voice.wav", kind="audio",
+                duty="voice_continuity", required=False,
+            ),
+            reference_attention.candidate(
+                "https://cdn/support.png", kind="image",
+                duty="supporting_identity", identity_key="support",
+            ),
+            reference_attention.candidate(
+                "https://cdn/scene.mp4", kind="video",
+                duty="scene_continuity", duration_sec=8,
+            ),
+            reference_attention.candidate(
+                "https://cdn/speaker.png", kind="image",
+                duty="speaker_identity", identity_key="speaker",
+            ),
+            reference_attention.candidate(
+                "https://cdn/scene.mp4", kind="video",
+                duty="style_continuity", required=False,
+            ),
+        ], max_video_references=3)
+
+        self.assertEqual(
+            [item["duty"] for item in manifest],
+            [
+                "scene_continuity", "speaker_identity",
+                "supporting_identity", "voice_continuity",
+            ],
+        )
+        self.assertEqual(
+            [item["uri"] for item in manifest].count("https://cdn/scene.mp4"), 1
+        )
+
+    def test_selector_fails_before_paid_call_when_required_video_budget_is_exceeded(self):
+        with self.assertRaisesRegex(ValueError, "参考素材注意力预算.*拆分"):
+            reference_attention.select_manifest([
+                reference_attention.candidate(
+                    f"https://cdn/person-{index}.mp4", kind="video",
+                    duty="supporting_identity", identity_key=str(index),
+                )
+                for index in range(4)
+            ], max_video_references=3)
+
+    def test_dialogue_manifest_compiles_exact_numbered_material_duties(self):
+        speaker = {"id": "speaker", "generation_mode": "ai_generated"}
+        supporting = {"id": "support", "generation_mode": "ai_generated"}
+        identity_anchors = {
+            character_assets.character_identity_key(speaker): s3_shots.DialogueAnchor(
+                image_reference="https://cdn/speaker.png", anchor_mode="static_image"
+            ),
+            character_assets.character_identity_key(supporting): s3_shots.DialogueAnchor(
+                image_reference="https://cdn/support.png", anchor_mode="static_image"
+            ),
+        }
+        request = s3_shots._dialogue_request_kwargs(
+            {"duration_sec": 8}, None,
+            native_voice_anchor=s3_shots.NativeVoiceAnchor(Path("voice.wav")),
+            character=speaker,
+            cast_characters=[supporting],
+            identity_anchors=identity_anchors,
+            scene_video_anchor=s3_shots.DialogueAnchor(
+                video_url="https://cdn/scene.mp4", duration_sec=8
+            ),
+        )
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {"idx": 1, "duration_sec": 8, "voiceover": "开始检查。"},
+            speaker,
+            reference_manifest=request["reference_manifest"],
+        )
+
+        self.assertEqual(
+            [item["duty"] for item in request["reference_manifest"]],
+            [
+                "scene_continuity", "speaker_identity",
+                "supporting_identity", "voice_continuity",
+            ],
+        )
+        self.assertIn("视频1只负责同场景空间连续性", prompt)
+        self.assertIn("图片1只负责主说话人身份", prompt)
+        self.assertIn("图片2只负责同场配角身份", prompt)
+        self.assertIn("音频1只负责声线、语速和情绪连续性", prompt)
+
+    def test_broll_manifest_prioritizes_scene_before_cast_identity(self):
+        supporting = {"id": "support", "generation_mode": "ai_generated"}
+        identity_anchors = {
+            character_assets.character_identity_key(supporting): s3_shots.DialogueAnchor(
+                image_reference="https://cdn/support.png", anchor_mode="static_image"
+            ),
+        }
+
+        request = s3_shots._broll_request_kwargs(
+            {"duration_sec": 8},
+            cast_characters=[supporting],
+            identity_anchors=identity_anchors,
+            scene_reference="https://cdn/scene.png",
+        )
+        prompt = s3_shots._build_broll_video_prompt(
+            {"duration_sec": 8, "scene": "night yard"},
+            reference_manifest=request["reference_manifest"],
+        )
+
+        self.assertEqual(
+            [item["duty"] for item in request["reference_manifest"]],
+            ["scene_continuity", "supporting_identity"],
+        )
+        self.assertIn("图片1只负责同场景空间连续性", prompt)
+        self.assertIn("图片2只负责同场配角身份", prompt)
+
+
+class ProviderCapacityTests(unittest.TestCase):
+    def setUp(self):
+        self.database = sqlite3.connect(":memory:")
+        self.database.row_factory = sqlite3.Row
+        self.database.executescript(db.DDL)
+
+    def tearDown(self):
+        self.database.close()
+
+    def test_configured_limit_is_upper_bound_and_definite_429_halves_capacity(self):
+        initial = provider_capacity.status(
+            self.database, "seedance", configured_limit=4
+        )
+        self.assertEqual(initial["effective_limit"], 4)
+
+        reduced = provider_capacity.record_rate_limit(
+            self.database, "seedance", configured_limit=4
+        )
+
+        self.assertEqual(reduced["learned_limit"], 2)
+        self.assertEqual(reduced["effective_limit"], 2)
+        self.assertEqual(reduced["last_reason"], "definite_rate_limit")
+        with self.assertRaises(provider_capacity.ProviderCapacityCooldownError):
+            provider_capacity.assert_submit_allowed(
+                self.database, "seedance"
+            )
+
+    def test_five_clean_waves_restore_one_slot_without_exceeding_configured_limit(self):
+        provider_capacity.record_rate_limit(
+            self.database, "seedance", configured_limit=4, cooldown_seconds=0
+        )
+        for _ in range(4):
+            status = provider_capacity.record_wave_success(
+                self.database, "seedance", configured_limit=4
+            )
+            self.assertEqual(status["learned_limit"], 2)
+        recovered = provider_capacity.record_wave_success(
+            self.database, "seedance", configured_limit=4
+        )
+        self.assertEqual(recovered["learned_limit"], 3)
+        self.assertEqual(recovered["success_streak"], 0)
+        for _ in range(10):
+            recovered = provider_capacity.record_wave_success(
+                self.database, "seedance", configured_limit=4
+            )
+        self.assertLessEqual(recovered["effective_limit"], 4)
+
+    def test_ambiguous_submission_does_not_change_learned_capacity(self):
+        before = provider_capacity.status(
+            self.database, "seedance", configured_limit=3
+        )
+        after = provider_capacity.record_ambiguous_submission(
+            self.database, "seedance", configured_limit=3
+        )
+        self.assertEqual(after["learned_limit"], before["learned_limit"])
+        self.assertEqual(after["success_streak"], before["success_streak"])
+
+    def test_provider_429_is_a_definite_rate_limit_class(self):
+        response = Mock(
+            status_code=429,
+            text=json.dumps({
+                "error": {
+                    "code": "RateLimitExceeded",
+                    "message": "too many requests",
+                },
+            }),
+        )
+        error = seedance._submission_error(
+            response, endpoint="https://ark/tasks", model="seedance-2-5",
+            content_roles=[],
+        )
+        self.assertIsInstance(error, seedance.SeedanceRateLimitError)
+        self.assertFalse(error.retryable)
+
+    def test_definite_429_blocks_the_next_waiting_submission_before_post(self):
+        asyncio.run(self._assert_429_blocks_next_submission())
+
+    async def _assert_429_blocks_next_submission(self):
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-CAP','T-1','capacity','PRODUCTION_RUNNING',?)",
+            (json.dumps({
+                "production_settings": {"budget_cents": 10000},
+            }),),
+        )
+        self.database.executemany(
+            "INSERT INTO shots(job_id,idx,state) VALUES('J-CAP',?,'GENERATING')",
+            [(1,), (2,)],
+        )
+        self.database.commit()
+        route = video_routing.VideoRoute(
+            model="seedance25", tier="seedance25",
+            generate_audio=False, qa_required=False,
+        )
+        submit = AsyncMock(side_effect=seedance.SeedanceRateLimitError(
+            "definite 429"
+        ))
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            s3_shots.seedance, "text_to_video", new=submit,
+        ):
+            for shot_idx in (1, 2):
+                with self.assertRaises((
+                    seedance.SeedanceRateLimitError,
+                    provider_capacity.ProviderCapacityCooldownError,
+                )):
+                    await s3_shots._generate_seedance_video(
+                        prompt="equipment yard",
+                        route=route,
+                        request_kwargs={"duration": 4, "resolution": "480p"},
+                        out_path=Path(temp) / f"{shot_idx}.mp4",
+                        key_hint=f"capacity-{shot_idx}",
+                        job_id="J-CAP",
+                        shot_idx=shot_idx,
+                        database=self.database,
+                        generation_snapshot={"max_concurrent_masters": 4},
+                    )
+
+        self.assertEqual(submit.await_count, 1)
+
+
+class MasterDependencyGraphTests(unittest.TestCase):
+    def test_graph_exposes_scene_identity_and_explicit_dependencies(self):
+        graph = master_dependencies.build_master_dependency_graph([
+            {
+                "idx": 1, "type": "dialogue", "speaker": "linxia",
+                "scene_anchor_key": "yard",
+                "continuity_contract": {
+                    "characters": [{"identity_key": "identity-linxia"}],
+                },
+            },
+            {
+                "idx": 2, "type": "broll", "scene_anchor_key": "office",
+            },
+            {
+                "idx": 3, "type": "dialogue", "speaker": "linxia",
+                "scene_anchor_key": "yard", "depends_on": [2],
+                "continuity_contract": {
+                    "characters": [{"identity_key": "identity-linxia"}],
+                },
+            },
+        ])
+
+        nodes = {node["idx"]: node for node in graph["nodes"]}
+        self.assertEqual(nodes[1]["depends_on"], [])
+        self.assertEqual(nodes[2]["depends_on"], [])
+        self.assertEqual(nodes[3]["depends_on"], [1, 2])
+        self.assertEqual(
+            nodes[3]["dependency_reasons"],
+            {"1": ["identity:identity-linxia", "scene:yard"], "2": ["explicit"]},
+        )
+        self.assertEqual(graph["waves"], [[1, 2], [3]])
+
+    def test_pending_waves_wait_for_a_manual_review_predecessor(self):
+        graph = master_dependencies.build_master_dependency_graph([
+            {"idx": 1, "type": "broll", "scene_anchor_key": "yard"},
+            {"idx": 2, "type": "broll", "scene_anchor_key": "yard"},
+            {"idx": 3, "type": "broll", "scene_anchor_key": "office"},
+        ])
+
+        ready, blocked = master_dependencies.ready_master_wave(
+            graph,
+            pending_indexes={2, 3},
+            blocked_indexes={1},
+        )
+
+        self.assertEqual(ready, [3])
+        self.assertEqual(blocked, {2: [1]})
 
 
 class _InjectedFinalConnection:
@@ -1027,7 +1382,7 @@ class MusicFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["resolution"], "1080p")
 
-    def test_seedance25_uses_explicit_official_task_type_and_omits_experimental_motion(self):
+    def test_seedance25_pure_text_generation_omits_reference_task_type(self):
         payload = seedance._video_task_payload(
             model="doubao-seedance-2-5-260628",
             content=[{"type": "text", "text": "test"}],
@@ -1041,8 +1396,31 @@ class MusicFallbackTests(unittest.IsolatedAsyncioTestCase):
             generate_audio=True,
         )
 
-        self.assertEqual(payload["omni_reference_task_type"], "auto")
+        self.assertNotIn("omni_reference_task_type", payload)
         self.assertNotIn("motion_strength", payload)
+
+    def test_seedance25_reference_generation_uses_auto_reference_task_type(self):
+        payload = seedance._video_task_payload(
+            model="doubao-seedance-2-5-260628",
+            content=[
+                {"type": "text", "text": "test"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "asset://character-1"},
+                    "role": "reference_image",
+                },
+            ],
+            duration=8,
+            resolution="720p",
+            ratio="9:16",
+            camera_fixed=False,
+            last_frame=None,
+            seed=None,
+            motion_strength=None,
+            generate_audio=True,
+        )
+
+        self.assertEqual(payload["omni_reference_task_type"], "auto")
 
     def test_local_image_accepts_path_objects(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -1240,6 +1618,40 @@ class VideoRoutingTests(unittest.TestCase):
         self.assertEqual(route.model, "doubao-seedance-2-5-260628")
         self.assertEqual(route.tier, "seedance25")
         self.assertTrue(route.generate_audio)
+
+    def test_request_builders_and_route_use_the_job_generation_snapshot(self):
+        snapshot = {
+            "version": 1,
+            "model": "doubao-seedance-2-5-260628",
+            "resolution": "1080p",
+            "output_format": "mp4",
+            "ratio": "16:9",
+            "audio_mode": "seedance_native",
+            "reference_video_budget": 2,
+            "max_concurrent_masters": 2,
+            "qa_enabled": True,
+            "max_auto_retries": 1,
+            "auto_retry_budget_cents": 900,
+            "job_budget_cents": 5000,
+        }
+        shot = {
+            "duration_sec": 4,
+            "_generation_snapshot": snapshot,
+            "narrative_type": "dialogue",
+        }
+        with patch.dict(os.environ, {
+            "ARK_VIDEO_RESOLUTION": "480p",
+            "ARK_VIDEO_PRIMARY_MODEL": "wrong-global-model",
+            "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET": "1",
+        }, clear=False):
+            request = s3_shots._dialogue_request_kwargs(shot, None)
+            route = video_routing.select_route(shot, shot)
+
+        self.assertEqual(request["resolution"], "1080p")
+        self.assertEqual(request["output_format"], "mp4")
+        self.assertEqual(request["ratio"], "16:9")
+        self.assertEqual(route.model, "doubao-seedance-2-5-260628")
+        self.assertTrue(route.generate_audio)
         self.assertTrue(route.qa_required)
         self.assertIsNone(route.fallback_model)
 
@@ -1320,6 +1732,24 @@ class VideoRoutingTests(unittest.TestCase):
         })
 
         self.assertIsNone(reason)
+
+    def test_negative_ui_prohibition_does_not_block_scene_transition(self):
+        reason = video_routing.precision_motion_reason({
+            "prompt": (
+                "不出现悬浮文案、可读文字、数字、商标、界面、标识或水印。"
+                "先在调度中心建立场景，随后切换到仓库装车区，"
+                "运输车在雨夜自然行驶。"
+            ),
+        })
+
+        self.assertIsNone(reason)
+
+    def test_actual_ui_state_transition_remains_blocked(self):
+        reason = video_routing.precision_motion_reason({
+            "action": "操作员点击调度界面按钮，界面切换为绿色完成状态",
+        })
+
+        self.assertEqual(reason, "UI 状态或交互变化")
 
 
 class StoryboardPromptSafetyTests(unittest.TestCase):
@@ -1880,6 +2310,16 @@ class BigASRTests(unittest.IsolatedAsyncioTestCase):
 
 
 class Seedance25DialogueTests(unittest.TestCase):
+    def setUp(self):
+        self.anchor_generators = patch.dict(os.environ, {
+            "CHARACTER_ANCHOR_GENERATOR": "seedream_5_0",
+            "SCENE_ANCHOR_GENERATOR": "seedream_5_0",
+        })
+        self.anchor_generators.start()
+
+    def tearDown(self):
+        self.anchor_generators.stop()
+
     def test_dialogue_master_is_marked_generating_before_provider_call(self):
         memory_db = sqlite3.connect(":memory:")
         memory_db.row_factory = sqlite3.Row
@@ -2004,9 +2444,9 @@ class Seedance25DialogueTests(unittest.TestCase):
         scene = plan["paid_scene_anchors"][0]
         self.assertEqual(identity["generator"], "seedance_2_5")
         self.assertEqual(identity["anchor_mode"], "dynamic_video")
-        self.assertEqual(identity["estimated_cost_cents"], 408)
+        self.assertEqual(identity["estimated_cost_cents"], 612)
         self.assertEqual(scene["generator"], "seedance_2_5")
-        self.assertEqual(scene["estimated_cost_cents"], 408)
+        self.assertEqual(scene["estimated_cost_cents"], 612)
 
     def test_character_makeup_plan_deduplicates_fixed_aliases_and_marks_ai(self):
         characters = [
@@ -3026,19 +3466,177 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertEqual(
             request["reference_audios"], ["C:/jobs/J-1/shots/03.wav"]
         )
-        self.assertEqual(request["output_format"], "mp4")
+        self.assertEqual(request["output_format"], "mov")
         self.assertEqual(request["reference_video_duration_sec"], 20)
         self.assertIn("仅编辑视频1中3-15秒", prompt)
         self.assertIn("嘴部动作", prompt)
         self.assertIn("原始声音、音色、语速、表情、身体动作、运镜", prompt)
+        self.assertIn("视频1只负责原画面", prompt)
+        self.assertIn("音频1是唯一口型时间基准", prompt)
         self.assertIn("其余均保持不变", prompt)
         self.assertEqual(prompt.count("二十八米级曲臂高空作业平台。"), 1)
         self.assertNotIn("我选一台", prompt)
 
+    def test_managed_mov_edit_transcodes_to_browser_safe_mp4_atomically(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "candidate.mov"
+            target = Path(temp) / "candidate.mp4"
+            source.write_bytes(b"provider-mov")
+
+            async def render(args):
+                Path(args[-1]).write_bytes(b"browser-mp4")
+
+            with patch.object(
+                ffmpeg, "_run", new=AsyncMock(side_effect=render)
+            ) as run:
+                asyncio.run(ffmpeg.transcode_edit_mov_to_mp4(source, target))
+
+            command = run.await_args.args[0]
+            self.assertIn("libx264", command)
+            self.assertIn("yuv420p", command)
+            self.assertIn("aac", command)
+            self.assertEqual(target.read_bytes(), b"browser-mp4")
+            self.assertEqual(source.read_bytes(), b"provider-mov")
+
+    def test_extend_request_uses_adaptive_mov_and_explicit_continuation(self):
+        shot = {
+            "duration_sec": 18,
+            "repair_source_path": "C:/jobs/J-1/shots/03.mp4",
+            "extend_duration_sec": 8,
+            "extend_direction": "镜头继续跟随工程师走向控制台，不新增台词",
+        }
+
+        request = s3_shots._extend_request_kwargs(shot)
+        prompt = s3_shots._build_extend_prompt(shot)
+
+        self.assertEqual(request["task_intent"], "extend")
+        self.assertEqual(request["duration"], 8)
+        self.assertEqual(request["ratio"], "adaptive")
+        self.assertEqual(request["output_format"], "mov")
+        self.assertEqual(
+            request["reference_videos"], ["C:/jobs/J-1/shots/03.mp4"]
+        )
+        self.assertEqual(request["reference_video_duration_sec"], 18)
+        self.assertIn("继续跟随工程师走向控制台", prompt)
+        self.assertIn("不得复述原片台词", prompt)
+
     def test_lip_sync_edit_never_remuxes_a_new_fixed_voice_track(self):
         source = inspect.getsource(s3_shots._gen_dialogue)
 
-        self.assertIn("fixed_voice_track and not lip_sync_edit", source)
+        self.assertIn("fixed_voice_track and not repair_mode", source)
+
+    def test_dialogue_edit_success_becomes_review_candidate_without_overwriting_prior(self):
+        asyncio.run(self._assert_dialogue_edit_success_becomes_review_candidate())
+
+    async def _assert_dialogue_edit_success_becomes_review_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            assets = Path(temp)
+            prior = assets / "J-EDIT" / "shots" / "03.mp4"
+            prior.parent.mkdir(parents=True)
+            prior.write_bytes(b"prior-master")
+
+            async def generate(**kwargs):
+                candidate = kwargs["out_path"]
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_bytes(b"edited-candidate")
+                audio = candidate.with_suffix(".wav")
+                audio.write_bytes(b"candidate-audio")
+                return s3_shots.SeedanceGenerationResult(
+                    b"edited-candidate", candidate, "https://cdn/edit",
+                    "{}", True, "seedance25", audio, 123,
+                    ({"task_id": "task-edit", "cost_cents": 123},),
+                    bigasr.Transcription("目标台词"),
+                )
+
+            with patch.object(s3_shots, "ASSETS_DIR", assets), \
+                    patch.object(s3_shots, "_mark_shot_generating"), \
+                    patch.object(
+                        s3_shots, "_record_failed_generation_independently"
+                    ) as record_failed, \
+                    patch.object(
+                        s3_shots, "_generate_seedance_video",
+                        new=AsyncMock(side_effect=generate),
+                    ):
+                idx, error, anchor = await s3_shots._gen_dialogue(
+                    "J-EDIT",
+                    {"idx": 3, "duration_sec": 20, "voiceover": "目标台词"},
+                    {"id": "linxia", "name": "林夏", "look": "年轻工程师"},
+                    {
+                        "idx": 3,
+                        "duration_sec": 20,
+                        "voiceover": "目标台词",
+                        "repair_mode": "seedance_lip_sync_edit",
+                        "repair_source_path": str(prior),
+                        "repair_start_sec": 3,
+                        "repair_end_sec": 15,
+                        "repair_dialogue": "目标台词",
+                    },
+                    asyncio.Semaphore(1),
+                )
+
+            self.assertEqual(idx, 3)
+            self.assertIsInstance(error, s3_shots.SeedanceQualityError)
+            self.assertIsNone(anchor)
+            self.assertEqual(prior.read_bytes(), b"prior-master")
+            self.assertTrue(error.candidate_path.is_file())
+            self.assertEqual(error.candidate_path.read_bytes(), b"edited-candidate")
+            self.assertIn("review", error.candidate_path.parts)
+            record_failed.assert_called_once_with("J-EDIT", 3, error)
+
+    def test_broll_extend_success_becomes_review_candidate_without_overwriting_prior(self):
+        asyncio.run(self._assert_broll_extend_success_becomes_review_candidate())
+
+    async def _assert_broll_extend_success_becomes_review_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            assets = Path(temp)
+            prior = assets / "J-EXTEND" / "shots" / "02.mp4"
+            prior.parent.mkdir(parents=True)
+            prior.write_bytes(b"prior-master")
+
+            async def generate(**kwargs):
+                candidate = kwargs["out_path"]
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_bytes(b"extended-candidate")
+                self.assertEqual(kwargs["request_kwargs"]["task_intent"], "extend")
+                self.assertIsNone(kwargs["expected_text"])
+                return s3_shots.SeedanceGenerationResult(
+                    b"extended-candidate", candidate, "https://cdn/extend",
+                    "{}", False, "seedance25", None, 88,
+                    ({"task_id": "task-extend", "cost_cents": 88},),
+                    bigasr.Transcription(""),
+                )
+
+            with patch.object(s3_shots, "ASSETS_DIR", assets), \
+                    patch.object(s3_shots, "_mark_shot_generating"), \
+                    patch.object(
+                        s3_shots, "_record_failed_generation_independently"
+                    ) as record_failed, \
+                    patch.object(s3_shots, "precision_motion_reason", return_value=None), \
+                    patch.object(
+                        s3_shots, "_generate_seedance_video",
+                        new=AsyncMock(side_effect=generate),
+                    ):
+                idx, error = await s3_shots._gen_broll(
+                    "J-EXTEND",
+                    {"idx": 2, "duration_sec": 18},
+                    None,
+                    {
+                        "idx": 2,
+                        "duration_sec": 18,
+                        "repair_mode": "seedance_extend",
+                        "repair_source_path": str(prior),
+                        "extend_duration_sec": 8,
+                        "extend_direction": "继续跟随工程师走向控制台",
+                    },
+                    asyncio.Semaphore(1),
+                )
+
+            self.assertEqual(idx, 2)
+            self.assertIsInstance(error, s3_shots.SeedanceQualityError)
+            self.assertEqual(prior.read_bytes(), b"prior-master")
+            self.assertTrue(error.candidate_path.is_file())
+            self.assertEqual(error.candidate_path.read_bytes(), b"extended-candidate")
+            record_failed.assert_called_once_with("J-EXTEND", 2, error)
 
     def test_ai_generated_character_ignores_cached_roster_reference(self):
         character = {
@@ -3125,11 +3723,35 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         self.assertIn("创作意图：", prompt)
         self.assertIn("时间轴：", prompt)
-        self.assertIn("0.0-", prompt)
-        self.assertIn("-8.0秒：", prompt)
+        self.assertIn("0-1秒：", prompt)
+        self.assertIn("1-7秒：", prompt)
+        self.assertIn("7-8秒：", prompt)
+        self.assertNotRegex(prompt, r"\d+\.\d+-\d+")
         self.assertIn(f"{{台词：{shot['voiceover']}}}", prompt)
         self.assertIn(f"<环境音：{shot['sound_design']}>", prompt)
         self.assertIn("无 BGM", prompt)
+
+    def test_presenter_prompt_uses_continuous_integer_timeline_and_one_dialogue(self):
+        dialogue = "设备已经完成安全检查，可以按计划进场。"
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "duration_sec": 7.3,
+                "scene": "设备交付区",
+                "camera": "缓慢推近",
+                "action": "林夏核对设备后抬头确认",
+                "voiceover": dialogue,
+            },
+            {"name": "林夏", "look": "年轻设备调度工程师"},
+        )
+
+        self.assertIn("0-1秒", prompt)
+        self.assertIn("1-7秒", prompt)
+        self.assertIn("7-8秒", prompt)
+        self.assertNotIn("0.0-", prompt)
+        self.assertNotIn(".0秒", prompt)
+        self.assertEqual(prompt.count(dialogue), 1)
+        self.assertIn("完整说出且只能说出时间轴中标注的台词", prompt)
 
     def test_default_sound_design_is_derived_from_scene_dynamics(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -3468,6 +4090,20 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         self.assertEqual(estimate, 2448)
 
+    def test_720p_budget_estimate_covers_measured_seedance_25_token_bill(self):
+        measured = seedance.usage_cost_cents({
+            "completion_tokens": 173700,
+        })
+        preflight = seedance.estimate_cost_cents(8, "720p")
+        runtime_gate = s3_shots._estimated_request_cost_cents({
+            "duration": 8,
+            "resolution": "720p",
+        })
+
+        self.assertEqual(measured, 1216)
+        self.assertGreaterEqual(preflight, measured)
+        self.assertEqual(runtime_gate, preflight)
+
     def test_runtime_has_no_omnihuman_dependency(self):
         source = inspect.getsource(s3_shots._gen_dialogue)
 
@@ -3509,7 +4145,7 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         self.assertEqual(anchor.duration_sec, 4)
 
-    def test_short_dialogue_prompt_explicitly_pads_after_editorial_end(self):
+    def test_short_dialogue_prompt_normalizes_to_integer_provider_timeline(self):
         prompt = s3_shots._build_native_dialogue_prompt(
             {
                 "idx": 1,
@@ -3525,8 +4161,10 @@ class Seedance25DialogueTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("0.4-4.0秒", prompt)
-        self.assertIn("供本地剪辑裁切", prompt)
+        self.assertIn("0-1秒", prompt)
+        self.assertIn("1-2秒", prompt)
+        self.assertIn("2-4秒", prompt)
+        self.assertNotRegex(prompt, r"\d+\.\d+-\d+")
 
     def test_native_dialogue_prompt_drops_source_on_screen_text_instructions(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -4818,6 +5456,10 @@ class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {"CHARACTER_ANCHOR_GENERATOR": "seedream_5_0"},
+            ),
             patch.object(s3_shots, "conn", return_value=database),
             patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),
             patch.object(s3_shots.seedance, "text_to_image", new=submit),
@@ -4859,6 +5501,10 @@ class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {"CHARACTER_ANCHOR_GENERATOR": "seedream_5_0"},
+            ),
             patch.object(s3_shots, "conn", return_value=database),
             patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),
             patch.object(s3_shots.seedance, "text_to_image", new=submit),
@@ -6269,6 +6915,36 @@ class LegacyRuntimeRemovalTests(unittest.TestCase):
 
         self.assertNotIn("volcengine", requirements.lower())
 
+    def test_removed_executor_bypasses_and_duration_blockers_cannot_return(self):
+        production_files = [
+            PROJECT_ROOT / "scripts/factory/production_planner.py",
+            PROJECT_ROOT / "scripts/factory/video_routing.py",
+            PROJECT_ROOT / "scripts/factory/steps/s3_shots.py",
+            PROJECT_ROOT / "scripts/factory/steps/s5_bgm.py",
+            PROJECT_ROOT / "scripts/factory/clients/music.py",
+            PROJECT_ROOT / "scripts/factory/management_api.py",
+        ]
+        source = "\n".join(
+            path.read_text(encoding="utf-8") for path in production_files
+        )
+        for forbidden in (
+            "_via_suno_legacy",
+            "_run_legacy",
+            "standard director pipeline allows at most 3 paid masters",
+            "standard director pipeline paid master duration exceeds 90s",
+            "script variant requires exactly 6 beats",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    def test_core_execution_delegates_contract_state_and_error_semantics(self):
+        planner_source = inspect.getsource(production_planner.compile_job_spec)
+        orchestrator_source = inspect.getsource(orchestrator._process_job)
+        self.assertIn("compile_production_spec", planner_source)
+        self.assertNotIn("UPDATE jobs SET state", orchestrator_source)
+        self.assertIn("transition(", orchestrator_source)
+        self.assertIn("describe_failure", orchestrator_source)
+
 
 class Seedance25StateMachineTests(unittest.TestCase):
     def test_batch_query_excludes_all_terminal_and_human_pause_states(self):
@@ -6346,7 +7022,10 @@ class Seedance25StateMachineTests(unittest.TestCase):
                 "SELECT state,error FROM jobs WHERE job_id='J-PAUSE'"
             ).fetchone()
             self.assertEqual(row["state"], "ANCHOR_REVIEW_REQUIRED")
-            self.assertIsNone(row["error"])
+            self.assertEqual(
+                row["error"],
+                "人物与场景锚点已生成，请完成一致性审核",
+            )
         finally:
             database.close()
 
@@ -6446,7 +7125,10 @@ class Seedance25StateMachineTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(row["state"], "PRODUCTION_REVIEW_REQUIRED")
             self.assertEqual(row["retries"], 2)
-            self.assertIn("visual_mismatch", row["error"])
+            self.assertEqual(
+                row["error"],
+                "母片已生成但需要人工复核，请处理候选母片",
+            )
         finally:
             temp.cleanup()
             database.close()
@@ -6483,7 +7165,10 @@ class Seedance25StateMachineTests(unittest.TestCase):
             ).fetchone()
             self.assertEqual(row["state"], "PROVIDER_ACTION_REQUIRED")
             self.assertEqual(row["retries"], 1)
-            self.assertIn("AccountOverdueError", row["error"])
+            self.assertEqual(
+                row["error"],
+                "模型账号当前不可用，请处理账号后再恢复任务",
+            )
         finally:
             database.close()
 
@@ -6497,7 +7182,7 @@ class Seedance25StateMachineTests(unittest.TestCase):
         orchestrator_source = inspect.getsource(orchestrator._process_job)
 
         self.assertIn("error=NULL", shot_commit_source)
-        self.assertIn("error=NULL", orchestrator_source)
+        self.assertIn('"error": None', orchestrator_source)
 
     def test_state_machine_skips_voice_generation_step(self):
         step_names = [step for _, step, _ in models.TRANSITIONS]
@@ -6674,6 +7359,106 @@ class ThumbnailEncodingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.anchor_generators = patch.dict(os.environ, {
+            "CHARACTER_ANCHOR_GENERATOR": "seedream_5_0",
+            "SCENE_ANCHOR_GENERATOR": "seedream_5_0",
+        })
+        self.anchor_generators.start()
+
+    def tearDown(self):
+        self.anchor_generators.stop()
+
+    def test_distinct_subspaces_share_one_explicit_project_site_anchor(self):
+        storyboard = {
+            "masters": [
+                {
+                    "idx": 1,
+                    "scene": "沿海城市工厂装卸区，暴雨夜",
+                    "scene_anchor_key": "factory-loading-yard-night",
+                    "site_anchor_key": "coastal-factory-site",
+                    "site_anchor_description": "沿海城市工厂项目现场",
+                },
+                {
+                    "idx": 4,
+                    "scene": "工厂产线旁，傍晚",
+                    "scene_anchor_key": "factory-production-line-evening",
+                    "site_anchor_key": "coastal-factory-site",
+                    "site_anchor_description": "沿海城市工厂项目现场",
+                },
+            ]
+        }
+
+        plan = scene_assets.recurring_scene_anchors(storyboard)
+
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["anchor_key"], "coastal-factory-site")
+        self.assertEqual(plan[0]["anchor_scope"], "site")
+        self.assertEqual(plan[0]["master_indexes"], [1, 4])
+        self.assertEqual(
+            plan[0]["description"], "沿海城市工厂项目现场"
+        )
+
+    def test_exact_scene_reference_wins_then_falls_back_to_project_site(self):
+        master = {
+            "scene_anchor_key": "factory-loading-yard-night",
+            "site_anchor_key": "coastal-factory-site",
+        }
+
+        self.assertEqual(
+            scene_assets.reference_anchor_key(
+                master,
+                {"factory-loading-yard-night", "coastal-factory-site"},
+            ),
+            "factory-loading-yard-night",
+        )
+        self.assertEqual(
+            scene_assets.reference_anchor_key(
+                master, {"coastal-factory-site"}
+            ),
+            "coastal-factory-site",
+        )
+
+    def test_project_site_anchor_prompt_does_not_lock_child_scene_layout(self):
+        prompt = scene_assets.scene_anchor_prompt({
+            "anchor_key": "coastal-factory-site",
+            "anchor_scope": "site",
+            "description": "沿海城市工厂项目现场",
+        })
+
+        self.assertIn("WORLD / SITE CONTINUITY", prompt)
+        self.assertIn("Do not lock the exact subspace layout", prompt)
+        self.assertNotIn("Lock architecture, equipment placement", prompt)
+
+    def test_project_site_reference_has_world_duty_not_exact_scene_duty(self):
+        shot = {
+            "idx": 1,
+            "duration_sec": 4,
+            "voiceover": "开始检查设备。",
+            "_spatial_anchor_scope": "site",
+        }
+
+        request = s3_shots._dialogue_request_kwargs(
+            shot,
+            None,
+            character={"id": "engineer", "generation_mode": "ai_generated"},
+            scene_reference="https://assets.example/project-site.png",
+        )
+        prompt = s3_shots._build_native_dialogue_prompt(
+            shot,
+            {"id": "engineer", "generation_mode": "ai_generated"},
+            scene_anchored=True,
+            reference_manifest=request["reference_manifest"],
+        )
+
+        scene_reference = next(
+            item for item in request["reference_manifest"]
+            if item["uri"].endswith("project-site.png")
+        )
+        self.assertEqual(scene_reference["duty"], "site_continuity")
+        self.assertIn("PROJECT SITE CONTINUITY", prompt)
+        self.assertNotIn("固定场景键", prompt)
+
     def test_generated_anchor_review_defaults_to_manual(self):
         self.assertEqual(s3_shots.normalize_anchor_review_mode(None), "manual")
         self.assertEqual(s3_shots.normalize_anchor_review_mode(""), "manual")
@@ -7488,6 +8273,62 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("prior_backup_path", qa)
         self.assertFalse(candidate.exists())
         self.assertFalse(backup.exists())
+
+    async def test_compose_does_not_fail_when_background_stdout_is_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            base = assets / "J-CLOSED-STDOUT"
+            master = base / "shots" / "01.mp4"
+            master.parent.mkdir(parents=True)
+            master.write_bytes(b"master")
+            database = sqlite3.connect(":memory:")
+            database.row_factory = sqlite3.Row
+            database.executescript(db.DDL)
+            database.execute(
+                "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                "VALUES('J-CLOSED-STDOUT','T-1','closed stdout','BGM_OK','{}')"
+            )
+            database.execute(
+                "INSERT INTO shots(job_id,idx,state,video_path) "
+                "VALUES('J-CLOSED-STDOUT',1,'OK',?)",
+                (str(master),),
+            )
+            database.commit()
+
+            async def write_final(_concat, _bgm, final, **_kwargs):
+                final.write_bytes(b"composed")
+
+            async def write_cover(_final, thumbnail):
+                thumbnail.write_bytes(b"cover")
+
+            with patch.object(s6_compose, "ASSETS_DIR", assets), \
+                    patch.object(s6_compose, "conn", return_value=database), \
+                    patch.object(
+                        s6_compose, "_prep_shot",
+                        new=AsyncMock(return_value=master),
+                    ), patch.object(
+                        s6_compose.ffmpeg, "concat_shots", new=AsyncMock()
+                    ), patch.object(
+                        s6_compose.ffmpeg, "mix_bgm",
+                        new=AsyncMock(side_effect=write_final),
+                    ), patch.object(
+                        s6_compose.ffmpeg, "generate_continuity_cover",
+                        new=AsyncMock(side_effect=write_cover),
+                    ), patch("builtins.print", side_effect=OSError(22, "closed")), \
+                    patch.dict(os.environ, {
+                        "APPEND_CTA": "false",
+                        "GEN_THUMBNAIL": "true",
+                        "GEN_MARKETING_THUMBNAIL": "false",
+                    }, clear=False):
+                await s6_compose.run("J-CLOSED-STDOUT")
+
+            final_path = database.execute(
+                "SELECT final_path FROM jobs WHERE job_id='J-CLOSED-STDOUT'"
+            ).fetchone()["final_path"]
+            final_bytes = Path(final_path).read_bytes()
+            database.close()
+
+        self.assertEqual(final_bytes, b"composed")
 
     def test_asr_timings_replace_estimated_static_subtitles_in_director_shots(self):
         storyboard = {

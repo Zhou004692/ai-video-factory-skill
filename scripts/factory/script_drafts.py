@@ -127,7 +127,10 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
         }
         # Continuity metadata is optional.  When present it is a hard
         # production constraint, not prose for the model to reinterpret.
-        for field in ("continuity_id", "scene_id", "scene", "location", "time_of_day"):
+        for field in (
+            "continuity_id", "scene_id", "scene", "location", "time_of_day",
+            "site_id", "site_description",
+        ):
             value = _text(beat.get(field))
             if value:
                 normalized[field] = value
@@ -388,6 +391,8 @@ def _prompt(
                 "visual_intent": "画面意图",
                 "source_ids": ["SRC-..."],
                 "continuity_id": "same-scene-stable-id",
+                "site_id": "same-project-site-id-or-empty",
+                "site_description": "同一具体项目现场的稳定描述；没有则留空",
                 "scene": "具体地点、时段与空间状态",
                 "characters": ["character_id"],
                 "broll_required": False,
@@ -420,6 +425,9 @@ def _prompt(
         "单人知识讲解才允许使用稳定口播构图。"
         "每个 beat 必须给出 continuity_id、scene 和 characters：同一地点、时段、人物关系和剧情目标连续时复用同一 continuity_id；"
         "只有地点或时段跳变、核心出场组合变化、剧情目标切换，或高风险复杂动作需要独立生成时才更换 continuity_id。"
+        "若多个 beat 明确发生在同一个具体项目现场、园区或建筑群，但属于装卸区、产线、调度室等不同子空间，"
+        "必须复用同一个 site_id，并用 site_description 描述这个项目现场；这些 beat 的 scene 和 continuity_id 仍保持各自独立。"
+        "只有泛称相似但并非同一具体现场的工厂、办公室或仓库，不得复用 site_id；不存在上层现场关系时 site_id 留空。"
         "不要按说话人或固定秒数更换 continuity_id。broll_required 仅在证据、实物、流程或环境画面能提供台词之外的有效信息时设为 true。"
         "只允许引用提供的 source_id；不得编造事实、金额、客户、政策或产品能力；"
         "不得照抄竞品台词，只能借鉴抽象结构。目标为 Seedance 2.5 原生母片加本地导演剪辑。"
@@ -701,6 +709,26 @@ def _scene_anchor_key(continuity_key: str) -> str:
     return f"scene-{digest}"
 
 
+def _site_anchor_metadata(beats: list[dict]) -> dict:
+    """Carry only an explicit shared project-site identity across subspaces."""
+    site_ids = list(dict.fromkeys(
+        _text(beat.get("site_id")).casefold()
+        for beat in beats if _text(beat.get("site_id"))
+    ))
+    if len(site_ids) != 1:
+        return {}
+    site_id = site_ids[0]
+    description = next((
+        _text(beat.get("site_description"))
+        for beat in beats if _text(beat.get("site_description"))
+    ), site_id)
+    digest = hashlib.sha256(site_id.encode("utf-8")).hexdigest()[:12]
+    return {
+        "site_anchor_key": f"site-{digest}",
+        "site_anchor_description": description,
+    }
+
+
 def _scene_description(beats: list[dict]) -> str:
     values = [
         _text(beat.get("scene") or beat.get("location"))
@@ -852,6 +880,7 @@ def _storyboard(script: dict) -> dict:
         group = [beat for _, beat in indexed_group]
         scene_anchor_key = _scene_anchor_key(continuity_key)
         scene_anchor_description = _scene_description(group)
+        site_anchor = _site_anchor_metadata(group)
         group_speakers = list(dict.fromkeys(
             effective_speaker(beat) for beat in group
         ))
@@ -921,6 +950,7 @@ def _storyboard(script: dict) -> dict:
             "continuity_key": continuity_key,
             "scene_anchor_key": scene_anchor_key,
             "scene_anchor_description": scene_anchor_description,
+            **site_anchor,
             "render_mode": render_mode,
             "duration": round(sum(
                 float(beat["duration_sec"]) for beat in group
@@ -950,6 +980,7 @@ def _storyboard(script: dict) -> dict:
             broll_cursor = 0.0
             visual_sequences = []
             group_beats = [beat for _, beat in selected_group]
+            site_anchor = _site_anchor_metadata(group_beats)
             cast: list[str] = []
             for beat_index, beat in selected_group:
                 broll_ranges[beat_index] = (
@@ -1001,6 +1032,7 @@ def _storyboard(script: dict) -> dict:
                 "continuity_key": continuity_key,
                 "scene_anchor_key": _scene_anchor_key(continuity_key),
                 "scene_anchor_description": _scene_description(group_beats),
+                **site_anchor,
                 "cast": cast,
                 "anchor_character": cast[0] if len(cast) == 1 else None,
                 "asset_tags": [

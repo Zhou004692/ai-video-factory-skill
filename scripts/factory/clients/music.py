@@ -125,62 +125,6 @@ async def _via_silent(duration_sec: int) -> bytes:
     return data
 
 
-async def _via_suno_legacy(style: str, duration: int, bpm_range, mood: str, *,
-                           metadata_out: dict | None = None,
-                           on_task_created=None, on_task_updated=None) -> bytes:
-    """Suno API(经第三方 sunoapi.com 转接,官方未公开)。"""
-    key = os.environ.get("SUNO_API_KEY")
-    if not key:
-        raise RuntimeError("SUNO_API_KEY not set")
-    payload = {
-        "prompt": f"{style}, {mood}, BPM {bpm_range[0]}-{bpm_range[1]}, instrumental, {duration}s",
-        "make_instrumental": True,
-        "wait_audio": True,
-    }
-    async with httpx.AsyncClient(timeout=300, headers={"Authorization": f"Bearer {key}"}) as cli:
-        try:
-            r = await cli.post("https://api.sunoapi.com/api/v1/suno/create", json=payload)
-        except httpx.TransportError as exc:
-            raise MusicTaskUnknownError(
-                f"Suno 提交结果未知：{exc}"
-            ) from exc
-        r.raise_for_status()
-        try:
-            body = r.json()
-            first = (body.get("data") or [{}])[0] if isinstance(body, dict) else {}
-            task_id = str(
-                (body.get("task_id") or body.get("id") if isinstance(body, dict) else "")
-                or first.get("task_id") or first.get("id") or ""
-            ).strip()
-        except (ValueError, TypeError, AttributeError, IndexError) as exc:
-            raise MusicTaskUnknownError("Suno 提交响应无法核对") from exc
-        if not task_id:
-            raise MusicTaskUnknownError("Suno 提交响应缺少 task_id")
-        if metadata_out is not None:
-            metadata_out["task_id"] = task_id
-        if on_task_created:
-            on_task_created(task_id)
-        url = str(first.get("audio_url") or "").strip()
-        if not url:
-            if on_task_updated:
-                on_task_updated(task_id, "action_required", {})
-            raise MusicTaskUnknownError(
-                "Suno task 已创建但音频结果尚不可核对", task_id=task_id
-            )
-        usage = body.get("usage") or first.get("usage") or {}
-        if metadata_out is not None:
-            metadata_out["usage"] = usage
-        if on_task_updated:
-            on_task_updated(task_id, "completed", {"usage": usage})
-        try:
-            audio, _ = await provider_downloads.download_bytes(url, timeout=60)
-        except httpx.HTTPError as exc:
-            raise MusicTaskUnknownError(
-                "Suno task 已完成但音频下载结果未知", task_id=task_id
-            ) from exc
-        return audio
-
-
 def _first_result(body: object) -> dict:
     if not isinstance(body, dict):
         return {}

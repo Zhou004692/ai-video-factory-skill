@@ -22,6 +22,14 @@ class SkillDistributionTests(unittest.TestCase):
 
         self.assertIn("DIALOGUE_AUDIO_MODE=seedance_native", template)
 
+    def test_distributed_template_defaults_anchor_generation_to_seedance_25(self):
+        template = (ROOT / "templates" / "env.example").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("CHARACTER_ANCHOR_GENERATOR=seedance_2_5", template)
+        self.assertIn("SCENE_ANCHOR_GENERATOR=seedance_2_5", template)
+
     def test_build_distribution_contains_runtime_but_excludes_private_state(self):
         from distribute_skill import audit_distribution, build_distribution
 
@@ -327,7 +335,8 @@ class SkillDistributionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             archive = build_archive(ROOT, Path(tmp))
 
-            self.assertEqual(archive.name, "ai-video-factory.zip")
+            version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+            self.assertEqual(archive.name, f"ai-video-factory-{version}.zip")
             self.assertTrue(archive.is_file())
             with zipfile.ZipFile(archive) as bundle:
                 names = set(bundle.namelist())

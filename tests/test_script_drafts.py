@@ -1264,6 +1264,39 @@ class ScriptDraftApprovalTests(unittest.TestCase):
             dialogue[1]["scene_anchor_key"],
         )
 
+    def test_distinct_physical_scenes_preserve_shared_project_site_identity(self):
+        script = _variant(0, self.source_id)
+        script["beats"] = script["beats"][:2]
+        script["beats"][0].update({
+            "continuity_id": "incident-start",
+            "scene": "沿海城市工厂装卸区，暴雨夜",
+            "site_id": "coastal-factory-project",
+            "site_description": "沿海城市工厂项目现场",
+        })
+        script["beats"][1].update({
+            "continuity_id": "incident-finish",
+            "scene": "沿海城市工厂产线旁，傍晚",
+            "site_id": "coastal-factory-project",
+            "site_description": "沿海城市工厂项目现场",
+        })
+
+        dialogue = [
+            master for master in script_drafts._storyboard(script)["masters"]
+            if master["type"] == "dialogue"
+        ]
+
+        self.assertEqual(len(dialogue), 2)
+        self.assertNotEqual(
+            dialogue[0]["scene_anchor_key"], dialogue[1]["scene_anchor_key"]
+        )
+        self.assertEqual(
+            dialogue[0]["site_anchor_key"], dialogue[1]["site_anchor_key"]
+        )
+        self.assertEqual(
+            dialogue[0]["site_anchor_description"],
+            "沿海城市工厂项目现场",
+        )
+
     def test_broll_is_split_by_story_scene_and_carries_only_that_scene_cast(self):
         script = _variant(0, self.source_id)
         script["beats"] = script["beats"][:4]
@@ -1530,7 +1563,7 @@ class ScriptDraftCliTests(ScriptDraftApprovalTests):
         with patch.object(cli_module, "conn", return_value=self.database), patch.object(
             cli_module, "_process_job", side_effect=fake_process
         ) as process, patch.dict(
-            "os.environ", {"SEEDANCE_JOB_BUDGET_CENTS": "5000"}
+            "os.environ", {"SEEDANCE_JOB_BUDGET_CENTS": "10000"}
         ):
             preview = runner.invoke(
                 cli_module.cli, ["produce-approved", self.job_id]
@@ -1615,7 +1648,7 @@ class ScriptDraftCliTests(ScriptDraftApprovalTests):
         with patch.object(cli_module, "conn", return_value=self.database), patch.object(
             cli_module, "_process_job"
         ) as process, patch.dict(
-            "os.environ", {"SEEDANCE_JOB_BUDGET_CENTS": "5000"}
+            "os.environ", {"SEEDANCE_JOB_BUDGET_CENTS": "10000"}
         ):
             produced = runner.invoke(
                 cli_module.cli,

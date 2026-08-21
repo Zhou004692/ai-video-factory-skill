@@ -182,7 +182,12 @@ def build_archive(source_root: Path, output_root: Path) -> Path:
     report = audit_distribution(package)
     if not report["ok"]:
         raise ValueError(json.dumps(report, ensure_ascii=False))
-    archive = output_root.resolve() / f"{SKILL_NAME}.zip"
+    version = (source_root.resolve() / "VERSION").read_text(
+        encoding="utf-8"
+    ).strip()
+    if not re.fullmatch(r"[0-9A-Za-z._-]+", version):
+        raise ValueError("VERSION contains unsupported archive filename characters")
+    archive = output_root.resolve() / f"{SKILL_NAME}-{version}.zip"
     if archive.exists():
         archive.unlink()
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:

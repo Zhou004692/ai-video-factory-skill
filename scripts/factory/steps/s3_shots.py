@@ -16,8 +16,10 @@ import shutil
 
 from .. import (
     ASSETS_DIR, SKILL_ROOT, anchor_generation, asset_library,
-    character_assets, character_voices, provider_health, provider_tasks,
-    scene_assets, subtitles,
+    character_assets, character_voices, master_dependencies,
+    production_config, provider_capacity, provider_health,
+    provider_executor as provider_tasks,
+    reference_attention, scene_assets, subtitles,
 )
 from ..db import conn
 from ..clients import (
@@ -669,11 +671,9 @@ def _estimated_request_cost_cents(request_kwargs: dict) -> int:
             request_kwargs.get("duration")
         )
     resolution = str(request_kwargs.get("resolution") or "720p").lower()
-    cents_per_second = {
-        "480p": 68,
-        "720p": 102,
-        "1080p": 136,
-    }.get(resolution, 102)
+    cents_per_second = seedance.estimated_cost_rate_cents_per_second(
+        resolution
+    )
     reference_duration = 0.0
     if request_kwargs.get("reference_videos"):
         reference_duration = max(
@@ -721,13 +721,23 @@ def _assert_paid_call_within_job_budget(
 
 
 def _auto_retry_denial(reasons: tuple[str, ...],
-                       projected_retry_cost_cents: int) -> str | None:
-    if _env_nonnegative_int("SEEDANCE_MAX_AUTO_RETRIES", 1) == 0:
+                       projected_retry_cost_cents: int,
+                       generation_snapshot: dict | None = None) -> str | None:
+    max_auto_retries = (
+        int(generation_snapshot["max_auto_retries"])
+        if generation_snapshot else _env_nonnegative_int(
+            "SEEDANCE_MAX_AUTO_RETRIES", 1
+        )
+    )
+    if max_auto_retries == 0:
         return "automatic retries disabled"
     if not (_HARD_RETRY_REASONS & set(reasons)):
         return "manual review required for soft-only visual mismatch"
-    retry_budget = _env_nonnegative_int(
-        "SEEDANCE_AUTO_RETRY_BUDGET_CENTS", 800
+    retry_budget = (
+        int(generation_snapshot["auto_retry_budget_cents"])
+        if generation_snapshot else _env_nonnegative_int(
+            "SEEDANCE_AUTO_RETRY_BUDGET_CENTS", 800
+        )
     )
     if retry_budget and projected_retry_cost_cents > retry_budget:
         return (
@@ -1159,10 +1169,11 @@ async def _ensure_character_identity_anchors(
             storyboard = json.loads(row["storyboard"] or "{}") if row else {}
         except json.JSONDecodeError:
             storyboard = {}
+    generation_snapshot = production_config.generation_snapshot(storyboard)
     makeup_plan = anchor_generation.apply_character_generator(
         character_assets.character_makeup_plan(characters),
         storyboard,
-        resolution=os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
+        resolution=generation_snapshot["resolution"],
     )
     characters_by_id = {
         str(character.get("id") or ""): character
@@ -1376,10 +1387,7 @@ async def _ensure_character_identity_anchors(
             result = await _generate_seedance_video(
                 prompt=_identity_anchor_prompt(character),
                 route=VideoRoute(
-                    model=os.getenv(
-                        "ARK_VIDEO_PRIMARY_MODEL",
-                        "doubao-seedance-2-5-260628",
-                    ),
+                    model=generation_snapshot["model"],
                     tier="seedance25",
                     generate_audio=False,
                     qa_required=False,
@@ -1387,8 +1395,9 @@ async def _ensure_character_identity_anchors(
                 ),
                 request_kwargs={
                     "duration": 4,
-                    "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
-                    "ratio": "9:16",
+                    "resolution": generation_snapshot["resolution"],
+                    "output_format": generation_snapshot["output_format"],
+                    "ratio": generation_snapshot["ratio"],
                     "camera_fixed": True,
                     "motion_strength": 0.15,
                 },
@@ -1471,6 +1480,14 @@ async def _fallback_static_identity_anchors(
     native identity master and retries the scene once without the image.
     """
     database = conn()
+    job_row = database.execute(
+        "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
+    ).fetchone()
+    try:
+        storyboard = json.loads(job_row["storyboard"] or "{}") if job_row else {}
+    except json.JSONDecodeError:
+        storyboard = {}
+    generation_snapshot = production_config.generation_snapshot(storyboard)
     seen: set[str] = set()
     for ordinal, character in enumerate(characters, start=1):
         identity_key = character_assets.character_identity_key(character)
@@ -1496,10 +1513,7 @@ async def _fallback_static_identity_anchors(
             result = await _generate_seedance_video(
                 prompt=_identity_anchor_prompt(character),
                 route=VideoRoute(
-                    model=os.getenv(
-                        "ARK_VIDEO_PRIMARY_MODEL",
-                        "doubao-seedance-2-5-260628",
-                    ),
+                    model=generation_snapshot["model"],
                     tier="seedance25",
                     generate_audio=False,
                     qa_required=False,
@@ -1507,8 +1521,9 @@ async def _fallback_static_identity_anchors(
                 ),
                 request_kwargs={
                     "duration": 4,
-                    "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
-                    "ratio": "9:16",
+                    "resolution": generation_snapshot["resolution"],
+                    "output_format": generation_snapshot["output_format"],
+                    "ratio": generation_snapshot["ratio"],
                     "camera_fixed": True,
                     "motion_strength": 0.15,
                 },
@@ -1591,6 +1606,7 @@ async def _ensure_scene_visual_anchors(
     location clip and the canonical image contract uses its extracted frame.
     """
     database = conn()
+    generation_snapshot = production_config.generation_snapshot(storyboard)
     resolved: dict[str, str] = {}
     for ordinal, spec in enumerate(
         scene_assets.recurring_scene_anchors(storyboard), start=1
@@ -1598,7 +1614,7 @@ async def _ensure_scene_visual_anchors(
         spec = anchor_generation.decorate_scene_anchor(
             spec,
             storyboard,
-            resolution=os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
+            resolution=generation_snapshot["resolution"],
         )
         key = spec["anchor_key"]
         existing = database.execute(
@@ -1660,8 +1676,9 @@ async def _ensure_scene_visual_anchors(
                     ),
                     request_kwargs={
                         "duration": 4,
-                        "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
-                        "ratio": "9:16", "camera_fixed": True,
+                        "resolution": generation_snapshot["resolution"],
+                        "output_format": generation_snapshot["output_format"],
+                        "ratio": generation_snapshot["ratio"], "camera_fixed": True,
                         "motion_strength": 0.1,
                     },
                     out_path=video_path,
@@ -1766,6 +1783,117 @@ async def _ensure_scene_visual_anchors(
     return resolved
 
 
+def _apply_dialogue_reference_manifest(
+    request: dict,
+    *,
+    shot: dict,
+    snapshot: dict,
+    voice_reference: Path | str | None,
+    character: dict | None,
+    cast_characters: list[dict] | None,
+    identity_anchors: dict[str, DialogueAnchor],
+    scene_reference: str | None,
+    scene_video_anchor: DialogueAnchor | None,
+) -> None:
+    candidates: list[dict] = []
+    if scene_video_anchor is not None and scene_video_anchor.video_url:
+        candidates.append(reference_attention.candidate(
+            scene_video_anchor.video_url,
+            kind="video",
+            duty="scene_continuity",
+            duration_sec=scene_video_anchor.duration_sec,
+        ))
+    if scene_reference:
+        candidates.append(reference_attention.candidate(
+            scene_reference,
+            kind="image",
+            duty=(
+                "site_continuity"
+                if shot.get("_spatial_anchor_scope") == "site"
+                else "scene_continuity"
+            ),
+        ))
+
+    def add_identity(member: dict, duty: str) -> None:
+        identity_key = character_assets.character_identity_key(member)
+        identity = identity_anchors.get(identity_key)
+        if identity is not None and identity.image_reference:
+            candidates.append(reference_attention.candidate(
+                identity.image_reference, kind="image", duty=duty,
+                identity_key=identity_key,
+            ))
+            return
+        if identity is not None and identity.video_url:
+            candidates.append(reference_attention.candidate(
+                identity.video_url, kind="video", duty=duty,
+                identity_key=identity_key, duration_sec=identity.duration_sec,
+            ))
+            return
+        asset_uri = str(
+            member.get("seedance_asset_uri")
+            or member.get("asset_uri")
+            or _roster_character(member.get("id")).get("seedance_asset_uri")
+            or ""
+        ).strip()
+        if asset_uri.startswith("asset://"):
+            candidates.append(reference_attention.candidate(
+                asset_uri, kind="image", duty=duty, identity_key=identity_key,
+            ))
+
+    if character:
+        add_identity(character, "speaker_identity")
+    for cast_character in cast_characters or []:
+        add_identity(cast_character, "supporting_identity")
+    if voice_reference is not None:
+        candidates.append(reference_attention.candidate(
+            str(voice_reference), kind="audio", duty="voice_continuity"
+        ))
+
+    known = {item["uri"] for item in candidates}
+    for uri in request.get("reference_videos") or []:
+        if uri not in known:
+            candidates.append(reference_attention.candidate(
+                uri, kind="video", duty="style_continuity",
+                duration_sec=float(request.get("reference_video_duration_sec") or 0),
+                required=False,
+            ))
+    for uri in request.get("references") or []:
+        if uri not in known:
+            candidates.append(reference_attention.candidate(
+                uri, kind="image", duty="speaker_identity"
+            ))
+    for uri in request.get("reference_audios") or []:
+        if uri not in known:
+            candidates.append(reference_attention.candidate(
+                uri, kind="audio", duty="voice_continuity"
+            ))
+
+    manifest = reference_attention.select_manifest(
+        candidates,
+        max_video_references=production_reference_video_budget(snapshot),
+    )
+    request["reference_manifest"] = manifest
+    videos = [item for item in manifest if item["kind"] == "video"]
+    images = [item for item in manifest if item["kind"] == "image"]
+    audios = [item for item in manifest if item["kind"] == "audio"]
+    if videos:
+        request["reference_videos"] = [item["uri"] for item in videos]
+        request["reference_video_duration_sec"] = sum(
+            float(item["duration_sec"] or 0) for item in videos
+        )
+    else:
+        request.pop("reference_videos", None)
+        request.pop("reference_video_duration_sec", None)
+    if images:
+        request["references"] = [item["uri"] for item in images]
+    else:
+        request.pop("references", None)
+    if audios:
+        request["reference_audios"] = [item["uri"] for item in audios]
+    else:
+        request.pop("reference_audios", None)
+
+
 def _dialogue_request_kwargs(
     shot: dict,
     anchor: DialogueAnchor | None,
@@ -1778,12 +1906,16 @@ def _dialogue_request_kwargs(
     scene_reference: str | None = None,
     scene_video_anchor: DialogueAnchor | None = None,
 ) -> dict:
+    snapshot = production_config.snapshot_from_unit(shot) or {}
     request = {
         "duration": seedance.normalize_generation_duration(
             shot["duration_sec"]
         ),
-        "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
-        "ratio": "9:16",
+        "resolution": snapshot.get("resolution") or os.getenv(
+            "ARK_VIDEO_RESOLUTION", "720p"
+        ),
+        "output_format": snapshot.get("output_format", "mp4"),
+        "ratio": snapshot.get("ratio", "9:16"),
         "camera_fixed": False,
         "motion_strength": 0.4,
     }
@@ -1865,7 +1997,7 @@ def _dialogue_request_kwargs(
         seen_video_urls.add(reference.video_url)
         deduped_videos.append(reference)
     if deduped_videos:
-        reference_budget = production_reference_video_budget()
+        reference_budget = production_reference_video_budget(snapshot)
         if len(deduped_videos) > reference_budget:
             raise SeedanceIdentityAuthorizationError(
                 "one scene exceeds the product attention budget of "
@@ -1933,6 +2065,17 @@ def _dialogue_request_kwargs(
             request["references"] = uploaded_references[:9]
         elif portrait and Path(portrait).exists():
             request["references"] = [str(portrait)]
+    _apply_dialogue_reference_manifest(
+        request,
+        shot=shot,
+        snapshot=snapshot,
+        voice_reference=voice_reference,
+        character=character,
+        cast_characters=cast_characters,
+        identity_anchors=identity_anchors,
+        scene_reference=scene_reference,
+        scene_video_anchor=scene_video_anchor,
+    )
     return request
 
 
@@ -2105,6 +2248,8 @@ def _continuity_qa_context(
             image_urls.append(image_url)
     image_urls = list(dict.fromkeys(image_urls))
     scene_url = str(scene_reference or "").strip()
+    if shot.get("_spatial_anchor_scope") == "site":
+        scene_url = ""
     previous = scene_video_anchor or speaker_anchor
     contract = shot.get("continuity_contract") or {}
     if not contract and not image_urls and not scene_url and previous is None:
@@ -2132,11 +2277,15 @@ def _voice_anchor_from_completed_shot(
 
 def _scene_voiceover_request_kwargs(
         shot: dict, anchor: NativeVoiceAnchor | None) -> dict:
+    snapshot = production_config.snapshot_from_unit(shot) or {}
     request = {
         "duration": seedance.normalize_generation_duration(
             shot["duration_sec"]
         ),
-        "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
+        "resolution": snapshot.get("resolution") or os.getenv(
+            "ARK_VIDEO_RESOLUTION", "720p"
+        ),
+        "output_format": snapshot.get("output_format", "mp4"),
         "ratio": "9:16",
     }
     if anchor is not None:
@@ -2144,7 +2293,7 @@ def _scene_voiceover_request_kwargs(
     return request
 
 
-def production_reference_video_budget() -> int:
+def production_reference_video_budget(snapshot: dict | None = None) -> int:
     """Return the product attention budget, capped by provider capability.
 
     Seedance 2.5 accepts up to ten reference videos.  That provider maximum is
@@ -2152,7 +2301,10 @@ def production_reference_video_budget() -> int:
     compete for attention.  Production keeps a smaller configurable guard and
     reports it honestly as a product budget.
     """
-    raw = os.getenv("SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET", "3")
+    raw = (
+        snapshot.get("reference_video_budget")
+        if snapshot else os.getenv("SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET", "3")
+    )
     try:
         requested = int(raw)
     except (TypeError, ValueError) as exc:
@@ -2178,12 +2330,16 @@ def _broll_request_kwargs(
     identity_anchors: dict[str, DialogueAnchor] | None = None,
     scene_reference: str | None = None,
 ) -> dict:
+    snapshot = production_config.snapshot_from_unit(shot) or {}
     request = {
         "duration": seedance.normalize_generation_duration(
             shot["duration_sec"]
         ),
-        "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
-        "ratio": "9:16",
+        "resolution": snapshot.get("resolution") or os.getenv(
+            "ARK_VIDEO_RESOLUTION", "720p"
+        ),
+        "output_format": snapshot.get("output_format", "mp4"),
+        "ratio": snapshot.get("ratio", "9:16"),
     }
     image_references: list[str] = []
     video_references: list[DialogueAnchor] = []
@@ -2212,7 +2368,7 @@ def _broll_request_kwargs(
         if anchor.video_url and anchor.video_url not in seen_videos:
             seen_videos.add(anchor.video_url)
             deduped_videos.append(anchor)
-    reference_budget = production_reference_video_budget()
+    reference_budget = production_reference_video_budget(snapshot)
     if len(deduped_videos) > reference_budget:
         raise SeedanceIdentityAuthorizationError(
             "one B-roll scene exceeds the product attention budget of "
@@ -2228,6 +2384,54 @@ def _broll_request_kwargs(
         )
     if image_references:
         request["references"] = list(dict.fromkeys(image_references))
+    candidates: list[dict] = []
+    if scene_reference:
+        candidates.append(reference_attention.candidate(
+            scene_reference,
+            kind="image",
+            duty=(
+                "site_continuity"
+                if shot.get("_spatial_anchor_scope") == "site"
+                else "scene_continuity"
+            ),
+        ))
+    for character in cast_characters or []:
+        identity_key = character_assets.character_identity_key(character)
+        anchor = (identity_anchors or {}).get(identity_key)
+        if anchor is not None and anchor.image_reference:
+            candidates.append(reference_attention.candidate(
+                anchor.image_reference, kind="image",
+                duty="supporting_identity", identity_key=identity_key,
+            ))
+        elif anchor is not None and anchor.video_url:
+            candidates.append(reference_attention.candidate(
+                anchor.video_url, kind="video",
+                duty="supporting_identity", identity_key=identity_key,
+                duration_sec=anchor.duration_sec,
+            ))
+        else:
+            asset_uri = str(
+                character.get("seedance_asset_uri")
+                or character.get("asset_uri") or ""
+            ).strip()
+            if asset_uri.startswith("asset://"):
+                candidates.append(reference_attention.candidate(
+                    asset_uri, kind="image", duty="supporting_identity",
+                    identity_key=identity_key,
+                ))
+    manifest = reference_attention.select_manifest(
+        candidates, max_video_references=reference_budget
+    )
+    request["reference_manifest"] = manifest
+    videos = [item for item in manifest if item["kind"] == "video"]
+    images = [item for item in manifest if item["kind"] == "image"]
+    if videos:
+        request["reference_videos"] = [item["uri"] for item in videos]
+        request["reference_video_duration_sec"] = sum(
+            float(item["duration_sec"] or 0) for item in videos
+        )
+    if images:
+        request["references"] = [item["uri"] for item in images]
     return request
 
 
@@ -2237,15 +2441,17 @@ def _lip_sync_edit_request_kwargs(shot: dict) -> dict:
     if not source:
         raise ValueError("口型局部修复缺少原始母片")
     duration = max(0.1, float(shot.get("duration_sec") or 0))
+    snapshot = production_config.snapshot_from_unit(shot) or {}
     request = {
         "duration": -1,
-        "resolution": os.getenv("ARK_VIDEO_RESOLUTION", "720p"),
+        "resolution": snapshot.get("resolution") or os.getenv(
+            "ARK_VIDEO_RESOLUTION", "720p"
+        ),
         "ratio": "adaptive",
         "task_intent": "edit",
-        # The managed pipeline stores and previews masters as MP4.  Keep the
-        # provider container aligned with the controlled target path; MOV is
-        # only safe after a dedicated MOV -> browser MP4 conversion exists.
-        "output_format": "mp4",
+        # Seedance recommends MOV for edit/extend continuity. The managed
+        # pipeline converts it to a browser-safe MP4 before QA and preview.
+        "output_format": "mov",
         "reference_videos": [source],
         "reference_video_duration_sec": duration,
     }
@@ -2253,6 +2459,55 @@ def _lip_sync_edit_request_kwargs(shot: dict) -> dict:
     if audio:
         request["reference_audios"] = [audio]
     return request
+
+
+def _extend_request_kwargs(shot: dict) -> dict:
+    """Build a Seedance 2.5 continuation request for one controlled master."""
+    source = str(shot.get("repair_source_path") or "").strip()
+    if not source:
+        raise ValueError("延长母片缺少受控原始母片")
+    try:
+        extension = float(shot.get("extend_duration_sec") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("延长秒数必须在 4 到 30 秒之间") from exc
+    if extension < 4 or extension > 30:
+        raise ValueError("延长秒数必须在 4 到 30 秒之间")
+    source_duration = max(0.1, float(shot.get("duration_sec") or 0.1))
+    snapshot = production_config.snapshot_from_unit(shot) or {}
+    return {
+        "duration": seedance.normalize_generation_duration(extension),
+        "resolution": snapshot.get("resolution") or os.getenv(
+            "ARK_VIDEO_RESOLUTION", "720p"
+        ),
+        "output_format": "mov",
+        "ratio": "adaptive",
+        "task_intent": "extend",
+        "reference_videos": [source],
+        "reference_video_duration_sec": source_duration,
+        "reference_manifest": reference_attention.select_manifest([
+            reference_attention.candidate(
+                source, kind="video", duty="scene_continuity",
+                duration_sec=source_duration,
+            )
+        ], max_video_references=1),
+    }
+
+
+def _build_extend_prompt(shot: dict) -> str:
+    direction = str(shot.get("extend_direction") or "").strip()
+    if not direction:
+        raise ValueError("请填写母片延长后的明确动作、运镜和结束状态")
+    duration = seedance.normalize_generation_duration(
+        shot.get("extend_duration_sec") or 0
+    )
+    return "\n".join([
+        "延长现有母片，不重拍、不改写原片。",
+        "素材职责：视频1只负责承接原片末帧的场景、人物身份、站位、动作惯性、光线和镜头轴线。",
+        f"延长方向：{direction}",
+        f"0-{duration:g}秒：从原片最后一帧无跳切继续动作和运镜，并自然收束。",
+        "不得复述原片台词，不得新增旁白、第二人声、字幕、文字、标识或水印。",
+        "人物五官、服装、场景布局、光线方向和摄影风格必须与原片连续。",
+    ])
 
 
 def _display_second(value: float) -> str:
@@ -2272,10 +2527,17 @@ def _build_lip_sync_edit_prompt(shot: dict) -> str:
     if not dialogue:
         raise ValueError("口型局部修复缺少目标台词")
     reason = str(shot.get("repair_direction") or "口型与原生语音不同步").strip()
+    material_duties = (
+        "素材职责：视频1只负责原画面、人物表演、运镜和剪辑；"
+        "音频1是唯一口型时间基准，必须完整保留音频1的音色、语速、节奏和内容。"
+        if shot.get("repair_audio_path") else
+        "素材职责：视频1同时提供原画面与唯一原声音轨，禁止替换或重构声音。"
+    )
     return "\n".join([
         f"仅编辑视频1中{_display_second(start)}-{_display_second(end)}秒的人物嘴部动作。",
+        material_duties,
         f"目标台词只用于口型校准：{{台词：{dialogue}}}",
-        "嘴唇、牙齿、舌位和下颌必须与视频1现有原生中文语音逐字同步，句末自然闭嘴。",
+        "嘴唇、牙齿、舌位和下颌必须与唯一时间基准中的中文语音逐字同步，句末自然闭嘴。",
         "保留视频1的原始声音、音色、语速、表情、身体动作、运镜、人物身份、"
         "服装、场景、灯光、构图、时长和镜头切换，其余均保持不变。",
         "不得重新配音，不得改变人物走位或摄影机运动，不得新增字幕、文字、人物或声音。",
@@ -2324,9 +2586,10 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                                     continuity_context: dict | None = None,
                                     paid_batch_id: str | None = None,
                                     asr_enabled: bool = True,
-                                    fixed_audio_path: Path | None = None,
-                                    fixed_transcription: bigasr.Transcription | None = None,
-                                    ) -> SeedanceGenerationResult:
+                                     fixed_audio_path: Path | None = None,
+                                     fixed_transcription: bigasr.Transcription | None = None,
+                                     generation_snapshot: dict | None = None,
+                                     ) -> SeedanceGenerationResult:
     """Generate, upload and gate a Seedance shot.
 
     Visuals fail closed. Dialogue uses one pre-generated fixed Volcengine TTS
@@ -2436,6 +2699,14 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         nonlocal spent_cost_cents, pre_recorded_cost_cents
         metadata: dict = {}
         call_kwargs = dict(generation_kwargs or request_kwargs)
+        try:
+            configured_capacity_limit = max(1, int(
+                (generation_snapshot or {}).get("max_concurrent_masters")
+                or os.getenv("SEEDANCE_MAX_CONCURRENT_MASTERS")
+                or MAX_CONCURRENT_SHOTS
+            ))
+        except (TypeError, ValueError):
+            configured_capacity_limit = max(1, int(MAX_CONCURRENT_SHOTS))
         _assert_paid_call_within_job_budget(
             job_id,
             spent_cost_cents=spent_cost_cents,
@@ -2443,8 +2714,20 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         )
         if health_database is not None:
             provider_health.assert_available(health_database, "seedance")
+            provider_capacity.assert_submit_allowed(
+                health_database, "seedance"
+            )
         provider_kwargs = dict(call_kwargs)
         provider_kwargs.pop("reference_video_duration_sec", None)
+        reference_audit = [
+            {
+                "kind": str(item.get("kind") or ""),
+                "duty": str(item.get("duty") or ""),
+                "material_index": int(item.get("material_index") or 0),
+            }
+            for item in provider_kwargs.pop("reference_manifest", [])
+            if isinstance(item, dict)
+        ]
         intent = call_kwargs.get("task_intent", "generate")
         deferred_completed: tuple[str, str, dict] | None = None
         attempt_task_ids: set[str] = {
@@ -2458,7 +2741,10 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             pending_call = {
                 "task_id": task_id,
                 "intent": intent,
-                "usage": {"status": "pending"},
+                "usage": {
+                    "status": "pending",
+                    "reference_manifest": reference_audit,
+                },
                 "cost_cents": 0,
             }
             provider_calls.append(pending_call)
@@ -2497,6 +2783,8 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             raw_usage = data.get("usage") if isinstance(data, dict) else {}
             usage = _safe_provider_usage(raw_usage)
             usage["status"] = status
+            if reference_audit:
+                usage["reference_manifest"] = reference_audit
             if status == "staged" and isinstance(data, dict):
                 usage.update({
                     "remote_status": "completed",
@@ -2622,6 +2910,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 "usage": {
                     **_safe_provider_usage(metadata.get("usage") or {}),
                     "status": "completed",
+                    "reference_manifest": reference_audit,
                 },
                 "cost_cents": call_cost,
             }
@@ -2640,7 +2929,17 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             else:
                 pending_call.update(final_call)
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_bytes(video)
+            provider_output = target_path
+            if str(call_kwargs.get("output_format") or "mp4").casefold() == "mov":
+                provider_output = target_path.with_name(
+                    f".{target_path.stem}.provider.mov"
+                )
+            provider_output.write_bytes(video)
+            if provider_output != target_path:
+                await ffmpeg.transcode_edit_mov_to_mp4(
+                    provider_output, target_path
+                )
+                video = target_path.read_bytes()
             audio_path = fixed_audio_path
             if fixed_audio_path is not None:
                 visual_path = target_path.with_name(
@@ -2680,6 +2979,8 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                         "artifact_url": url,
                     },
                 )
+            if provider_output != target_path:
+                provider_output.unlink(missing_ok=True)
             return video, target_path, url, audio_path
         except BaseException as exc:
             if reservation_id and health_database is not None:
@@ -2729,6 +3030,15 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                     "seedance",
                     "account_unavailable",
                     "Seedance 账号不可用，请处理账号问题后人工解除本地阻断。",
+                )
+            if (
+                health_database is not None
+                and isinstance(exc, seedance.SeedanceRateLimitError)
+            ):
+                provider_capacity.record_rate_limit(
+                    health_database,
+                    "seedance",
+                    configured_limit=configured_capacity_limit,
                 )
             _attach_provider_usage(
                 exc,
@@ -2863,7 +3173,9 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         int(provider_calls[-1]["cost_cents"])
         if provider_calls else _estimated_request_cost_cents(request_kwargs)
     )
-    denial = _auto_retry_denial(decision.reasons, projected_retry_cost)
+    denial = _auto_retry_denial(
+        decision.reasons, projected_retry_cost, generation_snapshot
+    )
     if denial is not None:
         # A transcript mismatch is a quality warning, not proof that the
         # already-paid master is unusable. Preserve it for the mandatory
@@ -2964,11 +3276,10 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
             combined["voiceover"] = (
                 sb_shot.get("voiceover") or shot.get("voiceover") or ""
             )
-            lip_sync_edit = (
-                str(combined.get("repair_mode") or "")
-                == "seedance_lip_sync_edit"
-            )
-            if fixed_voice_track and not lip_sync_edit:
+            repair_mode = str(combined.get("repair_mode") or "").strip()
+            lip_sync_edit = repair_mode == "seedance_lip_sync_edit"
+            extend_mode = repair_mode == "seedance_extend"
+            if fixed_voice_track and not repair_mode:
                 combined["duration_sec"] = fixed_voice_track.duration_sec
             speaker_anchor = _incremental_anchor(anchor)
             previous_scene_anchor = _incremental_anchor(scene_video_anchor)
@@ -2983,9 +3294,17 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
             )
             route = select_route(shot, sb_shot)
             out_path = ASSETS_DIR / job_id / "shots" / f"{shot['idx']:02d}.mp4"
+            if repair_mode:
+                out_path = (
+                    ASSETS_DIR / job_id / "shots" / "review" / "repairs"
+                    / f"{shot['idx']:02d}-{repair_mode}.mp4"
+                )
             if lip_sync_edit:
                 prompt = _build_lip_sync_edit_prompt(combined)
                 request_kwargs = _lip_sync_edit_request_kwargs(combined)
+            elif extend_mode:
+                prompt = _build_extend_prompt(combined)
+                request_kwargs = _extend_request_kwargs(combined)
             else:
                 prompt = _build_native_dialogue_prompt(
                     combined,
@@ -3014,6 +3333,21 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                     scene_reference=scene_reference,
                     scene_video_anchor=previous_scene_anchor,
                 )
+                prompt = _build_native_dialogue_prompt(
+                    combined,
+                    char,
+                    anchored=(
+                        speaker_anchor is not None
+                        or character_assets.character_identity_key(char)
+                        in (identity_anchors or {})
+                    ),
+                    voice_anchored=bool(
+                        fixed_voice_track or native_voice_anchor
+                    ),
+                    scene_anchored=bool(scene_reference),
+                    previous_scene_anchored=previous_scene_anchor is not None,
+                    reference_manifest=request_kwargs.get("reference_manifest"),
+                )
 
             async def generate_scene() -> SeedanceGenerationResult:
                 return await _generate_seedance_video(
@@ -3024,23 +3358,28 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                     key_hint=f"{job_id}-dialogue-{shot['idx']:02d}",
                     job_id=job_id,
                     shot_idx=shot["idx"],
-                    expected_text=combined["voiceover"],
+                    expected_text=(None if extend_mode else combined["voiceover"]),
                     continuity_context=continuity_context,
                     paid_batch_id=paid_batch_id,
                     asr_enabled=asr_enabled,
                     fixed_audio_path=(
                         fixed_voice_track.audio_path
-                        if fixed_voice_track and not lip_sync_edit else None
+                        if fixed_voice_track and not repair_mode else None
                     ),
                     fixed_transcription=(
                         fixed_voice_track.transcription
-                        if fixed_voice_track and not lip_sync_edit else None
+                        if fixed_voice_track and not repair_mode else None
+                    ),
+                    generation_snapshot=production_config.snapshot_from_unit(
+                        combined
                     ),
                 )
 
             try:
                 result = await generate_scene()
             except seedance.SeedanceInputPrivacyError:
+                if repair_mode:
+                    raise
                 if identity_anchors is None:
                     raise
                 await _fallback_static_identity_anchors(
@@ -3048,7 +3387,7 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                     [char, *(cast_characters or [])],
                     identity_anchors,
                 )
-                if not lip_sync_edit:
+                if not repair_mode:
                     continuity_context = _continuity_qa_context(
                         combined,
                         char,
@@ -3084,9 +3423,34 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                         scene_reference=scene_reference,
                         scene_video_anchor=previous_scene_anchor,
                     )
+                    prompt = _build_native_dialogue_prompt(
+                        combined,
+                        char,
+                        anchored=True,
+                        voice_anchored=bool(
+                            fixed_voice_track or native_voice_anchor
+                        ),
+                        scene_anchored=bool(scene_reference),
+                        previous_scene_anchored=(
+                            previous_scene_anchor is not None
+                        ),
+                        reference_manifest=request_kwargs.get(
+                            "reference_manifest"
+                        ),
+                    )
                 result = await generate_scene()
-            if result.audio_path is None:
+            if result.audio_path is None and not extend_mode:
                 raise RuntimeError("固定声线音轨未写入 Seedance 成片")
+
+            if repair_mode:
+                raise SeedanceQualityError(
+                    "Seedance 2.5 保留式编辑已生成候选片，等待人工复核后替换原母片",
+                    cost_cents=result.cost_cents,
+                    provider_calls=result.provider_calls,
+                    reasons=("repair_candidate_ready",),
+                    candidate_path=result.video_path,
+                    candidate_url=result.video_url,
+                )
 
             _persist_master_transcription(
                 job_id, shot["idx"], result.transcription
@@ -3124,23 +3488,32 @@ def _director_time_beats(duration: float, *, dialogue: str,
                          scene_voiceover: bool = False,
                          editorial_duration: float | None = None) -> list[str]:
     """Create a compact, continuous Seedance director timeline."""
-    duration = max(1.0, float(duration))
+    total_seconds = max(1, int(round(float(duration))))
     speech_end = min(
-        duration,
-        max(0.1, float(editorial_duration or duration)),
+        total_seconds,
+        max(2, int(math.ceil(float(editorial_duration or total_seconds)))),
     )
-    establish_end = min(1.0, max(0.05, speech_end * 0.12))
-    settle_start = max(establish_end, speech_end - min(0.6, speech_end * 0.2))
+    establish_end = 1
     speech_label = "画外音" if scene_voiceover else "台词"
     subject = "画外音开始，画面继续自然运动" if scene_voiceover else "人物自然开口并完成动作与表情变化"
     beats = [
-        f"0.0-{establish_end:.1f}秒：建立场景、人物或物件关系，动作自然起势。",
-        f"{establish_end:.1f}-{settle_start:.1f}秒：{subject}，完整说出且只能说出 {{{speech_label}：{dialogue}}}。",
-        f"{settle_start:.1f}-{speech_end:.1f}秒：话音自然结束，动作收束，画面保持连续稳定。",
+        f"0-{establish_end}秒：建立场景、人物或物件关系，动作自然起势。",
     ]
-    if speech_end < duration:
+    if speech_end - establish_end >= 2:
+        settle_start = speech_end - 1
+        beats.extend([
+            f"{establish_end}-{settle_start}秒：{subject}，完整说出且只能说出 "
+            f"{{{speech_label}：{dialogue}}}。",
+            f"{settle_start}-{speech_end}秒：话音自然结束，动作收束，画面保持连续稳定。",
+        ])
+    else:
         beats.append(
-            f"{speech_end:.1f}-{duration:.1f}秒：保持无新人声的自然动作和环境连续，供本地剪辑裁切。"
+            f"{establish_end}-{speech_end}秒：{subject}，完整说出且只能说出 "
+            f"{{{speech_label}：{dialogue}}}，句末自然闭嘴并收束动作。"
+        )
+    if speech_end < total_seconds:
+        beats.append(
+            f"{speech_end}-{total_seconds}秒：保持无新人声的自然动作和环境连续，供本地剪辑裁切。"
         )
     return beats
 
@@ -3268,7 +3641,7 @@ def _build_scene_voiceover_video_prompt(
             editorial_duration=editorial_duration,
         ),
         "这是画外音(V.O.)场景，下面的台词只进入原生音轨，不在画面中呈现说话者",
-        f"画外音完整说出且只能说出 {{画外音：{voiceover}}}",
+        "画外音必须完整说出且只能说出时间轴中标注的内容",
         "使用自然、清晰、专业的中国成年人普通话；不得改写、增删、重复或复述其他内容",
         f"<环境音：{sound_design}>；无 BGM，不要字幕。",
         "不得出现任何可识别人脸、正面人物、真人肖像或嘴部特写，不做口型同步",
@@ -3317,7 +3690,8 @@ def _build_native_dialogue_prompt(
         shot: dict, character: dict, *, anchored: bool = False,
         voice_anchored: bool = False,
         scene_anchored: bool = False,
-        previous_scene_anchored: bool = False) -> str:
+        previous_scene_anchored: bool = False,
+        reference_manifest: list[dict] | None = None) -> str:
     """Build one exact native-speaking Seedance 2.5 presenter prompt."""
     voiceover = str(shot.get("voiceover") or "").strip()
     if not voiceover:
@@ -3398,7 +3772,7 @@ def _build_native_dialogue_prompt(
                 "人物只能说出上方连续整数秒导演时间轴中标注的台词，"
                 "不得在时间轴外增加或复述任何人声。"
                 if cinematic else
-                f"人物完整说出且只能说出 {{台词：{voiceover}}}"
+                "人物必须完整说出且只能说出时间轴中标注的台词"
             )
         ),
         f"<环境音：{sound_design}>；无 BGM，不要字幕。",
@@ -3416,15 +3790,29 @@ def _build_native_dialogue_prompt(
         "安全帽、反光背心、工服、工程机械、设备铭牌、工牌、文件、屏幕和背景标牌一律纯色无字，或通过背面、遮挡、裁切、浅景深使其不可辨认。",
         "禁止企业名称、品牌、设备编号、车牌、字母、数字、二维码、字幕、标识或水印。",
     ]
-    if scene_anchored:
+    if reference_manifest:
         parts[1:1] = [
-            "场景连续性为硬约束，不是风格参考。",
-            f"固定场景键：{shot.get('scene_anchor_key') or ''}",
-            f"固定站位图：{_blocking_anchor_text(shot.get('blocking_anchor'))}",
-            "同一人物必须保持同一屏幕侧、相对距离、朝向和身高关系；"
-            "除非动作明确要求换位，否则禁止交换左右位置。",
-            "锁定建筑、设备位置、地面材质、天气、时段、主光方向与180度镜头轴线。",
+            "素材职责（编号严格对应本次请求顺序）：",
+            *reference_attention.compile_prompt_duties(reference_manifest),
         ]
+    if scene_anchored:
+        if shot.get("_spatial_anchor_scope") == "site":
+            parts[1:1] = [
+                "PROJECT SITE CONTINUITY：该参考只定义同一项目现场的世界观。",
+                f"项目现场键：{shot.get('site_anchor_key') or ''}",
+                "保持建筑语言、主要材质、设备体系、安全设施和环境身份一致；",
+                "当前母片仍按本镜 scene 生成独立子空间，禁止照搬参考图的具体布局、"
+                "人物站位、天气、时段、光线或机位。",
+            ]
+        else:
+            parts[1:1] = [
+                "场景连续性为硬约束，不是风格参考。",
+                f"固定场景键：{shot.get('scene_anchor_key') or ''}",
+                f"固定站位图：{_blocking_anchor_text(shot.get('blocking_anchor'))}",
+                "同一人物必须保持同一屏幕侧、相对距离、朝向和身高关系；"
+                "除非动作明确要求换位，否则禁止交换左右位置。",
+                "锁定建筑、设备位置、地面材质、天气、时段、主光方向与180度镜头轴线。",
+            ]
     if shot.get("continuity_contract"):
         parts[1:1] = [
             "结构化连续性契约（以下字段均为硬约束）：",
@@ -3476,7 +3864,9 @@ def _build_native_dialogue_prompt(
     return "\n".join(parts)
 
 
-def _build_broll_video_prompt(shot: dict) -> str:
+def _build_broll_video_prompt(
+    shot: dict, reference_manifest: list[dict] | None = None,
+) -> str:
     """Build a bounded cinematic B-roll request with canonical local mixing."""
     duration = seedance.normalize_generation_duration(
         shot.get("duration_sec") or shot.get("duration") or 4
@@ -3489,7 +3879,7 @@ def _build_broll_video_prompt(shot: dict) -> str:
     camera = non_text_visual_text(
         shot.get("camera") or "稳定电影感跟拍"
     ).strip()
-    return "\n".join([
+    parts = [
         "创作意图：生成服务叙事证据的电影化 B-roll，不生成口播画面。",
         f"场景：{scene}",
         f"动作：{action}",
@@ -3498,7 +3888,18 @@ def _build_broll_video_prompt(shot: dict) -> str:
         f"0-{duration}秒；画面与动作：{visual or action}；运镜：{camera}。",
         "无对白、无人声、无旁白；只保留与动作同步的环境音和物件音；无 BGM。",
         "禁止任何可读文字、字幕、品牌、设备编号、车牌、字母、数字、二维码或水印。",
-    ])
+    ]
+    if reference_manifest:
+        parts[1:1] = [
+            "素材职责（编号严格对应本次请求顺序）：",
+            *reference_attention.compile_prompt_duties(reference_manifest),
+        ]
+    if shot.get("_spatial_anchor_scope") == "site":
+        parts[1:1] = [
+            "PROJECT SITE CONTINUITY：保持项目现场的建筑语言、材质、设备体系和安全设施一致；",
+            "本镜是独立子空间，禁止照搬项目现场参考的具体布局、人物站位、天气、时段或机位。",
+        ]
+    return "\n".join(parts)
 
 
 def _safe_scene_voiceover_keyframe(shot: dict) -> str | None:
@@ -3571,27 +3972,47 @@ async def _gen_broll(job_id: str, shot: dict,
             if motion_strength is None:
                 motion_strength = 0.4
             route = select_route(shot, sb_shot)
-            out_path = ASSETS_DIR / job_id / "shots" / f"{shot['idx']:02d}.mp4"
-            request_kwargs = (
-                _scene_voiceover_request_kwargs(shot, voice_anchor)
-                if scene_voiceover else _broll_request_kwargs(
-                    shot,
-                    cast_characters=cast_characters,
-                    identity_anchors=identity_anchors,
-                    scene_reference=scene_reference,
-                )
+            runtime_shot = {**shot, **sb_shot}
+            extend_mode = (
+                str(runtime_shot.get("repair_mode") or "").strip()
+                == "seedance_extend"
             )
-            if scene_voiceover and fixed_voice_track is not None:
+            out_path = ASSETS_DIR / job_id / "shots" / f"{shot['idx']:02d}.mp4"
+            if extend_mode:
+                out_path = (
+                    ASSETS_DIR / job_id / "shots" / "review" / "repairs"
+                    / f"{shot['idx']:02d}-seedance_extend.mp4"
+                )
+                prompt_full = _build_extend_prompt(runtime_shot)
+                request_kwargs = _extend_request_kwargs(runtime_shot)
+            else:
+                request_kwargs = (
+                    _scene_voiceover_request_kwargs(runtime_shot, voice_anchor)
+                    if scene_voiceover else _broll_request_kwargs(
+                        runtime_shot,
+                        cast_characters=cast_characters,
+                        identity_anchors=identity_anchors,
+                        scene_reference=scene_reference,
+                    )
+                )
+            if not scene_voiceover and not extend_mode:
+                prompt_full = _build_broll_video_prompt(
+                    runtime_shot,
+                    reference_manifest=request_kwargs.get(
+                        "reference_manifest"
+                    ),
+                )
+            if scene_voiceover and fixed_voice_track is not None and not extend_mode:
                 request_kwargs["duration"] = seedance.normalize_generation_duration(
                     fixed_voice_track.duration_sec
                 )
                 request_kwargs["reference_audios"] = [
                     str(fixed_voice_track.audio_path)
                 ]
-            if not scene_voiceover and (
+            if extend_mode or (not scene_voiceover and (
                 request_kwargs.get("reference_videos")
                 or request_kwargs.get("references")
-            ):
+            )):
                 keyframe = None
                 last_frame = None
             request_kwargs.update({
@@ -3615,7 +4036,7 @@ async def _gen_broll(job_id: str, shot: dict,
                 forbid_people=scene_voiceover,
                 expected_text=(
                     sb_shot.get("voiceover") or shot.get("voiceover")
-                    if scene_voiceover else None
+                    if scene_voiceover and not extend_mode else None
                 ),
                 require_broll_semantics=not scene_voiceover,
                 continuity_context=(
@@ -3625,19 +4046,35 @@ async def _gen_broll(job_id: str, shot: dict,
                         "scene_image_url": scene_reference,
                         "previous_video_url": None,
                     }
-                    if scene_reference else None
+                    if (
+                        scene_reference
+                        and sb_shot.get("_spatial_anchor_scope") != "site"
+                    ) else None
                 ),
                 paid_batch_id=paid_batch_id,
                 asr_enabled=asr_enabled,
                 fixed_audio_path=(
                     fixed_voice_track.audio_path
-                    if fixed_voice_track else None
+                    if fixed_voice_track and not extend_mode else None
+                ),
+                generation_snapshot=production_config.snapshot_from_unit(
+                    sb_shot
                 ),
                 fixed_transcription=(
                     fixed_voice_track.transcription
-                    if fixed_voice_track else None
+                    if fixed_voice_track and not extend_mode else None
                 ),
             )
+
+            if extend_mode:
+                raise SeedanceQualityError(
+                    "Seedance 2.5 延长片段已生成候选片，等待人工复核后替换原母片",
+                    cost_cents=result.cost_cents,
+                    provider_calls=result.provider_calls,
+                    reasons=("repair_candidate_ready",),
+                    candidate_path=result.video_path,
+                    candidate_url=result.video_url,
+                )
 
             if scene_voiceover:
                 _persist_master_transcription(
@@ -3665,8 +4102,9 @@ async def run(job_id: str) -> None:
     chars = {c["id"]: c for c in json.loads(job["characters_json"])}
     characters = list(chars.values())
     generation_units = sb.get("masters") or sb["shots"]
+    generation_snapshot = production_config.generation_snapshot(sb)
     audio_mode = normalize_audio_mode(
-        (sb.get("production_settings") or {}).get("audio_mode")
+        generation_snapshot.get("audio_mode")
         or os.getenv("DIALOGUE_AUDIO_MODE")
     )
     bindings_changed = character_assets.apply_cached_bindings(db, characters)
@@ -3681,6 +4119,12 @@ async def run(job_id: str) -> None:
     continuity_changed = scene_assets.apply_continuity_metadata(
         sb, characters
     )
+    dependency_graph = master_dependencies.build_master_dependency_graph(
+        generation_units
+    )
+    if sb.get("master_dependency_graph") != dependency_graph:
+        sb["master_dependency_graph"] = dependency_graph
+        continuity_changed = True
     if bindings_changed or continuity_changed:
         db.execute(
             "UPDATE jobs SET storyboard=?,characters_json=? WHERE job_id=?",
@@ -3691,7 +4135,12 @@ async def run(job_id: str) -> None:
             ),
         )
         db.commit()
-    sb_shots = {s["idx"]: s for s in generation_units}
+    sb_shots = {
+        s["idx"]: production_config.attach_runtime_snapshot(
+            s, generation_snapshot
+        )
+        for s in generation_units
+    }
 
     # Resolve deterministic, reviewed local footage before any stochastic
     # Seedance submission. Matched rows become OK and disappear from the
@@ -3714,11 +4163,12 @@ async def run(job_id: str) -> None:
     if not rows and not review_rows:
         return
 
-    configured_concurrency = max(1, int(MAX_CONCURRENT_SHOTS))
-    model_concurrency = max(1, _env_nonnegative_int(
-        "SEEDANCE_MAX_CONCURRENT_MASTERS", configured_concurrency
+    configured_concurrency = max(
+        1, int(generation_snapshot["max_concurrent_masters"])
+    )
+    sem = asyncio.Semaphore(provider_capacity.effective_limit(
+        db, "seedance", configured_limit=configured_concurrency
     ))
-    sem = asyncio.Semaphore(min(configured_concurrency, model_concurrency))
     results: list[tuple[int, Exception | None]] = []
     identity_anchors = (
         await _ensure_character_identity_anchors(
@@ -3785,58 +4235,6 @@ async def run(job_id: str) -> None:
     for _, scene_key, completed_anchor in completed_scene_anchors:
         scene_video_anchors[scene_key] = completed_anchor
 
-    def dependency_keys(row) -> frozenset[str]:
-        shot = dict(row)
-        sb_shot = sb_shots.get(shot["idx"], {})
-        keys: set[str] = set()
-        scene_key = str(
-            sb_shot.get("scene_anchor_key") or ""
-        ).strip().casefold()
-        if scene_key:
-            keys.add(f"scene:{scene_key}")
-
-        def add_identity(character_id: object) -> None:
-            raw_id = str(character_id or "").strip()
-            if not raw_id:
-                return
-            character = chars.get(raw_id)
-            identity_key = (
-                character_assets.character_identity_key(character)
-                if character else raw_id
-            )
-            keys.add(f"identity:{identity_key}")
-
-        if shot["narrative_type"] != "dialogue":
-            add_identity(
-                shot.get("anchor_character")
-                or sb_shot.get("anchor_character")
-            )
-            for cast_character in _scene_cast_characters(
-                sb_shot, chars, ""
-            ):
-                add_identity(cast_character.get("id"))
-            return frozenset(keys)
-        speaker_id = str(shot.get("speaker_id") or "").strip()
-        speaker = chars.get(speaker_id)
-        identity_key = (
-            character_assets.character_identity_key(speaker)
-            if speaker else speaker_id
-        )
-        if identity_key:
-            keys.add(f"identity:{identity_key}")
-        render_mode = str(
-            sb_shot.get("render_mode") or "presenter"
-        ).casefold()
-        if render_mode == "cinematic_character":
-            for cast_character in _scene_cast_characters(
-                sb_shot, chars, speaker_id
-            ):
-                keys.add(
-                    "identity:"
-                    + character_assets.character_identity_key(cast_character)
-                )
-        return frozenset(keys)
-
     async def generate_row(row, paid_batch_id: str):
         r = row
         shot = dict(r)
@@ -3844,6 +4242,21 @@ async def run(job_id: str) -> None:
         scene_key = str(
             sb_shot.get("scene_anchor_key") or ""
         ).strip().casefold()
+        spatial_key = scene_assets.reference_anchor_key(
+            sb_shot, scene_anchors.keys()
+        )
+        site_key = str(
+            sb_shot.get("site_anchor_key") or ""
+        ).strip().casefold()
+        spatial_scope = (
+            "site" if spatial_key and spatial_key == site_key else "scene"
+        )
+        sb_shot = {
+            **sb_shot,
+            "_spatial_anchor_key": spatial_key,
+            "_spatial_anchor_scope": spatial_scope,
+        }
+        spatial_reference = scene_anchors.get(spatial_key)
         # Dialogue shots are deliberately sequential: each verified native
         # clip becomes the identity + voice reference for that speaker's next
         # clip. This is the consistency route proven in the 2.5 validation.
@@ -3929,9 +4342,7 @@ async def run(job_id: str) -> None:
                 ),
                 cast_characters=cast_characters,
                 identity_anchors=identity_anchors,
-                scene_reference=scene_anchors.get(
-                    scene_key
-                ),
+                scene_reference=spatial_reference,
                 scene_video_anchor=scene_video_anchors.get(scene_key),
                 paid_batch_id=paid_batch_id,
                 asr_enabled=(sb.get("production_settings") or {}).get(
@@ -3987,9 +4398,7 @@ async def run(job_id: str) -> None:
                 sem, scene_voiceover=True,
                 voice_anchor=voice_anchors.get(voice_key),
                 fixed_voice_track=fixed_voice_track,
-                scene_reference=scene_anchors.get(
-                    str(sb_shot.get("scene_anchor_key") or "").casefold()
-                ),
+                scene_reference=spatial_reference,
                 paid_batch_id=paid_batch_id,
                 asr_enabled=(sb.get("production_settings") or {}).get(
                     "asr_enabled", True
@@ -4011,9 +4420,7 @@ async def run(job_id: str) -> None:
             idx, error = await _gen_broll(
                 job_id, shot, anchor_path,
                 {**sb_shot, "audio_mode": audio_mode}, sem,
-                scene_reference=scene_anchors.get(
-                    str(sb_shot.get("scene_anchor_key") or "").casefold()
-                ),
+                scene_reference=spatial_reference,
                 cast_characters=broll_cast,
                 identity_anchors=identity_anchors,
                 paid_batch_id=paid_batch_id,
@@ -4023,19 +4430,20 @@ async def run(job_id: str) -> None:
             )
             return idx, error, None, None, None, None
 
-    pending_rows = list(rows)
+    pending_rows = {int(row["idx"]): row for row in rows}
+    review_indexes = {int(row["idx"]) for row in review_rows}
     while pending_rows:
-        occupied: set[str] = set()
-        wave = []
-        deferred = []
-        for row in pending_rows:
-            keys = dependency_keys(row)
-            if keys & occupied:
-                deferred.append(row)
-                continue
-            wave.append(row)
-            occupied.update(keys)
-        pending_rows = deferred
+        ready_indexes, _blocked = master_dependencies.ready_master_wave(
+            dependency_graph,
+            pending_indexes=set(pending_rows),
+            blocked_indexes=review_indexes,
+        )
+        if not ready_indexes:
+            break
+        wave = [pending_rows.pop(idx) for idx in ready_indexes]
+        sem = asyncio.Semaphore(provider_capacity.effective_limit(
+            db, "seedance", configured_limit=configured_concurrency
+        ))
         paid_batch_id = provider_tasks.begin_paid_submit_batch(db, job_id)
         wave_results = await asyncio.gather(
             *(generate_row(row, paid_batch_id) for row in wave),
@@ -4067,6 +4475,9 @@ async def run(job_id: str) -> None:
             raise fatal
         if wave_failed:
             break
+        provider_capacity.record_wave_success(
+            db, "seedance", configured_limit=configured_concurrency
+        )
 
     failed = [(i, e) for i, e in results if e is not None]
     failed.extend((

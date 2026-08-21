@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import shutil
 
+from ..media_runtime import resolve_binary, resolve_subtitle_font
+
 
 class FFmpegError(RuntimeError):
     pass
@@ -13,20 +15,7 @@ class FFmpegError(RuntimeError):
 
 def executable(name: str) -> str:
     """Resolve FFmpeg tools even when a Windows service lacks the user PATH."""
-    resolved = shutil.which(name)
-    if resolved:
-        return resolved
-    local_app_data = os.getenv("LOCALAPPDATA")
-    if local_app_data:
-        links = Path(local_app_data) / "Microsoft" / "WinGet" / "Links"
-        candidate = links / f"{name}.exe"
-        if candidate.is_file():
-            return str(candidate)
-    return name
-
-
-# 中文字幕字体(雅黑粗体,短视频清晰度好)。可用 SUBTITLE_FONT env 覆盖。
-SUBTITLE_FONT = os.getenv("SUBTITLE_FONT", "C:/Windows/Fonts/msyhbd.ttc")
+    return str(resolve_binary(name))
 # 品牌信息(片尾 CTA 用),可 env 覆盖
 BRAND_NAME = os.getenv("BRAND_NAME", "")
 BRAND_CTA = os.getenv("BRAND_CTA", "设备租赁不踩坑 · 关注了解更多")
@@ -42,7 +31,7 @@ def _drawtext(textfile: Path, *, fontsize: int, y: str,
               enable: str | None = None) -> str:
     """构造一个 drawtext filter 片段。中文走 textfile(避免命令行编码坑)。"""
     parts = [
-        f"fontfile='{_esc(SUBTITLE_FONT)}'",
+        f"fontfile='{_esc(resolve_subtitle_font())}'",
         f"textfile='{_esc(textfile)}'",
         f"fontcolor={color}",
         f"fontsize={fontsize}",
@@ -204,6 +193,32 @@ async def has_audio_stream(path: Path) -> bool:
         str(path),
     ])
     return "codec_type=audio" in out
+
+
+async def transcode_edit_mov_to_mp4(source: Path, target: Path) -> None:
+    """Convert a Seedance edit/extend MOV to a browser-safe MP4 atomically."""
+    source = Path(source)
+    target = Path(target)
+    if not source.is_file():
+        raise FFmpegError(f"Seedance MOV source does not exist: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.stem}.transcoding{target.suffix}")
+    temporary.unlink(missing_ok=True)
+    try:
+        await _run([
+            "-i", str(source),
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(temporary),
+        ])
+        if not temporary.is_file() or temporary.stat().st_size <= 0:
+            raise FFmpegError("Seedance MOV conversion produced no MP4 output")
+        temporary.replace(target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 async def extract_audio_wav(video_path: Path, output_path: Path) -> None:

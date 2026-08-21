@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import escape
 import json
 import mimetypes
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -15,16 +16,38 @@ from urllib import request
 from urllib.parse import parse_qs, urlparse
 import webbrowser
 
+from dotenv import load_dotenv
+
+SERVER_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(SERVER_ROOT / ".env")
+
 from factory import SKILL_ROOT
 from factory.db import conn
 from factory.management_api import (
     CUSTOM_CHARACTER_IMAGE_MAX_BYTES, ManagementService,
 )
+from factory.runtime_profile import RuntimeProfile, resolve_runtime_profile
+from factory.server_auth import AuthRejected, COOKIE_NAME, ServerSessionManager
 
 
 UI_ROOT = Path(__file__).resolve().parent / "management_ui"
 MEDIA_UPLOAD_MAX_BYTES = 512 * 1024 * 1024
 MEDIA_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def configure_console_runtime(
+    *, root: Path = SKILL_ROOT, environ: dict[str, str] | None = None
+) -> tuple[RuntimeProfile, ServerSessionManager | None]:
+    values = dict(os.environ if environ is None else environ)
+    profile = resolve_runtime_profile(root=root, environ=values)
+    if profile.mode == "desktop":
+        return profile, None
+    return profile, ServerSessionManager(
+        session_secret=str(values.get("FACTORY_SESSION_SECRET") or ""),
+        password_hash=str(values.get("FACTORY_ADMIN_PASSWORD_HASH") or ""),
+        public_base_url=str(profile.public_base_url),
+        session_ttl_sec=int(values.get("FACTORY_SESSION_TTL_SEC") or 12 * 60 * 60),
+    )
 
 
 def existing_console_url(
@@ -87,6 +110,25 @@ def run_source_feed_scheduler(
             continue
 
 
+def run_provider_reconcile_sweeper(
+    service: ManagementService,
+    service_lock: threading.RLock,
+    stop_event: threading.Event,
+    *,
+    interval_sec: float = 30.0,
+    limit: int = 10,
+) -> None:
+    """Periodically inspect known remote tasks; never submit paid work."""
+    while not stop_event.wait(max(0.0, float(interval_sec))):
+        try:
+            with service_lock:
+                service.reconcile_provider_tasks(limit=limit)
+        except Exception:
+            # A sweep is advisory. Per-task errors are retained by the service,
+            # and a process-level failure must not take down the local console.
+            continue
+
+
 def validate_local_bind_host(host: str) -> str:
     """Keep this credential-bearing console reachable from this machine only."""
     value = str(host or "").strip().lower()
@@ -126,14 +168,68 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     service: ManagementService
     queue_supervisor: threading.Thread | None = None
     service_lock = threading.RLock()
+    runtime_mode = "desktop"
+    auth_manager: ServerSessionManager | None = None
 
     def log_message(self, format: str, *args) -> None:
         return
 
-    def _json(self, payload: dict, status: int = 200) -> None:
+    def _json(
+        self, payload: dict, status: int = 200, *, headers: dict[str, str] | None = None
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorize_server_request(self) -> bool:
+        if self.runtime_mode != "server":
+            self._authorized_session = None
+            return True
+        if self.auth_manager is None:
+            self._json({"error": "服务端认证未初始化"}, 503)
+            return False
+        try:
+            self._authorized_session = self.auth_manager.authorize(
+                self.command,
+                urlparse(self.path).path,
+                dict(self.headers.items()),
+            )
+            return True
+        except AuthRejected as exc:
+            request_path = urlparse(self.path).path
+            if exc.status == 401 and self.command == "GET" and not request_path.startswith("/api/"):
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", "/login")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return False
+            self.close_connection = True
+            self._json(
+                {"error": str(exc)}, exc.status,
+                headers={"Connection": "close"},
+            )
+            return False
+
+    def _login_html(self) -> None:
+        body = """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>AI Video Factory Login</title></head><body>
+<main><h1>AI Video Factory</h1><form id='login'><label>管理员密码
+<input id='password' type='password' autocomplete='current-password' required></label>
+<button>登录</button><p id='error' role='alert'></p></form></main>
+<script>document.querySelector('#login').onsubmit=async(e)=>{e.preventDefault();
+const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({password:document.querySelector('#password').value})});
+const p=await r.json();if(r.ok){sessionStorage.setItem('avf_csrf',p.csrf_token);location.href='/';}
+else document.querySelector('#error').textContent=p.error||'登录失败';};</script></body></html>""".encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -171,7 +267,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self, *, binary_kind: str | None = None
     ) -> tuple[int, str] | None:
         origin = self.headers.get("Origin")
-        if origin:
+        if origin and self.runtime_mode != "server":
             parsed_origin = urlparse(origin)
             host = self.headers.get("Host", "")
             parsed_host = urlparse(f"//{host}")
@@ -258,11 +354,22 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             ))
 
     def do_GET(self) -> None:
+        if not self._authorize_server_request():
+            return
         with self.service_lock:
             return self._do_GET()
 
     def _do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path in {"/healthz", "/readyz"}:
+            return self._json({"ok": True, "runtime": self.runtime_mode})
+        if parsed.path == "/login":
+            return self._login_html()
+        if parsed.path == "/api/auth/session":
+            return self._json({
+                "authenticated": True,
+                "csrf_token": self._authorized_session.csrf_token,
+            })
         if parsed.path == "/api/integrations/douyin/oauth/callback":
             query = parse_qs(parsed.query)
             if query.get("error"):
@@ -480,6 +587,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self._static(parsed.path)
 
     def do_POST(self) -> None:
+        if not self._authorize_server_request():
+            return
         with self.service_lock:
             return self._do_POST()
 
@@ -503,8 +612,31 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if character_upload:
                 return self._character_image_upload(character_upload.group(1))
             payload = self._body()
+            if request_path == "/api/auth/login" and self.runtime_mode == "server":
+                issued = self.auth_manager.login(str(payload.get("password") or ""))
+                return self._json(
+                    {"authenticated": True, "csrf_token": issued.csrf_token},
+                    headers={
+                        "Set-Cookie": (
+                            f"{COOKIE_NAME}={issued.token}; Path=/; HttpOnly; Secure; "
+                            "SameSite=Lax"
+                        )
+                    },
+                )
+            if request_path == "/api/auth/logout" and self.runtime_mode == "server":
+                return self._json(
+                    {"authenticated": False},
+                    headers={
+                        "Set-Cookie": (
+                            f"{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; "
+                            "SameSite=Lax"
+                        )
+                    },
+                )
             if request_path == "/api/integrations/douyin/oauth/start":
                 result = self.service.start_douyin_oauth()
+            elif request_path == "/api/quality-canary/jobs":
+                result = self.service.create_quality_canary(payload)
             elif request_path == "/api/providers/seedance/clear-block":
                 result = self.service.clear_seedance_provider_block()
             elif request_path == "/api/integrations/douyin/disconnect":
@@ -538,9 +670,19 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             elif (request_path.startswith("/api/source-feeds/")
                   and request_path.endswith("/collect")):
                 result = self.service.collect_source_feed(request_path.split("/")[3])
+            elif (request_path.startswith("/api/source-feeds/")
+                  and request_path.endswith("/settings")):
+                result = self.service.update_source_feed(
+                    request_path.split("/")[3], payload
+                )
             elif (request_path.startswith("/api/source-candidates/")
                   and request_path.endswith("/promote")):
                 result = self.service.promote_source_candidate(request_path.split("/")[3])
+            elif (request_path.startswith("/api/source-candidates/")
+                  and request_path.endswith("/reject")):
+                result = self.service.reject_source_candidate(
+                    request_path.split("/")[3], payload
+                )
             elif (request_path.startswith("/api/sources/")
                   and request_path.endswith("/analyze")):
                 if payload.get("confirmed") is not True:
@@ -646,6 +788,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     job_id,
                     confirmed=payload.get("confirmed") is True,
                     approved_budget_cents=payload.get("approved_budget_cents"),
+                    high_risk_confirmed=(
+                        payload.get("high_risk_confirmed") is True
+                    ),
                 )
             elif (request_path.endswith("/upgrade-director")
                   and request_path.startswith("/api/videos/")):
@@ -663,6 +808,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 job_id = request_path.split("/")[3]
                 result = self.service.reconcile_provider_task(
                     job_id, str(payload.get("task_id") or "")
+                )
+            elif request_path == "/api/production/reconcile":
+                result = self.service.reconcile_provider_tasks(
+                    limit=int(payload.get("limit") or 10)
                 )
             elif (request_path.startswith("/api/videos/")
                   and request_path.endswith("/regenerate")
@@ -687,6 +836,18 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     start_sec=float(payload.get("repair_start_sec")),
                     end_sec=float(payload.get("repair_end_sec")),
                     reason=str(payload.get("reason") or ""),
+                )
+            elif (request_path.startswith("/api/videos/")
+                  and request_path.endswith("/extend")
+                  and "/masters/" in request_path):
+                parts = request_path.split("/")
+                job_id = parts[3]
+                master_idx = int(parts[5])
+                result = self.service.prepare_master_extension(
+                    job_id,
+                    master_idx,
+                    extension_sec=float(payload.get("extension_sec")),
+                    direction=str(payload.get("direction") or ""),
                 )
             elif (request_path.startswith("/api/videos/")
                   and request_path.endswith("/candidate-review")
@@ -734,6 +895,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return self._json({"error": str(exc)}, 500)
 
     def do_DELETE(self) -> None:
+        if not self._authorize_server_request():
+            return
         with self.service_lock:
             return self._do_DELETE()
 
@@ -782,24 +945,39 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
 
 def serve(
-    host: str = "127.0.0.1",
+    host: str | None = None,
     port: int = 8765,
     *,
     open_browser: bool = True,
     start_page: str = "overview",
 ) -> None:
-    host = validate_local_bind_host(host)
+    profile, auth_manager = configure_console_runtime()
+    requested_host = str(host or profile.bind_host)
+    if profile.mode == "desktop":
+        requested_host = validate_local_bind_host(requested_host)
+    elif requested_host != profile.bind_host:
+        raise ValueError(
+            "server 模式监听地址必须由 FACTORY_BIND_HOST 统一配置"
+        )
+    host = requested_host
+    ConsoleHandler.runtime_mode = profile.mode
+    ConsoleHandler.auth_manager = auth_manager
     database = conn()
-    ConsoleHandler.service = ManagementService(database, SKILL_ROOT)
-    stop_event = threading.Event()
-    supervisor = threading.Thread(
-        target=run_queue_supervisor,
-        args=(ConsoleHandler.service, ConsoleHandler.service_lock, stop_event),
-        name="video-queue-supervisor",
-        daemon=True,
+    ConsoleHandler.service = ManagementService(
+        database, SKILL_ROOT, worker_mode=profile.worker_mode
     )
+    stop_event = threading.Event()
+    supervisor = None
     ConsoleHandler.queue_supervisor = supervisor
-    supervisor.start()
+    if profile.worker_mode == "child_process":
+        supervisor = threading.Thread(
+            target=run_queue_supervisor,
+            args=(ConsoleHandler.service, ConsoleHandler.service_lock, stop_event),
+            name="video-queue-supervisor",
+            daemon=True,
+        )
+        ConsoleHandler.queue_supervisor = supervisor
+        supervisor.start()
     source_scheduler = threading.Thread(
         target=run_source_feed_scheduler,
         args=(ConsoleHandler.service, ConsoleHandler.service_lock, stop_event),
@@ -807,13 +985,43 @@ def serve(
         daemon=True,
     )
     source_scheduler.start()
+    reconcile_sweeper = None
+    if str(os.getenv("PROVIDER_RECONCILE_ENABLED", "true")).strip().casefold() \
+            not in {"0", "false", "no", "off"}:
+        try:
+            reconcile_interval = max(
+                1.0, float(os.getenv("PROVIDER_RECONCILE_INTERVAL_SEC", "30"))
+            )
+        except (TypeError, ValueError):
+            reconcile_interval = 30.0
+        try:
+            reconcile_limit = max(
+                1, min(50, int(os.getenv("PROVIDER_RECONCILE_BATCH_SIZE", "10")))
+            )
+        except (TypeError, ValueError):
+            reconcile_limit = 10
+        reconcile_sweeper = threading.Thread(
+            target=run_provider_reconcile_sweeper,
+            args=(ConsoleHandler.service, ConsoleHandler.service_lock, stop_event),
+            kwargs={
+                "interval_sec": reconcile_interval,
+                "limit": reconcile_limit,
+            },
+            name="provider-reconcile-sweeper",
+            daemon=True,
+        )
+        reconcile_sweeper.start()
     server = ThreadingHTTPServer((host, port), ConsoleHandler)
     start_page = start_page if start_page in {
         "overview", "projects", "scripts", "videos", "publishing", "characters", "config"
     } else "overview"
-    url = f"http://{host}:{port}/#{start_page}"
+    url = (
+        f"{profile.public_base_url}/#{start_page}"
+        if profile.mode == "server"
+        else f"http://{host}:{port}/#{start_page}"
+    )
     print(f"AI Video Factory 管理台已启动：{url}")
-    if open_browser:
+    if open_browser and profile.mode == "desktop":
         webbrowser.open(url)
     try:
         server.serve_forever()
@@ -821,8 +1029,11 @@ def serve(
         pass
     finally:
         stop_event.set()
-        supervisor.join(timeout=3)
+        if supervisor is not None:
+            supervisor.join(timeout=3)
         source_scheduler.join(timeout=3)
+        if reconcile_sweeper is not None:
+            reconcile_sweeper.join(timeout=3)
         ConsoleHandler.queue_supervisor = None
         server.server_close()
         database.close()
@@ -830,7 +1041,7 @@ def serve(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument(
@@ -839,18 +1050,21 @@ def main() -> int:
         default="overview",
     )
     args = parser.parse_args()
-    existing = existing_console_url(
-        args.host,
-        args.port,
-        start_page=args.start_page,
-    )
-    if existing:
-        print(f"AI Video Factory 管理台已在运行：{existing}")
-        if not args.no_browser:
-            webbrowser.open(existing)
-        return 0
+    profile, _ = configure_console_runtime()
+    host = args.host or profile.bind_host
+    if profile.mode == "desktop":
+        existing = existing_console_url(
+            host,
+            args.port,
+            start_page=args.start_page,
+        )
+        if existing:
+            print(f"AI Video Factory 管理台已在运行：{existing}")
+            if not args.no_browser:
+                webbrowser.open(existing)
+            return 0
     serve(
-        args.host,
+        host,
         args.port,
         open_browser=not args.no_browser,
         start_page=args.start_page,

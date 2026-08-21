@@ -1,6 +1,9 @@
 """P0 production failure classification and provider circuit-breaker tests."""
+from copy import deepcopy
 from pathlib import Path
 import asyncio
+import importlib
+import importlib.util
 import json
 import os
 import sqlite3
@@ -32,13 +35,15 @@ def load_provider_failure(name: str) -> dict:
 
 
 from factory import (  # noqa: E402
-    db, orchestrator, provider_tasks, script_drafts, script_sources,
+    db, master_dependencies, master_risk, orchestrator, provider_capacity,
+    provider_tasks, quality_canary, reference_attention, script_drafts,
+    script_sources,
 )
 from factory.clients import (  # noqa: E402
     music, provider_downloads, seedance, seedream_45,
 )
 from factory.management_api import ManagementService  # noqa: E402
-from factory.steps import s3_shots, s5_bgm  # noqa: E402
+from factory.steps import s3_shots, s5_bgm, s6_compose  # noqa: E402
 from factory.video_routing import VideoRoute  # noqa: E402
 from management_server import ConsoleHandler  # noqa: E402
 from http.server import ThreadingHTTPServer  # noqa: E402
@@ -47,6 +52,253 @@ try:
     from factory import provider_health  # noqa: E402
 except ImportError:
     provider_health = None
+
+
+class FailureOutcomeContractTests(unittest.TestCase):
+    def test_every_failure_has_stable_code_and_one_next_action(self):
+        module_spec = importlib.util.find_spec("factory.error_registry")
+        self.assertIsNotNone(
+            module_spec,
+            "central failure registry must exist before classifying failures",
+        )
+        registry = importlib.import_module("factory.error_registry")
+
+        outcome = registry.describe_failure(
+            RuntimeError("precision-sensitive shot blocked")
+        )
+
+        self.assertEqual(outcome.code, "prompt_auto_repair_required")
+        self.assertEqual(outcome.category, "contract")
+        self.assertEqual(outcome.stage, "preflight")
+        self.assertEqual(outcome.retry_policy, "manual")
+        self.assertEqual(outcome.cost_effect, "none")
+        self.assertEqual(outcome.next_action.id, "recompile_production_spec")
+        self.assertEqual(outcome.next_action.label, "重新编译生产规格")
+
+    def test_registered_failures_use_fixed_safe_messages_and_unique_actions(self):
+        registry = importlib.import_module("factory.error_registry")
+
+        class SignaledFailure(RuntimeError):
+            pass
+
+        cases = [
+            ("request_invalid", "", "recompile_production_spec", "none"),
+            ("input_privacy_rejected", "", "replace_private_reference", "none"),
+            ("output_policy_rejected", "", "revise_output_prompt", "none"),
+            ("output_copyright_rejected", "", "replace_copyright_reference", "none"),
+            ("account_unavailable", "PROVIDER_ACTION_REQUIRED", "view_provider_account_guide", "none"),
+            ("transient_network", "", "retry_automatically", "none"),
+            ("transient_network", "PROVIDER_ACTION_REQUIRED", "reconcile_provider_task", "unknown"),
+        ]
+        secret = "Bearer TOP-SECRET https://evil.example/x?token=LEAK C:\\Users\\private"
+        for code, pause_state, action_id, cost_effect in cases:
+            with self.subTest(code=code, pause_state=pause_state):
+                error = SignaledFailure(secret)
+                error.stable_code = code
+                if pause_state:
+                    error.pause_state = pause_state
+                outcome = registry.describe_failure(error, stage="master_generation")
+                self.assertEqual(outcome.code, code)
+                self.assertEqual(outcome.stage, "master_generation")
+                self.assertEqual(outcome.next_action.id, action_id)
+                self.assertEqual(outcome.cost_effect, cost_effect)
+                self.assertTrue(outcome.user_message)
+                self.assertTrue(outcome.technical_summary)
+                rendered = (
+                    outcome.user_message + " " + outcome.technical_summary
+                ).casefold()
+                for forbidden in (
+                    "top-secret", "token=", "evil.example", "c:\\users",
+                ):
+                    self.assertNotIn(forbidden, rendered)
+
+    def test_unknown_failure_never_defaults_to_continue_generation(self):
+        registry = importlib.import_module("factory.error_registry")
+
+        outcome = registry.describe_failure(
+            RuntimeError("https://provider.invalid?api_key=secret")
+        )
+
+        self.assertEqual(outcome.code, "internal_error")
+        self.assertEqual(outcome.retry_policy, "manual")
+        self.assertEqual(outcome.next_action.id, "preserve_and_diagnose")
+        self.assertNotIn("secret", outcome.user_message.casefold())
+        self.assertNotIn("provider.invalid", outcome.technical_summary.casefold())
+
+    def test_orchestrator_persists_only_the_registered_safe_outcome(self):
+        database = memory_database()
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state) "
+            "VALUES('J-OUTCOME','T-OUTCOME','安全错误落库','PENDING')"
+        )
+        database.commit()
+
+        error = RuntimeError(
+            "Bearer TOP-SECRET https://evil.example/x?token=LEAK"
+        )
+        error.stable_code = "account_unavailable"
+        error.pause_state = "PROVIDER_ACTION_REQUIRED"
+        with (
+            patch.object(orchestrator, "conn", return_value=database),
+            patch.object(
+                orchestrator, "_run_step", new=AsyncMock(side_effect=error)
+            ),
+        ):
+            asyncio.run(
+                orchestrator._process_job("J-OUTCOME", asyncio.Semaphore(1))
+            )
+
+        row = database.execute(
+            "SELECT state,error,failure_code FROM jobs WHERE job_id='J-OUTCOME'"
+        ).fetchone()
+        self.assertEqual(row["state"], "PROVIDER_ACTION_REQUIRED")
+        self.assertEqual(row["failure_code"], "account_unavailable")
+        self.assertEqual(
+            row["error"],
+            "模型账号当前不可用，请处理账号后再恢复任务",
+        )
+        events = [
+            str(item[0]) for item in database.execute(
+                "SELECT message FROM events WHERE job_id='J-OUTCOME'"
+            ).fetchall()
+        ]
+        self.assertTrue(events)
+        rendered = " ".join(events).casefold()
+        self.assertNotIn("top-secret", rendered)
+        self.assertNotIn("token=", rendered)
+        self.assertNotIn("evil.example", rendered)
+        database.close()
+
+    def test_management_uses_registered_action_for_failed_jobs(self):
+        database = memory_database()
+        database.executemany(
+            "INSERT INTO jobs(job_id,topic_id,title,state,error,failure_code) "
+            "VALUES(?,?,?,'FAILED',?,?)",
+            [
+                (
+                    "J-PRIVACY", "T-PRIVACY", "隐私失败",
+                    "输入素材未通过真人隐私校验，请更换已授权素材",
+                    "input_privacy_rejected",
+                ),
+                (
+                    "J-INTERNAL", "T-INTERNAL", "未知失败",
+                    "生产过程出现未识别异常，已保留现场，请重新诊断",
+                    "internal_error",
+                ),
+            ],
+        )
+        database.commit()
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ManagementService(database, Path(tmp))
+            jobs = {item["job_id"]: item for item in service.videos()["jobs"]}
+
+        self.assertEqual(
+            jobs["J-PRIVACY"]["next_action"]["id"],
+            "replace_private_reference",
+        )
+        self.assertEqual(
+            jobs["J-INTERNAL"]["next_action"]["id"],
+            "preserve_and_diagnose",
+        )
+        self.assertFalse(jobs["J-PRIVACY"]["resumable"])
+        self.assertFalse(jobs["J-INTERNAL"]["resumable"])
+        database.close()
+
+
+class Seedance25AcceptanceFixtureTests(unittest.TestCase):
+    FIXTURE = (
+        PROJECT_ROOT / "tests" / "fixtures" / "acceptance"
+        / "seedance25_multicharacter.json"
+    )
+
+    def test_fixture_covers_the_no_cost_end_to_end_contract(self):
+        payload = json.loads(self.FIXTURE.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(payload["characters"]), 3)
+        self.assertEqual(len(set(payload["recurring_scenes"])), 2)
+        graph = master_dependencies.build_master_dependency_graph(
+            payload["masters"]
+        )
+        self.assertEqual(graph["waves"], payload["expected_dependency_waves"])
+
+        manifest = reference_attention.select_manifest(
+            [reference_attention.candidate(**item)
+             for item in payload["reference_candidates"]],
+            max_video_references=3,
+            max_total_references=6,
+        )
+        duties = reference_attention.compile_prompt_duties(manifest)
+        self.assertEqual(
+            [item["duty"] for item in manifest],
+            [
+                "scene_continuity", "speaker_identity",
+                "supporting_identity", "voice_continuity",
+            ],
+        )
+        self.assertTrue(any(line.startswith("视频1") for line in duties))
+        self.assertTrue(any(line.startswith("音频1") for line in duties))
+
+        risk = master_risk.assess_master(payload["masters"][3])
+        self.assertEqual(risk["level"], "high")
+        self.assertEqual(
+            [item["kind"] for item in payload["review_candidates"]],
+            ["edit", "extend"],
+        )
+        self.assertEqual(
+            sum(payload["cost_breakdown_cents"].values()),
+            payload["expected_total_cost_cents"],
+        )
+        self.assertEqual(
+            payload["state_path"],
+            [
+                "STORYBOARDED", "PRODUCTION_QUEUED",
+                "PRODUCTION_RUNNING", "ANCHOR_REVIEW_REQUIRED",
+                "PRODUCTION_REVIEW_REQUIRED", "SHOTS_OK", "BGM_OK",
+                "COMPOSED", "READY_TO_PUBLISH",
+            ],
+        )
+        self.assertEqual(payload["remote_recovery"]["method"], "GET")
+        self.assertFalse(payload["remote_recovery"]["allow_submit"])
+
+    def test_fixture_adaptive_capacity_and_provider_ledger_are_idempotent(self):
+        payload = json.loads(self.FIXTURE.read_text(encoding="utf-8"))
+        database = memory_database()
+        reduced = provider_capacity.record_rate_limit(
+            database, "seedance",
+            configured_limit=payload["configured_concurrency"],
+            cooldown_seconds=0,
+        )
+        self.assertEqual(reduced["effective_limit"], 2)
+        for _ in range(5):
+            recovered = provider_capacity.record_wave_success(
+                database, "seedance",
+                configured_limit=payload["configured_concurrency"],
+            )
+        self.assertEqual(recovered["effective_limit"], 3)
+
+        call = payload["provider_call"]
+        database.execute(
+            "INSERT OR IGNORE INTO provider_calls(task_id,job_id,shot_idx,"
+            "provider,intent,usage_json,cost_cents) VALUES(?,?,?,?,?,?,?)",
+            (
+                call["task_id"], call["job_id"], call["shot_idx"],
+                call["provider"], call["intent"],
+                json.dumps({"status": "completed"}), call["cost_cents"],
+            ),
+        )
+        database.execute(
+            "INSERT OR IGNORE INTO provider_calls(task_id,job_id,shot_idx,"
+            "provider,intent,usage_json,cost_cents) VALUES(?,?,?,?,?,?,?)",
+            (
+                call["task_id"], call["job_id"], call["shot_idx"],
+                call["provider"], call["intent"],
+                json.dumps({"status": "completed"}), call["cost_cents"],
+            ),
+        )
+        self.assertEqual(database.execute(
+            "SELECT COUNT(*) FROM provider_calls WHERE task_id=?",
+            (call["task_id"],),
+        ).fetchone()[0], 1)
 
 
 def memory_database() -> sqlite3.Connection:
@@ -327,7 +579,10 @@ class ProductionFailureOutcomeMatrixTests(
             0,
         )
         self.assertEqual((row["cost_cents"], row["state"]), (0, "FAILED"))
-        self.assertIsNone(view["next_action"])
+        self.assertEqual(view["next_action"], {
+            "id": "retry_failed_job",
+            "label": "重新尝试任务",
+        })
         self.assert_safe_message(row["error"])
 
     async def test_account_circuit_blocks_sibling_submit_and_exposes_next_action(self):
@@ -1003,7 +1258,9 @@ class BackgroundMusicFailureMatrixTests(
             local_artifact = Path(tmp) / "J-BGM-LOCAL" / "bgm.mp3"
             self.assertEqual(local_artifact.read_bytes(), b"silent-bgm")
 
-            library = Mock(side_effect=RuntimeError("no local bgm"))
+            library = Mock(side_effect=music.MusicProviderConfigError(
+                "no local bgm"
+            ))
             paid_submit = AsyncMock()
             with (
                 patch.dict(
@@ -1097,14 +1354,58 @@ class BackgroundMusicFailureMatrixTests(
                 "next_action": views["J-BGM-LIBRARY"]["next_action"],
                 "message": views["J-BGM-LIBRARY"]["error"],
             },
-            calls={"local": 3, "provider_submit": 0, "provider_rows": 0},
+            calls={"local": 1, "provider_submit": 0, "provider_rows": 0},
             cost={"job": 0, "shots": (0,)},
-            job_state="FAILED", shot_states=("OK",), next_action=None,
-            message_contains="library",
+            job_state="FAILED", shot_states=("OK",), next_action={
+                "id": "configure_music_provider",
+                "label": "检查音乐配置",
+            },
+            message_contains="音乐",
         )
         self.assertTrue(jobs["J-BGM-LOCAL"]["bgm_path"])
         self.assertFalse(jobs["J-BGM-LIBRARY"]["bgm_path"])
         paid_submit.assert_not_awaited()
+        database.close()
+
+    def test_music_configuration_failure_resumes_only_local_postproduction_after_fix(self):
+        database = memory_database()
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents,"
+            "failure_code,error) VALUES(?, 'T-BGM', 'bgm recovery', 'FAILED', ?, 0, ?, ?)",
+            (
+                "J-BGM-RECOVER",
+                json.dumps({"masters": [{"idx": 1, "duration": 4, "type": "dialogue"}]}),
+                "music_configuration_invalid",
+                "音乐素材库配置不可用，请检查音乐配置",
+            ),
+        )
+        database.execute(
+            "INSERT INTO shots(job_id,idx,state,duration_sec,cost_cents) "
+            "VALUES('J-BGM-RECOVER',1,'OK',4,0)"
+        )
+        database.commit()
+        with tempfile.TemporaryDirectory() as tmp:
+            service = ManagementService(database, Path(tmp))
+            with (
+                patch.object(service, "_music_provider", return_value="silent"),
+                patch.object(s5_bgm, "run", new=AsyncMock()),
+                patch.object(s6_compose, "run", new=AsyncMock()),
+                patch(
+                    "factory.management_api.finalize_accepted_candidates",
+                    return_value=None,
+                ),
+            ):
+                result = service.resume_failed_video("J-BGM-RECOVER")
+
+        self.assertEqual(result["state"], "COMPOSED")
+        self.assertEqual(result["preserved_masters"], 1)
+        persisted = database.execute(
+            "SELECT state,failure_code,cost_cents FROM jobs WHERE job_id='J-BGM-RECOVER'"
+        ).fetchone()
+        self.assertEqual(
+            (persisted["state"], persisted["failure_code"], persisted["cost_cents"]),
+            ("COMPOSED", None, 0),
+        )
         database.close()
 
 
@@ -3378,6 +3679,136 @@ class ProviderManagementTests(unittest.TestCase):
         self.assertIn("已解除本地阻断，请返回任务确认续跑", script)
         self.assertIn("不会自动检测余额", script)
         self.assertIn("不会自动续跑", script)
+
+
+class RealQualityCanaryContractTests(unittest.TestCase):
+    def test_frozen_profiles_are_exactly_the_three_authorized_shapes(self):
+        profiles = quality_canary.load_frozen_profiles()
+
+        self.assertEqual(
+            [(item["duration_sec"], len(item["characters"])) for item in profiles],
+            [(8, 1), (18, 2), (26, 3)],
+        )
+        self.assertEqual(
+            [item["budget_cents"] for item in profiles], [1500, 3000, 4500]
+        )
+        self.assertTrue(all(item["max_auto_retries"] == 0 for item in profiles))
+        self.assertTrue(all(item["requires_explicit_authorization"] for item in profiles))
+
+    def test_acceptance_record_preserves_cost_tasks_and_review_risks(self):
+        job = {
+            "job_id": "J-CANARY-OBSERVED", "title": "已完成真实样本",
+            "state": "READY_TO_PUBLISH", "cost_cents": 9102,
+            "total_master_duration_sec": 70.5,
+            "production_settings": {
+                "orientation": "9:16", "audio_mode": "seedance_native",
+                "generation_snapshot": {
+                    "model": "doubao-seedance-2-5-260628",
+                    "max_auto_retries": 1, "job_budget_cents": 15000,
+                },
+            },
+            "storyboard": {"title": "完整输入", "masters": [{"idx": 1}]},
+            "characters": [{"id": "lead", "name": "林夏"}],
+            "scene_anchor_plan": [{"anchor_key": "site", "status": "ready"}],
+            "character_makeup_plan": [{"identity_key": "lead", "status": "ready"}],
+            "shots": [{
+                "idx": 3, "state": "OK", "cost_cents": 2626,
+                "quality_reasons": ["lip_sync_mismatch", "visual_mismatch"],
+                "quality_status": "candidate_accepted",
+                "human_decision": "accept_candidate",
+                "video_path": r"C:\runtime\data\assets\J-CANARY-OBSERVED\shots\03.mp4",
+                "video_url": "https://signed.example/private.mp4?token=secret",
+            }],
+            "latest_review": {
+                "decision": "approved", "first_pass": 0,
+                "checks": {"identity": True, "lip_sync": True},
+            },
+            "final_path": r"C:\runtime\data\assets\J-CANARY-OBSERVED\final.mp4",
+        }
+        calls = [{
+            "task_id": "remote-task-1", "shot_idx": 3,
+            "provider": "seedance", "intent": "generate",
+            "cost_cents": 2626,
+            "usage_json": json.dumps({
+                "total_tokens": 375092, "status": "completed",
+                "reference_manifest": [{"kind": "video", "duty": "speaker_identity"}],
+            }),
+        }]
+
+        record = quality_canary.build_acceptance_record(
+            job, calls, root=Path(r"C:\runtime"), run_id="observed-test13"
+        )
+
+        self.assertEqual(record["classification"], "observational")
+        self.assertEqual(record["completion_status"], "evidence_only")
+        self.assertEqual(record["cost"]["actual_cents"], 9102)
+        self.assertEqual(record["provider_tasks"][0]["task_id"], "remote-task-1")
+        self.assertEqual(record["provider_tasks"][0]["total_tokens"], 375092)
+        self.assertEqual(
+            record["quality"]["shot_findings"][0]["quality_reasons"],
+            ["lip_sync_mismatch", "visual_mismatch"],
+        )
+        self.assertEqual(record["quality"]["final_review"]["first_pass"], 0)
+        self.assertIsNone(record["quality"]["manual_scores"])
+        serialized = json.dumps(record, ensure_ascii=False)
+        self.assertNotIn("signed.example", serialized)
+        self.assertNotIn("token=secret", serialized)
+
+    def test_canary_classification_requires_the_exact_frozen_contract(self):
+        frozen = quality_canary.prepare_run_contract("single-speaker-8s-v1")
+        base_job = {
+            "job_id": "J-CANARY-8S",
+            "title": "8 秒正式样本",
+            "state": "READY_TO_PUBLISH",
+            "cost_cents": 700,
+            "total_master_duration_sec": 8,
+            "characters": [{"name": "林夏"}],
+            "storyboard": {},
+            "shots": [],
+            "production_settings": {
+                "generation_snapshot": dict(frozen),
+            },
+        }
+
+        exact = quality_canary.build_acceptance_record(
+            base_job, [], root=PROJECT_ROOT, run_id="exact-canary",
+            profile_id="single-speaker-8s-v1",
+        )
+        self.assertEqual(exact["classification"], "canary")
+        self.assertEqual(exact["profile_id"], "single-speaker-8s-v1")
+
+        wrong_script = deepcopy(base_job)
+        wrong_script["production_settings"]["generation_snapshot"][
+            "quality_canary_frozen_input"
+        ]["script"][0]["dialogue"] = "这不是冻结脚本"
+        observed = quality_canary.build_acceptance_record(
+            wrong_script, [], root=PROJECT_ROOT, run_id="spoofed-canary",
+            profile_id="single-speaker-8s-v1",
+        )
+        self.assertEqual(observed["classification"], "observational")
+        self.assertIsNone(observed["profile_id"])
+
+        same_shape_wrong_character = deepcopy(base_job)
+        same_shape_wrong_character["characters"] = [{"name": "其他角色"}]
+        observed = quality_canary.build_acceptance_record(
+            same_shape_wrong_character, [], root=PROJECT_ROOT,
+            run_id="same-shape-wrong-character",
+            profile_id="single-speaker-8s-v1",
+        )
+        self.assertEqual(observed["classification"], "observational")
+        self.assertIsNone(observed["profile_id"])
+
+    def test_write_acceptance_record_is_atomic_and_runtime_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record = {"schema_version": 1, "run_id": "run-001"}
+            path = quality_canary.write_acceptance_record(root, record)
+
+            self.assertEqual(
+                path, root / "data" / "acceptance" / "run-001" / "acceptance.json"
+            )
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), record)
+            self.assertFalse(path.with_suffix(".json.tmp").exists())
 
 
 if __name__ == "__main__":

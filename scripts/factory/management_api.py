@@ -14,13 +14,14 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import httpx
 
 from . import (
-    anchor_generation, character_assets, character_voices, media_sources, performance_feedback, production_metrics, production_planner,
-    provider_health, provider_tasks, scene_assets, script_drafts, script_sources, source_analysis, source_scheduler, topic_briefs,
+    anchor_generation, character_assets, character_voices, error_registry, master_dependencies, media_sources, performance_feedback, production_metrics, production_planner, quality_canary,
+    production_config, provider_capacity, provider_health, provider_tasks, recovery_controller, scene_assets, script_drafts, script_sources, source_analysis, source_scheduler, state_machine, topic_briefs,
 )
 from .clients import douyin, music, seedance, volc_assets, volc_tts
 from .video_routing import AUDIO_MODE_FIXED_TTS, normalize_audio_mode
@@ -28,13 +29,65 @@ from .review_candidates import (
     controlled_candidate_path, controlled_job_asset_path,
     finalize_accepted_candidates,
 )
-from .steps import s3_shots, s5_bgm, s6_compose
+from .steps import s1_storyboard, s3_shots, s5_bgm, s6_compose
 
 
 CUSTOM_CHARACTER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 CUSTOM_CHARACTER_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 CUSTOM_CHARACTER_IMAGE_MAX_COUNT = 24
 WEIXIN_CHANNELS_ASSISTANT_URL = "https://channels.weixin.qq.com/login"
+
+FINAL_COST_STATES = {"COMPOSED", "READY_TO_PUBLISH", "PUBLISHED"}
+
+_TERMINAL_VIDEO_STATES = {"PUBLISHED", "REJECTED"}
+_DEFAULT_VIDEO_ACTIONS = {
+    "PENDING": {"id": "view_progress", "label": "查看任务进度"},
+    "STORYBOARDED": {"id": "confirm_budget", "label": "完成制作设置并预检"},
+    "PRODUCTION_QUEUED": {"id": "view_progress", "label": "查看排队进度"},
+    "PRODUCTION_RUNNING": {"id": "view_progress", "label": "查看生产进度"},
+    "REVIEW_DECIDING": {"id": "view_progress", "label": "查看复核进度"},
+    "ANCHOR_REVIEW_REQUIRED": {
+        "id": "review_continuity_anchors", "label": "确认人物与场景锚点",
+    },
+    "CHARACTER_OK": {"id": "view_progress", "label": "查看生产进度"},
+    "VOICE_OK": {"id": "view_progress", "label": "查看生产进度"},
+    "SHOTS_OK": {
+        "id": "resume_local_postproduction", "label": "继续本地后期",
+    },
+    "BGM_OK": {
+        "id": "resume_local_postproduction", "label": "继续本地合成",
+    },
+    "COMPOSED": {"id": "review_final_video", "label": "验收成片"},
+    "READY_TO_PUBLISH": {"id": "publish_video", "label": "选择渠道并发布"},
+    "FAILED": {"id": "preserve_and_diagnose", "label": "保留现场并重新诊断"},
+    "BLOCKED": {"id": "preserve_and_diagnose", "label": "保留现场并重新诊断"},
+    "RECOVERY_REQUIRED": {
+        "id": "preserve_and_diagnose", "label": "检查恢复现场",
+    },
+}
+
+_VIDEO_STATE_REASONS = {
+    "PENDING": "任务已创建，正在等待进入制作流程",
+    "STORYBOARDED": "导演计划已就绪，等待确认制作设置与预算",
+    "PRODUCTION_QUEUED": "任务已进入生产队列",
+    "PRODUCTION_RUNNING": "人物、场景或母片正在生成",
+    "REVIEW_DECIDING": "人工复核决定正在安全落盘",
+    "ANCHOR_REVIEW_REQUIRED": "人物与场景锚点已生成，等待人工确认",
+    "CHARACTER_OK": "人物资产已就绪，正在继续生产",
+    "VOICE_OK": "声音资产已就绪，正在继续生产",
+    "SHOTS_OK": "全部母片已就绪，等待本地后期",
+    "BGM_OK": "配乐已就绪，等待本地合成",
+    "COMPOSED": "成片已生成，等待人工验收",
+    "READY_TO_PUBLISH": "成片已通过验收，等待选择渠道发布",
+    "FAILED": "生产失败，现场与技术证据已保留",
+    "BLOCKED": "任务已阻断，等待人工诊断",
+    "RECOVERY_REQUIRED": "自动恢复次数已达上限，等待人工检查",
+    "PRODUCTION_REVIEW_REQUIRED": "候选母片等待人工复核",
+    "PROVIDER_ACTION_REQUIRED": "远端模型任务需要人工处理或核对",
+    "REJECTED_PENDING_RECONCILIATION": "业务已终止，仍需核对远端成本",
+    "REJECTED": "任务已由人工终止",
+    "PUBLISHED": "视频已发布",
+}
 
 
 SECRET_KEYS = {
@@ -49,6 +102,126 @@ SECRET_KEYS = {
     "DOUYIN_CLIENT_SECRET",
     "DOUYIN_ACCESS_TOKEN",
 }
+
+
+def _calibration_summary(samples: list[tuple[int, int]]) -> dict:
+    estimated_total = sum(item[0] for item in samples)
+    actual_total = sum(item[1] for item in samples)
+    variance = actual_total - estimated_total
+    variance_percent = (
+        round(variance * 100 / estimated_total, 1)
+        if estimated_total else None
+    )
+    mape = (
+        round(sum(
+            abs(actual - estimated) * 100 / estimated
+            for estimated, actual in samples
+        ) / len(samples), 1)
+        if samples else None
+    )
+    return {
+        "sample_count": len(samples),
+        "estimated_cost_cents": estimated_total,
+        "actual_cost_cents": actual_total,
+        "variance_cents": variance,
+        "variance_percent": variance_percent,
+        "mean_absolute_percentage_error": mape,
+        "status": (
+            "no_data" if not samples
+            else "calibrating" if len(samples) < 3
+            else "stable" if mape is not None and mape <= 10
+            else "drift"
+        ),
+    }
+
+
+def _cost_estimation_calibration(database, jobs) -> dict:
+    """Summarize only immutable confirmation snapshots from final jobs."""
+    samples: list[tuple[int, int, str]] = []
+    segment_samples: dict[str, dict[str, list[tuple[int, int]]]] = {
+        "resolution": {},
+        "duration_bucket": {},
+        "reference_type": {},
+    }
+    calls_by_master: dict[tuple[str, int], int] = {}
+    for call in database.execute(
+        "SELECT job_id,shot_idx,SUM(cost_cents) AS actual_cost_cents "
+        "FROM provider_calls WHERE provider LIKE 'seedance%' "
+        "AND shot_idx>0 GROUP BY job_id,shot_idx"
+    ).fetchall():
+        calls_by_master[(str(call["job_id"]), int(call["shot_idx"]))] = int(
+            call["actual_cost_cents"] or 0
+        )
+    for row in jobs:
+        if str(row["state"] or "") not in FINAL_COST_STATES:
+            continue
+        try:
+            storyboard = json.loads(row["storyboard"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        confirmed = (
+            storyboard.get("production_settings") or {}
+        ).get("confirmed_cost_estimate")
+        if not isinstance(confirmed, dict):
+            continue
+        try:
+            estimated = int(confirmed.get("projected_total_cost_cents") or 0)
+        except (TypeError, ValueError):
+            continue
+        if estimated <= 0:
+            continue
+        samples.append((
+            estimated,
+            int(row["cost_cents"] or 0),
+            str(confirmed.get("pricing_version") or "unknown"),
+        ))
+        paid_masters = confirmed.get("paid_masters") or []
+        if not isinstance(paid_masters, list):
+            continue
+        for master in paid_masters:
+            if not isinstance(master, dict):
+                continue
+            try:
+                master_idx = int(master.get("master_idx") or 0)
+                master_estimate = int(master.get("estimated_cost_cents") or 0)
+            except (TypeError, ValueError):
+                continue
+            actual = calls_by_master.get((str(row["job_id"]), master_idx))
+            if master_idx <= 0 or master_estimate <= 0 or actual is None:
+                continue
+            for dimension in segment_samples:
+                key = str(master.get(dimension) or "").strip()
+                if key:
+                    segment_samples[dimension].setdefault(key, []).append(
+                        (master_estimate, actual)
+                    )
+    overall = _calibration_summary([
+        (estimated, actual) for estimated, actual, _version in samples
+    ])
+    order = {
+        "resolution": ["480p", "720p", "1080p"],
+        "duration_bucket": ["4-12s", "13-24s", "25-30s"],
+        "reference_type": ["none", "audio", "image", "video", "mixed"],
+    }
+    segments = {}
+    for dimension, grouped in segment_samples.items():
+        keys = sorted(
+            grouped,
+            key=lambda key: (
+                order[dimension].index(key)
+                if key in order[dimension] else len(order[dimension]),
+                key,
+            ),
+        )
+        segments[dimension] = [
+            {"key": key, **_calibration_summary(grouped[key])}
+            for key in keys
+        ]
+    return {
+        **overall,
+        "pricing_versions": sorted({item[2] for item in samples}),
+        "segments": segments,
+    }
 
 
 def _files_have_same_content(left: Path, right: Path) -> bool:
@@ -70,6 +243,46 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _lip_sync_repair_suggestion(
+    storyboard: dict, master: dict, master_idx: int, duration_sec: float,
+) -> dict:
+    """Locate the smallest speech interval backed by the edited subtitle cues."""
+    duration = max(0.1, float(duration_sec or master.get("duration") or 0.1))
+    intervals: list[tuple[float, float]] = []
+    dialogue: list[str] = []
+    for edit in storyboard.get("shots") or []:
+        if int(edit.get("audio_master_idx") or 0) != int(master_idx):
+            continue
+        audio_start = max(0.0, float(edit.get("audio_start") or 0))
+        for cue in edit.get("subtitle_cues") or []:
+            start = max(0.0, min(duration, audio_start + float(
+                cue.get("start") or 0
+            )))
+            end = max(start, min(duration, audio_start + float(
+                cue.get("end") or cue.get("start") or 0
+            )))
+            if end <= start:
+                continue
+            intervals.append((start, end))
+            text = str(cue.get("text") or "").strip()
+            if text and text not in dialogue:
+                dialogue.append(text)
+    if intervals:
+        start = min(item[0] for item in intervals)
+        end = max(item[1] for item in intervals)
+    else:
+        start, end = 0.0, duration
+        fallback = str(master.get("voiceover") or "").strip()
+        if fallback:
+            dialogue.append(fallback)
+    return {
+        "start_sec": round(start, 3),
+        "end_sec": round(end, 3),
+        "dialogue": "，".join(dialogue),
+        "reason": "自动根据字幕时间轴定位口型偏差区间",
+    }
 
 EDITABLE_CONFIG = {
     "DEFAULT_LLM_PROVIDER",
@@ -252,6 +465,44 @@ def _completed_scene_keys(
     }
 
 
+def _request_invalid_identity_anchor_retry_ready(
+    database: sqlite3.Connection,
+    *,
+    job_id: str,
+    state: object,
+    failure_code: object,
+    cost_cents: object,
+    shots: list,
+) -> bool:
+    """Allow an explicit retry only for an unpaid identity-anchor rejection."""
+    if (
+        str(state or "") != "FAILED"
+        or str(failure_code or "") != "request_invalid"
+        or int(cost_cents or 0) != 0
+        or not shots
+        or any(str(row["state"]) != "PENDING" for row in shots)
+    ):
+        return False
+    if database.execute(
+        "SELECT 1 FROM provider_calls WHERE job_id=? LIMIT 1", (job_id,)
+    ).fetchone():
+        return False
+    failed = database.execute(
+        "SELECT cost_cents,video_path,video_url,image_path,image_url "
+        "FROM character_identity_anchors WHERE job_id=? AND state='FAILED' "
+        "AND source_type IN ('seedance_identity_anchor','seedream_identity_image')",
+        (job_id,),
+    ).fetchall()
+    return bool(failed) and all(
+        int(row["cost_cents"] or 0) == 0
+        and not any(
+            str(row[field] or "").strip()
+            for field in ("video_path", "video_url", "image_path", "image_url")
+        )
+        for row in failed
+    )
+
+
 def _publication_metadata(value: object) -> dict:
     if isinstance(value, dict):
         return value
@@ -374,11 +625,29 @@ def _process_is_alive(pid: int | None) -> bool:
 class ManagementService:
     """Read and mutate local factory state through a UI-safe boundary."""
 
-    def __init__(self, database: sqlite3.Connection, root: Path):
+    def __init__(
+        self,
+        database: sqlite3.Connection,
+        root: Path,
+        *,
+        worker_mode: str = "child_process",
+    ):
         self.database = database
         self.root = Path(root).resolve()
         self.env_path = self.root / ".env"
+        if worker_mode not in {"child_process", "external"}:
+            raise ValueError("worker_mode must be child_process or external")
+        self.worker_mode = worker_mode
         self._production_workers: dict[str, subprocess.Popen] = {}
+        self._last_provider_sweep = {
+            "last_sweep_at": None,
+            "checked": 0,
+            "completed": 0,
+            "pending": 0,
+            "failed": 0,
+            "skipped": 0,
+            "items": [],
+        }
         character_assets.ensure_schema(self.database)
         character_voices.ensure_schema(self.database)
         source_scheduler.ensure_schema(self.database)
@@ -390,6 +659,12 @@ class ManagementService:
             ("failure_code", "TEXT"),
             ("production_worker_pid", "INTEGER"),
             ("production_started_at", "TIMESTAMP"),
+            ("production_heartbeat_at", "TEXT"),
+            ("worker_lease_id", "TEXT"),
+            ("recovery_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("production_spec_json", "TEXT"),
+            ("production_spec_hash", "TEXT"),
+            ("production_spec_version", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in job_columns:
                 self.database.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
@@ -1045,6 +1320,81 @@ class ManagementService:
             "cost_delta_cents": delta,
         }
 
+    def reconcile_provider_tasks(self, *, limit: int = 10) -> dict:
+        """Inspect a bounded set of known remote tasks without any paid submit."""
+        bounded_limit = max(1, min(50, int(limit or 10)))
+        rows = self.database.execute(
+            "SELECT p.task_id,p.job_id,p.usage_json "
+            "FROM provider_calls p JOIN jobs j ON j.job_id=p.job_id "
+            "WHERE j.state IN "
+            "('PROVIDER_ACTION_REQUIRED','REJECTED_PENDING_RECONCILIATION') "
+            "ORDER BY p.created_at,p.task_id"
+        ).fetchall()
+        report = {
+            "last_sweep_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            ),
+            "checked": 0,
+            "completed": 0,
+            "pending": 0,
+            "failed": 0,
+            "skipped": 0,
+            "items": [],
+        }
+        for row in rows:
+            try:
+                usage = json.loads(row["usage_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                usage = {}
+            status = str(
+                usage.get("status") if isinstance(usage, dict) else ""
+            ).strip().casefold()
+            if status not in provider_tasks.UNRESOLVED_STATUSES:
+                continue
+            storage_task_id = str(row["task_id"])
+            remote_task_id = provider_tasks.effective_task_id(
+                storage_task_id, row["usage_json"]
+            )
+            if (
+                storage_task_id.startswith("local-submit:")
+                and remote_task_id == storage_task_id
+            ):
+                report["skipped"] += 1
+                continue
+            if report["checked"] >= bounded_limit:
+                break
+            report["checked"] += 1
+            item = {
+                "job_id": str(row["job_id"]),
+                "task_id": remote_task_id,
+            }
+            try:
+                result = self.reconcile_provider_task(
+                    str(row["job_id"]), remote_task_id
+                )
+                remote_status = str(
+                    result.get("remote_status") or "unknown"
+                ).strip().casefold()
+                item.update({
+                    "outcome": (
+                        "completed"
+                        if remote_status in {"completed", "failed"}
+                        else "pending"
+                    ),
+                    "remote_status": remote_status,
+                    "state": result.get("state"),
+                })
+                report[item["outcome"]] += 1
+            except Exception as exc:
+                report["failed"] += 1
+                item.update({
+                    "outcome": "failed",
+                    "message": str(exc)[:300],
+                })
+            report["items"].append(item)
+        self._last_provider_sweep = report
+        return dict(report)
+
     def _repair_dangling_job_links(self) -> list[str]:
         """Return approved drafts with a deleted production job to review."""
         rows = self.database.execute(
@@ -1080,13 +1430,12 @@ class ManagementService:
                 continue
             if _process_is_alive(row["production_worker_pid"]):
                 continue
-            updated = self.database.execute(
-                "UPDATE jobs SET state='PRODUCTION_QUEUED',"
-                "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
-                "WHERE job_id=? AND state='PRODUCTION_RUNNING'",
-                (row["job_id"],),
+            outcome = recovery_controller.reconcile_job(
+                self.database,
+                str(row["job_id"]),
+                worker_alive=_process_is_alive,
             )
-            if updated.rowcount != 1:
+            if outcome.action != "requeue":
                 continue
             recovered.append(str(row["job_id"]))
             self.database.execute(
@@ -1126,6 +1475,15 @@ class ManagementService:
             "SELECT message FROM events WHERE step='production_queue' "
             "AND level='error' ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        environment = _read_env(self.env_path)
+        try:
+            configured_master_limit = max(1, int(
+                environment.get("SEEDANCE_MAX_CONCURRENT_MASTERS")
+                or environment.get("MAX_CONCURRENT_SHOTS")
+                or 3
+            ))
+        except (TypeError, ValueError):
+            configured_master_limit = 3
         return {
             "supervisor_alive": bool(supervisor_alive),
             "concurrency_limit": self._production_limit(),
@@ -1133,6 +1491,11 @@ class ManagementService:
             "queued": queued,
             "orphaned_recovered": int(recovered or 0),
             "last_error": str(error["message"]) if error else None,
+            "master_capacity": provider_capacity.status(
+                self.database, "seedance",
+                configured_limit=configured_master_limit,
+            ),
+            "provider_recovery": dict(self._last_provider_sweep),
         }
 
     def _clear_stale_success_errors(self) -> list[str]:
@@ -1170,7 +1533,7 @@ class ManagementService:
             "SELECT COUNT(*) FROM script_drafts"
         ).fetchone()[0]
         jobs = self.database.execute(
-            "SELECT j.job_id,j.state,j.cost_cents FROM jobs j WHERE NOT ("
+            "SELECT j.job_id,j.state,j.cost_cents,j.storyboard FROM jobs j WHERE NOT ("
             "j.state='PENDING' AND NOT EXISTS (SELECT 1 FROM script_drafts d "
             "WHERE d.approved_job_id=j.job_id AND d.status='approved') "
             "AND NOT EXISTS (SELECT 1 FROM shots s WHERE s.job_id=j.job_id))"
@@ -1236,6 +1599,22 @@ class ManagementService:
         ).fetchone()[0]
         ready_to_publish = states.get("READY_TO_PUBLISH", 0)
         failures_total = states.get("FAILED", 0) + states.get("BLOCKED", 0)
+        metric_now = datetime.now(timezone.utc)
+        reliability_daily = production_metrics.reliability_trends(
+            self.database, days=30, now=metric_now,
+        )
+        reliability_windows = {
+            "7d": production_metrics.reliability_summary(
+                self.database,
+                since=(metric_now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S"),
+                now=metric_now,
+            ),
+            "30d": production_metrics.reliability_summary(
+                self.database,
+                since=(metric_now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S"),
+                now=metric_now,
+            ),
+        }
         return {
             "scripts": {
                 "sources": source_count,
@@ -1265,6 +1644,9 @@ class ManagementService:
                 "reconciliation_status": (
                     "reconciled" if cost_delta_cents == 0 else "partial"
                 ),
+                "cost_estimation": _cost_estimation_calibration(
+                    self.database, jobs
+                ),
                 "states": dict(states),
             },
             "publishing": {
@@ -1278,6 +1660,61 @@ class ManagementService:
                 "active_characters": active_characters,
                 "readiness": self._readiness(),
             },
+            "reliability": {
+                "windows": reliability_windows,
+                "daily": reliability_daily,
+                "release_gate": quality_canary.evaluate_release_gate(
+                    reliability_daily,
+                ),
+                "canary_profiles": [{
+                    "id": str(profile["id"]),
+                    "duration_sec": int(profile["duration_sec"]),
+                    "budget_cents": int(profile["budget_cents"]),
+                    "character_count": len(profile.get("characters") or []),
+                } for profile in quality_canary.load_frozen_profiles()],
+            },
+        }
+
+    def create_quality_canary(self, payload: dict) -> dict:
+        """Create an isolated, user-confirmed canary job without paid calls."""
+        profile_id = str(payload.get("profile_id") or "").strip()
+        contract = quality_canary.prepare_explicit_run(
+            profile_id,
+            confirmed=payload.get("confirmed") is True,
+            budget_cents=int(payload.get("budget_cents") or 0),
+        )
+        storyboard = quality_canary.build_isolated_storyboard(profile_id, contract)
+        s1_storyboard._validate(storyboard)
+        token = secrets.token_hex(6)
+        job_id = f"J-CANARY-{token}"
+        topic_id = f"CANARY-{token}"
+        title = f"质量金丝雀 · {profile_id}"
+        characters = storyboard["characters"]
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,batch_id,state,storyboard,"
+            "characters_json,cost_cents) VALUES(?,?,?,?,?,?,?,0)",
+            (
+                job_id, topic_id, title,
+                f"CANARY-{datetime.now(timezone.utc).date().isoformat()}",
+                "STORYBOARDED",
+                json.dumps(storyboard, ensure_ascii=False),
+                json.dumps(characters, ensure_ascii=False),
+            ),
+        )
+        self.database.execute(
+            "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+            (
+                job_id, "quality_canary", "info",
+                "已创建隔离质量金丝雀；尚未调用 Provider，开始生成前仍需确认制作预算",
+            ),
+        )
+        self.database.commit()
+        return {
+            "job_id": job_id,
+            "state": "STORYBOARDED",
+            "title": title,
+            "contract": contract,
+            "provider_calls": 0,
         }
 
     def todo_center(self) -> dict:
@@ -1470,6 +1907,16 @@ class ManagementService:
             endpoint=str(payload.get("endpoint") or ""),
             source_kind=str(payload.get("source_kind") or "hotspot"),
             enabled=payload.get("enabled") is not False,
+            authorization_confirmed=payload.get("authorization_confirmed") is not False,
+            interval_minutes=payload.get("interval_minutes") or 60,
+        )
+
+    def update_source_feed(self, feed_id: str, payload: dict) -> dict:
+        return source_scheduler.update_feed(
+            self.database,
+            feed_id,
+            enabled=payload.get("enabled") is not False,
+            interval_minutes=payload.get("interval_minutes") or 60,
         )
 
     def collect_source_feed(self, feed_id: str) -> dict:
@@ -1490,6 +1937,13 @@ class ManagementService:
 
     def promote_source_candidate(self, candidate_id: str) -> dict:
         return source_scheduler.promote_candidate(self.database, candidate_id)
+
+    def reject_source_candidate(self, candidate_id: str, payload: dict) -> dict:
+        return source_scheduler.reject_candidate(
+            self.database,
+            candidate_id,
+            reason=str(payload.get("reason") or ""),
+        )
 
     def delete_source_candidate(self, candidate_id: str) -> dict:
         deleted = source_scheduler.delete_candidate(self.database, candidate_id)
@@ -2130,6 +2584,46 @@ class ManagementService:
             )
             job["characters"] = storyboard.get("characters") or []
             job["production_settings"] = storyboard.get("production_settings") or {}
+            confirmed_cost = job["production_settings"].get(
+                "confirmed_cost_estimate"
+            )
+            actual_cost = int(job.get("cost_cents") or 0)
+            if isinstance(confirmed_cost, dict) and confirmed_cost.get(
+                "projected_total_cost_cents"
+            ) is not None:
+                estimated_cost = int(
+                    confirmed_cost.get("projected_total_cost_cents") or 0
+                )
+                variance = actual_cost - estimated_cost
+                is_final = str(job.get("state") or "") in FINAL_COST_STATES
+                job["cost_observation"] = {
+                    "estimated_cost_cents": estimated_cost,
+                    "actual_cost_cents": actual_cost,
+                    "variance_cents": variance,
+                    "variance_percent": (
+                        round(variance * 100 / estimated_cost, 1)
+                        if estimated_cost > 0 else None
+                    ),
+                    "status": (
+                        "over_estimate" if is_final and variance > 0
+                        else "within_estimate" if is_final
+                        else "pending"
+                    ),
+                    "is_final": is_final,
+                    "pricing_version": str(
+                        confirmed_cost.get("pricing_version") or ""
+                    ),
+                }
+            else:
+                job["cost_observation"] = {
+                    "estimated_cost_cents": None,
+                    "actual_cost_cents": actual_cost,
+                    "variance_cents": None,
+                    "variance_percent": None,
+                    "status": "unavailable",
+                    "is_final": str(job.get("state") or "") in FINAL_COST_STATES,
+                    "pricing_version": None,
+                }
             call_summary = self.database.execute(
                 "SELECT COUNT(*) AS call_count,COALESCE(SUM(cost_cents),0) AS cost "
                 "FROM provider_calls WHERE job_id=?",
@@ -2329,6 +2823,33 @@ class ManagementService:
                     }
                     and shot.get("has_prior_master")
                 )
+                shot["extension_eligible"] = bool(
+                    job["state"] in {
+                        "COMPOSED", "FAILED", "BLOCKED",
+                        "PRODUCTION_REVIEW_REQUIRED",
+                    }
+                    and shot.get("state") in {
+                        "OK", "FAILED", "REVIEW_REQUIRED",
+                    }
+                    and shot.get("has_prior_master")
+                )
+                shot["lip_sync_repair_suggestion"] = None
+                if (
+                    shot["lip_sync_repair_eligible"]
+                    and "lip_sync_mismatch" in shot["quality_reasons"]
+                ):
+                    shot["lip_sync_repair_suggestion"] = (
+                        _lip_sync_repair_suggestion(
+                            storyboard,
+                            master,
+                            idx,
+                            float(
+                                master.get("duration")
+                                or shot.get("duration_sec")
+                                or 0
+                            ),
+                        )
+                    )
             job["completed_master_count"] = len(completed_indexes)
             job["generating_master_count"] = sum(
                 1 for shot in shots if shot.get("state") == "GENERATING"
@@ -2380,6 +2901,17 @@ class ManagementService:
                     for shot in failed_shots
                 ),
             } - {""}
+            identity_anchor_retry_ready = (
+                _request_invalid_identity_anchor_retry_ready(
+                    self.database,
+                    job_id=job["job_id"],
+                    state=job["state"],
+                    failure_code=job.get("failure_code"),
+                    cost_cents=job.get("cost_cents"),
+                    shots=shots,
+                )
+            )
+            job["identity_anchor_retry_ready"] = identity_anchor_retry_ready
             provider_recovery_ready = bool(
                 job["state"] in {"FAILED", "PROVIDER_ACTION_REQUIRED"}
                 and not job["unresolved_provider_tasks"]
@@ -2393,7 +2925,11 @@ class ManagementService:
                 job["state"] == "FAILED" and not structured_failure_codes
             )
             job["resumable"] = bool(
-                (legacy_failed_recovery or provider_recovery_ready)
+                (
+                    legacy_failed_recovery
+                    or provider_recovery_ready
+                    or identity_anchor_retry_ready
+                )
                 and (
                     job["remaining_master_count"]
                     or (shots and all(shot.get("state") == "OK" for shot in shots))
@@ -2404,6 +2940,7 @@ class ManagementService:
                 and shots
                 and all(shot.get("state") == "OK" for shot in shots)
                 and not job["unresolved_provider_tasks"]
+                and job.get("failure_code") != "music_configuration_invalid"
             )
             if job["local_postproduction_resumable"]:
                 job["resumable"] = True
@@ -2516,6 +3053,9 @@ class ManagementService:
                     master_indexes = []
                 entry = {
                     "anchor_key": anchor_key,
+                    "anchor_scope": str(
+                        planned.get("anchor_scope") or "scene"
+                    ),
                     "anchor_token": scene_assets.anchor_token(anchor_key),
                     "description": str(
                         persisted.get("description")
@@ -2641,7 +3181,13 @@ class ManagementService:
                     },
                 },
             }.get(job["state"])
-            if job["state"] == "BGM_OK" and job["local_postproduction_resumable"]:
+            if identity_anchor_retry_ready:
+                job["display_state_label"] = "人物定妆待重试"
+                job["next_action"] = {
+                    "id": "retry_identity_anchor",
+                    "label": "修复后重新尝试人物定妆",
+                }
+            elif job["state"] == "BGM_OK" and job["local_postproduction_resumable"]:
                 job["display_state_label"] = "待完成本地合成"
                 job["next_action"] = {
                     "id": "resume_local_postproduction",
@@ -2650,8 +3196,57 @@ class ManagementService:
             elif pause_presentation:
                 job["display_state_label"] = pause_presentation["label"]
                 job["next_action"] = pause_presentation["next_action"]
+            elif job["state"] == "FAILED" and job["resumable"]:
+                job["next_action"] = (
+                    {
+                        "id": "resume_local_postproduction",
+                        "label": "继续本地后期",
+                    }
+                    if job["local_postproduction_resumable"]
+                    else {
+                        "id": "resume_failed_video",
+                        "label": "继续生成剩余母片",
+                    }
+                )
+            elif job["state"] == "FAILED" and str(
+                job.get("failure_code") or ""
+            ).strip():
+                failure = error_registry.describe_code(
+                    job["failure_code"], stage="production"
+                )
+                job["next_action"] = {
+                    "id": failure.next_action.id,
+                    "label": failure.next_action.label,
+                }
             else:
+                default_action = _DEFAULT_VIDEO_ACTIONS.get(job["state"])
+                if job["state"] == "COMPOSED" and (
+                    job.get("latest_review") or {}
+                ).get("decision") == "approved":
+                    default_action = {
+                        "id": "submit_publish", "label": "提交到待发布",
+                    }
+                job["next_action"] = (
+                    dict(default_action) if default_action else None
+                )
+            if job["state"] in _TERMINAL_VIDEO_STATES:
                 job["next_action"] = None
+            job["allowed_actions"] = (
+                [dict(job["next_action"])] if job["next_action"] else []
+            )
+            failure_code = str(job.get("failure_code") or "").strip()
+            if failure_code:
+                status_message = error_registry.describe_code(
+                    failure_code, stage="production"
+                ).user_message
+            else:
+                status_message = _VIDEO_STATE_REASONS.get(
+                    job["state"], "任务状态已更新，请按下一步操作继续"
+                )
+            job["status_reason"] = {
+                "code": failure_code or str(job["state"]).lower(),
+                "message": status_message,
+            }
         return {"jobs": jobs}
 
     def upgrade_director_plan(self, job_id: str) -> dict:
@@ -2831,7 +3426,8 @@ class ManagementService:
 
     def resume_failed_video(self, job_id: str) -> dict:
         job = self.database.execute(
-            "SELECT state,bgm_path,failure_code FROM jobs WHERE job_id=?", (job_id,)
+            "SELECT state,bgm_path,failure_code,cost_cents FROM jobs WHERE job_id=?",
+            (job_id,),
         ).fetchone()
         if not job:
             raise ValueError("视频任务不存在")
@@ -2871,15 +3467,13 @@ class ManagementService:
                 )
                 self.database.commit()
                 raise RuntimeError(f"local postproduction failed: {exc}") from exc
-            updated = self.database.execute(
-                "UPDATE jobs SET state='COMPOSED',error=NULL,retries=0,"
-                "updated_at=CURRENT_TIMESTAMP "
-                "WHERE job_id=? AND state='BGM_OK'",
-                (job_id,),
+            state_machine.transition(
+                self.database,
+                job_id,
+                "composed",
+                event_id=f"{job_id}:resume-compose:{secrets.token_hex(12)}",
+                updates={"error": None, "failure_code": None, "retries": 0},
             )
-            if int(updated.rowcount or 0) != 1:
-                self.database.rollback()
-                raise ValueError("视频任务状态已被并发修改")
             self.database.execute(
                 "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
                 (job_id, "local_postproduction_resume", "info", "本地成片合成已恢复完成"),
@@ -2907,9 +3501,25 @@ class ManagementService:
         structured_failure_codes = {
             str(job["failure_code"] or "").strip(), *shot_failure_codes,
         } - {""}
-        if structured_failure_codes and structured_failure_codes != {
-            "account_unavailable"
-        }:
+        music_configuration_retry_ready = bool(
+            structured_failure_codes == {"music_configuration_invalid"}
+            and shots
+            and all(row["state"] == "OK" for row in shots)
+        )
+        identity_anchor_retry_ready = _request_invalid_identity_anchor_retry_ready(
+            self.database,
+            job_id=job_id,
+            state=resume_from_state,
+            failure_code=job["failure_code"],
+            cost_cents=job["cost_cents"],
+            shots=list(shots),
+        )
+        if (
+            structured_failure_codes
+            and structured_failure_codes != {"account_unavailable"}
+            and not identity_anchor_retry_ready
+            and not music_configuration_retry_ready
+        ):
             raise ValueError(
                 "该失败任务的稳定 failure code 不可恢复；"
                 "隐私、内容政策、版权及其他 Provider 拒绝禁止重新提交"
@@ -2982,15 +3592,16 @@ class ManagementService:
                 "存在尚未核对的远端任务，已保留本地候选决定；"
                 "请先核对 task_id：" + ", ".join(unresolved[:5])
             )
-            updated = self.database.execute(
-                "UPDATE jobs SET state='PROVIDER_ACTION_REQUIRED',error=?,"
-                "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
-                "WHERE job_id=? AND state='FAILED'",
-                (message, job_id),
+            state_machine.transition(
+                self.database,
+                job_id,
+                "provider_paused",
+                event_id=f"{job_id}:resume-provider:{secrets.token_hex(12)}",
+                updates={
+                    "error": message,
+                    "production_worker_pid": None,
+                },
             )
-            if int(updated.rowcount or 0) != 1:
-                self.database.rollback()
-                raise ValueError("视频任务状态已被并发修改")
             self.database.commit()
             return {
                 "job_id": job_id,
@@ -3007,14 +3618,15 @@ class ManagementService:
                 f"WHERE job_id=? AND idx IN ({placeholders})",
                 (job_id, *review_indexes),
             )
-            self.database.execute(
-                "UPDATE jobs SET state='PRODUCTION_REVIEW_REQUIRED',error=?,"
-                "failure_code=NULL,updated_at=CURRENT_TIMESTAMP "
-                "WHERE job_id=? AND state=?",
-                (
-                    f"仍有 {len(review_indexes)} 条母片待人工复核",
-                    job_id, resume_from_state,
-                ),
+            state_machine.transition(
+                self.database,
+                job_id,
+                "resume_review",
+                event_id=f"{job_id}:resume-review:{secrets.token_hex(12)}",
+                updates={
+                    "error": f"仍有 {len(review_indexes)} 条母片待人工复核",
+                    "failure_code": None,
+                },
             )
             self.database.commit()
             return {
@@ -3033,20 +3645,23 @@ class ManagementService:
                 and music.may_submit_paid_work(music_provider)
             ):
                 self._assert_no_unresolved_provider_tasks(job_id)
-            self.database.execute(
-                "UPDATE jobs SET state='SHOTS_OK',error=NULL,"
-                "failure_code=NULL,updated_at=CURRENT_TIMESTAMP "
-                "WHERE job_id=? AND state=?",
-                (job_id, resume_from_state),
+            state_machine.transition(
+                self.database,
+                job_id,
+                "resume_local_post",
+                event_id=f"{job_id}:resume-local:{secrets.token_hex(12)}",
+                updates={"error": None, "failure_code": None},
             )
             self.database.commit()
             try:
                 if not (bgm and bgm.is_file()):
                     asyncio.run(s5_bgm.run(job_id, provider=music_provider))
-                self.database.execute(
-                    "UPDATE jobs SET state='BGM_OK',error=NULL,"
-                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-                    (job_id,),
+                state_machine.transition(
+                    self.database,
+                    job_id,
+                    "bgm_completed",
+                    event_id=f"{job_id}:resume-bgm:{secrets.token_hex(12)}",
+                    updates={"error": None},
                 )
                 self.database.commit()
                 asyncio.run(s6_compose.run(job_id))
@@ -3054,17 +3669,27 @@ class ManagementService:
                     self.database, self.root / "data" / "assets", job_id
                 )
             except Exception as exc:
-                self.database.execute(
-                    "UPDATE jobs SET state='FAILED',error=?,"
-                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-                    (f"local postproduction failed: {exc}", job_id),
+                outcome = error_registry.describe_failure(
+                    exc, stage="local_postproduction"
+                )
+                state_machine.transition(
+                    self.database,
+                    job_id,
+                    "failed",
+                    event_id=f"{job_id}:resume-local-failed:{secrets.token_hex(12)}",
+                    updates={
+                        "error": outcome.user_message,
+                        "failure_code": outcome.code,
+                    },
                 )
                 self.database.commit()
                 raise RuntimeError(f"local postproduction failed: {exc}") from exc
-            self.database.execute(
-                "UPDATE jobs SET state='COMPOSED',error=NULL,retries=0,"
-                "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-                (job_id,),
+            state_machine.transition(
+                self.database,
+                job_id,
+                "composed",
+                event_id=f"{job_id}:resume-composed:{secrets.token_hex(12)}",
+                updates={"error": None, "failure_code": None, "retries": 0},
             )
             self.database.commit()
             return {
@@ -3076,17 +3701,30 @@ class ManagementService:
                 "local_postproduction": True,
             }
         self._assert_no_unresolved_provider_tasks(job_id)
+        if identity_anchor_retry_ready:
+            self.database.execute(
+                "UPDATE character_identity_anchors SET state='PENDING',"
+                "error=NULL,approval_state='PENDING_REVIEW',approved_at=NULL,"
+                "review_note='',updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state='FAILED' AND cost_cents=0",
+                (job_id,),
+            )
         placeholders = ",".join("?" for _ in retry_indexes)
         self.database.execute(
             f"UPDATE shots SET state='PENDING',error=NULL,video_qa=NULL "
             f"WHERE job_id=? AND idx IN ({placeholders})",
             (job_id, *retry_indexes),
         )
-        self.database.execute(
-            "UPDATE jobs SET state='STORYBOARDED',retries=0,error=NULL,"
-            "failure_code=NULL,updated_at=CURRENT_TIMESTAMP "
-            "WHERE job_id=? AND state=?",
-            (job_id, resume_from_state),
+        state_machine.transition(
+            self.database,
+            job_id,
+            "resume_generation",
+            event_id=f"{job_id}:resume-generation:{secrets.token_hex(12)}",
+            updates={
+                "retries": 0,
+                "error": None,
+                "failure_code": None,
+            },
         )
         self.database.commit()
         return {
@@ -3358,6 +3996,110 @@ class ManagementService:
             "repair_end_sec": end,
         }
 
+    def prepare_master_extension(
+        self, job_id: str, master_idx: int, *, extension_sec: float,
+        direction: str,
+    ) -> dict:
+        """Queue a Seedance extend candidate without replacing the prior master."""
+        job = self.database.execute(
+            "SELECT state,storyboard FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if not job:
+            raise ValueError("视频任务不存在")
+        if job["state"] not in {
+            "COMPOSED", "FAILED", "BLOCKED", "PRODUCTION_REVIEW_REQUIRED",
+        }:
+            raise ValueError("只有已生成或待人工复核的视频任务可以延长母片")
+        self._assert_no_unresolved_provider_tasks(job_id)
+        target = self.database.execute(
+            "SELECT idx,state,duration_sec,video_path FROM shots "
+            "WHERE job_id=? AND idx=?",
+            (job_id, int(master_idx)),
+        ).fetchone()
+        if not target:
+            raise ValueError("需要延长的母片不存在")
+        if target["state"] not in {"OK", "FAILED", "REVIEW_REQUIRED"}:
+            raise ValueError("该母片尚未形成可延长的视频")
+        other_incomplete = self.database.execute(
+            "SELECT COUNT(*) FROM shots WHERE job_id=? AND idx!=? AND state!='OK'",
+            (job_id, int(master_idx)),
+        ).fetchone()[0]
+        if other_incomplete:
+            raise ValueError("任务还有其他未完成母片，请先完成或复核后再延长")
+        try:
+            extension = float(extension_sec)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("延长时长必须在 4 到 30 秒之间") from exc
+        if extension < 4 or extension > 30:
+            raise ValueError("延长时长必须在 4 到 30 秒之间")
+        direction_text = str(direction or "").strip()
+        if not direction_text:
+            raise ValueError("请填写延长后的动作、运镜和结束状态")
+
+        try:
+            storyboard = json.loads(job["storyboard"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("视频任务的导演计划无法读取") from exc
+        masters = storyboard.get("masters") or storyboard.get("shots") or []
+        master = next((
+            item for item in masters
+            if int(item.get("idx") or 0) == int(master_idx)
+        ), None)
+        if master is None:
+            raise ValueError("导演计划中不存在该母片")
+        source = controlled_job_asset_path(
+            self.root / "data" / "assets", job_id, target["video_path"],
+            require_file=True,
+        )
+        if source is None:
+            raise ValueError("原始母片文件不存在，不能执行保留式延长")
+
+        for key in (
+            "repair_start_sec", "repair_end_sec", "repair_dialogue",
+            "repair_audio_path",
+        ):
+            master.pop(key, None)
+        master.update({
+            "repair_mode": "seedance_extend",
+            "repair_source_path": str(source),
+            "extend_duration_sec": extension,
+            "extend_direction": direction_text,
+        })
+        extend_prompt = s3_shots._build_extend_prompt({
+            **master,
+            "duration_sec": float(
+                master.get("duration") or target["duration_sec"] or 0
+            ),
+        })
+        self.database.execute(
+            "UPDATE shots SET state='PENDING',prompt=?,provider=NULL,"
+            "video_model=NULL,native_audio=0,error=NULL "
+            "WHERE job_id=? AND idx=?",
+            (extend_prompt, job_id, int(master_idx)),
+        )
+        self.database.execute(
+            "UPDATE jobs SET state='STORYBOARDED',storyboard=?,error=NULL,"
+            "retries=0,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
+            (json.dumps(storyboard, ensure_ascii=False), job_id),
+        )
+        self.database.execute("DELETE FROM review_events WHERE job_id=?", (job_id,))
+        self.database.execute(
+            "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
+            (
+                job_id, "master_extension", "info",
+                f"母片 #{int(master_idx)} 已进入 Seedance 2.5 "
+                f"延长 {extension:g} 秒候选生成",
+            ),
+        )
+        self.database.commit()
+        return {
+            "job_id": job_id,
+            "state": "STORYBOARDED",
+            "repair_kind": "seedance_extend",
+            "repair_master_idx": int(master_idx),
+            "extension_sec": extension,
+        }
+
     def configure_video(self, job_id: str, settings: dict) -> dict:
         row = self.database.execute(
             "SELECT state,storyboard FROM jobs WHERE job_id=?", (job_id,),
@@ -3523,6 +4265,20 @@ class ManagementService:
                 strict=True,
             ),
         }
+        snapshot_input = dict(normalized)
+        for field in (
+            "video_model", "model", "resolution", "output_format",
+            "reference_video_budget", "max_concurrent_masters", "qa_enabled",
+            "max_auto_retries", "auto_retry_budget_cents",
+        ):
+            if field in settings:
+                snapshot_input[field] = settings[field]
+        normalized[production_config.GENERATION_SNAPSHOT_KEY] = (
+            production_config.freeze_generation_snapshot(
+                snapshot_input,
+                env=_read_env(self.env_path),
+            )
+        )
         storyboard["production_profile"] = normalized["production_profile"]
         storyboard["production_settings"] = normalized
         if runtime_characters:
@@ -3531,6 +4287,9 @@ class ManagementService:
             storyboard, runtime_characters
         )
         generation_units = storyboard.get("masters") or storyboard.get("shots") or []
+        storyboard["master_dependency_graph"] = (
+            master_dependencies.build_master_dependency_graph(generation_units)
+        )
         # Production settings may be revisited while resuming a partially paid
         # job.  Keep successful masters so changing presentation settings never
         # discards usable provider output or causes it to be purchased again.
@@ -3573,7 +4332,11 @@ class ManagementService:
             ),
         )
         self.database.commit()
-        return {"job_id": job_id, "production_settings": normalized}
+        return {
+            "job_id": job_id,
+            "production_settings": normalized,
+            "master_dependency_graph": storyboard["master_dependency_graph"],
+        }
 
     def review_video(
         self, job_id: str, *, decision: str, manual_minutes: float = 0,
@@ -3698,23 +4461,41 @@ class ManagementService:
 
     def dispatch_production_queue(self) -> dict:
         """Atomically claim queued jobs up to the local concurrency limit."""
+        if self.worker_mode == "external":
+            queued = self.database.execute(
+                "SELECT job_id FROM jobs WHERE state='PRODUCTION_QUEUED' "
+                "ORDER BY priority DESC, created_at ASC, job_id ASC"
+            ).fetchall()
+            return {
+                "worker_mode": "external",
+                "queued_jobs": [str(row["job_id"]) for row in queued],
+                "dispatched_jobs": [],
+                "failed_workers": [],
+            }
         exited_jobs: list[str] = []
         for job_id, worker in list(self._production_workers.items()):
             returncode = worker.poll()
             if returncode is None or not isinstance(returncode, int):
                 continue
             self._production_workers.pop(job_id, None)
-            updated = self.database.execute(
-                "UPDATE jobs SET state='FAILED',error=?,"
-                "production_worker_pid=NULL,"
-                "updated_at=CURRENT_TIMESTAMP "
-                "WHERE job_id=? AND state='PRODUCTION_RUNNING'",
-                (f"production worker exited before completion (code {returncode})", job_id),
-            )
-            self.database.commit()
-            if updated.rowcount == 1:
+            try:
+                state_machine.transition(
+                    self.database,
+                    job_id,
+                    "failed",
+                    event_id=(
+                        f"{job_id}:worker-exit:{returncode}:"
+                        f"{secrets.token_hex(8)}"
+                    ),
+                    updates={
+                        "error": "本地生产进程意外退出，任务现场已保留",
+                        "failure_code": "internal_error",
+                        "production_worker_pid": None,
+                    },
+                    payload={"worker_exit_code": int(returncode)},
+                )
                 exited_jobs.append(job_id)
-            else:
+            except state_machine.InvalidTransitionError:
                 self.database.execute(
                     "UPDATE jobs SET production_worker_pid=NULL "
                     "WHERE job_id=?",
@@ -3741,13 +4522,22 @@ class ManagementService:
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         for row in queued:
             job_id = row["job_id"]
-            claimed = self.database.execute(
-                "UPDATE jobs SET state='PRODUCTION_RUNNING',error=NULL,"
-                "updated_at=CURRENT_TIMESTAMP "
-                "WHERE job_id=? AND state='PRODUCTION_QUEUED'", (job_id,),
-            )
-            self.database.commit()
-            if claimed.rowcount != 1:
+            try:
+                state_machine.transition(
+                    self.database,
+                    job_id,
+                    "production_started",
+                    event_id=f"{job_id}:worker:{secrets.token_hex(12)}",
+                    updates={
+                        "error": None,
+                        "failure_code": None,
+                        "production_heartbeat_at": (
+                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        ),
+                        "worker_lease_id": None,
+                    },
+                )
+            except state_machine.InvalidTransitionError:
                 continue
             try:
                 worker = subprocess.Popen(
@@ -3771,13 +4561,15 @@ class ManagementService:
                 )
                 self.database.commit()
             except Exception:
-                self.database.execute(
-                    "UPDATE jobs SET state='PRODUCTION_QUEUED',"
-                    "production_worker_pid=NULL,"
-                    "updated_at=CURRENT_TIMESTAMP "
-                    "WHERE job_id=? AND state='PRODUCTION_RUNNING'", (job_id,),
+                state_machine.transition(
+                    self.database,
+                    job_id,
+                    "worker_start_failed",
+                    event_id=(
+                        f"{job_id}:worker-start-failed:{secrets.token_hex(12)}"
+                    ),
+                    updates={"production_worker_pid": None},
                 )
-                self.database.commit()
                 raise
             dispatched.append(job_id)
         return {"dispatched_jobs": dispatched, "failed_workers": exited_jobs}
@@ -4118,6 +4910,7 @@ class ManagementService:
         reviewed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if normalized == "reject_job":
             try:
+                self.database.execute("BEGIN IMMEDIATE")
                 unresolved_provider_tasks = provider_tasks.unresolved_task_ids(
                     self.database, job_id
                 )
@@ -4125,22 +4918,21 @@ class ManagementService:
                     "REJECTED_PENDING_RECONCILIATION"
                     if unresolved_provider_tasks else "REJECTED"
                 )
-                rejected = self.database.execute(
-                    "UPDATE jobs SET state=?,error=?,"
-                    "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
-                    "WHERE job_id=? AND state=?",
-                    (
-                        rejection_state,
-                        (
+                state_machine.transition(
+                    self.database,
+                    job_id,
+                    "rejection_requested",
+                    event_id=f"{job_id}:review-reject:{operation_id}",
+                    target_state=rejection_state,
+                    updates={
+                        "error": (
                             "已人工终止，仍有远端成本待核对"
                             if unresolved_provider_tasks
                             else "人工终止视频任务；不会自动重试"
                         ),
-                        job_id, claimed_job_state,
-                    ),
+                        "production_worker_pid": None,
+                    },
                 )
-                if int(rejected.rowcount or 0) != 1:
-                    raise ValueError("该视频任务复核决定已被其他请求处理")
                 review_rows = self.database.execute(
                     "SELECT idx,state,video_qa FROM shots WHERE job_id=? ORDER BY idx",
                     (job_id,),
@@ -4328,20 +5120,23 @@ class ManagementService:
                     else:
                         next_state = "COMPOSED"
 
-                updated = self.database.execute(
-                    "UPDATE jobs SET state=?,error=?,retries=CASE WHEN ? IN "
-                    "('PRODUCTION_QUEUED','COMPOSED') THEN 0 ELSE retries END,"
-                    "production_worker_pid=CASE WHEN ? IN "
-                    "('PRODUCTION_QUEUED','PROVIDER_ACTION_REQUIRED') "
-                    "THEN NULL ELSE production_worker_pid END,"
-                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND state=?",
-                    (
-                        next_state, error_message, next_state, next_state,
-                        job_id, claimed_job_state,
-                    ),
+                transition_updates: dict[str, object] = {
+                    "error": error_message,
+                }
+                if next_state in {"PRODUCTION_QUEUED", "COMPOSED"}:
+                    transition_updates["retries"] = 0
+                if next_state in {
+                    "PRODUCTION_QUEUED", "PROVIDER_ACTION_REQUIRED",
+                }:
+                    transition_updates["production_worker_pid"] = None
+                state_machine.transition(
+                    self.database,
+                    job_id,
+                    "review_decided",
+                    event_id=f"{job_id}:review-decision:{operation_id}",
+                    target_state=next_state,
+                    updates=transition_updates,
                 )
-                if int(updated.rowcount or 0) != 1:
-                    raise ValueError("该视频任务已被人工终止或并发处理")
                 event_detail = error_message or decision_label
                 self.database.execute(
                     "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
@@ -4637,14 +5432,13 @@ class ManagementService:
         try:
             if needs_bgm_generation:
                 asyncio.run(s5_bgm.run(job_id, provider=music_provider))
-            bgm_ok = self.database.execute(
-                "UPDATE jobs SET state='BGM_OK',error=NULL,"
-                "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND state='SHOTS_OK'",
-                (job_id,),
+            state_machine.transition(
+                self.database,
+                job_id,
+                "bgm_completed",
+                event_id=f"{job_id}:review-bgm:{operation_id}",
+                updates={"error": None, "failure_code": None},
             )
-            if int(bgm_ok.rowcount or 0) != 1:
-                raise ValueError("本地后期状态已被并发修改")
-            self.database.commit()
             asyncio.run(s6_compose.run(job_id))
             finalize_accepted_candidates(
                 self.database, self.root / "data" / "assets", job_id
@@ -4654,13 +5448,19 @@ class ManagementService:
                 final.unlink(missing_ok=True)
             if final and final_backup and final_backup.exists():
                 final_backup.replace(final)
-            self.database.execute(
-                "UPDATE jobs SET state='FAILED',error=?,"
-                "updated_at=CURRENT_TIMESTAMP WHERE job_id=? "
-                "AND state IN ('SHOTS_OK','BGM_OK')",
-                (f"local recompose failed: {exc}", job_id),
+            outcome = error_registry.describe_failure(
+                exc, stage="local_recompose"
             )
-            self.database.commit()
+            state_machine.transition(
+                self.database,
+                job_id,
+                "failed",
+                event_id=f"{job_id}:review-compose-failed:{operation_id}",
+                updates={
+                    "error": outcome.user_message,
+                    "failure_code": outcome.code,
+                },
+            )
             raise RuntimeError(f"local recompose failed: {exc}") from exc
         if final_backup:
             try:
@@ -4670,14 +5470,13 @@ class ManagementService:
                 # A stale backup is safe for later GC and must not turn a
                 # successful production decision into an HTTP 500.
                 pass
-        composed = self.database.execute(
-            "UPDATE jobs SET state='COMPOSED',error=NULL,retries=0,"
-            "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND state='BGM_OK'",
-            (job_id,),
+        state_machine.transition(
+            self.database,
+            job_id,
+            "composed",
+            event_id=f"{job_id}:review-composed:{operation_id}",
+            updates={"error": None, "failure_code": None, "retries": 0},
         )
-        if int(composed.rowcount or 0) != 1:
-            self.database.rollback()
-            raise ValueError("本地后期状态已被并发修改")
         self.database.execute(
             "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
             (
@@ -5744,6 +6543,7 @@ class ManagementService:
     def start_video_job(
         self, job_id: str, *, confirmed: bool,
         approved_budget_cents: int | None = None,
+        high_risk_confirmed: bool = False,
     ) -> dict:
         if not confirmed:
             raise ValueError("开始付费生成前必须明确确认预算")
@@ -5760,6 +6560,17 @@ class ManagementService:
         storyboard_row = self.database.execute(
             "SELECT storyboard,cost_cents FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()
+        contract = production_planner.compile_job_spec(
+            self.database, job_id, self.root, persist=False
+        )
+        blockers = [
+            issue for issue in contract.issues if issue.severity == "blocking"
+        ]
+        if blockers:
+            details = "；".join(
+                f"{issue.code}: {issue.message}" for issue in blockers
+            )
+            raise ValueError(f"生产规格未通过：{details}")
         try:
             storyboard = json.loads(storyboard_row["storyboard"] or "{}")
         except json.JSONDecodeError:
@@ -5821,6 +6632,16 @@ class ManagementService:
             ),
             current_cost_cents=int(storyboard_row["cost_cents"] or 0),
         )
+        if (
+            preflight.get("requires_long_master_confirmation")
+            and not high_risk_confirmed
+        ):
+            indexes = "、".join(
+                f"#{idx}" for idx in preflight["high_risk_master_indexes"]
+            )
+            raise ValueError(
+                f"长母片存在高风险（{indexes}）；请明确确认风险后再开始生成"
+            )
         if not preflight["budget_ok"]:
             try:
                 approved_budget = int(approved_budget_cents or 0)
@@ -5833,19 +6654,60 @@ class ManagementService:
                 )
             settings = storyboard.setdefault("production_settings", {})
             settings["budget_cents"] = approved_budget
-            self.database.execute(
-                "UPDATE jobs SET storyboard=?,updated_at=CURRENT_TIMESTAMP "
-                "WHERE job_id=? AND state='STORYBOARDED'",
-                (json.dumps(storyboard, ensure_ascii=False), job_id),
+            snapshot = settings.get(
+                production_config.GENERATION_SNAPSHOT_KEY
             )
-            self.database.commit()
-        claimed = self.database.execute(
-            "UPDATE jobs SET state='PRODUCTION_QUEUED',updated_at=CURRENT_TIMESTAMP "
-            "WHERE job_id=? AND state='STORYBOARDED'", (job_id,),
+            if isinstance(snapshot, dict):
+                snapshot["job_budget_cents"] = approved_budget
+        settings = storyboard.setdefault("production_settings", {})
+        settings["confirmed_cost_estimate"] = {
+            "estimated_additional_cost_cents": int(
+                preflight.get("estimated_cost_cents") or 0
+            ),
+            "projected_total_cost_cents": int(
+                preflight.get("projected_total_cost_cents") or 0
+            ),
+            "current_cost_cents": int(
+                preflight.get("current_cost_cents") or 0
+            ),
+            "budget_cents": int(
+                settings.get("budget_cents")
+                or preflight.get("budget_cents")
+                or 0
+            ),
+            "pricing_version": seedance.ESTIMATION_PRICING_VERSION,
+            "paid_masters": [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "master_idx", "resolution", "duration_bucket",
+                        "reference_type", "reference_manifest",
+                        "estimated_cost_cents",
+                    )
+                }
+                for item in preflight.get("paid_masters") or []
+            ],
+        }
+        final_contract = production_planner.compile_job_spec(
+            self.database,
+            job_id,
+            self.root,
+            storyboard_override=storyboard,
+            persist=True,
         )
-        self.database.commit()
-        if claimed.rowcount != 1:
-            raise ValueError("视频生成已经启动，请勿重复提交")
+        if not final_contract.payable:
+            raise ValueError("生产规格在预算确认后失效，请重新执行预检")
+        state_machine.transition(
+            self.database,
+            job_id,
+            "queued",
+            event_id=f"{job_id}:queued:{final_contract.spec.spec_hash}",
+            updates={
+                "storyboard": json.dumps(storyboard, ensure_ascii=False),
+                "error": None,
+                "failure_code": None,
+            },
+        )
         dispatch = self.dispatch_production_queue()
         status = "started" if job_id in dispatch["dispatched_jobs"] else "queued"
         return {"job_id": job_id, "status": status}

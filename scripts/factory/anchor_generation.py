@@ -33,7 +33,7 @@ _ALIASES = {
 def normalize_generator(value: object, *, strict: bool = False) -> str:
     text = str(value or "").strip().lower().replace(".", "_").replace("-", "_")
     if not text:
-        return SEEDREAM_5
+        return SEEDANCE_25
     normalized = _ALIASES.get(text)
     if normalized:
         return normalized
@@ -41,7 +41,7 @@ def normalize_generator(value: object, *, strict: bool = False) -> str:
         raise ValueError(
             "锚点生成模型无效，仅支持 seedream_5_0 或 seedance_2_5"
         )
-    return SEEDREAM_5
+    return SEEDANCE_25
 
 
 def selected_generator(storyboard: dict, kind: str) -> str:

@@ -8,8 +8,16 @@ import os
 from pathlib import Path
 import shutil
 import sys
+from typing import Mapping
 
 from dotenv import dotenv_values
+
+from factory.media_runtime import (
+    MediaRuntimeError,
+    resolve_binary,
+    resolve_subtitle_font,
+)
+from factory.runtime_profile import RuntimeProfileError, resolve_runtime_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,9 +33,19 @@ def _configured(value: object) -> bool:
     return bool(text and not text.startswith("<") and not text.endswith("..."))
 
 
-def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
+def diagnose(
+    root: Path = ROOT,
+    *,
+    profile: str = "script",
+    environ: Mapping[str, str] | None = None,
+) -> dict:
     env_path = root / ".env"
-    config = dict(dotenv_values(env_path))
+    config = {
+        key: str(value or "") for key, value in dotenv_values(env_path).items()
+    }
+    if environ is not None:
+        for key, value in environ.items():
+            config.setdefault(key, value)
     provider = str(config.get("DEFAULT_LLM_PROVIDER") or "doubao").strip().lower()
     if profile == "learning":
         required = ()
@@ -40,6 +58,28 @@ def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
         required = VIDEO_KEYS + (
             FIXED_TTS_KEYS if audio_mode != "seedance_native" else ()
         )
+    try:
+        runtime = resolve_runtime_profile(root=root, environ=config)
+        runtime_public = runtime.as_public_dict()
+        disk = shutil.disk_usage(runtime.data_dir)
+        runtime_check = {"ok": True, "detail": runtime_public}
+        data_check = {
+            "ok": True,
+            "detail": {
+                "path": str(runtime.data_dir),
+                "writable": True,
+                "free_bytes": disk.free,
+            },
+        }
+    except (RuntimeProfileError, OSError) as exc:
+        runtime = None
+        runtime_public = {
+            "mode": str(config.get("FACTORY_RUNTIME") or "desktop"),
+            "data_dir": str(config.get("FACTORY_DATA_DIR") or root / "data"),
+        }
+        runtime_check = {"ok": False, "detail": str(exc)}
+        data_check = {"ok": False, "detail": str(exc)}
+
     checks = {
         "python": {"ok": sys.version_info >= (3, 11), "detail": sys.version.split()[0]},
         "packages": {
@@ -54,18 +94,26 @@ def diagnose(root: Path = ROOT, *, profile: str = "script") -> dict:
                 **{key: _configured(config.get(key)) for key in required},
             },
         },
-        "data_directory": {
-            "ok": (root / "data").is_dir(), "detail": str(root / "data")
-        },
+        "runtime": runtime_check,
+        "data_directory": data_check,
     }
     if profile == "video":
         for binary in ("ffmpeg", "ffprobe"):
-            checks[binary] = {
-                "ok": shutil.which(binary) is not None,
-                "detail": shutil.which(binary) or "not found",
-            }
+            try:
+                resolved = resolve_binary(
+                    binary, environ=config, which=shutil.which
+                )
+                checks[binary] = {"ok": True, "detail": str(resolved)}
+            except MediaRuntimeError as exc:
+                checks[binary] = {"ok": False, "detail": str(exc)}
+        try:
+            font = resolve_subtitle_font(environ=config)
+            checks["subtitle_font"] = {"ok": True, "detail": str(font)}
+        except MediaRuntimeError as exc:
+            checks["subtitle_font"] = {"ok": False, "detail": str(exc)}
     return {
         "profile": profile,
+        "runtime": runtime_public,
         "ready": all(item["ok"] for item in checks.values()),
         "checks": checks,
         "paid_provider_calls": 0,
@@ -79,7 +127,7 @@ def main() -> int:
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    report = diagnose(profile=args.profile)
+    report = diagnose(profile=args.profile, environ=os.environ)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:

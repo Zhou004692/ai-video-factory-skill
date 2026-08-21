@@ -239,7 +239,10 @@ class SceneVoiceoverVideoTests(unittest.TestCase):
         self.assertIn("时间轴：", prompt)
         self.assertIn(f"{{画外音：{SCENE_SHOT['voiceover']}}}", prompt)
         self.assertIn("<环境音：纸张翻动与轻微设备底噪>", prompt)
-        self.assertIn("-8.0秒：", prompt)
+        self.assertIn("0-1秒：", prompt)
+        self.assertIn("1-7秒：", prompt)
+        self.assertIn("7-8秒：", prompt)
+        self.assertNotRegex(prompt, r"\d+\.\d+-\d+")
 
     def test_legacy_human_clauses_are_removed_from_video_prompt(self):
         prompt = s3_shots._build_scene_voiceover_video_prompt(
