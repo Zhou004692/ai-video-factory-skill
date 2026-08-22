@@ -152,6 +152,48 @@ def review_job() -> dict:
     return job
 
 
+def lip_sync_review_job() -> dict:
+    job = review_job()
+    job.update({
+        "job_id": "J-BROWSER-LIP-SYNC",
+        "title": "Localized lip sync repair evidence",
+        "cost_cents": 1080,
+    })
+    shot = job["shots"][0]
+    shot.update({
+        "idx": 1,
+        "duration_sec": 8,
+        "cost_cents": 1080,
+        "quality_reasons": ["lip_sync_mismatch"],
+        "lip_sync_repair_eligible": True,
+        "lip_sync_evidence": {
+            "overall_alignment": 0.61,
+            "confidence": 0.92,
+            "segments": [{
+                "start_sec": 2.5,
+                "end_sec": 4.5,
+                "alignment": 0.48,
+                "confidence": 0.92,
+                "offset_ms": 240,
+                "severity": "high",
+                "dialogue": "今晚必须恢复供电",
+                "reason": "下颌动作比语音慢",
+            }],
+        },
+        "lip_sync_repair_suggestion": {
+            "start_sec": 2.25,
+            "end_sec": 4.75,
+            "dialogue": "今晚必须恢复供电",
+            "reason": "口型偏移 240ms，置信度 92%",
+            "source": "lip_sync_evidence",
+        },
+    })
+    job["planned_masters"] = [{
+        "idx": 1, "type": "dialogue", "speaker": "lead",
+    }]
+    return job
+
+
 def provider_job(*, reconcilable: bool, rejected: bool = False) -> dict:
     state = "REJECTED_PENDING_RECONCILIATION" if rejected else "PROVIDER_ACTION_REQUIRED"
     job = base_job(
@@ -384,6 +426,42 @@ def run_review_decision(browser, base_url: str, decision: str) -> None:
     assert_clean(page, errors, bad)
 
 
+def run_lip_sync_evidence_repair(browser, base_url: str) -> None:
+    job = lip_sync_review_job()
+    page, posts, errors, bad = scenario_page(browser, base_url, job)
+    page.locator(f'[data-video-id="{job["job_id"]}"]').click()
+    page.locator("#drawer-next-action").click()
+
+    # Evidence must be visible before the operator chooses accept/regenerate/edit.
+    evidence = page.get_by_text("\u53e3\u578b\u5b9a\u4f4d\u8bc1\u636e", exact=True)
+    assert evidence.is_visible()
+    review_text = page.locator("#modal").inner_text()
+    assert "2.5\u20134.5" in review_text
+    assert "240ms" in review_text
+    assert "92%" in review_text
+
+    page.locator("[data-candidate-lip-sync-repair]").click()
+    assert page.locator("#lip-sync-start").input_value() == "2.25"
+    assert page.locator("#lip-sync-end").input_value() == "4.75"
+    page.locator("#lip-sync-start").fill("2.4")
+    page.locator("#lip-sync-end").fill("4.6")
+    page.locator("#lip-sync-reason").fill("\u53ea\u4fee\u590d\u8be5\u53e5\u53e3\u578b")
+    page.locator("#confirm-lip-sync-repair").click()
+    page.wait_for_timeout(200)
+
+    assert posts == [{
+        "path": "/api/videos/J-BROWSER-LIP-SYNC/masters/1/lip-sync-repair",
+        "body": {
+            "repair_start_sec": 2.4,
+            "repair_end_sec": 4.6,
+            "reason": "\u53ea\u4fee\u590d\u8be5\u53e5\u53e3\u578b",
+        },
+    }], posts
+    assert not any(item["path"].endswith("/produce") for item in posts)
+    assert not any(item["path"].endswith("/candidate-review") for item in posts)
+    assert_clean(page, errors, bad)
+
+
 def run_provider_reconcile(browser, base_url: str, *, rejected: bool) -> None:
     job = provider_job(reconcilable=True, rejected=rejected)
     page, posts, errors, bad = scenario_page(browser, base_url, job)
@@ -496,6 +574,7 @@ def run_browser_gate() -> None:
                 "accept_candidate", "regenerate_master", "reject_job",
             ):
                 run_review_decision(browser, base_url, decision)
+            run_lip_sync_evidence_repair(browser, base_url)
             run_provider_reconcile(browser, base_url, rejected=False)
             run_provider_manual_only(browser, base_url)
             run_provider_recovery_ready(browser, base_url)
@@ -523,7 +602,7 @@ def main() -> None:
     if args.release_gate:
         run_unit_gate()
     run_browser_gate()
-    print("management production-fault browser check: PASS (9 scenarios)")
+    print("management production-fault browser check: PASS (10 scenarios)")
 
 
 if __name__ == "__main__":
