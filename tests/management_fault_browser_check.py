@@ -194,6 +194,36 @@ def lip_sync_review_job() -> dict:
     return job
 
 
+def lip_sync_repair_candidate_job() -> dict:
+    job = review_job()
+    job.update({
+        "job_id": "J-BROWSER-LIP-REPAIR-CANDIDATE",
+        "title": "Localized lip sync repair comparison",
+        "cost_cents": 2023,
+    })
+    shot = job["shots"][0]
+    shot.update({
+        "idx": 1,
+        "duration_sec": 8,
+        "cost_cents": 2023,
+        "quality_reasons": ["repair_candidate_ready"],
+        "lip_sync_repair_eligible": False,
+        "repair_comparison": {
+            "available": True,
+            "mode": "seedance_lip_sync_edit",
+            "original_preview_url": "/original.mp4",
+            "candidate_preview_url": "/candidate.mp4",
+            "repair_start_sec": 2.4,
+            "repair_end_sec": 4.6,
+            "additional_cost_cents": 1079,
+        },
+    })
+    job["planned_masters"] = [{
+        "idx": 1, "type": "dialogue", "speaker": "lead",
+    }]
+    return job
+
+
 def provider_job(*, reconcilable: bool, rejected: bool = False) -> dict:
     state = "REJECTED_PENDING_RECONCILIATION" if rejected else "PROVIDER_ACTION_REQUIRED"
     job = base_job(
@@ -342,6 +372,9 @@ def scenario_page(browser, base_url: str, job: dict):
     page.route("**/candidate.mp4*", lambda route: route.fulfill(
         status=200, content_type="video/mp4", body=b""
     ))
+    page.route("**/original.mp4*", lambda route: route.fulfill(
+        status=200, content_type="video/mp4", body=b""
+    ))
     page.route("**/favicon.ico", lambda route: route.fulfill(status=204, body=b""))
 
     def route_api(route: Route) -> None:
@@ -462,6 +495,35 @@ def run_lip_sync_evidence_repair(browser, base_url: str) -> None:
     assert_clean(page, errors, bad)
 
 
+def run_lip_sync_repair_comparison(browser, base_url: str) -> None:
+    job = lip_sync_repair_candidate_job()
+    page, posts, errors, bad = scenario_page(browser, base_url, job)
+    page.locator(f'[data-video-id="{job["job_id"]}"]').click()
+    page.locator("#drawer-next-action").click()
+
+    modal = page.locator("#modal")
+    assert modal.get_by_text("原始母片", exact=True).is_visible()
+    assert modal.get_by_text("局部修复候选", exact=True).is_visible()
+    comparison_text = modal.inner_text()
+    assert "2.4–4.6 秒" in comparison_text
+    assert "¥10.79" in comparison_text
+    assert "局部口型修复候选已生成" in comparison_text
+    assert "repair_candidate_ready" not in comparison_text
+    assert modal.locator(".repair-comparison video").count() == 2
+
+    modal.locator('[data-candidate-decision="accept_candidate"]').click()
+    page.wait_for_timeout(150)
+    assert posts == [{
+        "path": (
+            "/api/videos/J-BROWSER-LIP-REPAIR-CANDIDATE/masters/1/"
+            "candidate-review"
+        ),
+        "body": {"decision": "accept_candidate"},
+    }], posts
+    assert not any(item["path"].endswith("/produce") for item in posts)
+    assert_clean(page, errors, bad)
+
+
 def run_provider_reconcile(browser, base_url: str, *, rejected: bool) -> None:
     job = provider_job(reconcilable=True, rejected=rejected)
     page, posts, errors, bad = scenario_page(browser, base_url, job)
@@ -575,6 +637,7 @@ def run_browser_gate() -> None:
             ):
                 run_review_decision(browser, base_url, decision)
             run_lip_sync_evidence_repair(browser, base_url)
+            run_lip_sync_repair_comparison(browser, base_url)
             run_provider_reconcile(browser, base_url, rejected=False)
             run_provider_manual_only(browser, base_url)
             run_provider_recovery_ready(browser, base_url)
@@ -602,7 +665,7 @@ def main() -> None:
     if args.release_gate:
         run_unit_gate()
     run_browser_gate()
-    print("management production-fault browser check: PASS (10 scenarios)")
+    print("management production-fault browser check: PASS (11 scenarios)")
 
 
 if __name__ == "__main__":

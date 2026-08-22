@@ -457,7 +457,7 @@ function directorPlanLabel(plan={}){const continuity=plan.master_grouping==='con
 function confirmDirectorPlanUpgrade(job){openModal('DIRECTOR PLAN UPGRADE','升级新版导演方案',`<div class="review-callout"><strong>只重建分镜计划，不调用付费模型</strong><p>系统将从已审核剧本重新规划对白母片、场景 B-roll 和本地双轨剪辑，同时保留人物绑定、画幅、字幕和成本提醒设置</p></div><div class="modal-actions"><button class="mini-action" onclick="document.querySelector('#modal-close').click()">取消</button><button class="primary-action" id="confirm-director-upgrade">确认升级</button></div>`);$('#confirm-director-upgrade').onclick=async()=>{const button=$('#confirm-director-upgrade');button.disabled=true;try{await api(`/api/videos/${encodeURIComponent(job.job_id)}/upgrade-director`,{method:'POST',body:'{}'});closeModal();closeDrawer();toast('导演方案已升级');await loadPage('videos')}catch(e){button.disabled=false;toast(e.message,true)}}}
 function confirmFailedDirectorPlanRebuild(job){openModal('SAFE PLAN REBUILD','重建可执行导演计划',`<div class="impact-callout"><strong>先修正计划，再允许下一次付费调用</strong><span>系统会从已审核剧本重新计算每句台词的最低可说时长，重建母片与连续性约束；旧母片计划将失效，历史成本保留，不会在本步骤调用模型</span></div><div class="review-callout"><strong>为什么不能直接继续</strong><p>当前失败可能来自台词时长、人物服装或画面文字等结构性冲突，直接重试会重复同一请求</p></div><div class="modal-actions"><button class="mini-action" onclick="document.querySelector('#modal-close').click()">取消</button><button class="primary-action" id="confirm-director-rebuild">确认重建并重新预检</button></div>`);$('#confirm-director-rebuild').onclick=async()=>{const button=$('#confirm-director-rebuild');button.disabled=true;try{await api(`/api/videos/${encodeURIComponent(job.job_id)}/rebuild-director`,{method:'POST',body:'{}'});closeModal();closeDrawer();if(!await loadPage('videos'))return;const fresh=state.videos.jobs.find(item=>item.job_id===job.job_id);toast('导演方案已安全重建，历史成本保留');confirmProduction(fresh)}catch(e){button.disabled=false;toast(e.message,true)}}}
 const masterTypeLabel=value=>value==='broll'?'场景 B-roll':'对白母片';
-const qualityReasonLabel=value=>({missing_industry_subject:'缺少行业主体或设备',missing_environment_context:'缺少环境建立镜头',missing_meaningful_action:'缺少有效业务动作',meaningless_hand_closeup:'无意义手部特写占比过高',unexpected_readable_text:'画面出现可读文字',visual_mismatch:'画面与导演要求不匹配',unexpected_person:'出现不应出镜的人物',unexpected_speech:'出现非预期人声',transcript_mismatch:'台词与语音不一致',lip_sync_mismatch:'口型与语音不一致',qa_error:'母片已生成，自动质检未完成，需人工复核',broll_semantic_evidence_missing:'缺少 B-roll 场景质检证据'})[value]||value;
+const qualityReasonLabel=value=>({missing_industry_subject:'缺少行业主体或设备',missing_environment_context:'缺少环境建立镜头',missing_meaningful_action:'缺少有效业务动作',meaningless_hand_closeup:'无意义手部特写占比过高',unexpected_readable_text:'画面出现可读文字',visual_mismatch:'画面与导演要求不匹配',unexpected_person:'出现不应出镜的人物',unexpected_speech:'出现非预期人声',transcript_mismatch:'台词与语音不一致',lip_sync_mismatch:'口型与语音不一致',repair_candidate_ready:'局部口型修复候选已生成',qa_error:'母片已生成，自动质检未完成，需人工复核',broll_semantic_evidence_missing:'缺少 B-roll 场景质检证据'})[value]||value;
 const qualityDecisionLabel=decision=>({accept_candidate:'人工已接受候选',regenerate_master:'人工已要求单条重做',reject_job:'人工已终止任务',keep_prior:'人工已保留旧版'}[decision]||'人工复核已完成');
 const masterStateLabel=state=>({PENDING:'等待生成',GENERATING:'生成中',OK:'生成完成',REVIEW_REQUIRED:'待人工复核',FAILED:'生成失败'})[state]||state||'等待生成';
 const masterQualityText=shot=>shot.quality_status==='candidate_accepted_pending'?'已接受候选，等待其余母片':shot.review_resolved?qualityDecisionLabel(shot.human_decision):shot.quality_reasons?.length?shot.quality_reasons.map(qualityReasonLabel).join('；'):shot.error?summarizeError(shot.error):shot.manual_review_required?'待人工复核':masterStateLabel(shot.state);
@@ -482,6 +482,14 @@ async function resolveMasterCandidate(job,shot,decision){
   }catch(e){buttons.forEach(button=>button.disabled=false);if(active)active.textContent=accepting?'接受候选':decision==='regenerate_master'?'单条重做':'终止任务';toast(e.message,true)}
 }
 
+function repairComparisonMarkup(shot){
+  const comparison=shot.repair_comparison;
+  if(!comparison?.available)return'';
+  const start=Number(comparison.repair_start_sec||0);
+  const end=Number(comparison.repair_end_sec||0);
+  return `<section class="repair-comparison"><header><strong>局部修复前后对比</strong><span>修复区间 ${start}–${end} 秒 · 增量成本 ${money(comparison.additional_cost_cents)}</span></header><div class="repair-comparison-grid"><article><b>原始母片</b><video controls preload="metadata" src="${esc(comparison.original_preview_url)}?v=${Date.now()}"></video></article><article><b>局部修复候选</b><video controls preload="metadata" src="${esc(comparison.candidate_preview_url)}?v=${Date.now()}"></video></article></div><small>两段视频使用同一修复区间；人工确认后才替换原母片，不触发整条视频重做</small></section>`;
+}
+
 function candidateReviewContext(job,shot){
   const makeup=job.character_makeup_plan||[];
   const makeupMarkup=makeup.length?`<div class="candidate-context-list">${makeup.map(item=>`<article>${item.preview_url?`<img src="${esc(item.preview_url)}" alt="${esc(item.display_name||'人物')} 定妆">`:'<span class="candidate-context-missing">未提供</span>'}<b>${esc(item.display_name||item.identity_key||'人物')}</b></article>`).join('')}</div>`:'<p class="candidate-context-empty">人物定妆：未提供</p>';
@@ -499,6 +507,15 @@ function openMasterCandidateReview(job,shot){
   const lipSyncRepair=shot.lip_sync_repair_eligible?'<button class="mini-action" data-candidate-lip-sync-repair>局部口型修复</button>':'';
   openModal('MASTER REVIEW',`复核母片 #${shot.idx}`,`<div class="candidate-review-layout"><section class="candidate-review-media"><video class="video-preview" controls preload="metadata" src="${esc(shot.candidate_preview_url)}?v=${Date.now()}"></video><small>此视频是被自动质检拦截的候选版本，尚未进入最终成片</small>${candidateReviewContext(job,shot)}</section><section class="candidate-review-reasons"><p class="section-no">QUALITY FINDINGS</p><h3>候选与要求的差异</h3><ul>${reasons}</ul>${lipSyncEvidence(shot)}<div class="impact-callout"><strong>${readableTextWarning?'检测到悬浮文案，建议优先单条重做，仍可人工接受':'人工决定不会重复购买已接受母片'}</strong><span>${readableTextWarning?'人工接受会保留该质检风险记录并直接进入本地合成，请确认文字不影响交付。':shot.lip_sync_repair_eligible?'无需先接受口型不合格候选；可直接进入局部编辑，原候选保留。':'接受候选只进入本地包装；单条重做只重生成当前非 OK 母片；终止任务不会删除已付费产物。'}</span></div>${technical}</section></div><div class="modal-actions candidate-review-actions"><button class="mini-action danger" data-candidate-decision="reject_job">终止任务</button><button class="mini-action" data-candidate-decision="regenerate_master">单条重做</button>${lipSyncRepair}${acceptance}</div>`);
   $('#modal').classList.add('candidate-review-open');
+  const comparison=repairComparisonMarkup(shot);
+  if(comparison){
+    const media=$('#modal .candidate-review-media');
+    const directVideo=[...media.children].find(item=>item.classList?.contains('video-preview'));
+    const directNote=directVideo?.nextElementSibling;
+    directVideo?.remove();
+    if(directNote?.tagName==='SMALL')directNote.remove();
+    media.insertAdjacentHTML('afterbegin',comparison);
+  }
   $$('[data-candidate-decision]',$('#modal')).forEach(button=>button.onclick=()=>resolveMasterCandidate(job,shot,button.dataset.candidateDecision));
   const repair=$('[data-candidate-lip-sync-repair]',$('#modal'));if(repair)repair.onclick=()=>confirmLipSyncRepair(job,shot);
 }

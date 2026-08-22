@@ -13,11 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from factory import db, production_contract, provider_tasks, subtitles  # noqa: E402
+from factory.management_api import ManagementService  # noqa: E402
 from factory.video_routing import precision_motion_reason  # noqa: E402
 
 
 FIXTURE_ROOT = ROOT / "tests" / "fixtures" / "incidents"
 EXPECTED_FIXTURES = {
+    "localized_lip_sync_repair.json",
     "unknown_speaker.json",
     "overlong_master.json",
     "precision_motion.json",
@@ -61,6 +63,7 @@ class IncidentReplayTests(unittest.TestCase):
 
     def test_all_incidents_replay_through_current_production_boundaries(self):
         handlers = {
+            "localized_lip_sync_repair": self._replay_localized_lip_sync_repair,
             "production_contract": self._replay_contract,
             "precision_motion": self._replay_precision_motion,
             "provider_owner": self._replay_provider_owner,
@@ -91,6 +94,140 @@ class IncidentReplayTests(unittest.TestCase):
         self.assertIn(
             fixture["expected"]["issue_code"],
             [issue.code for issue in result.issues],
+        )
+        self.assertEqual(
+            self.database.execute(
+                "SELECT COUNT(*) FROM provider_calls WHERE job_id=?", (job_id,)
+            ).fetchone()[0],
+            0,
+        )
+
+    def _replay_localized_lip_sync_repair(self, fixture: dict) -> None:
+        source = fixture["input"]
+        expected = fixture["expected"]
+        job_id = f"J-INCIDENT-{fixture['incident_id']}"
+        asset_root = self.root / "data" / "assets" / job_id / "shots"
+        original = asset_root / "review" / "01-source.mp4"
+        original.parent.mkdir(parents=True, exist_ok=True)
+        original.write_bytes(b"sanitized-original-master")
+        storyboard = {
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": source["duration_sec"],
+                "speaker": "lead",
+                "voiceover": source["dialogue"],
+            }],
+            "shots": [{
+                "idx": 1,
+                "video_master_idx": 1,
+                "audio_master_idx": 1,
+                "duration": source["duration_sec"],
+                "subtitle_cues": [{
+                    "start": 2.5,
+                    "end": 4.5,
+                    "text": source["dialogue"],
+                }],
+            }],
+            "production_settings": {"budget_cents": 5000},
+        }
+        initial_qa = {
+            "status": "manual_review_required",
+            "reasons": ["lip_sync_mismatch"],
+            "candidate_path": str(original),
+            "result": {"lip_sync_evidence": source["evidence"]},
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES(?,?,?,'PRODUCTION_REVIEW_REQUIRED',?,?)",
+            (
+                job_id,
+                "T-INCIDENT",
+                fixture["incident_id"],
+                json.dumps(storyboard, ensure_ascii=False),
+                source["baseline_cost_cents"],
+            ),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,duration_sec,state,provider,cost_cents,"
+            "video_qa) VALUES(?,1,?,'REVIEW_REQUIRED','seedance',?,?)",
+            (
+                job_id,
+                source["duration_sec"],
+                source["baseline_cost_cents"],
+                json.dumps(initial_qa, ensure_ascii=False),
+            ),
+        )
+        self.database.commit()
+        service = ManagementService(self.database, self.root)
+
+        before = next(
+            item for item in service.videos()["jobs"]
+            if item["job_id"] == job_id
+        )["shots"][0]
+        self.assertEqual(
+            before["lip_sync_repair_suggestion"]["start_sec"],
+            expected["suggested_start_sec"],
+        )
+        self.assertEqual(
+            before["lip_sync_repair_suggestion"]["end_sec"],
+            expected["suggested_end_sec"],
+        )
+
+        service.prepare_master_lip_sync_repair(
+            job_id,
+            1,
+            start_sec=expected["suggested_start_sec"],
+            end_sec=expected["suggested_end_sec"],
+            reason="只修复有证据的口型偏差区间",
+        )
+        persisted = json.loads(self.database.execute(
+            "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()[0])["masters"][0]
+        self.assertEqual(
+            persisted["repair_baseline_cost_cents"],
+            source["baseline_cost_cents"],
+        )
+        self.assertEqual(
+            Path(persisted["repair_source_path"]).resolve(),
+            original.resolve(),
+        )
+
+        repaired = asset_root / "review" / "repairs" / "01-repair.mp4"
+        repaired.parent.mkdir(parents=True, exist_ok=True)
+        repaired.write_bytes(b"sanitized-repair-candidate")
+        total_cost = (
+            source["baseline_cost_cents"] + source["repair_cost_cents"]
+        )
+        repair_qa = {
+            "status": "manual_review_required",
+            "reasons": ["repair_candidate_ready"],
+            "candidate_path": str(repaired),
+        }
+        self.database.execute(
+            "UPDATE shots SET state='REVIEW_REQUIRED',cost_cents=?,video_qa=? "
+            "WHERE job_id=? AND idx=1",
+            (total_cost, json.dumps(repair_qa), job_id),
+        )
+        self.database.execute(
+            "UPDATE jobs SET state='PRODUCTION_REVIEW_REQUIRED',cost_cents=? "
+            "WHERE job_id=?",
+            (total_cost, job_id),
+        )
+        self.database.commit()
+
+        after = next(
+            item for item in service.videos()["jobs"]
+            if item["job_id"] == job_id
+        )["shots"][0]
+        comparison = after["repair_comparison"]
+        self.assertTrue(comparison["available"])
+        self.assertEqual(
+            comparison["additional_cost_cents"],
+            expected["comparison_additional_cost_cents"],
+        )
+        self.assertEqual(
+            service.master_repair_source_file(job_id, 1), original.resolve()
         )
         self.assertEqual(
             self.database.execute(

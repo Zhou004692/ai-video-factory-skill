@@ -459,6 +459,44 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
             except (IndexError, ValueError) as exc:
                 return self._json({"error": str(exc)}, 404)
         if (parsed.path.startswith("/api/videos/")
+                and parsed.path.endswith("/repair-source")
+                and "/masters/" in parsed.path):
+            try:
+                parts = parsed.path.split("/")
+                path = self.service.master_repair_source_file(
+                    parts[3], int(parts[5])
+                )
+                size = path.stat().st_size
+                byte_range = self.headers.get("Range")
+                start, end = (0, size - 1)
+                if byte_range:
+                    start, end = parse_byte_range(byte_range, size)
+                length = end - start + 1
+                self.send_response(
+                    HTTPStatus.PARTIAL_CONTENT if byte_range else HTTPStatus.OK
+                )
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "no-store")
+                if byte_range:
+                    self.send_header(
+                        "Content-Range", f"bytes {start}-{end}/{size}"
+                    )
+                self.end_headers()
+                with path.open("rb") as stream:
+                    stream.seek(start)
+                    remaining = length
+                    while remaining:
+                        chunk = stream.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+            except (IndexError, ValueError) as exc:
+                return self._json({"error": str(exc)}, 404)
+        if (parsed.path.startswith("/api/videos/")
                 and parsed.path.endswith("/candidate")
                 and "/masters/" in parsed.path):
             try:

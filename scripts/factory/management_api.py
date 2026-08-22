@@ -2916,6 +2916,45 @@ class ManagementService:
                             qa,
                         )
                     )
+                shot["repair_comparison"] = None
+                if (
+                    str(master.get("repair_mode") or "")
+                    == "seedance_lip_sync_edit"
+                    and shot.get("candidate_preview_url")
+                ):
+                    source = controlled_job_asset_path(
+                        self.root / "data" / "assets",
+                        job["job_id"],
+                        master.get("repair_source_path"),
+                        require_file=True,
+                    )
+                    if source is not None:
+                        baseline_cost = max(
+                            0,
+                            int(master.get("repair_baseline_cost_cents") or 0),
+                        )
+                        shot["repair_comparison"] = {
+                            "available": True,
+                            "mode": "seedance_lip_sync_edit",
+                            "original_preview_url": (
+                                f"/api/videos/{job['job_id']}/masters/"
+                                f"{idx}/repair-source"
+                            ),
+                            "candidate_preview_url": (
+                                shot["candidate_preview_url"]
+                            ),
+                            "repair_start_sec": float(
+                                master.get("repair_start_sec") or 0
+                            ),
+                            "repair_end_sec": float(
+                                master.get("repair_end_sec") or 0
+                            ),
+                            "additional_cost_cents": max(
+                                0,
+                                int(shot.get("cost_cents") or 0)
+                                - baseline_cost,
+                            ),
+                        }
             job["completed_master_count"] = len(completed_indexes)
             job["generating_master_count"] = sum(
                 1 for shot in shots if shot.get("state") == "GENERATING"
@@ -3948,7 +3987,8 @@ class ManagementService:
             raise ValueError("只有已生成或待人工复核的视频任务可以修复口型")
         self._assert_no_unresolved_provider_tasks(job_id)
         target = self.database.execute(
-            "SELECT idx,state,duration_sec,video_path,video_url,video_qa FROM shots "
+            "SELECT idx,state,duration_sec,cost_cents,video_path,video_url,"
+            "video_qa FROM shots "
             "WHERE job_id=? AND idx=?",
             (job_id, int(master_idx)),
         ).fetchone()
@@ -4040,6 +4080,14 @@ class ManagementService:
             "repair_end_sec": end,
             "repair_dialogue": repair_dialogue,
             "repair_direction": reason_text,
+            "repair_baseline_cost_cents": max(
+                0,
+                int(
+                    master.get("repair_baseline_cost_cents")
+                    or target["cost_cents"]
+                    or 0
+                ),
+            ),
         })
         if source_url.startswith("https://"):
             master["repair_source_url"] = source_url
@@ -4742,6 +4790,39 @@ class ManagementService:
         )
         if path is None:
             raise ValueError("待复核候选母片不存在")
+        return path
+
+    def master_repair_source_file(
+        self, job_id: str, master_idx: int
+    ) -> Path:
+        row = self.database.execute(
+            "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError("视频任务不存在")
+        try:
+            storyboard = json.loads(row["storyboard"] or "{}")
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("原始修复母片不存在") from exc
+        masters = storyboard.get("masters") or storyboard.get("shots") or []
+        master = next((
+            item for item in masters
+            if int(item.get("idx") or 0) == int(master_idx)
+        ), None)
+        if (
+            not master
+            or str(master.get("repair_mode") or "")
+            != "seedance_lip_sync_edit"
+        ):
+            raise ValueError("原始修复母片不存在")
+        path = controlled_job_asset_path(
+            self.root / "data" / "assets",
+            job_id,
+            master.get("repair_source_path"),
+            require_file=True,
+        )
+        if path is None:
+            raise ValueError("原始修复母片不存在")
         return path
 
     def _controlled_job_asset(

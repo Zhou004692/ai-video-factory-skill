@@ -2632,6 +2632,7 @@ class ManagementServiceTests(unittest.TestCase):
         )
         self.assertEqual(master["repair_start_sec"], 3.0)
         self.assertEqual(master["repair_end_sec"], 15.0)
+        self.assertEqual(master["repair_baseline_cost_cents"], 1600)
         self.assertEqual(
             Path(master["repair_audio_path"]).resolve(), master_audio.resolve()
         )
@@ -2774,6 +2775,73 @@ class ManagementServiceTests(unittest.TestCase):
             persisted_qa["candidate_path"], str(candidate_path)
         )
         self.assertEqual(candidate_path.read_bytes(), b"original review candidate")
+
+    def test_video_api_exposes_lip_sync_repair_before_after_comparison(self):
+        asset_root = (
+            self.root / "data" / "assets" / "J-LIP-COMPARE" / "shots"
+        )
+        original = asset_root / "01.mp4"
+        candidate = asset_root / "review" / "repairs" / "01-repair.mp4"
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        original.write_bytes(b"original-master")
+        candidate.write_bytes(b"repair-candidate")
+        storyboard = {
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": 8,
+                "repair_mode": "seedance_lip_sync_edit",
+                "repair_source_path": str(original),
+                "repair_start_sec": 2.4,
+                "repair_end_sec": 4.6,
+                "repair_baseline_cost_cents": 944,
+            }],
+            "shots": [],
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-LIP-COMPARE','T-1','lip sync comparison',"
+            "'PRODUCTION_REVIEW_REQUIRED',?,2023)",
+            (json.dumps(storyboard),),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,duration_sec,state,provider,cost_cents,"
+            "video_path,video_qa) VALUES('J-LIP-COMPARE',1,8,"
+            "'REVIEW_REQUIRED','seedance',2023,?,?)",
+            (
+                str(original),
+                json.dumps({
+                    "status": "manual_review_required",
+                    "reasons": ["repair_candidate_ready"],
+                    "candidate_path": str(candidate),
+                }),
+            ),
+        )
+        self.database.commit()
+
+        job = next(
+            item for item in self.service.videos()["jobs"]
+            if item["job_id"] == "J-LIP-COMPARE"
+        )
+        comparison = job["shots"][0]["repair_comparison"]
+
+        self.assertEqual(comparison, {
+            "available": True,
+            "mode": "seedance_lip_sync_edit",
+            "original_preview_url": (
+                "/api/videos/J-LIP-COMPARE/masters/1/repair-source"
+            ),
+            "candidate_preview_url": (
+                "/api/videos/J-LIP-COMPARE/masters/1/candidate"
+            ),
+            "repair_start_sec": 2.4,
+            "repair_end_sec": 4.6,
+            "additional_cost_cents": 1079,
+        })
+        self.assertEqual(
+            self.service.master_repair_source_file("J-LIP-COMPARE", 1),
+            original.resolve(),
+        )
 
     def test_failed_lip_sync_edit_can_be_prepared_again_from_controlled_source(self):
         candidate_path = (
@@ -10635,6 +10703,33 @@ class ManagementMediaServerTests(unittest.TestCase):
         self.assertEqual(body, b"candidate-video")
         self.assertEqual(content_type, "video/mp4")
         service.master_candidate_file.assert_called_once_with("J-REVIEW", 2)
+
+    def test_master_repair_source_endpoint_streams_original_video(self):
+        service = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / "original.mp4"
+            original.write_bytes(b"original-video")
+            service.master_repair_source_file.return_value = original
+            ConsoleHandler.service = service
+            server = ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = (
+                    f"http://127.0.0.1:{server.server_port}"
+                    "/api/videos/J-LIP/masters/3/repair-source"
+                )
+                response = request.urlopen(url)
+                body = response.read()
+                content_type = response.headers["Content-Type"]
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(body, b"original-video")
+        self.assertEqual(content_type, "video/mp4")
+        service.master_repair_source_file.assert_called_once_with("J-LIP", 3)
 
     def test_byte_range_supports_preview_seeking_and_suffix_requests(self):
         self.assertEqual(parse_byte_range("bytes=10-19", 100), (10, 19))
