@@ -3716,6 +3716,22 @@ class RealQualityCanaryContractTests(unittest.TestCase):
                 "quality_reasons": ["lip_sync_mismatch", "visual_mismatch"],
                 "quality_status": "candidate_accepted",
                 "human_decision": "accept_candidate",
+                "lip_sync_evidence": {
+                    "overall_alignment": 0.61,
+                    "confidence": 0.92,
+                    "provider_raw": "must-not-leave-runtime",
+                    "segments": [{
+                        "start_sec": 2.5,
+                        "end_sec": 4.5,
+                        "alignment": 0.48,
+                        "confidence": 0.92,
+                        "offset_ms": 240,
+                        "severity": "provider-defined-value",
+                        "dialogue": "今晚必须恢复供电",
+                        "reason": "下颌动作比语音慢",
+                        "signed_url": "https://signed.example/evidence",
+                    }],
+                },
                 "video_path": r"C:\runtime\data\assets\J-CANARY-OBSERVED\shots\03.mp4",
                 "video_url": "https://signed.example/private.mp4?token=secret",
             }],
@@ -3748,11 +3764,29 @@ class RealQualityCanaryContractTests(unittest.TestCase):
             record["quality"]["shot_findings"][0]["quality_reasons"],
             ["lip_sync_mismatch", "visual_mismatch"],
         )
+        self.assertEqual(
+            record["quality"]["shot_findings"][0].get("lip_sync_evidence"),
+            {
+                "overall_alignment": 0.61,
+                "confidence": 0.92,
+                "segments": [{
+                    "start_sec": 2.5,
+                    "end_sec": 4.5,
+                    "alignment": 0.48,
+                    "confidence": 0.92,
+                    "offset_ms": 240,
+                    "dialogue": "今晚必须恢复供电",
+                    "reason": "下颌动作比语音慢",
+                    "severity": "high",
+                }],
+            },
+        )
         self.assertEqual(record["quality"]["final_review"]["first_pass"], 0)
         self.assertIsNone(record["quality"]["manual_scores"])
         serialized = json.dumps(record, ensure_ascii=False)
         self.assertNotIn("signed.example", serialized)
         self.assertNotIn("token=secret", serialized)
+        self.assertNotIn("must-not-leave-runtime", serialized)
 
     def test_canary_classification_requires_the_exact_frozen_contract(self):
         frozen = quality_canary.prepare_run_contract("single-speaker-8s-v1")

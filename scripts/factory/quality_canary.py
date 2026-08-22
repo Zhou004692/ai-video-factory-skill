@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import SKILL_ROOT, production_config
+from .clients import video_qa
 
 
 PROFILE_PATH = SKILL_ROOT / "references" / "quality_canary_scripts.json"
@@ -341,13 +342,22 @@ def build_acceptance_record(
         reasons = list(shot.get("quality_reasons") or [])
         decision = str(shot.get("human_decision") or "")
         if reasons or decision:
-            findings.append({
+            finding = {
                 "master_idx": int(shot.get("idx") or 0),
                 "state": str(shot.get("state") or ""),
                 "quality_status": str(shot.get("quality_status") or ""),
                 "quality_reasons": reasons,
                 "human_decision": decision,
-            })
+            }
+            if isinstance(shot.get("lip_sync_evidence"), Mapping):
+                finding["lip_sync_evidence"] = (
+                    video_qa.normalize_lip_sync_evidence({
+                        "lip_sync_evidence": deepcopy(
+                            shot["lip_sync_evidence"]
+                        ),
+                    })
+                )
+            findings.append(finding)
     settings = deepcopy(job.get("production_settings") or {})
     snapshot = deepcopy(settings.get("generation_snapshot") or {})
     return {
