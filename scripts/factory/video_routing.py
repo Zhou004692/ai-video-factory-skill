@@ -1,10 +1,32 @@
 """Shot-level Seedance 2.5 routing for native video and speech."""
 from dataclasses import dataclass
 import os
+import re
 from typing import Mapping
 
 
 SEEDANCE25_MODEL = "doubao-seedance-2-5-260628"
+AUDIO_MODE_FIXED_TTS = "fixed_tts"
+AUDIO_MODE_SEEDANCE_NATIVE = "seedance_native"
+AUDIO_MODE_OPTIONS = (AUDIO_MODE_FIXED_TTS, AUDIO_MODE_SEEDANCE_NATIVE)
+DEFAULT_AUDIO_MODE = AUDIO_MODE_SEEDANCE_NATIVE
+
+
+def normalize_audio_mode(value: object, *, strict: bool = False) -> str:
+    normalized = str(value or DEFAULT_AUDIO_MODE).strip().casefold()
+    aliases = {
+        "tts": AUDIO_MODE_FIXED_TTS,
+        "volc_tts": AUDIO_MODE_FIXED_TTS,
+        "external_tts": AUDIO_MODE_FIXED_TTS,
+        "native": AUDIO_MODE_SEEDANCE_NATIVE,
+        "seedance": AUDIO_MODE_SEEDANCE_NATIVE,
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in AUDIO_MODE_OPTIONS:
+        if strict:
+            raise ValueError("对白声音方案必须是固定声线或 Seedance 原生声线")
+        return DEFAULT_AUDIO_MODE
+    return normalized
 
 
 def precision_motion_reason(shot: Mapping[str, object]) -> str | None:
@@ -19,10 +41,19 @@ def precision_motion_reason(shot: Mapping[str, object]) -> str | None:
     }:
         return "motion_control requests deterministic/precise motion"
 
-    text = " ".join(
+    raw_text = " ".join(
         str(shot.get(field) or "")
         for field in ("scene", "scene_dynamics", "action", "prompt", "end_scene")
     ).lower()
+    clauses = re.split(r"[。！？!?；;\n]+", raw_text)
+    negative_constraints = (
+        "不出现", "不得出现", "禁止出现", "不要出现",
+        "without ", "must not show", "do not show", "no readable",
+    )
+    text = " ".join(
+        clause for clause in clauses
+        if not any(marker in clause for marker in negative_constraints)
+    )
     absolute_directions = (
         "向画面左侧", "向画面右侧", "从左向右", "从右向左",
         "left to right", "right to left",
@@ -82,12 +113,39 @@ def _truthy(value: object, default: bool = False) -> bool:
 
 def select_route(shot: dict, storyboard_shot: dict,
                  *, env: Mapping[str, str] | None = None) -> VideoRoute:
-    """Route every new shot to Seedance 2.5 with its native audio enabled."""
+    """Route video with either fixed TTS or Seedance-native dialogue audio."""
     env = env or os.environ
+    snapshot = (
+        storyboard_shot.get("_generation_snapshot")
+        or shot.get("_generation_snapshot")
+        or {}
+    )
+    audio_mode = normalize_audio_mode(
+        storyboard_shot.get("audio_mode")
+        or shot.get("audio_mode")
+        or env.get("DIALOGUE_AUDIO_MODE")
+    )
+    narrative_type = str(
+        storyboard_shot.get("narrative_type")
+        or storyboard_shot.get("type")
+        or shot.get("narrative_type")
+        or shot.get("type")
+        or ""
+    ).strip().casefold()
     return VideoRoute(
-        model=env.get("ARK_VIDEO_PRIMARY_MODEL", SEEDANCE25_MODEL),
+        model=str(
+            snapshot.get("model")
+            or env.get("ARK_VIDEO_PRIMARY_MODEL", SEEDANCE25_MODEL)
+        ),
         tier="seedance25",
-        generate_audio=True,
-        qa_required=_truthy(env.get("VIDEO_QA_ENABLED"), default=True),
+        generate_audio=(
+            narrative_type != "dialogue"
+            or audio_mode == AUDIO_MODE_SEEDANCE_NATIVE
+        ),
+        qa_required=(
+            bool(snapshot["qa_enabled"])
+            if "qa_enabled" in snapshot
+            else _truthy(env.get("VIDEO_QA_ENABLED"), default=True)
+        ),
         fallback_model=None,
     )

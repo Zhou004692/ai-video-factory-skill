@@ -14,7 +14,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 
-MAX_SOURCE_CHARS = 30000
+MAX_SOURCE_CHARS = 2_000_000
 _SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
 _TEXT_EXTENSIONS = {".txt", ".md", ".markdown", *_SUBTITLE_EXTENSIONS}
 _SRT_TIMECODE = re.compile(
@@ -56,6 +56,27 @@ def normalize_content(content: str) -> str:
             f"script source exceeds {MAX_SOURCE_CHARS} normalized characters"
         )
     return value
+
+
+def compact_text_for_prompt(content: str, *, max_chars: int = 60_000) -> str:
+    """Bound prompt size while sampling the whole source, never a silent prefix."""
+    text = str(content or "")
+    limit = max(200, int(max_chars))
+    if len(text) <= limit:
+        return text
+    marker = "\n\n[... content omitted between sampled sections ...]\n\n"
+    available = max(3, limit - (len(marker) * 2))
+    head_size = available // 3
+    middle_size = available // 3
+    tail_size = available - head_size - middle_size
+    middle_start = max(0, (len(text) - middle_size) // 2)
+    return (
+        text[:head_size]
+        + marker
+        + text[middle_start:middle_start + middle_size]
+        + marker
+        + text[-tail_size:]
+    )[:limit]
 
 
 def subtitle_to_text(content: str) -> str:
@@ -260,7 +281,7 @@ def link_source_to_topic(db, source_id: str, topic_id: str) -> None:
     db.commit()
 
 
-def topic_source_context(db, topic_id: str, *, max_chars: int = 12000) -> str:
+def topic_source_context(db, topic_id: str, *, max_chars: int = 60_000) -> str:
     rows = db.execute(
         "SELECT s.title, s.source_uri, s.source_type, s.content, "
         "s.metadata_json FROM script_sources s "
@@ -330,4 +351,4 @@ def topic_source_context(db, topic_id: str, *, max_chars: int = 12000) -> str:
             claims = analysis.get("claims_to_verify") or []
             if claims:
                 parts.append(f"- 待核验声明: {' / '.join(claims)}")
-    return "\n\n".join(parts)[:max_chars]
+    return compact_text_for_prompt("\n\n".join(parts), max_chars=max_chars)

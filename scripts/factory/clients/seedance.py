@@ -6,15 +6,13 @@ reference 模式 + native audio + motion control + first/last frame 锁定等能
 本 client 暴露 2.x role 模式:
   first_frame         单图 i2v(1.0 已有,兼容老调用)
   last_frame          2.0 新:尾帧锁定
-  reference_image     2.0 新:多张参考图(最多 9 张,角色/物件保持)
-  reference_video     2.0 新:视频参考(最多 3 段,控运镜风格)
-  reference_audio     2.0 新:音频参考(最多 3 段,控节奏/情绪)
+  reference_image     参考图(2.5 最多 30 张,角色/物件保持)
+  reference_video     视频参考(2.5 最多 10 段,控运镜/连续动作)
+  reference_audio     音频参考(2.5 最多 10 段,控音色/节奏/情绪)
 
 文档:
-  https://www.volcengine.com/docs/82379       (火山方舟主入口)
-  https://www.volcengine.com/docs/82379/1520757 (1.0 Pro 接口)
-  https://www.volcengine.com/docs/82379/2298881 (2.0 SDK 示例)
-  https://blog.laozhang.ai/en/posts/seedance-2-api (字段说明实测)
+  https://docs.volcengine.com/docs/82379/2607688?lang=zh (2.5 教程)
+  https://docs.volcengine.com/docs/82379/2607689?lang=zh (2.5 提示词)
 
 环境变量:
   ARK_API_KEY             火山方舟 API Key
@@ -24,21 +22,53 @@ reference 模式 + native audio + motion control + first/last frame 锁定等能
 """
 import asyncio
 import base64
+import json
 import math
 import os
 from pathlib import Path
+import re
 
 import httpx
+
+from . import provider_downloads
 
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 SEEDANCE_25_MIN_GENERATION_DURATION_SEC = 4
 SEEDANCE_25_MAX_GENERATION_DURATION_SEC = 30
+SEEDANCE_25_CAPABILITIES = {
+    "resolutions": frozenset({"480p", "720p", "1080p"}),
+    "reference_limits": {
+        "reference_image": 30,
+        "reference_video": 10,
+        "reference_audio": 10,
+    },
+    "task_types": frozenset({"auto", "edit", "extend"}),
+}
+
+
+def capability_profile(model: str) -> dict:
+    """Return the single provider capability contract used by every layer."""
+    if "seedance-2-5" in str(model or "").lower():
+        return SEEDANCE_25_CAPABILITIES
+    return {
+        "resolutions": frozenset({"480p", "720p", "1080p"}),
+        "reference_limits": {
+            "reference_image": 9,
+            "reference_video": 3,
+            "reference_audio": 3,
+        },
+        "task_types": frozenset({"auto"}),
+    }
 
 
 class SeedanceParameterError(ValueError):
     """A provider contract violation that must never be retried as-is."""
 
     non_retryable = True
+    retryable = False
+    code = "request_invalid"
+    error_code = code
+    stable_code = code
 
 
 def normalize_generation_duration(duration: float) -> int:
@@ -66,78 +96,292 @@ class SeedanceInputPrivacyError(RuntimeError):
     """An ordinary image reference was classified as real-person material."""
 
     non_retryable = True
+    retryable = False
+    code = "input_privacy_rejected"
+    error_code = code
+    stable_code = code
 
 
 class SeedanceSubmissionUnknownError(RuntimeError):
-    """The submit connection broke before a provider task id was received."""
+    """A transient provider transport or service failure."""
 
-    non_retryable = True
+    submit_result_unknown = True
+    non_retryable = False
+    retryable = True
+    code = "transient_network"
+    error_code = code
+    stable_code = code
 
 
 class SeedanceOutputPolicyError(RuntimeError):
     """The provider rejected generated output for a policy reason."""
 
     non_retryable = True
+    retryable = False
+    code = "output_policy_rejected"
+    error_code = code
+    stable_code = code
+
+
+class SeedanceAccountUnavailableError(RuntimeError):
+    """The Ark account cannot accept paid work until the user intervenes."""
+
+    non_retryable = True
+    retryable = False
+    pause_state = "PROVIDER_ACTION_REQUIRED"
+    code = "account_unavailable"
+    error_code = code
+    stable_code = code
+
+
+class SeedanceRateLimitError(RuntimeError):
+    """A definite pre-task 429 that is safe to use for capacity learning."""
+
+    non_retryable = True
+    retryable = False
+    code = "rate_limited"
+    error_code = code
+    stable_code = code
+
+
+def _classified(error: Exception, code: str, *, retryable: bool) -> Exception:
+    error.code = code
+    error.error_code = code
+    error.stable_code = code
+    error.retryable = retryable
+    error.non_retryable = not retryable
+    return error
+
+
+def _safe_provider_code(value: str) -> str:
+    code = str(value or "").strip()
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,79}", code):
+        return code
+    return "unknown"
+
+
+def _provider_error(
+    *,
+    provider_code: str = "",
+    provider_message: str = "",
+    status_code: int | None = None,
+    task_id: str | None = None,
+) -> Exception:
+    """Map submit and terminal poll failures into one stable taxonomy."""
+    detail = f"{provider_code} {provider_message}".casefold()
+    task = f"任务 {task_id} " if task_id else ""
+    if status_code == 429 or "ratelimit" in detail or "too many requests" in detail:
+        return SeedanceRateLimitError(
+            "Seedance 并发额度已满，系统已自动降低有效并发；"
+            "请等待冷却后继续，已完成母片不会重做。"
+        )
+    if (
+        "inputimagesensitivecontentdetected" in detail
+        or "inputimagessensitivecontentdetected" in detail
+    ):
+        return SeedanceInputPrivacyError(
+            f"Seedance {task}拒绝了可能包含隐私信息的输入图片；"
+            "请使用 authorized asset:// 已授权素材或移除该引用。"
+        )
+    if "copyright" in detail:
+        return _classified(
+            SeedanceOutputPolicyError(
+                f"Seedance {task}输出因版权或敏感内容策略被拒绝；"
+                "请调整受保护形象或作品引用。"
+            ),
+            "output_copyright_rejected",
+            retryable=False,
+        )
+    if (
+        "outputvideosensitivecontentdetected" in detail
+        or "policyviolation" in detail
+    ):
+        return SeedanceOutputPolicyError(
+            f"Seedance {task}输出被内容安全策略拒绝；请调整该母片内容。"
+        )
+    if "invalidparameter" in detail:
+        return SeedanceParameterError(
+            f"Seedance {task}请求参数未通过服务端校验；请修正参数后再提交。"
+        )
+    account_markers = (
+        "accountoverdue",
+        "overdue balance",
+        "accountdisabled",
+        "invalidaccesskey",
+        "authenticationfailed",
+        "unauthorized",
+        "access key is invalid",
+    )
+    if (
+        status_code in {401, 403}
+        or str(provider_code).casefold().startswith("account")
+        or any(
+            marker in detail for marker in account_markers
+        )
+    ):
+        return SeedanceAccountUnavailableError(
+            "火山方舟账号认证失败、被停用或欠费，系统已停止新的 Seedance 提交；"
+            "如为欠费请充值，并在处理账号问题后从管理台人工解除本地阻断。"
+        )
+    transient_markers = (
+        "remoteprotocolerror",
+        "timeout",
+        "timed out",
+        "internalservererror",
+        "serviceunavailable",
+        "temporarily unavailable",
+    )
+    if (status_code is not None and status_code >= 500) or any(
+        marker in detail for marker in transient_markers
+    ):
+        return SeedanceSubmissionUnknownError(
+            "Seedance 服务暂时不可用或网络连接中断；本次错误可按重试策略处理。"
+        )
+    if status_code is not None and 400 <= status_code < 500:
+        return SeedanceParameterError(
+            "Seedance 请求被服务端拒绝；请检查配置与请求参数后再提交。"
+        )
+    safe_code = _safe_provider_code(provider_code)
+    safe_detail = "未知 Provider 终止错误，原始详情已省略"
+    error = SeedanceParameterError(
+        f"Seedance {task}返回未知终止错误；系统不会自动发起新的付费提交；"
+        f"provider_code={safe_code or 'unknown'}; "
+        f"provider_detail={safe_detail or 'not provided'}"
+    )
+    error.provider_code = safe_code
+    error.provider_detail = safe_detail
+    return error
 
 
 def _submission_transport_error(exc: BaseException) -> RuntimeError:
-    return SeedanceSubmissionUnknownError(
-        "Seedance 提交连接中断，任务是否已创建未知；为避免重复付费，系统不会"
-        "自动重提。请先在火山方舟任务列表核对本次任务，再决定是否续跑。"
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        error = SeedanceSubmissionUnknownError(
+            "Seedance 提交前连接失败；本次错误归类为 transient_network，"
+            "可按重试策略处理。"
+        )
+        error.submit_result_unknown = False
+        return error
+    return _ambiguous_provider_error(stage="submit")
+
+
+def _ambiguous_provider_error(
+    *, stage: str, task_id: str | None = None
+) -> SeedanceSubmissionUnknownError:
+    if stage == "submit":
+        message = (
+            "Seedance 提交结果未知，请核对远端任务后再处理；"
+            "系统不会自动重新提交。"
+        )
+    else:
+        message = (
+            f"Seedance 任务 {task_id or 'unknown'} 的{stage}结果未知；"
+            "请核对远端任务后再处理，系统不会自动重新提交。"
+        )
+    error = _classified(
+        SeedanceSubmissionUnknownError(message),
+        "transient_network",
+        retryable=False,
     )
+    error.pause_state = "PROVIDER_ACTION_REQUIRED"
+    if task_id:
+        error.task_id = task_id
+    return error
+
+
+def _response_contract_error(detail: str) -> SeedanceParameterError:
+    safe_detail = str(detail or "")[:200]
+    error = SeedanceParameterError(
+        "Seedance provider response did not match the expected contract; "
+        f"provider_detail={safe_detail}"
+    )
+    error.provider_code = "InvalidProviderResponse"
+    error.provider_detail = safe_detail
+    return error
+
+
+def _known_task_error(error: Exception, task_id: str) -> Exception:
+    """Make any failure after task creation safe against a second paid POST."""
+    error.task_id = task_id
+    error.pause_state = "PROVIDER_ACTION_REQUIRED"
+    error.retryable = False
+    error.non_retryable = True
+    return error
+
+
+def _response_json_object(response, *, stage: str) -> dict:
+    try:
+        data = response.json()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise _response_contract_error(
+            f"{stage} response was not valid JSON"
+        ) from None
+    if not isinstance(data, dict):
+        raise _response_contract_error(
+            f"{stage} response must be an object"
+        )
+    return data
 
 
 def _task_failure_error(task_id: str, data: dict) -> RuntimeError:
     detail = data.get("error") or {}
-    code = str(detail.get("code") or "")
-    if (
-        "OutputVideoSensitiveContentDetected" in code
-        or "PolicyViolation" in code
-    ):
-        return SeedanceOutputPolicyError(
-            f"Seedance 任务 {task_id} 被输出版权或敏感内容策略拦截；"
-            "请去除无关作品名、角色背景或受保护形象后，仅重试该母片。"
-        )
-    message = str(detail.get("message") or "provider task failed")[:500]
-    return RuntimeError(
-        f"Seedance 任务 {task_id} 生成失败：{code or 'unknown_error'}；"
-        f"{message}"
+    if not isinstance(detail, dict):
+        return _known_task_error(_provider_error(
+            provider_message=str(detail)[:500],
+            task_id=task_id,
+        ), task_id)
+    provider_code = str(detail.get("code") or "")
+    error = _provider_error(
+        provider_code=provider_code,
+        provider_message=str(detail.get("message") or "")[:500],
+        task_id=task_id,
     )
+    if getattr(error, "stable_code", "") == "transient_network":
+        error.args = (
+            f"Seedance 任务 {task_id} 已在远端终止失败；请核对远端任务后再处理，"
+            "系统不会自动重新提交。",
+        )
+    error.provider_code = _safe_provider_code(provider_code)
+    if not hasattr(error, "provider_detail"):
+        error.provider_detail = "Provider terminal task failure"
+    return _known_task_error(error, task_id)
 
 
 def _submission_error(response, *, endpoint: str, model: str,
                       content_roles: list[str]) -> Exception:
-    detail = response.text[:800]
-    if "InputImageSensitiveContentDetected.PrivacyInformation" in detail:
-        return SeedanceInputPrivacyError(
-            "Seedance rejected an ordinary image reference because it may "
-            "contain a real person. Use an authorized asset:// portrait for "
-            "a fixed real/virtual identity, or description-only generation "
-            "for a custom fictional role; the rejected request is not "
-            "automatically retried."
-        )
-    if "InvalidParameter" in detail:
-        return SeedanceParameterError(
-            "Seedance 请求参数未通过服务端校验；系统已停止自动重试。"
-            f"provider_detail={detail} | endpoint={endpoint}, model={model}, "
-            f"content_roles={content_roles}"
-        )
-    return RuntimeError(
-        f"seedance submit {response.status_code}: {detail} | "
-        f"endpoint={endpoint}, model={model}, content_roles={content_roles}"
+    del endpoint, model, content_roles
+    if int(response.status_code) >= 500:
+        return _ambiguous_provider_error(stage="submit")
+    try:
+        payload = json.loads(response.text or "{}")
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    detail = payload.get("error") if isinstance(payload, dict) else {}
+    if not isinstance(detail, dict):
+        detail = {}
+    return _provider_error(
+        provider_code=str(detail.get("code") or ""),
+        provider_message=str(detail.get("message") or ""),
+        status_code=int(response.status_code),
     )
 
 
 def _headers():
     key = os.environ.get("ARK_API_KEY")
     if not key:
-        raise RuntimeError("ARK_API_KEY not set in .env")
+        raise SeedanceAccountUnavailableError(
+            "缺少 ARK_API_KEY，Seedance 账号配置需要人工处理。"
+        )
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
 def _img_to_data_uri(path: str) -> str:
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+    except OSError as exc:
+        raise SeedanceParameterError(
+            f"Seedance reference image is not readable: {Path(path).name}"
+        ) from exc
     ext = Path(path).suffix.lstrip(".") or "png"
     return f"data:image/{ext};base64,{b64}"
 
@@ -154,8 +398,13 @@ def _file_to_data_uri(path: str, mime_hint: str) -> str:
     """通用文件(视频/音频)转 data URI。"""
     if path.startswith(("http://", "https://", "data:")):
         return path
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+    except OSError as exc:
+        raise SeedanceParameterError(
+            f"Seedance reference media is not readable: {Path(path).name}"
+        ) from exc
     return f"data:{mime_hint};base64,{b64}"
 
 
@@ -173,7 +422,9 @@ _VIDEO_ROLES = {"first_frame", "last_frame",
 def _push_image(content: list, role: str, item: str) -> None:
     """统一往 content 数组里 push 一张 image/data URI。"""
     if role not in _VIDEO_ROLES:
-        raise ValueError(f"unknown role {role!r}, valid: {_VIDEO_ROLES}")
+        raise SeedanceParameterError(
+            f"unknown role {role!r}, valid: {_VIDEO_ROLES}"
+        )
     content.append({
         "type": "image_url",
         "image_url": {"url": _to_image_arg(item)},
@@ -215,24 +466,42 @@ def _video_task_payload(*, model: str, content: list, duration: float,
                         task_intent: str = "generate") -> dict:
     """Build one Seedance task payload using official API field names."""
     if output_format not in {"mp4", "mov"}:
-        raise ValueError("output_format must be 'mp4' or 'mov'")
-    if task_intent not in {"generate", "edit"}:
-        raise ValueError("task_intent must be 'generate' or 'edit'")
+        raise SeedanceParameterError("output_format must be 'mp4' or 'mov'")
+    if task_intent not in {"generate", "edit", "extend"}:
+        raise SeedanceParameterError(
+            "task_intent must be 'generate', 'edit', or 'extend'"
+        )
     roles = {item.get("role") for item in content if item.get("role")}
     if task_intent == "edit":
         if ratio != "adaptive":
-            raise ValueError("Seedance edit tasks require ratio='adaptive'")
+            raise SeedanceParameterError(
+                "Seedance edit tasks require ratio='adaptive'"
+            )
         if duration != -1:
-            raise ValueError("Seedance edit tasks require duration=-1")
+            raise SeedanceParameterError("Seedance edit tasks require duration=-1")
         if not ({"reference_video", "reference_audio"} & roles):
-            raise ValueError(
+            raise SeedanceParameterError(
                 "Seedance edit tasks require reference_video or reference_audio"
             )
+    profile = capability_profile(model)
     if "seedance-2-5" in model.lower():
-        if resolution not in {"480p", "720p"}:
-            raise ValueError("Seedance 2.5 resolution must be 480p or 720p")
+        if resolution not in profile["resolutions"]:
+            raise SeedanceParameterError(
+                "Seedance 2.5 resolution must be 480p, 720p, or 1080p"
+            )
         if task_intent == "generate":
             duration = normalize_generation_duration(duration)
+        if task_intent == "extend":
+            if ratio != "adaptive":
+                raise SeedanceParameterError(
+                    "Seedance extend tasks require ratio='adaptive'"
+                )
+            if not ({"reference_video"} & roles):
+                raise SeedanceParameterError(
+                    "Seedance extend tasks require reference_video"
+                )
+            if duration != -1:
+                duration = normalize_generation_duration(duration)
 
     payload = {
         "model": model,
@@ -241,6 +510,14 @@ def _video_task_payload(*, model: str, content: list, duration: float,
         "resolution": resolution,
         "output_format": output_format,
     }
+    # omni_reference_task_type is a reference-task discriminator.  Sending it
+    # on pure text-to-video requests makes the provider validate a reference
+    # task that has no reference input and is rejected synchronously.  Keep it
+    # for actual multimodal/edit/extend requests only.
+    if "seedance-2-5" in model.lower() and roles:
+        payload["omni_reference_task_type"] = (
+            "auto" if task_intent == "generate" else task_intent
+        )
     if not ({"first_frame", "last_frame"} & roles):
         payload["ratio"] = ratio
     # Seedance 2.x rejects camera_fixed in both T2V and I2V (including when
@@ -250,7 +527,10 @@ def _video_task_payload(*, model: str, content: list, duration: float,
         payload["camera_fixed"] = camera_fixed
     if seed is not None:
         payload["seed"] = seed
-    if motion_strength is not None:
+    # motion_strength is not part of the published Seedance 2.5 API contract.
+    # Keep it only for older/experimental model families that explicitly
+    # accepted the field, so production 2.5 requests remain fail-closed.
+    if motion_strength is not None and "seedance-2-5" not in model.lower():
         payload["motion_strength"] = motion_strength
     if generate_audio:
         payload["generate_audio"] = True
@@ -265,10 +545,7 @@ def _validate_reference_limits(
     audio_count: int,
 ) -> None:
     """Validate model-specific multimodal reference limits before submission."""
-    if "seedance-2-5" in model.lower():
-        limits = {"reference_image": 30, "reference_video": 10, "reference_audio": 10}
-    else:
-        limits = {"reference_image": 9, "reference_video": 3, "reference_audio": 3}
+    limits = capability_profile(model)["reference_limits"]
 
     counts = {
         "reference_image": image_count,
@@ -278,7 +555,9 @@ def _validate_reference_limits(
     for reference_type, count in counts.items():
         maximum = limits[reference_type]
         if count > maximum:
-            raise ValueError(f"{reference_type} count {count} exceeds max {maximum}")
+            raise SeedanceParameterError(
+                f"{reference_type} count {count} exceeds max {maximum}"
+            )
 
 
 async def text_to_video(
@@ -289,9 +568,9 @@ async def text_to_video(
     # 2.0 全 role:
     first_frame: str | None = None,
     last_frame: str | None = None,
-    references: list[str] | None = None,           # reference_image[] 最多 9 张
-    reference_videos: list[str] | None = None,     # 最多 3 段
-    reference_audios: list[str] | None = None,     # 最多 3 段
+    references: list[str] | None = None,           # 2.5 最多 30 张
+    reference_videos: list[str] | None = None,     # 2.5 最多 10 段
+    reference_audios: list[str] | None = None,     # 2.5 最多 10 段
     # 基本控制
     duration: float = 10.0,
     resolution: str = "720p",
@@ -300,13 +579,15 @@ async def text_to_video(
     model: str | None = None,
     # 2.0 运动控制
     camera_fixed: bool = False,
-    motion_strength: float | None = None,          # 0.0-1.0 实测可调
+    motion_strength: float | None = None,          # 仅旧/实验模型兼容
     # native audio(2.0 新):让视频自带音轨(对话/音效/环境音/BGM)
     generate_audio: bool = False,
     audio_output: bool | None = None,
     output_format: str = "mp4",
     task_intent: str = "generate",
     metadata_out: dict | None = None,
+    on_task_created=None,
+    on_task_updated=None,
     timeout: int = 600,
 ) -> bytes:
     """文+多 reference → 视频。返回 mp4 字节。
@@ -326,7 +607,7 @@ async def text_to_video(
     if resolution in _RES_MAP:
         resolution = _RES_MAP[resolution]
     elif resolution not in {"480p", "720p", "1080p"}:
-        raise ValueError(
+        raise SeedanceParameterError(
             f"unsupported resolution {resolution!r}; "
             f"use 480p/720p/1080p or a WxH key from {list(_RES_MAP)}"
         )
@@ -392,10 +673,38 @@ async def text_to_video(
                     c.get("role") for c in content if c.get("role")
                 ],
             )
-        task_id = r.json()["id"]
+        try:
+            submit_data = _response_json_object(r, stage="submit")
+        except SeedanceParameterError:
+            # The remote side may have created a paid task before returning a
+            # malformed 2xx response. Never turn that ambiguity into a repost.
+            raise _ambiguous_provider_error(stage="submit") from None
+        task_id = submit_data.get("id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise _ambiguous_provider_error(stage="submit")
+        task_id = task_id.strip()
+        if metadata_out is not None:
+            metadata_out["task_id"] = task_id
+        if on_task_created is not None:
+            try:
+                on_task_created(task_id)
+            except Exception:
+                raise _ambiguous_provider_error(
+                    stage="本地持久化", task_id=task_id
+                ) from None
+
+        def notify_task_updated(status: str, data: dict) -> None:
+            if on_task_updated is None:
+                return
+            try:
+                on_task_updated(task_id, status, data)
+            except Exception:
+                raise _ambiguous_provider_error(
+                    stage="本地持久化", task_id=task_id
+                ) from None
 
         # 2. 轮询
-        for _ in range(timeout // 5):
+        for _ in range(max(1, timeout // 5)):
             await asyncio.sleep(5)
             try:
                 s = await cli.get(
@@ -405,10 +714,45 @@ async def text_to_video(
                 # The paid task id is known. Continue polling that same task;
                 # never create a second task because a status request failed.
                 continue
-            s.raise_for_status()
-            data = s.json()
+            if s.status_code >= 500:
+                continue
+            if s.status_code >= 400:
+                notify_task_updated(
+                    "action_required", {"status": "action_required"}
+                )
+                raise _known_task_error(_submission_error(
+                    s,
+                    endpoint=f"{ARK_BASE}/contents/generations/tasks/{task_id}",
+                    model=payload["model"],
+                    content_roles=[],
+                ), task_id)
+            try:
+                data = _response_json_object(s, stage="poll")
+            except SeedanceParameterError as exc:
+                notify_task_updated(
+                    "action_required", {"status": "action_required"}
+                )
+                raise _known_task_error(exc, task_id) from None
             status = data.get("status")
-            if status == "succeeded":
+            if status in {"succeeded", "completed"}:
+                content_result = data.get("content")
+                video_url = (
+                    content_result.get("video_url")
+                    if isinstance(content_result, dict)
+                    else None
+                )
+                if not isinstance(video_url, str) or not video_url.strip():
+                    notify_task_updated("action_required", {
+                        "status": "action_required",
+                        "usage": data.get("usage") or {},
+                    })
+                    raise _known_task_error(
+                        _response_contract_error(
+                            f"{status} result missing video_url"
+                        ),
+                        task_id,
+                    )
+                video_url = video_url.strip()
                 if metadata_out is not None:
                     metadata_out.update({
                         "task_id": task_id,
@@ -416,13 +760,87 @@ async def text_to_video(
                         "created_at": data.get("created_at"),
                         "updated_at": data.get("updated_at"),
                     })
-                video_url = data["content"]["video_url"]
-                vid = await cli.get(video_url, timeout=120)
-                vid.raise_for_status()
-                return vid.content
+                try:
+                    video, _ = await provider_downloads.download_bytes(
+                        video_url, timeout=120
+                    )
+                except httpx.TransportError:
+                    notify_task_updated("action_required", {
+                        "status": "action_required",
+                        "usage": data.get("usage") or {},
+                    })
+                    raise _ambiguous_provider_error(
+                        stage="下载", task_id=task_id
+                    ) from None
+                except httpx.HTTPStatusError as exc:
+                    notify_task_updated("action_required", {
+                        "status": "action_required",
+                        "usage": data.get("usage") or {},
+                    })
+                    if exc.response.status_code >= 500:
+                        raise _ambiguous_provider_error(
+                            stage="下载", task_id=task_id
+                        ) from None
+                    error = _provider_error(
+                        status_code=exc.response.status_code,
+                        task_id=task_id,
+                    )
+                    raise _known_task_error(error, task_id) from None
+                notify_task_updated("completed", data)
+                return video
             if status == "failed":
+                notify_task_updated("failed", data)
                 raise _task_failure_error(task_id, data)
-        raise TimeoutError(f"seedance task {task_id} timed out")
+        notify_task_updated("action_required", {"status": "action_required"})
+        raise _ambiguous_provider_error(stage="轮询", task_id=task_id)
+
+
+async def inspect_task(task_id: str) -> dict:
+    """Inspect and, when complete, download one known remote task without POST."""
+    normalized_id = str(task_id or "").strip()
+    if not normalized_id:
+        raise ValueError("Seedance task_id is required")
+    async with httpx.AsyncClient(timeout=120, headers=_headers()) as cli:
+        try:
+            response = await cli.get(
+                f"{ARK_BASE}/contents/generations/tasks/{normalized_id}"
+            )
+        except httpx.TransportError:
+            return {"status": "unknown", "task_id": normalized_id}
+        if response.status_code >= 500:
+            return {"status": "unknown", "task_id": normalized_id}
+        if response.status_code >= 400:
+            response.raise_for_status()
+        data = _response_json_object(response, stage="reconcile")
+        raw_status = str(data.get("status") or "").strip().casefold()
+        status = (
+            "completed" if raw_status in {"completed", "succeeded"}
+            else "failed" if raw_status == "failed"
+            else "pending" if raw_status in {"pending", "queued", "running"}
+            else "unknown"
+        )
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        result = {
+            "status": status,
+            "task_id": normalized_id,
+            "usage": usage,
+            "cost_cents": usage_cost_cents(usage),
+        }
+        if status != "completed":
+            return result
+        content = data.get("content")
+        video_url = (
+            content.get("video_url") if isinstance(content, dict) else None
+        )
+        if not isinstance(video_url, str) or not video_url.strip():
+            return {**result, "status": "unknown"}
+        try:
+            video, final_url = await provider_downloads.download_bytes(
+                video_url.strip(), timeout=120
+            )
+        except httpx.HTTPError:
+            return {**result, "status": "unknown", "video_url": video_url}
+        return {**result, "video_url": final_url, "video": video}
 
 
 async def text_to_image(prompt: str, resolution: str = "1024x1536",
@@ -438,24 +856,60 @@ async def text_to_image(prompt: str, resolution: str = "1024x1536",
         "model": model,
         "prompt": prompt,
         "size": resolution,
+        "watermark": False,
     }
     if seed is not None:
         payload["seed"] = seed
     async with httpx.AsyncClient(timeout=120, headers=_headers()) as cli:
-        r = await cli.post(f"{ARK_BASE}/images/generations", json=payload)
+        try:
+            r = await cli.post(f"{ARK_BASE}/images/generations", json=payload)
+        except httpx.TransportError as exc:
+            raise _submission_transport_error(exc) from None
         if r.status_code >= 400:
-            raise RuntimeError(
-                f"seedream(fallback) {r.status_code}: {r.text[:600]} | model={model}"
+            raise _submission_error(
+                r,
+                endpoint=f"{ARK_BASE}/images/generations",
+                model=model,
+                content_roles=[],
             )
-        url = r.json()["data"][0]["url"]
-        img = await cli.get(url)
-        return img.content
+        try:
+            data = _response_json_object(r, stage="image submit")
+        except SeedanceParameterError:
+            raise _ambiguous_provider_error(stage="submit") from None
+        items = data.get("data")
+        url = (
+            items[0].get("url")
+            if isinstance(items, list) and items and isinstance(items[0], dict)
+            else None
+        )
+        if not isinstance(url, str) or not url.strip():
+            raise _ambiguous_provider_error(stage="submit")
+        try:
+            img, _ = await provider_downloads.download_bytes(
+                url.strip(), timeout=120
+            )
+        except (ValueError, httpx.HTTPError):
+            raise _ambiguous_provider_error(stage="图像下载") from None
+        return img
+
+
+ESTIMATION_PRICING_VERSION = "seedance25-area-v1"
+
+
+def estimated_cost_rate_cents_per_second(resolution: str = "720p") -> int:
+    """Conservative Seedance 2.5 rate calibrated by output pixel area."""
+    return {
+        "480p": 68,
+        "720p": 153,
+        "1080p": 344,
+    }.get(str(resolution or "720p").lower(), 153)
 
 
 def estimate_cost_cents(duration: float, resolution: str = "720p") -> int:
     """Conservative Seedance 2.5 estimate derived from measured token bills."""
-    rate = {"480p": 68, "720p": 102, "1080p": 136}.get(resolution, 102)
-    return int(rate * duration)
+    return int(
+        estimated_cost_rate_cents_per_second(resolution) * duration
+    )
 
 
 def usage_cost_cents(

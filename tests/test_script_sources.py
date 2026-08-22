@@ -880,26 +880,53 @@ class TopicBriefTests(unittest.TestCase):
         self.assertEqual(cached["brief_id"], result["brief_id"])
         cached_generator.assert_not_called()
 
-    def test_generate_brief_repairs_model_response_with_wrong_angle_count(self):
+    def test_generate_brief_keeps_two_usable_angles_without_padding(self):
         incomplete = self._raw_brief()
         incomplete["angles"] = incomplete["angles"][:2]
-        generator = Mock(side_effect=[
-            (incomplete, {"input_tokens": 80, "output_tokens": 30}),
-            (self._raw_brief(), {"input_tokens": 90, "output_tokens": 40}),
-        ])
+        generator = Mock(return_value=(
+            incomplete, {"input_tokens": 80, "output_tokens": 30}
+        ))
 
         result = topic_briefs.generate_brief(
             self.memory_db, [self.source.source_id], generate_json=generator
         )
 
-        self.assertEqual(len(result["brief"]["angles"]), 3)
-        self.assertEqual(generator.call_count, 2)
-        self.assertIn("上一次响应只生成了 2 个角度", generator.call_args.args[0])
+        self.assertEqual(len(result["brief"]["angles"]), 2)
+        self.assertEqual(generator.call_count, 1)
         row = self.memory_db.execute(
             "SELECT input_tokens, output_tokens FROM topic_briefs WHERE brief_id=?",
             (result["brief_id"],),
         ).fetchone()
-        self.assertEqual(tuple(row), (170, 70))
+        self.assertEqual(tuple(row), (80, 30))
+
+    def test_generate_brief_accepts_two_strong_angles_without_second_model_call(self):
+        available = self._raw_brief()
+        available["angles"] = available["angles"][:2]
+        available["recommended_index"] = 1
+        generator = Mock(return_value=(
+            available, {"input_tokens": 80, "output_tokens": 30}
+        ))
+
+        result = topic_briefs.generate_brief(
+            self.memory_db, [self.source.source_id], generate_json=generator
+        )
+
+        self.assertEqual(generator.call_count, 1)
+        self.assertEqual(len(result["brief"]["angles"]), 2)
+        self.assertEqual(result["brief"]["recommended_index"], 1)
+
+    def test_long_source_is_stored_and_prompt_compaction_samples_full_span(self):
+        content = "HEAD\n" + ("A" * 70000) + "\nMIDDLE\n" + ("B" * 70000) + "\nTAIL"
+
+        normalized = script_sources.normalize_content(content)
+        compacted = script_sources.compact_text_for_prompt(normalized, max_chars=1200)
+
+        self.assertGreater(len(normalized), 100000)
+        self.assertLessEqual(len(compacted), 1200)
+        self.assertIn("HEAD", compacted)
+        self.assertIn("MIDDLE", compacted)
+        self.assertIn("TAIL", compacted)
+        self.assertIn("omitted", compacted.casefold())
 
     def test_generate_brief_retries_truncated_json_with_larger_output_budget(self):
         calls = []
@@ -931,7 +958,7 @@ class TopicBriefTests(unittest.TestCase):
             self.memory_db, [self.source.source_id], generate_json=generator
         )
 
-        self.assertEqual(generator.call_count, 2)
+        self.assertEqual(generator.call_count, 1)
         self.assertEqual(len(result["brief"]["angles"]), 1)
         self.assertEqual(
             self.memory_db.execute("SELECT COUNT(*) FROM topic_briefs").fetchone()[0],

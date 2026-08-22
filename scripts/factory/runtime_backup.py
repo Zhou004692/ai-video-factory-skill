@@ -1,0 +1,74 @@
+"""Recoverable application-state snapshots used during local upgrades."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import shutil
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def create_upgrade_snapshot(
+    *, root: Path, data_dir: Path, env_file: Path
+) -> Path | None:
+    targets = (
+        ("environment", env_file, ".env"),
+        ("database", data_dir / "factory.db", "factory.db"),
+        ("character_assets", data_dir / "character_assets", "character_assets"),
+        ("assets", data_dir / "assets", "assets"),
+    )
+    if not any(source.exists() for _, source, _ in targets):
+        return None
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = data_dir / "backups" / f"upgrade-{stamp}"
+    backup.mkdir(parents=True, exist_ok=False)
+    manifest: dict[str, object] = {"version": 1, "items": []}
+    items: list[dict[str, object]] = []
+    for name, source, relative in targets:
+        item: dict[str, object] = {
+            "name": name,
+            "source": str(source.resolve()),
+            "snapshot": relative,
+            "existed": source.exists(),
+            "kind": "directory" if source.is_dir() else "file",
+        }
+        if source.is_dir():
+            shutil.copytree(source, backup / relative)
+        elif source.is_file():
+            shutil.copy2(source, backup / relative)
+            item["sha256"] = _file_digest(backup / relative)
+        items.append(item)
+    manifest["items"] = items
+    (backup / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return backup
+
+
+def restore_upgrade_snapshot(backup: Path) -> None:
+    manifest = json.loads((backup / "manifest.json").read_text(encoding="utf-8"))
+    for item in manifest["items"]:
+        target = Path(item["source"])
+        snapshot = backup / item["snapshot"]
+        if not item["existed"]:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if item["kind"] == "directory":
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(snapshot, target)
+        else:
+            shutil.copy2(snapshot, target)

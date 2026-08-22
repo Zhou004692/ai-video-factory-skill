@@ -1,0 +1,132 @@
+{
+  "fixture_version": 1,
+  "title": "暴雨夜三人协同抢修",
+  "characters": [
+    {"id": "linxia", "name": "林夏", "identity_key": "role:linxia"},
+    {"id": "zhouan", "name": "周安", "identity_key": "role:zhouan"},
+    {"id": "chenmo", "name": "陈默", "identity_key": "role:chenmo"}
+  ],
+  "recurring_scenes": ["storm_roof", "equipment_room"],
+  "masters": [
+    {
+      "idx": 1,
+      "type": "dialogue",
+      "duration": 18,
+      "speaker": "linxia",
+      "scene_anchor_key": "storm_roof",
+      "cast": ["linxia", "zhouan"],
+      "dialogue": "先确认风速和吊篮锁止，任何人都不能抢这一步",
+      "performance_beats": ["抬手示意", "检查仪表"]
+    },
+    {
+      "idx": 2,
+      "type": "dialogue",
+      "duration": 15,
+      "speaker": "zhouan",
+      "scene_anchor_key": "storm_roof",
+      "cast": ["linxia", "zhouan"],
+      "dialogue": "风速回落，主绳和安全绳已经完成双重确认",
+      "performance_beats": ["拉紧绳索", "回头确认"]
+    },
+    {
+      "idx": 3,
+      "type": "broll",
+      "duration": 10,
+      "scene_anchor_key": "equipment_room",
+      "asset_tags": ["配电柜", "应急照明"]
+    },
+    {
+      "idx": 4,
+      "type": "dialogue",
+      "duration": 26,
+      "speaker": "linxia",
+      "scene_anchor_key": "storm_roof",
+      "cast": ["linxia", "zhouan", "chenmo"],
+      "dialogue_blocks": [
+        {"speaker": "linxia", "text": "先断电，再进入吊篮"},
+        {"speaker": "zhouan", "text": "主绳已固定"},
+        {"speaker": "chenmo", "text": "备用电源切换完成"}
+      ],
+      "performance_beats": ["奔跑", "拉闸", "攀爬", "固定", "回望"],
+      "scene_change_markers": ["楼顶边缘", "吊篮内部"]
+    },
+    {
+      "idx": 5,
+      "type": "broll",
+      "duration": 8,
+      "scene_anchor_key": "equipment_room",
+      "asset_tags": ["配电柜", "状态灯"]
+    }
+  ],
+  "expected_dependency_waves": [[1, 3], [2, 5], [4]],
+  "reference_candidates": [
+    {
+      "uri": "asset://scene-storm-roof",
+      "kind": "video",
+      "duty": "scene_continuity",
+      "identity_key": "storm_roof",
+      "duration_sec": 4,
+      "required": true
+    },
+    {
+      "uri": "asset://role-linxia",
+      "kind": "image",
+      "duty": "speaker_identity",
+      "identity_key": "role:linxia",
+      "required": true
+    },
+    {
+      "uri": "asset://role-zhouan",
+      "kind": "image",
+      "duty": "supporting_identity",
+      "identity_key": "role:zhouan",
+      "required": true
+    },
+    {
+      "uri": "asset://voice-linxia",
+      "kind": "audio",
+      "duty": "voice_continuity",
+      "identity_key": "role:linxia",
+      "duration_sec": 6,
+      "required": true
+    }
+  ],
+  "review_candidates": [
+    {"master_idx": 2, "kind": "edit", "status": "REVIEW_REQUIRED"},
+    {"master_idx": 3, "kind": "extend", "status": "REVIEW_REQUIRED"}
+  ],
+  "cost_breakdown_cents": {
+    "identity_anchors": 87,
+    "scene_anchors": 58,
+    "native_masters": 2400,
+    "repairs": 500,
+    "local_director": 0
+  },
+  "expected_total_cost_cents": 3045,
+  "configured_concurrency": 3,
+  "provider_call": {
+    "task_id": "fixture-task-001",
+    "job_id": "fixture-job-001",
+    "shot_idx": 1,
+    "provider": "seedance",
+    "intent": "generate",
+    "cost_cents": 700
+  },
+  "remote_recovery": {
+    "task_id": "fixture-remote-recovery-001",
+    "method": "GET",
+    "allow_submit": false,
+    "expected_state": "PROVIDER_ACTION_REQUIRED"
+  },
+  "state_path": [
+    "STORYBOARDED",
+    "PRODUCTION_QUEUED",
+    "PRODUCTION_RUNNING",
+    "ANCHOR_REVIEW_REQUIRED",
+    "PRODUCTION_REVIEW_REQUIRED",
+    "SHOTS_OK",
+    "BGM_OK",
+    "COMPOSED",
+    "READY_TO_PUBLISH"
+  ]
+}

@@ -10,25 +10,450 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 
 from factory import (  # noqa: E402
+    anchor_generation,
     character_assets,
     db,
+    master_dependencies,
     models,
     orchestrator,
+    provider_capacity,
+    provider_tasks,
+    production_planner,
     prompts,
+    reference_attention,
     scene_assets,
+    subtitles,
     video_routing,
 )
 from factory.clients import bigasr, ffmpeg, music, seedance, video_qa  # noqa: E402
-from factory.steps import s1_storyboard, s3_shots, s6_compose  # noqa: E402
+from factory.steps import s1_storyboard, s3_shots, s5_bgm, s6_compose  # noqa: E402
+
+
+_PROVIDER_ENV_KEYS = (
+    "ARK_API_KEY",
+    "VOLC_AK",
+    "VOLC_SK",
+    "TOS_BUCKET",
+    "TOS_ENDPOINT",
+    "SUNO_API_KEY",
+    "DEFAULT_MUSIC_PROVIDER",
+    "CHARACTER_ANCHOR_GENERATOR",
+    "SCENE_ANCHOR_GENERATOR",
+)
+_PROVIDER_ENV_SNAPSHOT: dict[str, str] = {}
+
+
+class AnchorGeneratorDefaultTests(unittest.TestCase):
+    def test_unconfigured_character_and_scene_anchors_default_to_seedance_25(self):
+        with patch.dict(
+            os.environ,
+            {
+                "CHARACTER_ANCHOR_GENERATOR": "",
+                "SCENE_ANCHOR_GENERATOR": "",
+            },
+        ):
+            self.assertEqual(
+                anchor_generation.normalize_generator(None),
+                anchor_generation.SEEDANCE_25,
+            )
+            self.assertEqual(
+                anchor_generation.selected_generator({}, "character"),
+                anchor_generation.SEEDANCE_25,
+            )
+            self.assertEqual(
+                anchor_generation.selected_generator({}, "scene"),
+                anchor_generation.SEEDANCE_25,
+            )
+
+    def test_explicit_seedream_override_remains_supported(self):
+        storyboard = {
+            "production_settings": {
+                "character_anchor_generator": "seedream_5_0",
+                "scene_anchor_generator": "seedream_5_0",
+            }
+        }
+
+        self.assertEqual(
+            anchor_generation.selected_generator(storyboard, "character"),
+            anchor_generation.SEEDREAM_5,
+        )
+        self.assertEqual(
+            anchor_generation.selected_generator(storyboard, "scene"),
+            anchor_generation.SEEDREAM_5,
+        )
+
+
+def setUpModule():
+    """Keep full-suite discovery from importing the user's live .env into tests."""
+    global _PROVIDER_ENV_SNAPSHOT
+    _PROVIDER_ENV_SNAPSHOT = {
+        key: os.environ[key] for key in _PROVIDER_ENV_KEYS if key in os.environ
+    }
+    for key in _PROVIDER_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def tearDownModule():
+    for key in _PROVIDER_ENV_KEYS:
+        os.environ.pop(key, None)
+    os.environ.update(_PROVIDER_ENV_SNAPSHOT)
+
+
+class ReferenceAttentionTests(unittest.TestCase):
+    def test_selector_orders_duties_and_deduplicates_without_reordering(self):
+        manifest = reference_attention.select_manifest([
+            reference_attention.candidate(
+                "https://cdn/voice.wav", kind="audio",
+                duty="voice_continuity", required=False,
+            ),
+            reference_attention.candidate(
+                "https://cdn/support.png", kind="image",
+                duty="supporting_identity", identity_key="support",
+            ),
+            reference_attention.candidate(
+                "https://cdn/scene.mp4", kind="video",
+                duty="scene_continuity", duration_sec=8,
+            ),
+            reference_attention.candidate(
+                "https://cdn/speaker.png", kind="image",
+                duty="speaker_identity", identity_key="speaker",
+            ),
+            reference_attention.candidate(
+                "https://cdn/scene.mp4", kind="video",
+                duty="style_continuity", required=False,
+            ),
+        ], max_video_references=3)
+
+        self.assertEqual(
+            [item["duty"] for item in manifest],
+            [
+                "scene_continuity", "speaker_identity",
+                "supporting_identity", "voice_continuity",
+            ],
+        )
+        self.assertEqual(
+            [item["uri"] for item in manifest].count("https://cdn/scene.mp4"), 1
+        )
+
+    def test_selector_fails_before_paid_call_when_required_video_budget_is_exceeded(self):
+        with self.assertRaisesRegex(ValueError, "参考素材注意力预算.*拆分"):
+            reference_attention.select_manifest([
+                reference_attention.candidate(
+                    f"https://cdn/person-{index}.mp4", kind="video",
+                    duty="supporting_identity", identity_key=str(index),
+                )
+                for index in range(4)
+            ], max_video_references=3)
+
+    def test_dialogue_manifest_compiles_exact_numbered_material_duties(self):
+        speaker = {"id": "speaker", "generation_mode": "ai_generated"}
+        supporting = {"id": "support", "generation_mode": "ai_generated"}
+        identity_anchors = {
+            character_assets.character_identity_key(speaker): s3_shots.DialogueAnchor(
+                image_reference="https://cdn/speaker.png", anchor_mode="static_image"
+            ),
+            character_assets.character_identity_key(supporting): s3_shots.DialogueAnchor(
+                image_reference="https://cdn/support.png", anchor_mode="static_image"
+            ),
+        }
+        request = s3_shots._dialogue_request_kwargs(
+            {"duration_sec": 8}, None,
+            native_voice_anchor=s3_shots.NativeVoiceAnchor(Path("voice.wav")),
+            character=speaker,
+            cast_characters=[supporting],
+            identity_anchors=identity_anchors,
+            scene_video_anchor=s3_shots.DialogueAnchor(
+                video_url="https://cdn/scene.mp4", duration_sec=8
+            ),
+        )
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {"idx": 1, "duration_sec": 8, "voiceover": "开始检查。"},
+            speaker,
+            reference_manifest=request["reference_manifest"],
+        )
+
+        self.assertEqual(
+            [item["duty"] for item in request["reference_manifest"]],
+            [
+                "scene_continuity", "speaker_identity",
+                "supporting_identity", "voice_continuity",
+            ],
+        )
+        self.assertIn("视频1只负责同场景空间连续性", prompt)
+        self.assertIn("图片1只负责主说话人身份", prompt)
+        self.assertIn("图片2只负责同场配角身份", prompt)
+        self.assertIn("音频1只负责声线、语速和情绪连续性", prompt)
+
+    def test_broll_manifest_prioritizes_scene_before_cast_identity(self):
+        supporting = {"id": "support", "generation_mode": "ai_generated"}
+        identity_anchors = {
+            character_assets.character_identity_key(supporting): s3_shots.DialogueAnchor(
+                image_reference="https://cdn/support.png", anchor_mode="static_image"
+            ),
+        }
+
+        request = s3_shots._broll_request_kwargs(
+            {"duration_sec": 8},
+            cast_characters=[supporting],
+            identity_anchors=identity_anchors,
+            scene_reference="https://cdn/scene.png",
+        )
+        prompt = s3_shots._build_broll_video_prompt(
+            {"duration_sec": 8, "scene": "night yard"},
+            reference_manifest=request["reference_manifest"],
+        )
+
+        self.assertEqual(
+            [item["duty"] for item in request["reference_manifest"]],
+            ["scene_continuity", "supporting_identity"],
+        )
+        self.assertIn("图片1只负责同场景空间连续性", prompt)
+        self.assertIn("图片2只负责同场配角身份", prompt)
+
+
+class ProviderCapacityTests(unittest.TestCase):
+    def setUp(self):
+        self.database = sqlite3.connect(":memory:")
+        self.database.row_factory = sqlite3.Row
+        self.database.executescript(db.DDL)
+
+    def tearDown(self):
+        self.database.close()
+
+    def test_configured_limit_is_upper_bound_and_definite_429_halves_capacity(self):
+        initial = provider_capacity.status(
+            self.database, "seedance", configured_limit=4
+        )
+        self.assertEqual(initial["effective_limit"], 4)
+
+        reduced = provider_capacity.record_rate_limit(
+            self.database, "seedance", configured_limit=4
+        )
+
+        self.assertEqual(reduced["learned_limit"], 2)
+        self.assertEqual(reduced["effective_limit"], 2)
+        self.assertEqual(reduced["last_reason"], "definite_rate_limit")
+        with self.assertRaises(provider_capacity.ProviderCapacityCooldownError):
+            provider_capacity.assert_submit_allowed(
+                self.database, "seedance"
+            )
+
+    def test_five_clean_waves_restore_one_slot_without_exceeding_configured_limit(self):
+        provider_capacity.record_rate_limit(
+            self.database, "seedance", configured_limit=4, cooldown_seconds=0
+        )
+        for _ in range(4):
+            status = provider_capacity.record_wave_success(
+                self.database, "seedance", configured_limit=4
+            )
+            self.assertEqual(status["learned_limit"], 2)
+        recovered = provider_capacity.record_wave_success(
+            self.database, "seedance", configured_limit=4
+        )
+        self.assertEqual(recovered["learned_limit"], 3)
+        self.assertEqual(recovered["success_streak"], 0)
+        for _ in range(10):
+            recovered = provider_capacity.record_wave_success(
+                self.database, "seedance", configured_limit=4
+            )
+        self.assertLessEqual(recovered["effective_limit"], 4)
+
+    def test_ambiguous_submission_does_not_change_learned_capacity(self):
+        before = provider_capacity.status(
+            self.database, "seedance", configured_limit=3
+        )
+        after = provider_capacity.record_ambiguous_submission(
+            self.database, "seedance", configured_limit=3
+        )
+        self.assertEqual(after["learned_limit"], before["learned_limit"])
+        self.assertEqual(after["success_streak"], before["success_streak"])
+
+    def test_provider_429_is_a_definite_rate_limit_class(self):
+        response = Mock(
+            status_code=429,
+            text=json.dumps({
+                "error": {
+                    "code": "RateLimitExceeded",
+                    "message": "too many requests",
+                },
+            }),
+        )
+        error = seedance._submission_error(
+            response, endpoint="https://ark/tasks", model="seedance-2-5",
+            content_roles=[],
+        )
+        self.assertIsInstance(error, seedance.SeedanceRateLimitError)
+        self.assertFalse(error.retryable)
+
+    def test_definite_429_blocks_the_next_waiting_submission_before_post(self):
+        asyncio.run(self._assert_429_blocks_next_submission())
+
+    async def _assert_429_blocks_next_submission(self):
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-CAP','T-1','capacity','PRODUCTION_RUNNING',?)",
+            (json.dumps({
+                "production_settings": {"budget_cents": 10000},
+            }),),
+        )
+        self.database.executemany(
+            "INSERT INTO shots(job_id,idx,state) VALUES('J-CAP',?,'GENERATING')",
+            [(1,), (2,)],
+        )
+        self.database.commit()
+        route = video_routing.VideoRoute(
+            model="seedance25", tier="seedance25",
+            generate_audio=False, qa_required=False,
+        )
+        submit = AsyncMock(side_effect=seedance.SeedanceRateLimitError(
+            "definite 429"
+        ))
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            s3_shots.seedance, "text_to_video", new=submit,
+        ):
+            for shot_idx in (1, 2):
+                with self.assertRaises((
+                    seedance.SeedanceRateLimitError,
+                    provider_capacity.ProviderCapacityCooldownError,
+                )):
+                    await s3_shots._generate_seedance_video(
+                        prompt="equipment yard",
+                        route=route,
+                        request_kwargs={"duration": 4, "resolution": "480p"},
+                        out_path=Path(temp) / f"{shot_idx}.mp4",
+                        key_hint=f"capacity-{shot_idx}",
+                        job_id="J-CAP",
+                        shot_idx=shot_idx,
+                        database=self.database,
+                        generation_snapshot={"max_concurrent_masters": 4},
+                    )
+
+        self.assertEqual(submit.await_count, 1)
+
+
+class MasterDependencyGraphTests(unittest.TestCase):
+    def test_graph_exposes_scene_identity_and_explicit_dependencies(self):
+        graph = master_dependencies.build_master_dependency_graph([
+            {
+                "idx": 1, "type": "dialogue", "speaker": "linxia",
+                "scene_anchor_key": "yard",
+                "continuity_contract": {
+                    "characters": [{"identity_key": "identity-linxia"}],
+                },
+            },
+            {
+                "idx": 2, "type": "broll", "scene_anchor_key": "office",
+            },
+            {
+                "idx": 3, "type": "dialogue", "speaker": "linxia",
+                "scene_anchor_key": "yard", "depends_on": [2],
+                "continuity_contract": {
+                    "characters": [{"identity_key": "identity-linxia"}],
+                },
+            },
+        ])
+
+        nodes = {node["idx"]: node for node in graph["nodes"]}
+        self.assertEqual(nodes[1]["depends_on"], [])
+        self.assertEqual(nodes[2]["depends_on"], [])
+        self.assertEqual(nodes[3]["depends_on"], [1, 2])
+        self.assertEqual(
+            nodes[3]["dependency_reasons"],
+            {"1": ["identity:identity-linxia", "scene:yard"], "2": ["explicit"]},
+        )
+        self.assertEqual(graph["waves"], [[1, 2], [3]])
+
+    def test_pending_waves_wait_for_a_manual_review_predecessor(self):
+        graph = master_dependencies.build_master_dependency_graph([
+            {"idx": 1, "type": "broll", "scene_anchor_key": "yard"},
+            {"idx": 2, "type": "broll", "scene_anchor_key": "yard"},
+            {"idx": 3, "type": "broll", "scene_anchor_key": "office"},
+        ])
+
+        ready, blocked = master_dependencies.ready_master_wave(
+            graph,
+            pending_indexes={2, 3},
+            blocked_indexes={1},
+        )
+
+        self.assertEqual(ready, [3])
+        self.assertEqual(blocked, {2: [1]})
+
+
+class _InjectedFinalConnection:
+    def __init__(self, connection, *, fail_sql: str = "", fail_commit: bool = False):
+        self.connection = connection
+        self.fail_sql = fail_sql
+        self.fail_commit = fail_commit
+        self.rolled_back = False
+        self.closed = False
+
+    def execute(self, sql, parameters=()):
+        if self.fail_sql and self.fail_sql in sql:
+            raise sqlite3.OperationalError("injected final accounting failure")
+        return self.connection.execute(sql, parameters)
+
+    def commit(self):
+        if self.fail_commit:
+            raise sqlite3.OperationalError("injected final commit failure")
+        return self.connection.commit()
+
+    def rollback(self):
+        self.rolled_back = True
+        return self.connection.rollback()
+
+    def close(self):
+        self.closed = True
+        return self.connection.close()
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+class _NonClosingConnection:
+    """Keep an in-memory fixture readable after production closes its handle."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def close(self):
+        pass
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
 
 
 class SeedancePayloadTests(unittest.TestCase):
+    def test_account_overdue_submission_is_non_retryable_and_actionable(self):
+        response = Mock(
+            status_code=403,
+            text=(
+                '{"error":{"code":"AccountOverdueError","message":'
+                '"The account has an overdue balance"}}'
+            ),
+        )
+
+        error = seedance._submission_error(
+            response,
+            endpoint="https://ark.example/tasks",
+            model="doubao-seedance-2-5-260628",
+            content_roles=[],
+        )
+
+        self.assertIsInstance(error, seedance.SeedanceAccountUnavailableError)
+        self.assertTrue(error.non_retryable)
+        self.assertEqual(error.pause_state, "PROVIDER_ACTION_REQUIRED")
+        self.assertIn("欠费", str(error))
+        self.assertIn("充值", str(error))
+
     def test_invalid_parameter_submission_is_non_retryable(self):
         response = Mock(
             status_code=400,
@@ -55,14 +480,19 @@ class SeedancePayloadTests(unittest.TestCase):
                 with self.assertRaises(seedance.SeedanceParameterError):
                     seedance.normalize_generation_duration(invalid)
 
-    def test_transport_disconnect_is_classified_as_unknown_submission(self):
+    def test_transport_disconnect_after_submit_requires_manual_reconciliation(self):
         error = seedance._submission_transport_error(
-            RuntimeError("Server disconnected without sending a response")
+            seedance.httpx.RemoteProtocolError(
+                "Server disconnected without sending a response"
+            )
         )
 
         self.assertIsInstance(error, seedance.SeedanceSubmissionUnknownError)
         self.assertTrue(error.non_retryable)
-        self.assertIn("是否已创建未知", str(error))
+        self.assertFalse(error.retryable)
+        self.assertEqual(error.code, "transient_network")
+        self.assertEqual(error.pause_state, "PROVIDER_ACTION_REQUIRED")
+        self.assertIn("提交结果未知", str(error))
 
     def test_output_copyright_policy_error_is_non_retryable_and_readable(self):
         error = seedance._task_failure_error(
@@ -115,7 +545,68 @@ class SeedancePayloadTests(unittest.TestCase):
 
 
 class MusicFallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_missing_optional_library_falls_back_to_silent_bgm(self):
+    def test_unknown_provider_and_unimplemented_haimian_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "unknown-music"):
+            music.resolve_provider(explicit="unknown-music")
+        with self.assertRaisesRegex(ValueError, "haimian|海绵"):
+            music.estimate_cost_cents(60, provider="haimian")
+        self.assertFalse(music.provider_registry()["haimian"]["supported"])
+        self.assertIsNone(music.provider_registry()["haimian"]["executor"])
+
+    async def test_suno_task_first_ambiguity_is_persisted_and_never_reposted(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-SUNO-TASK','T-1','suno task','SHOTS_OK','{}')"
+        )
+        database.commit()
+        calls = 0
+
+        async def ambiguous_generate(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            kwargs["on_task_created"]("suno-remote-1")
+            raise music.MusicTaskUnknownError(
+                "suno task status unknown", task_id="suno-remote-1"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            s5_bgm, "conn", return_value=database
+        ), patch.object(s5_bgm, "ASSETS_DIR", Path(tmp)), patch.object(
+            music, "generate", new=ambiguous_generate
+        ):
+            with self.assertRaises(music.MusicTaskUnknownError):
+                await s5_bgm.run("J-SUNO-TASK", provider="suno")
+            with self.assertRaisesRegex(Exception, "核对|task"):
+                await s5_bgm.run("J-SUNO-TASK", provider="suno")
+
+        row = database.execute(
+            "SELECT task_id,provider,intent,usage_json,cost_cents "
+            "FROM provider_calls WHERE task_id='suno-remote-1'"
+        ).fetchone()
+        self.assertEqual(calls, 1)
+        self.assertEqual((row["provider"], row["intent"]), ("suno", "bgm"))
+        self.assertEqual(json.loads(row["usage_json"])["status"], "action_required")
+        self.assertEqual(row["cost_cents"], 0)
+        database.close()
+    def test_music_provider_resolver_has_one_explicit_env_file_precedence(self):
+        with patch.dict(
+            os.environ, {"DEFAULT_MUSIC_PROVIDER": "suno"}, clear=False
+        ):
+            self.assertEqual(
+                music.resolve_provider({"DEFAULT_MUSIC_PROVIDER": "silent"}),
+                "suno",
+            )
+            self.assertEqual(
+                music.resolve_provider(
+                    {"DEFAULT_MUSIC_PROVIDER": "silent"}, explicit="library"
+                ),
+                "library",
+            )
+
+    async def test_explicit_library_missing_fails_closed_with_actionable_error(self):
         with patch.dict(os.environ, {"DEFAULT_MUSIC_PROVIDER": "library"}), \
                 patch.object(
                     music, "_via_library",
@@ -123,10 +614,655 @@ class MusicFallbackTests(unittest.IsolatedAsyncioTestCase):
                 ), patch.object(
                     music, "_via_silent", new=AsyncMock(return_value=b"silent")
                 ) as silent:
-            audio = await music.generate("business", 30)
+            with self.assertRaisesRegex(
+                music.MusicProviderConfigError, "library|音乐库|mp3"
+            ):
+                await music.generate("business", 30)
 
-        self.assertEqual(audio, b"silent")
-        silent.assert_awaited_once_with(30)
+        silent.assert_not_awaited()
+
+    async def test_suno_posts_once_then_polls_and_downloads_the_same_task(self):
+        counts = {"post": 0, "poll": 0, "download": 0}
+        polled_paths = []
+
+        def handler(request):
+            if request.method == "POST":
+                counts["post"] += 1
+                return httpx.Response(200, json={"id": "suno-task-001"})
+            if request.url.host == "api.sunoapi.com":
+                counts["poll"] += 1
+                polled_paths.append(request.url.path)
+                if counts["poll"] == 1:
+                    return httpx.Response(200, json={"status": "running"})
+                return httpx.Response(200, json={
+                    "status": "completed",
+                    "data": [{"audio_url": "https://media.example/bgm.mp3"}],
+                    "usage": {"credits": 1},
+                })
+            counts["download"] += 1
+            return httpx.Response(200, content=b"paid-bgm")
+
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(*_args, **kwargs):
+            return real_async_client(
+                transport=httpx.MockTransport(handler),
+                headers=kwargs.get("headers"),
+            )
+        created = []
+        updated = []
+        with patch.dict(os.environ, {
+                    "SUNO_API_KEY": "test-key",
+                    "PROVIDER_DOWNLOAD_TRUSTED_HOSTS": "media.example",
+                }), \
+                patch(
+                    "socket.getaddrinfo",
+                    return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+                ), \
+                patch.object(
+                    music.httpx, "AsyncClient", side_effect=client_factory
+                ), \
+                patch.object(music.asyncio, "sleep", new=AsyncMock()):
+            audio = await music.generate(
+                "business", 60, provider="suno",
+                on_task_created=created.append,
+                on_task_updated=lambda task_id, status, data: updated.append(
+                    (task_id, status, data)
+                ),
+            )
+
+        self.assertEqual(audio, b"paid-bgm")
+        self.assertEqual(counts, {"post": 1, "poll": 2, "download": 1})
+        self.assertEqual(created, ["suno-task-001"])
+        self.assertEqual(
+            polled_paths,
+            ["/api/v1/suno/task/suno-task-001"] * 2,
+        )
+        self.assertEqual(updated[-1][0:2], ("suno-task-001", "completed"))
+
+    async def test_suno_post_ambiguity_keeps_gate_closed_for_second_run(self):
+        cases = {
+            "http_5xx": lambda _request: httpx.Response(503, text="busy"),
+            "malformed_2xx": lambda _request: httpx.Response(
+                200, content=b"not-json"
+            ),
+            "missing_task_id": lambda _request: httpx.Response(
+                200, json={"data": [{}]}
+            ),
+            "transport": lambda request: (_ for _ in ()).throw(
+                httpx.ConnectError("connection reset", request=request)
+            ),
+            "cancelled": lambda _request: (_ for _ in ()).throw(
+                asyncio.CancelledError()
+            ),
+        }
+        for suffix, response in cases.items():
+            with self.subTest(case=suffix):
+                database = sqlite3.connect(":memory:")
+                database.row_factory = sqlite3.Row
+                database.executescript(db.DDL)
+                job_id = f"J-SUNO-{suffix.upper()}"
+                database.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                    "VALUES(?, 'T-1', 'suno ambiguity', 'SHOTS_OK', '{}')",
+                    (job_id,),
+                )
+                database.commit()
+                posts = 0
+
+                def handler(request):
+                    nonlocal posts
+                    posts += 1
+                    return response(request)
+
+                real_async_client = httpx.AsyncClient
+
+                def client_factory(*_args, **_kwargs):
+                    return real_async_client(
+                        transport=httpx.MockTransport(handler)
+                    )
+
+                with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                    os.environ, {"SUNO_API_KEY": "test-key"}
+                ), patch.object(
+                    s5_bgm, "conn", return_value=database
+                ), patch.object(
+                    s5_bgm, "ASSETS_DIR", Path(tmp)
+                ), patch.object(
+                    music.httpx, "AsyncClient", side_effect=client_factory
+                ):
+                    with self.assertRaises(BaseException):
+                        await s5_bgm.run(job_id, provider="suno")
+                    with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                        await s5_bgm.run(job_id, provider="suno")
+
+                row = database.execute(
+                    "SELECT task_id,usage_json FROM provider_calls"
+                ).fetchone()
+                self.assertEqual(posts, 1)
+                self.assertTrue(row["task_id"].startswith("local-submit:"))
+                self.assertEqual(
+                    json.loads(row["usage_json"])["status"],
+                    "action_required",
+                )
+                database.close()
+
+    async def test_suno_pre_submit_configuration_failure_releases_reservation(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-SUNO-PREFLIGHT','T-1','preflight','SHOTS_OK','{}')"
+        )
+        database.commit()
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            s5_bgm, "conn", return_value=database
+        ):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "SUNO_API_KEY"):
+                    await s5_bgm.run("J-SUNO-PREFLIGHT", provider="suno")
+
+        self.assertEqual(
+            database.execute("SELECT COUNT(*) FROM provider_calls").fetchone()[0],
+            0,
+        )
+        database.close()
+
+    async def test_s5_completed_bgm_cost_and_artifact_are_idempotent(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-SUNO-DONE','T-1','done','SHOTS_OK','{}',0)"
+        )
+        database.commit()
+        counts = {"post": 0, "poll": 0, "download": 0}
+
+        def handler(request):
+            if request.method == "POST":
+                counts["post"] += 1
+                return httpx.Response(200, json={"id": "suno-done-1"})
+            if request.url.host == "api.sunoapi.com":
+                counts["poll"] += 1
+                return httpx.Response(200, json={
+                    "status": "completed",
+                    "data": [{"audio_url": "https://media.example/done.mp3"}],
+                    "usage": {"credits": 1},
+                })
+            counts["download"] += 1
+            return httpx.Response(200, content=b"completed-bgm")
+
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(*_args, **_kwargs):
+            return real_async_client(transport=httpx.MockTransport(handler))
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {
+                "SUNO_API_KEY": "test-key",
+                "PROVIDER_DOWNLOAD_TRUSTED_HOSTS": "media.example",
+            }
+        ), patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+        ), patch.object(
+            s5_bgm, "conn", return_value=database
+        ), patch.object(
+            s5_bgm, "ASSETS_DIR", Path(tmp)
+        ), patch.object(
+            music.httpx, "AsyncClient", side_effect=client_factory
+        ), patch.object(music.asyncio, "sleep", new=AsyncMock()):
+            await s5_bgm.run("J-SUNO-DONE", provider="suno")
+            await s5_bgm.run("J-SUNO-DONE", provider="suno")
+
+            bgm = Path(tmp) / "J-SUNO-DONE" / "bgm.mp3"
+            self.assertEqual(bgm.read_bytes(), b"completed-bgm")
+
+        call = database.execute(
+            "SELECT cost_cents,usage_json FROM provider_calls "
+            "WHERE task_id='suno-done-1'"
+        ).fetchone()
+        job = database.execute(
+            "SELECT cost_cents,bgm_path FROM jobs WHERE job_id='J-SUNO-DONE'"
+        ).fetchone()
+        self.assertEqual(counts, {"post": 1, "poll": 1, "download": 1})
+        self.assertEqual(call["cost_cents"], 20)
+        self.assertEqual(json.loads(call["usage_json"])["status"], "completed")
+        self.assertEqual(job["cost_cents"], 20)
+        self.assertEqual(job["bgm_path"], str(Path(tmp) / "J-SUNO-DONE" / "bgm.mp3"))
+        database.close()
+
+    async def test_suno_known_task_poll_or_download_failure_never_reposts(self):
+        for phase in ("poll", "download"):
+            with self.subTest(phase=phase):
+                database = sqlite3.connect(":memory:")
+                database.row_factory = sqlite3.Row
+                database.executescript(db.DDL)
+                job_id = f"J-SUNO-{phase.upper()}-FAIL"
+                database.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                    "VALUES(?, 'T-1', 'known task', 'SHOTS_OK', '{}')",
+                    (job_id,),
+                )
+                database.commit()
+                counts = {"post": 0, "poll": 0, "download": 0}
+
+                def handler(request):
+                    if request.method == "POST":
+                        counts["post"] += 1
+                        return httpx.Response(200, json={"id": f"task-{phase}"})
+                    if request.url.host == "api.sunoapi.com":
+                        counts["poll"] += 1
+                        if phase == "poll":
+                            return httpx.Response(503, text="poll unavailable")
+                        return httpx.Response(200, json={
+                            "status": "completed",
+                            "data": [{
+                                "audio_url": "https://media.example/fail.mp3"
+                            }],
+                        })
+                    counts["download"] += 1
+                    return httpx.Response(503, text="download unavailable")
+
+                real_async_client = httpx.AsyncClient
+
+                def client_factory(*_args, **_kwargs):
+                    return real_async_client(
+                        transport=httpx.MockTransport(handler)
+                    )
+
+                with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                    os.environ, {
+                        "SUNO_API_KEY": "test-key",
+                        "PROVIDER_DOWNLOAD_TRUSTED_HOSTS": "media.example",
+                    }
+                ), patch(
+                    "socket.getaddrinfo",
+                    return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+                ), patch.object(
+                    s5_bgm, "conn", return_value=database
+                ), patch.object(
+                    s5_bgm, "ASSETS_DIR", Path(tmp)
+                ), patch.object(
+                    music.httpx, "AsyncClient", side_effect=client_factory
+                ):
+                    with self.assertRaises(music.MusicTaskUnknownError):
+                        await s5_bgm.run(job_id, provider="suno")
+                    with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                        await s5_bgm.run(job_id, provider="suno")
+
+                row = database.execute(
+                    "SELECT task_id,usage_json FROM provider_calls"
+                ).fetchone()
+                self.assertEqual(counts["post"], 1)
+                self.assertEqual(row["task_id"], f"task-{phase}")
+                self.assertEqual(
+                    json.loads(row["usage_json"])["status"],
+                    "action_required",
+                )
+                database.close()
+
+    async def test_s5_publish_db_failure_keeps_cost_journal_and_blocks_repost(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-SUNO-PUBLISH-DB','T-1','publish db','SHOTS_OK','{}',0)"
+        )
+        database.execute(
+            "CREATE TRIGGER fail_suno_publish_complete "
+            "BEFORE UPDATE OF usage_json ON provider_calls "
+            "WHEN json_extract(NEW.usage_json, '$.status')='completed' "
+            "BEGIN SELECT RAISE(ABORT,'suno publish finalize failed'); END"
+        )
+        database.commit()
+        posts = 0
+
+        def handler(request):
+            nonlocal posts
+            if request.method == "POST":
+                posts += 1
+                return httpx.Response(200, json={"id": "suno-publish-db-1"})
+            if request.url.host == "api.sunoapi.com":
+                return httpx.Response(200, json={
+                    "status": "completed",
+                    "data": [{"audio_url": "https://media.example/db.mp3"}],
+                    "usage": {"credits": 1},
+                })
+            return httpx.Response(200, content=b"recoverable-bgm")
+
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(*_args, **_kwargs):
+            return real_async_client(transport=httpx.MockTransport(handler))
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {
+                "SUNO_API_KEY": "test-key",
+                "PROVIDER_DOWNLOAD_TRUSTED_HOSTS": "media.example",
+            }
+        ), patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+        ), patch.object(
+            s5_bgm, "conn", return_value=database
+        ), patch.object(
+            s5_bgm, "ASSETS_DIR", Path(tmp)
+        ), patch.object(
+            music.httpx, "AsyncClient", side_effect=client_factory
+        ):
+            with self.assertRaisesRegex(
+                music.MusicTaskUnknownError, "暂存|禁止重新提交"
+            ):
+                await s5_bgm.run("J-SUNO-PUBLISH-DB", provider="suno")
+            with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                await s5_bgm.run("J-SUNO-PUBLISH-DB", provider="suno")
+
+            target = Path(tmp) / "J-SUNO-PUBLISH-DB" / "bgm.mp3"
+            self.assertEqual(target.read_bytes(), b"recoverable-bgm")
+            call = database.execute(
+                "SELECT cost_cents,usage_json FROM provider_calls "
+                "WHERE task_id='suno-publish-db-1'"
+            ).fetchone()
+            job = database.execute(
+                "SELECT state,cost_cents FROM jobs "
+                "WHERE job_id='J-SUNO-PUBLISH-DB'"
+            ).fetchone()
+            usage = json.loads(call["usage_json"])
+            self.assertEqual(posts, 1)
+            self.assertEqual(call["cost_cents"], 20)
+            self.assertEqual(job["cost_cents"], 20)
+            self.assertEqual(job["state"], "PROVIDER_ACTION_REQUIRED")
+            self.assertEqual(usage["status"], "action_required")
+            self.assertTrue(Path(usage["publish_staging_path"]).is_file())
+        database.close()
+
+    async def test_suno_promotion_failure_persists_remote_id_for_reconcile(self):
+        from factory.management_api import ManagementService
+
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        job_id = "J-SUNO-PROMOTE-FAIL"
+        remote_id = "suno-promote-fail-1"
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES(?, 'T-1', 'promote fail', 'SHOTS_OK', '{}', 0)",
+            (job_id,),
+        )
+        database.execute(
+            "CREATE TRIGGER fail_remote_promotion BEFORE INSERT ON provider_calls "
+            "WHEN NEW.task_id='suno-promote-fail-1' "
+            "BEGIN SELECT RAISE(ABORT,'remote insert failed'); END"
+        )
+        database.commit()
+        posts = 0
+
+        def handler(request):
+            nonlocal posts
+            posts += 1
+            return httpx.Response(200, json={"id": remote_id})
+
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(*_args, **_kwargs):
+            return real_async_client(transport=httpx.MockTransport(handler))
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"SUNO_API_KEY": "test-key"}
+        ), patch.object(
+            s5_bgm, "conn", return_value=database
+        ), patch.object(
+            s5_bgm, "ASSETS_DIR", Path(tmp)
+        ), patch.object(
+            music.httpx, "AsyncClient", side_effect=client_factory
+        ):
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "remote insert"):
+                await s5_bgm.run(job_id, provider="suno")
+            with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                await s5_bgm.run(job_id, provider="suno")
+
+            row = database.execute(
+                "SELECT task_id,provider,intent,usage_json FROM provider_calls"
+            ).fetchone()
+            usage = json.loads(row["usage_json"])
+            self.assertEqual(posts, 1)
+            self.assertTrue(row["task_id"].startswith("local-submit:"))
+            self.assertEqual((row["provider"], row["intent"]), ("suno", "bgm"))
+            self.assertEqual(usage["status"], "action_required")
+            self.assertEqual(usage["remote_task_id"], remote_id)
+            self.assertEqual(usage["provider"], "suno")
+            self.assertEqual(usage["intent"], "bgm")
+
+            database.execute("DROP TRIGGER fail_remote_promotion")
+            database.execute(
+                "UPDATE jobs SET state='PROVIDER_ACTION_REQUIRED' WHERE job_id=?",
+                (job_id,),
+            )
+            database.commit()
+            restarted = ManagementService(database, Path(tmp))
+            unresolved = next(
+                item for item in restarted.videos()["jobs"]
+                if item["job_id"] == job_id
+            )["unresolved_provider_tasks"]
+            self.assertEqual(unresolved[0]["task_id"], remote_id)
+
+            inspect_result = {
+                "status": "failed", "usage": {}, "cost_cents": 20,
+            }
+            with patch(
+                "factory.management_api.music.inspect_task",
+                new=Mock(return_value=object()),
+            ) as inspect, patch(
+                "factory.management_api.asyncio.run",
+                return_value=inspect_result,
+            ):
+                reconciled = restarted.reconcile_provider_task(job_id, remote_id)
+            inspect.assert_called_once_with(remote_id, provider="suno")
+            self.assertEqual(reconciled["remote_status"], "failed")
+            self.assertIsNone(database.execute(
+                "SELECT 1 FROM provider_calls WHERE task_id LIKE 'local-submit:%'"
+            ).fetchone())
+            self.assertEqual(database.execute(
+                "SELECT cost_cents FROM provider_calls WHERE task_id=?",
+                (remote_id,),
+            ).fetchone()[0], 20)
+        database.close()
+
+    async def test_suno_download_clients_never_forward_provider_authorization(self):
+        for operation in ("generate", "inspect"):
+            with self.subTest(operation=operation):
+                seen_download_headers = []
+
+                def handler(request):
+                    if request.url.host == "api.sunoapi.com":
+                        return httpx.Response(200, json={
+                            "id": "suno-headerless-1",
+                            "status": "completed",
+                            "data": [{
+                                "audio_url": "https://evil.example/audio.mp3"
+                            }],
+                        })
+                    seen_download_headers.append(dict(request.headers))
+                    return httpx.Response(200, content=b"audio")
+
+                real_async_client = httpx.AsyncClient
+
+                def client_factory(*_args, **kwargs):
+                    return real_async_client(
+                        transport=httpx.MockTransport(handler),
+                        headers=kwargs.get("headers"),
+                    )
+
+                with patch.dict(os.environ, {
+                    "SUNO_API_KEY": "secret-key",
+                    "PROVIDER_DOWNLOAD_TRUSTED_HOSTS": "evil.example",
+                }), patch(
+                    "socket.getaddrinfo",
+                    return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+                ), patch.object(
+                    music.httpx, "AsyncClient", side_effect=client_factory
+                ):
+                    if operation == "generate":
+                        audio = await music.generate(
+                            "business", 60, provider="suno"
+                        )
+                    else:
+                        inspected = await music.inspect_task(
+                            "suno-headerless-1", provider="suno"
+                        )
+                        audio = inspected["audio"]
+
+                self.assertEqual(audio, b"audio")
+                self.assertEqual(len(seen_download_headers), 1)
+                lowered = {
+                    str(key).casefold(): value
+                    for key, value in seen_download_headers[0].items()
+                }
+                self.assertNotIn("authorization", lowered)
+
+    async def test_suno_dual_stack_download_failover_never_reposts(self):
+        counts = {"post": 0, "download": 0}
+        attempted_hosts = []
+
+        def handler(request):
+            if request.url.host == "api.sunoapi.com":
+                counts["post"] += int(request.method == "POST")
+                return httpx.Response(200, json={
+                    "id": "suno-dual-stack-1",
+                    "status": "completed",
+                    "data": [{
+                        "audio_url": "https://dual.example/audio.mp3"
+                    }],
+                })
+            counts["download"] += 1
+            attempted_hosts.append(request.url.host)
+            if ":" in request.url.host:
+                raise httpx.ConnectError(
+                    "ipv6 unavailable", request=request
+                )
+            return httpx.Response(200, content=b"audio-via-ipv4")
+
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(*_args, **kwargs):
+            return real_async_client(
+                transport=httpx.MockTransport(handler),
+                headers=kwargs.get("headers"),
+            )
+
+        with patch.dict(os.environ, {"SUNO_API_KEY": "test-key"}), patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (10, 1, 6, "", ("2001:4860:4860::8888", 443, 0, 0)),
+                (2, 1, 6, "", ("8.8.8.8", 443)),
+            ],
+        ), patch.object(
+            music.httpx, "AsyncClient", side_effect=client_factory
+        ):
+            audio = await music.generate(
+                "business", 60, provider="suno"
+            )
+
+        self.assertEqual(audio, b"audio-via-ipv4")
+        self.assertEqual(counts, {"post": 1, "download": 2})
+        self.assertEqual(attempted_hosts, [
+            "2001:4860:4860::8888", "8.8.8.8",
+        ])
+
+    async def test_suno_rejects_unsafe_download_urls_before_request(self):
+        unsafe_cases = (
+            "http://public.example/audio.mp3",
+            "https://localhost/audio.mp3",
+            "https://127.0.0.1/audio.mp3",
+            "https://10.0.0.8/audio.mp3",
+            "https://169.254.1.2/audio.mp3",
+        )
+        for unsafe_url in unsafe_cases:
+            with self.subTest(url=unsafe_url):
+                downloads = 0
+
+                def handler(request):
+                    nonlocal downloads
+                    if request.url.host == "api.sunoapi.com":
+                        return httpx.Response(200, json={
+                            "id": "suno-unsafe-1",
+                            "status": "completed",
+                            "data": [{"audio_url": unsafe_url}],
+                        })
+                    downloads += 1
+                    return httpx.Response(200, content=b"must-not-download")
+
+                real_async_client = httpx.AsyncClient
+
+                def client_factory(*_args, **kwargs):
+                    return real_async_client(
+                        transport=httpx.MockTransport(handler),
+                        headers=kwargs.get("headers"),
+                    )
+
+                with patch.dict(
+                    os.environ, {"SUNO_API_KEY": "secret-key"}, clear=True
+                ), patch.object(
+                    music.httpx, "AsyncClient", side_effect=client_factory
+                ):
+                    with self.assertRaisesRegex(ValueError, "HTTPS|public|安全"):
+                        await music.generate("business", 60, provider="suno")
+                self.assertEqual(downloads, 0)
+
+    async def test_suno_rejects_private_dns_and_unsafe_redirect_hops(self):
+        for mode in ("private_dns", "redirect"):
+            with self.subTest(mode=mode):
+                secret_requests = 0
+
+                def handler(request):
+                    nonlocal secret_requests
+                    if request.url.host == "api.sunoapi.com":
+                        url = (
+                            "https://dns-private.example/audio.mp3"
+                            if mode == "private_dns"
+                            else "https://evil.example/start"
+                        )
+                        return httpx.Response(200, json={
+                            "id": "suno-hop-1", "status": "completed",
+                            "data": [{"audio_url": url}],
+                        })
+                    if request.url.host in {"127.0.0.1", "localhost"}:
+                        secret_requests += 1
+                        return httpx.Response(200, content=b"secret")
+                    return httpx.Response(
+                        302, headers={"location": "https://127.0.0.1/secret"}
+                    )
+
+                real_async_client = httpx.AsyncClient
+
+                def client_factory(*_args, **kwargs):
+                    return real_async_client(
+                        transport=httpx.MockTransport(handler),
+                        headers=kwargs.get("headers"),
+                    )
+
+                env = {"SUNO_API_KEY": "secret-key"}
+                if mode == "redirect":
+                    env["PROVIDER_DOWNLOAD_TRUSTED_HOSTS"] = "evil.example"
+                def dns_result(host, port, **_kwargs):
+                    address = (
+                        "10.2.3.4" if host == "dns-private.example"
+                        else "8.8.8.8"
+                    )
+                    return [(2, 1, 6, "", (address, port))]
+
+                with patch.dict(os.environ, env, clear=True), patch(
+                    "socket.getaddrinfo", side_effect=dns_result,
+                ), patch.object(
+                    music.httpx, "AsyncClient", side_effect=client_factory
+                ):
+                    with self.assertRaisesRegex(ValueError, "public|安全"):
+                        await music.generate("business", 60, provider="suno")
+                self.assertEqual(secret_requests, 0)
 
     def test_edit_contract_rejects_fixed_ratio_before_api_call(self):
         with self.assertRaisesRegex(ValueError, "ratio='adaptive'"):
@@ -230,20 +1366,61 @@ class MusicFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["duration"], 8)
 
-    def test_seedance25_rejects_unsupported_1080p_output(self):
-        with self.assertRaisesRegex(ValueError, "480p or 720p"):
-            seedance._video_task_payload(
-                model="doubao-seedance-2-5-260628",
-                content=[{"type": "text", "text": "test"}],
-                duration=8,
-                resolution="1080p",
-                ratio="9:16",
-                camera_fixed=False,
-                last_frame=None,
-                seed=None,
-                motion_strength=None,
-                generate_audio=True,
-            )
+    def test_seedance25_accepts_official_1080p_output(self):
+        payload = seedance._video_task_payload(
+            model="doubao-seedance-2-5-260628",
+            content=[{"type": "text", "text": "test"}],
+            duration=8,
+            resolution="1080p",
+            ratio="9:16",
+            camera_fixed=False,
+            last_frame=None,
+            seed=None,
+            motion_strength=None,
+            generate_audio=True,
+        )
+
+        self.assertEqual(payload["resolution"], "1080p")
+
+    def test_seedance25_pure_text_generation_omits_reference_task_type(self):
+        payload = seedance._video_task_payload(
+            model="doubao-seedance-2-5-260628",
+            content=[{"type": "text", "text": "test"}],
+            duration=8,
+            resolution="720p",
+            ratio="9:16",
+            camera_fixed=False,
+            last_frame=None,
+            seed=None,
+            motion_strength=0.4,
+            generate_audio=True,
+        )
+
+        self.assertNotIn("omni_reference_task_type", payload)
+        self.assertNotIn("motion_strength", payload)
+
+    def test_seedance25_reference_generation_uses_auto_reference_task_type(self):
+        payload = seedance._video_task_payload(
+            model="doubao-seedance-2-5-260628",
+            content=[
+                {"type": "text", "text": "test"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "asset://character-1"},
+                    "role": "reference_image",
+                },
+            ],
+            duration=8,
+            resolution="720p",
+            ratio="9:16",
+            camera_fixed=False,
+            last_frame=None,
+            seed=None,
+            motion_strength=None,
+            generate_audio=True,
+        )
+
+        self.assertEqual(payload["omni_reference_task_type"], "auto")
 
     def test_local_image_accepts_path_objects(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -432,7 +1609,7 @@ class VideoRoutingTests(unittest.TestCase):
             "ARK_VIDEO_PRIMARY_MODEL": "doubao-seedance-2-5-260628",
         }
 
-    def test_broll_defaults_to_seedance25_native_audio(self):
+    def test_broll_keeps_seedance_native_ambient_audio(self):
         self.assertTrue(hasattr(video_routing, "select_route"))
         route = video_routing.select_route(
             {"narrative_type": "broll"}, {}, env=self.env
@@ -441,31 +1618,78 @@ class VideoRoutingTests(unittest.TestCase):
         self.assertEqual(route.model, "doubao-seedance-2-5-260628")
         self.assertEqual(route.tier, "seedance25")
         self.assertTrue(route.generate_audio)
+
+    def test_request_builders_and_route_use_the_job_generation_snapshot(self):
+        snapshot = {
+            "version": 1,
+            "model": "doubao-seedance-2-5-260628",
+            "resolution": "1080p",
+            "output_format": "mp4",
+            "ratio": "16:9",
+            "audio_mode": "seedance_native",
+            "reference_video_budget": 2,
+            "max_concurrent_masters": 2,
+            "qa_enabled": True,
+            "max_auto_retries": 1,
+            "auto_retry_budget_cents": 900,
+            "job_budget_cents": 5000,
+        }
+        shot = {
+            "duration_sec": 4,
+            "_generation_snapshot": snapshot,
+            "narrative_type": "dialogue",
+        }
+        with patch.dict(os.environ, {
+            "ARK_VIDEO_RESOLUTION": "480p",
+            "ARK_VIDEO_PRIMARY_MODEL": "wrong-global-model",
+            "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET": "1",
+        }, clear=False):
+            request = s3_shots._dialogue_request_kwargs(shot, None)
+            route = video_routing.select_route(shot, shot)
+
+        self.assertEqual(request["resolution"], "1080p")
+        self.assertEqual(request["output_format"], "mp4")
+        self.assertEqual(request["ratio"], "16:9")
+        self.assertEqual(route.model, "doubao-seedance-2-5-260628")
+        self.assertTrue(route.generate_audio)
         self.assertTrue(route.qa_required)
         self.assertIsNone(route.fallback_model)
 
-    def test_scene_dialogue_uses_seedance25_native_voice(self):
+    def test_scene_dialogue_uses_external_fixed_voice(self):
         self.assertTrue(hasattr(video_routing, "select_route"))
         route = video_routing.select_route(
             {"narrative_type": "dialogue"},
-            {"render_mode": "scene"},
+            {"render_mode": "scene", "audio_mode": "fixed_tts"},
             env=self.env,
         )
 
         self.assertEqual(route.model, "doubao-seedance-2-5-260628")
-        self.assertTrue(route.generate_audio)
+        self.assertFalse(route.generate_audio)
         self.assertTrue(route.qa_required)
 
-    def test_digital_human_dialogue_uses_seedance25_native_voice(self):
+    def test_scene_dialogue_can_use_seedance_native_voice(self):
+        route = video_routing.select_route(
+            {"narrative_type": "dialogue"},
+            {"render_mode": "scene", "audio_mode": "seedance_native"},
+            env=self.env,
+        )
+
+        self.assertTrue(route.generate_audio)
+
+    def test_digital_human_dialogue_uses_external_fixed_voice(self):
         self.assertTrue(hasattr(video_routing, "select_route"))
         route = video_routing.select_route(
             {"narrative_type": "dialogue"},
-            {"render_mode": "digital_human", "native_audio": False},
+            {
+                "render_mode": "digital_human",
+                "native_audio": False,
+                "audio_mode": "fixed_tts",
+            },
             env=self.env,
         )
 
         self.assertEqual(route.model, "doubao-seedance-2-5-260628")
-        self.assertTrue(route.generate_audio)
+        self.assertFalse(route.generate_audio)
 
     def test_precision_gauge_motion_is_rejected_before_generation(self):
         reason = video_routing.precision_motion_reason({
@@ -508,6 +1732,24 @@ class VideoRoutingTests(unittest.TestCase):
         })
 
         self.assertIsNone(reason)
+
+    def test_negative_ui_prohibition_does_not_block_scene_transition(self):
+        reason = video_routing.precision_motion_reason({
+            "prompt": (
+                "不出现悬浮文案、可读文字、数字、商标、界面、标识或水印。"
+                "先在调度中心建立场景，随后切换到仓库装车区，"
+                "运输车在雨夜自然行驶。"
+            ),
+        })
+
+        self.assertIsNone(reason)
+
+    def test_actual_ui_state_transition_remains_blocked(self):
+        reason = video_routing.precision_motion_reason({
+            "action": "操作员点击调度界面按钮，界面切换为绿色完成状态",
+        })
+
+        self.assertEqual(reason, "UI 状态或交互变化")
 
 
 class StoryboardPromptSafetyTests(unittest.TestCase):
@@ -1068,6 +2310,144 @@ class BigASRTests(unittest.IsolatedAsyncioTestCase):
 
 
 class Seedance25DialogueTests(unittest.TestCase):
+    def setUp(self):
+        self.anchor_generators = patch.dict(os.environ, {
+            "CHARACTER_ANCHOR_GENERATOR": "seedream_5_0",
+            "SCENE_ANCHOR_GENERATOR": "seedream_5_0",
+        })
+        self.anchor_generators.start()
+
+    def tearDown(self):
+        self.anchor_generators.stop()
+
+    def test_dialogue_master_is_marked_generating_before_provider_call(self):
+        memory_db = sqlite3.connect(":memory:")
+        memory_db.row_factory = sqlite3.Row
+        memory_db.executescript(db.DDL)
+        db._add_cols_if_missing(memory_db, "shots", [
+            ("narrative_type", "TEXT"),
+            ("speaker_id", "TEXT"),
+            ("audio_path", "TEXT"),
+            ("audio_url", "TEXT"),
+            ("video_url", "TEXT"),
+            ("anchor_character", "TEXT"),
+            ("character_in_scene_path", "TEXT"),
+            ("character_in_scene_url", "TEXT"),
+        ] + db.SHOT_OBSERVABILITY_COLUMNS)
+        memory_db.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,updated_at) "
+            "VALUES('J-ACTIVE','T-ACTIVE','Active','PRODUCTION_RUNNING',"
+            "'2000-01-01 00:00:00')"
+        )
+        memory_db.execute(
+            "INSERT INTO shots(job_id,idx,duration_sec,state,narrative_type,"
+            "speaker_id,voiceover) VALUES('J-ACTIVE',1,4,'PENDING',"
+            "'dialogue','lead','你好')"
+        )
+        memory_db.commit()
+        observed_states = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "01.wav"
+            audio_path.write_bytes(b"audio")
+            video_path = Path(tmp) / "01.mp4"
+            video_path.write_bytes(b"video")
+
+            async def generate(**_kwargs):
+                row = memory_db.execute(
+                    "SELECT state,provider,error FROM shots "
+                    "WHERE job_id='J-ACTIVE' AND idx=1"
+                ).fetchone()
+                observed_states.append(dict(row))
+                return s3_shots.SeedanceGenerationResult(
+                    video=b"video", video_path=video_path,
+                    video_url="https://cdn/01.mp4", qa_note="{}",
+                    native_audio=True,
+                    model="doubao-seedance-2-5-260628",
+                    audio_path=audio_path, cost_cents=0,
+                    provider_calls=(),
+                )
+
+            shot = dict(memory_db.execute(
+                "SELECT * FROM shots WHERE job_id='J-ACTIVE' AND idx=1"
+            ).fetchone())
+            character = {
+                "id": "lead", "name": "主角",
+                "generation_mode": "ai_generated", "look": "年轻主角",
+            }
+            with (
+                patch.object(
+                    s3_shots, "conn",
+                    return_value=_NonClosingConnection(memory_db),
+                ),
+                patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),
+                patch.object(
+                    s3_shots, "_generate_seedance_video",
+                    new=AsyncMock(side_effect=generate),
+                ),
+            ):
+                idx, error, _anchor = asyncio.run(s3_shots._gen_dialogue(
+                    "J-ACTIVE", shot, character,
+                    {
+                        "idx": 1, "speaker": "lead", "duration": 4,
+                        "voiceover": "你好", "render_mode": "presenter",
+                    },
+                    asyncio.Semaphore(1),
+                ))
+
+        self.assertEqual(idx, 1)
+        self.assertIsNone(error)
+        self.assertEqual(observed_states, [{
+            "state": "GENERATING", "provider": "seedance", "error": None,
+        }])
+        row = memory_db.execute(
+            "SELECT state FROM shots WHERE job_id='J-ACTIVE' AND idx=1"
+        ).fetchone()
+        job = memory_db.execute(
+            "SELECT updated_at FROM jobs WHERE job_id='J-ACTIVE'"
+        ).fetchone()
+        self.assertEqual(row["state"], "OK")
+        self.assertNotEqual(job["updated_at"], "2000-01-01 00:00:00")
+
+    def test_planner_uses_selected_seedance_for_character_and_scene_anchors(self):
+        memory_db = sqlite3.connect(":memory:")
+        memory_db.row_factory = sqlite3.Row
+        memory_db.executescript(db.DDL)
+        storyboard = {
+            "production_settings": {
+                "character_anchor_generator": "seedance_2_5",
+                "scene_anchor_generator": "seedance_2_5",
+            },
+            "characters": [{
+                "id": "customer", "name": "Customer",
+                "generation_mode": "ai_generated",
+            }],
+            "masters": [
+                {
+                    "idx": 1, "type": "dialogue", "speaker": "customer",
+                    "duration": 4, "scene": "repair bay",
+                    "scene_anchor_key": "repair-bay-a",
+                },
+                {
+                    "idx": 2, "type": "dialogue", "speaker": "customer",
+                    "duration": 4, "scene": "repair bay",
+                    "scene_anchor_key": "repair-bay-a",
+                },
+            ],
+        }
+
+        plan = production_planner.analyze_storyboard(
+            memory_db, storyboard, budget_cents=10000, resolution="720p"
+        )
+
+        identity = plan["paid_identity_anchors"][0]
+        scene = plan["paid_scene_anchors"][0]
+        self.assertEqual(identity["generator"], "seedance_2_5")
+        self.assertEqual(identity["anchor_mode"], "dynamic_video")
+        self.assertEqual(identity["estimated_cost_cents"], 612)
+        self.assertEqual(scene["generator"], "seedance_2_5")
+        self.assertEqual(scene["estimated_cost_cents"], 612)
+
     def test_character_makeup_plan_deduplicates_fixed_aliases_and_marks_ai(self):
         characters = [
             {
@@ -1163,7 +2543,7 @@ class Seedance25DialogueTests(unittest.TestCase):
         )
         self.assertEqual(request["reference_video_duration_sec"], 8)
 
-    def test_dialogue_request_reuses_static_identity_with_previous_master(self):
+    def test_dialogue_request_keeps_static_identity_without_cross_scene_video(self):
         primary = {
             "id": "customer",
             "name": "Customer",
@@ -1190,11 +2570,7 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertEqual(
             request["references"], ["https://cdn/customer-identity.png"]
         )
-        self.assertEqual(
-            request["reference_videos"],
-            ["https://cdn/previous-master.mp4"],
-        )
-        self.assertEqual(request["reference_video_duration_sec"], 8)
+        self.assertNotIn("reference_videos", request)
 
     def test_scene_cast_is_limited_to_characters_named_in_the_scene(self):
         characters = {
@@ -1307,6 +2683,159 @@ class Seedance25DialogueTests(unittest.TestCase):
             ).fetchone()[0],
             29,
         )
+
+    def test_identity_anchor_stage_can_use_selected_seedance_generator(self):
+        memory_db = sqlite3.connect(":memory:")
+        memory_db.row_factory = sqlite3.Row
+        memory_db.executescript(db.DDL)
+        storyboard = {
+            "production_settings": {
+                "character_anchor_generator": "seedance_2_5",
+                "budget_cents": 5000,
+            }
+        }
+        memory_db.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES(?,?,?,?,?,?)",
+            ("J-ID-S25", "T", "Identity S25", "PRODUCTION_RUNNING",
+             json.dumps(storyboard), 0),
+        )
+        memory_db.commit()
+        characters = [{
+            "id": "customer", "name": "Customer",
+            "generation_mode": "ai_generated", "look": "young customer",
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "identity.mp4"
+            video_path.write_bytes(b"video")
+            preview_path = Path(tmp) / "frame.jpg"
+            preview_path.write_bytes(b"jpg")
+            result = s3_shots.SeedanceGenerationResult(
+                video=b"video", video_path=video_path,
+                video_url="https://cdn/identity.mp4", qa_note="{}",
+                native_audio=False, model="doubao-seedance-2-5-260628",
+                audio_path=None, cost_cents=408,
+                provider_calls=({
+                    "task_id": "identity-s25", "intent": "identity",
+                    "usage": {}, "cost_cents": 408,
+                },),
+            )
+            with (
+                patch.object(s3_shots, "conn", return_value=memory_db),
+                patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),
+                patch.object(
+                    s3_shots.seedance, "text_to_image", new=AsyncMock()
+                ) as image_generate,
+                patch.object(
+                    s3_shots, "_generate_seedance_video",
+                    new=AsyncMock(return_value=result),
+                ) as video_generate,
+                patch.object(
+                    s3_shots.ffmpeg, "extract_frames",
+                    new=AsyncMock(return_value=[preview_path]),
+                ),
+            ):
+                anchors = asyncio.run(
+                    s3_shots._ensure_character_identity_anchors(
+                        "J-ID-S25", characters, storyboard=storyboard
+                    )
+                )
+
+        identity_key = character_assets.character_identity_key(characters[0])
+        self.assertEqual(image_generate.await_count, 0)
+        self.assertEqual(video_generate.await_count, 1)
+        self.assertEqual(anchors[identity_key].anchor_mode, "dynamic_video")
+        row = memory_db.execute(
+            "SELECT generator,model,preview_path,cost_cents "
+            "FROM character_identity_anchors WHERE job_id='J-ID-S25'"
+        ).fetchone()
+        self.assertEqual(row["generator"], "seedance_2_5")
+        self.assertEqual(row["model"], "doubao-seedance-2-5-260628")
+        self.assertEqual(row["preview_path"], str(preview_path))
+        self.assertEqual(row["cost_cents"], 408)
+
+    def test_dynamic_identity_uses_one_provider_owner_from_submit_to_final(self):
+        memory_db = sqlite3.connect(":memory:")
+        memory_db.row_factory = sqlite3.Row
+        memory_db.executescript(db.DDL)
+        storyboard = {
+            "production_settings": {
+                "character_anchor_generator": "seedance_2_5",
+                "budget_cents": 5000,
+            }
+        }
+        memory_db.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                "J-ID-OWNER", "T", "Identity owner",
+                "PRODUCTION_RUNNING", json.dumps(storyboard), 0,
+            ),
+        )
+        memory_db.commit()
+        characters = [{
+            "id": "customer", "name": "Customer",
+            "generation_mode": "ai_generated", "look": "young customer",
+        }]
+
+        async def generate_video(**kwargs):
+            task_id = "identity-owner-task"
+            usage = {"completion_tokens": 38830, "total_tokens": 38830}
+            kwargs["metadata_out"].update({"task_id": task_id, "usage": usage})
+            kwargs["on_task_created"](task_id)
+            kwargs["on_task_updated"](
+                task_id, "completed", {"usage": usage}
+            )
+            return b"video"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            preview_path = Path(tmp) / "frame.jpg"
+            preview_path.write_bytes(b"jpg")
+            with (
+                patch.object(s3_shots, "conn", return_value=memory_db),
+                patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),
+                patch.object(
+                    s3_shots.seedance,
+                    "text_to_video",
+                    new=AsyncMock(side_effect=generate_video),
+                ),
+                patch.object(
+                    s3_shots.tos,
+                    "upload",
+                    return_value="https://cdn/identity-owner.mp4",
+                ),
+                patch.object(
+                    s3_shots.ffmpeg,
+                    "extract_frames",
+                    new=AsyncMock(return_value=[preview_path]),
+                ),
+            ):
+                asyncio.run(
+                    s3_shots._ensure_character_identity_anchors(
+                        "J-ID-OWNER", characters, storyboard=storyboard
+                    )
+                )
+
+        call = memory_db.execute(
+            "SELECT job_id,shot_idx,provider,intent,cost_cents,usage_json "
+            "FROM provider_calls WHERE task_id='identity-owner-task'"
+        ).fetchone()
+        identity = memory_db.execute(
+            "SELECT state,cost_cents FROM character_identity_anchors "
+            "WHERE job_id='J-ID-OWNER'"
+        ).fetchone()
+        job_cost = memory_db.execute(
+            "SELECT cost_cents FROM jobs WHERE job_id='J-ID-OWNER'"
+        ).fetchone()[0]
+        self.assertEqual(
+            tuple(call[:4]),
+            ("J-ID-OWNER", -1001, "seedance_identity", "generate"),
+        )
+        self.assertEqual(json.loads(call[5])["status"], "completed")
+        self.assertEqual(identity["state"], "READY")
+        self.assertGreater(call["cost_cents"], 0)
+        self.assertEqual(identity["cost_cents"], call["cost_cents"])
+        self.assertEqual(job_cost, call["cost_cents"])
 
     def test_dialogue_privacy_rejection_falls_back_to_dynamic_identity(self):
         memory_db = sqlite3.connect(":memory:")
@@ -1452,6 +2981,10 @@ class Seedance25DialogueTests(unittest.TestCase):
         with (
             patch.object(s3_shots, "conn", return_value=memory_db),
             patch.object(
+                s3_shots, "_resolve_speaking_voice_bindings",
+                return_value=False,
+            ),
+            patch.object(
                 s3_shots, "_ensure_character_identity_anchors",
                 AsyncMock(side_effect=RuntimeError("identity anchor failed")),
             ),
@@ -1534,6 +3067,16 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         with (
             patch.object(s3_shots, "conn", return_value=memory_db),
+            patch.object(
+                s3_shots, "_resolve_speaking_voice_bindings",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots, "_synthesize_fixed_voice_track",
+                AsyncMock(return_value=s3_shots.FixedVoiceTrack(
+                    Path("fixed.wav"), bigasr.Transcription(""), (), 4
+                )),
+            ),
             patch.object(
                 s3_shots, "_ensure_character_identity_anchors",
                 AsyncMock(return_value={}),
@@ -1759,6 +3302,368 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertIn("_scene_cast_characters", source)
         self.assertNotIn("if character_id != shot[\"speaker_id\"]", source)
 
+    def test_cinematic_ensemble_prompt_assigns_each_line_to_its_speaker(self):
+        shot = {
+            "idx": 1,
+            "speaker": "klein",
+            "speakers": ["klein", "audrey"],
+            "duration_sec": 12,
+            "render_mode": "cinematic_character",
+            "scene": "foggy hall",
+            "camera": "continuous moving camera",
+            "action": "the two characters investigate the room",
+            "voiceover": "First line.Second line.",
+            "performance_beats": [
+                {
+                    "speaker": "klein",
+                    "start": 0,
+                    "duration": 6,
+                    "visual_intent": "Klein examines the clue",
+                    "dialogue": "First line.",
+                },
+                {
+                    "speaker": "audrey",
+                    "start": 6,
+                    "duration": 6,
+                    "visual_intent": "Audrey reacts",
+                    "dialogue": "Second line.",
+                },
+            ],
+            "cast": [{"id": "audrey", "name": "Audrey", "look": "young woman"}],
+        }
+
+        prompt = s3_shots._build_native_dialogue_prompt(
+            shot, {"id": "klein", "name": "Klein", "look": "young man"}
+        )
+
+        self.assertIn("角色 klein", prompt)
+        self.assertIn("角色 audrey", prompt)
+        self.assertIn("多人对白必须严格按照", prompt)
+        self.assertNotIn("其他同场人物只能做动作和反应，不得开口", prompt)
+
+    def test_cinematic_prompt_uses_continuous_integer_timeline_and_unique_dialogue(self):
+        shot = {
+            "idx": 1,
+            "speaker": "linxia",
+            "duration_sec": 12,
+            "render_mode": "cinematic_character",
+            "scene": "暴雨中的高空设备抢修现场",
+            "camera": "跟随人物走向设备后缓慢推近",
+            "action": "林夏观察臂架并指向曲臂高空作业平台",
+            "voiceover": "关键不是举得高。还要保留水平作业半径。",
+            "performance_beats": [
+                {
+                    "speaker": "linxia",
+                    "start": 0.4,
+                    "duration": 4.6,
+                    "visual_intent": "林夏走向设备并观察臂架",
+                    "dialogue": "关键不是举得高。",
+                },
+                {
+                    "speaker": "linxia",
+                    "start": 5,
+                    "duration": 7,
+                    "visual_intent": "镜头推近，林夏指向作业半径",
+                    "dialogue": "还要保留水平作业半径。",
+                },
+            ],
+        }
+
+        prompt = s3_shots._build_native_dialogue_prompt(
+            shot,
+            {"id": "linxia", "name": "林夏", "look": "年轻的设备调度工程师"},
+        )
+
+        self.assertIn("连续整数秒导演时间轴", prompt)
+        self.assertIn("0-5秒", prompt)
+        self.assertIn("5-12秒", prompt)
+        self.assertEqual(prompt.count("关键不是举得高。"), 1)
+        self.assertEqual(prompt.count("还要保留水平作业半径。"), 1)
+        self.assertIn("嘴部保持清晰可见", prompt)
+        self.assertIn("运镜服务剧情", prompt)
+
+    def test_cinematic_prompt_without_performance_beats_still_has_one_canonical_line(self):
+        dialogue = "两小时内安排设备到场。"
+
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "speaker": "linxia",
+                "duration_sec": 8,
+                "render_mode": "cinematic_character",
+                "scene": "暴雨抢修现场",
+                "camera": "从设备全景跟移到人物中近景",
+                "action": "林夏走到控制台前确认调度信息",
+                "voiceover": dialogue,
+            },
+            {"id": "linxia", "name": "林夏", "look": "年轻的设备调度工程师"},
+        )
+
+        self.assertIn("0-8秒", prompt)
+        self.assertEqual(prompt.count(dialogue), 1)
+        self.assertIn("{台词：两小时内安排设备到场。}", prompt)
+
+    def test_cinematic_prompt_protects_lips_only_inside_speech_windows(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "duration_sec": 12,
+                "render_mode": "cinematic_character",
+                "scene": "暴雨中的高空抢修现场",
+                "camera": "跟拍人物穿过设备区后推近",
+                "action": "林夏快步检查设备并转身汇报",
+                "voiceover": "设备已经恢复运行。",
+                "performance_beats": [
+                    {"duration_sec": 5, "action": "快步检查设备"},
+                    {"duration_sec": 4, "dialogue": "设备已经恢复运行。"},
+                    {"duration_sec": 3, "action": "转身示意同伴"},
+                ],
+            },
+            {"id": "linxia", "name": "林夏", "look": "年轻工程师"},
+        )
+
+        self.assertIn("只在台词所在的关键音节时间窗", prompt)
+        self.assertIn("非台词时间窗允许", prompt)
+        self.assertNotIn("明显的走位、环绕、推拉和动作变化优先安排", prompt)
+
+    def test_broll_prompt_has_structured_timeline_and_canonical_audio_policy(self):
+        prompt = s3_shots._build_broll_video_prompt({
+            "idx": 2,
+            "duration_sec": 8,
+            "prompt": "暴雨中的高空作业车展开支腿",
+            "scene": "抢修现场",
+            "action": "作业车展开支腿并升起臂架",
+            "camera": "低机位跟移后缓慢推近",
+        })
+
+        self.assertIn("连续整数秒导演时间轴", prompt)
+        self.assertIn("0-8秒", prompt)
+        self.assertIn("无对白、无人声、无旁白", prompt)
+        self.assertIn("无 BGM", prompt)
+        self.assertIn("禁止任何可读文字", prompt)
+
+    def test_lip_sync_edit_uses_original_master_and_preserves_cinematic_dimensions(self):
+        shot = {
+            "idx": 3,
+            "duration_sec": 20,
+            "voiceover": "我选一台二十八米级曲臂高空作业平台。",
+            "repair_dialogue": "二十八米级曲臂高空作业平台。",
+            "repair_source_path": "C:/jobs/J-1/shots/03.mp4",
+            "repair_source_url": "https://cdn.example/jobs/J-1/shots/03.mp4",
+            "repair_audio_path": "C:/jobs/J-1/shots/03.wav",
+            "repair_start_sec": 3,
+            "repair_end_sec": 15,
+        }
+
+        request = s3_shots._lip_sync_edit_request_kwargs(shot)
+        prompt = s3_shots._build_lip_sync_edit_prompt(shot)
+
+        self.assertEqual(request["task_intent"], "edit")
+        self.assertEqual(request["duration"], -1)
+        self.assertEqual(request["ratio"], "adaptive")
+        self.assertEqual(
+            request["reference_videos"],
+            ["https://cdn.example/jobs/J-1/shots/03.mp4"],
+        )
+        self.assertNotIn("reference_audios", request)
+        self.assertEqual(request["output_format"], "mov")
+        self.assertEqual(request["reference_video_duration_sec"], 20)
+        self.assertIn("仅编辑@视频1中3-15秒", prompt)
+        self.assertIn("嘴部动作", prompt)
+        self.assertIn("原始声音、音色、语速、表情、身体动作、运镜", prompt)
+        self.assertIn("@视频1同时提供原画面与唯一原声音轨", prompt)
+        self.assertIn("其余均保持不变", prompt)
+        self.assertEqual(prompt.count("二十八米级曲臂高空作业平台。"), 1)
+        self.assertNotIn("我选一台", prompt)
+
+    def test_lip_sync_edit_preflight_prices_output_and_source_video(self):
+        memory_db = sqlite3.connect(":memory:")
+        memory_db.row_factory = sqlite3.Row
+        memory_db.executescript(db.DDL)
+        storyboard = {
+            "production_settings": {"resolution": "720p"},
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": 8,
+                "speaker": "林夏",
+                "voiceover": "暴雨再大，也不能让客户停工。",
+                "repair_mode": "seedance_lip_sync_edit",
+                "repair_source_path": "C:/jobs/J-1/review/candidate.mp4",
+            }],
+        }
+
+        plan = production_planner.analyze_storyboard(
+            memory_db, storyboard, budget_cents=5000, resolution="720p"
+        )
+
+        paid_master = plan["paid_masters"][0]
+        expected = seedance.estimate_cost_cents(16, "720p")
+        self.assertEqual(paid_master.get("reference_duration_sec"), 8)
+        self.assertEqual(paid_master["estimated_cost_cents"], expected)
+        self.assertEqual(plan["estimated_cost_cents"], expected)
+
+    def test_managed_mov_edit_transcodes_to_browser_safe_mp4_atomically(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "candidate.mov"
+            target = Path(temp) / "candidate.mp4"
+            source.write_bytes(b"provider-mov")
+
+            async def render(args):
+                Path(args[-1]).write_bytes(b"browser-mp4")
+
+            with patch.object(
+                ffmpeg, "_run", new=AsyncMock(side_effect=render)
+            ) as run:
+                asyncio.run(ffmpeg.transcode_edit_mov_to_mp4(source, target))
+
+            command = run.await_args.args[0]
+            self.assertIn("libx264", command)
+            self.assertIn("yuv420p", command)
+            self.assertIn("aac", command)
+            self.assertEqual(target.read_bytes(), b"browser-mp4")
+            self.assertEqual(source.read_bytes(), b"provider-mov")
+
+    def test_extend_request_uses_adaptive_mov_and_explicit_continuation(self):
+        shot = {
+            "duration_sec": 18,
+            "repair_source_path": "C:/jobs/J-1/shots/03.mp4",
+            "extend_duration_sec": 8,
+            "extend_direction": "镜头继续跟随工程师走向控制台，不新增台词",
+        }
+
+        request = s3_shots._extend_request_kwargs(shot)
+        prompt = s3_shots._build_extend_prompt(shot)
+
+        self.assertEqual(request["task_intent"], "extend")
+        self.assertEqual(request["duration"], 8)
+        self.assertEqual(request["ratio"], "adaptive")
+        self.assertEqual(request["output_format"], "mov")
+        self.assertEqual(
+            request["reference_videos"], ["C:/jobs/J-1/shots/03.mp4"]
+        )
+        self.assertEqual(request["reference_video_duration_sec"], 18)
+        self.assertIn("继续跟随工程师走向控制台", prompt)
+        self.assertIn("不得复述原片台词", prompt)
+
+    def test_lip_sync_edit_never_remuxes_a_new_fixed_voice_track(self):
+        source = inspect.getsource(s3_shots._gen_dialogue)
+
+        self.assertIn("fixed_voice_track and not repair_mode", source)
+
+    def test_dialogue_edit_success_becomes_review_candidate_without_overwriting_prior(self):
+        asyncio.run(self._assert_dialogue_edit_success_becomes_review_candidate())
+
+    async def _assert_dialogue_edit_success_becomes_review_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            assets = Path(temp)
+            prior = assets / "J-EDIT" / "shots" / "03.mp4"
+            prior.parent.mkdir(parents=True)
+            prior.write_bytes(b"prior-master")
+
+            async def generate(**kwargs):
+                candidate = kwargs["out_path"]
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_bytes(b"edited-candidate")
+                audio = candidate.with_suffix(".wav")
+                audio.write_bytes(b"candidate-audio")
+                return s3_shots.SeedanceGenerationResult(
+                    b"edited-candidate", candidate, "https://cdn/edit",
+                    "{}", True, "seedance25", audio, 123,
+                    ({"task_id": "task-edit", "cost_cents": 123},),
+                    bigasr.Transcription("目标台词"),
+                )
+
+            with patch.object(s3_shots, "ASSETS_DIR", assets), \
+                    patch.object(s3_shots, "_mark_shot_generating"), \
+                    patch.object(
+                        s3_shots, "_record_failed_generation_independently"
+                    ) as record_failed, \
+                    patch.object(
+                        s3_shots, "_generate_seedance_video",
+                        new=AsyncMock(side_effect=generate),
+                    ):
+                idx, error, anchor = await s3_shots._gen_dialogue(
+                    "J-EDIT",
+                    {"idx": 3, "duration_sec": 20, "voiceover": "目标台词"},
+                    {"id": "linxia", "name": "林夏", "look": "年轻工程师"},
+                    {
+                        "idx": 3,
+                        "duration_sec": 20,
+                        "voiceover": "目标台词",
+                        "repair_mode": "seedance_lip_sync_edit",
+                        "repair_source_path": str(prior),
+                        "repair_start_sec": 3,
+                        "repair_end_sec": 15,
+                        "repair_dialogue": "目标台词",
+                    },
+                    asyncio.Semaphore(1),
+                )
+
+            self.assertEqual(idx, 3)
+            self.assertIsInstance(error, s3_shots.SeedanceQualityError)
+            self.assertIsNone(anchor)
+            self.assertEqual(prior.read_bytes(), b"prior-master")
+            self.assertTrue(error.candidate_path.is_file())
+            self.assertEqual(error.candidate_path.read_bytes(), b"edited-candidate")
+            self.assertIn("review", error.candidate_path.parts)
+            record_failed.assert_called_once_with("J-EDIT", 3, error)
+
+    def test_broll_extend_success_becomes_review_candidate_without_overwriting_prior(self):
+        asyncio.run(self._assert_broll_extend_success_becomes_review_candidate())
+
+    async def _assert_broll_extend_success_becomes_review_candidate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            assets = Path(temp)
+            prior = assets / "J-EXTEND" / "shots" / "02.mp4"
+            prior.parent.mkdir(parents=True)
+            prior.write_bytes(b"prior-master")
+
+            async def generate(**kwargs):
+                candidate = kwargs["out_path"]
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_bytes(b"extended-candidate")
+                self.assertEqual(kwargs["request_kwargs"]["task_intent"], "extend")
+                self.assertIsNone(kwargs["expected_text"])
+                return s3_shots.SeedanceGenerationResult(
+                    b"extended-candidate", candidate, "https://cdn/extend",
+                    "{}", False, "seedance25", None, 88,
+                    ({"task_id": "task-extend", "cost_cents": 88},),
+                    bigasr.Transcription(""),
+                )
+
+            with patch.object(s3_shots, "ASSETS_DIR", assets), \
+                    patch.object(s3_shots, "_mark_shot_generating"), \
+                    patch.object(
+                        s3_shots, "_record_failed_generation_independently"
+                    ) as record_failed, \
+                    patch.object(s3_shots, "precision_motion_reason", return_value=None), \
+                    patch.object(
+                        s3_shots, "_generate_seedance_video",
+                        new=AsyncMock(side_effect=generate),
+                    ):
+                idx, error = await s3_shots._gen_broll(
+                    "J-EXTEND",
+                    {"idx": 2, "duration_sec": 18},
+                    None,
+                    {
+                        "idx": 2,
+                        "duration_sec": 18,
+                        "repair_mode": "seedance_extend",
+                        "repair_source_path": str(prior),
+                        "extend_duration_sec": 8,
+                        "extend_direction": "继续跟随工程师走向控制台",
+                    },
+                    asyncio.Semaphore(1),
+                )
+
+            self.assertEqual(idx, 2)
+            self.assertIsInstance(error, s3_shots.SeedanceQualityError)
+            self.assertEqual(prior.read_bytes(), b"prior-master")
+            self.assertTrue(error.candidate_path.is_file())
+            self.assertEqual(error.candidate_path.read_bytes(), b"extended-candidate")
+            record_failed.assert_called_once_with("J-EXTEND", 2, error)
+
     def test_ai_generated_character_ignores_cached_roster_reference(self):
         character = {
             "id": "sales_xiaoneng",
@@ -1844,11 +3749,35 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         self.assertIn("创作意图：", prompt)
         self.assertIn("时间轴：", prompt)
-        self.assertIn("0.0-", prompt)
-        self.assertIn("-8.0秒：", prompt)
+        self.assertIn("0-1秒：", prompt)
+        self.assertIn("1-7秒：", prompt)
+        self.assertIn("7-8秒：", prompt)
+        self.assertNotRegex(prompt, r"\d+\.\d+-\d+")
         self.assertIn(f"{{台词：{shot['voiceover']}}}", prompt)
         self.assertIn(f"<环境音：{shot['sound_design']}>", prompt)
         self.assertIn("无 BGM", prompt)
+
+    def test_presenter_prompt_uses_continuous_integer_timeline_and_one_dialogue(self):
+        dialogue = "设备已经完成安全检查，可以按计划进场。"
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "duration_sec": 7.3,
+                "scene": "设备交付区",
+                "camera": "缓慢推近",
+                "action": "林夏核对设备后抬头确认",
+                "voiceover": dialogue,
+            },
+            {"name": "林夏", "look": "年轻设备调度工程师"},
+        )
+
+        self.assertIn("0-1秒", prompt)
+        self.assertIn("1-7秒", prompt)
+        self.assertIn("7-8秒", prompt)
+        self.assertNotIn("0.0-", prompt)
+        self.assertNotIn(".0秒", prompt)
+        self.assertEqual(prompt.count(dialogue), 1)
+        self.assertIn("完整说出且只能说出时间轴中标注的台词", prompt)
 
     def test_default_sound_design_is_derived_from_scene_dynamics(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -1864,7 +3793,7 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         self.assertIn("由“纸页被风轻轻带动”产生的轻微环境声与物件声", prompt)
 
-    def test_anchored_dialogue_uses_video_for_identity_and_native_voice(self):
+    def test_anchored_dialogue_assigns_orthogonal_reference_duties(self):
         prompt = s3_shots._build_native_dialogue_prompt(
             {
                 "idx": 2,
@@ -1874,13 +3803,68 @@ class Seedance25DialogueTests(unittest.TestCase):
             },
             {"name": "老周", "look": "虚构的中年工程师"},
             anchored=True,
+            voice_anchored=True,
         )
 
         self.assertIn("素材职责：", prompt)
-        self.assertIn("身份参考图只锁定人物外貌", prompt)
-        self.assertIn("前序视频只延续原生声线", prompt)
+        self.assertIn("身份参考只负责锁定人物身份", prompt)
+        self.assertIn("音频参考只负责延续原生声线", prompt)
         self.assertIn("不得复述参考素材中的旧台词", prompt)
         self.assertNotIn("音频1", prompt)
+
+    def test_fixed_identity_anchor_does_not_lock_scene_wardrobe(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "duration_sec": 8,
+                "scene": "户外设备停车场，工作人员佩戴白色安全帽和反光背心",
+                "voiceover": "这批设备今天完成交付。",
+            },
+            {
+                "id": "staff",
+                "name": "老大",
+                "script_character_name": "女工作人员",
+                "generation_mode": "fixed_asset",
+                "identity_type": "virtual_person",
+                "seedance_asset_uri": "asset://staff",
+                "look": "古装戏楼名伶",
+            },
+            anchored=True,
+        )
+
+        self.assertIn("身份参考只负责锁定人物身份中的不可变特征", prompt)
+        self.assertIn("服装、PPE、防护装备和职业状态严格服从本镜场景设定", prompt)
+        self.assertNotIn("体型与服装", prompt)
+
+    def test_identity_only_prompt_does_not_claim_missing_audio_reference(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "duration_sec": 8,
+                "scene": "设备停车场",
+                "voiceover": "现在开始检查。",
+            },
+            {"name": "林夏", "look": "年轻工程师"},
+            anchored=True,
+            voice_anchored=False,
+        )
+
+        self.assertIn("身份参考只负责锁定人物身份", prompt)
+        self.assertNotIn("音频参考只负责延续原生声线", prompt)
+
+    def test_dialogue_prompt_blocks_text_on_equipment_and_ppe(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "duration_sec": 8,
+                "scene": "户外设备停车场，工作人员佩戴安全帽和反光背心",
+                "voiceover": "设备已经完成交付。",
+            },
+            {"id": "staff", "name": "工作人员", "generation_mode": "ai_generated"},
+        )
+
+        self.assertIn("安全帽、反光背心、工服、工程机械、设备铭牌", prompt)
+        self.assertIn("禁止企业名称、品牌、设备编号、车牌、字母、数字、二维码", prompt)
 
     def test_fixed_character_prompt_does_not_claim_the_person_is_fictional(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -2087,18 +4071,40 @@ class Seedance25DialogueTests(unittest.TestCase):
             "asset://asset-authorized-example",
         )
 
-    def test_followup_dialogue_reuses_native_video_only(self):
+    def test_cross_scene_followup_reuses_voice_audio_not_previous_character_video(self):
         shot = {"duration_sec": 8}
         anchor = s3_shots.DialogueAnchor(
             video_url="https://cdn/anchor.mp4",
             duration_sec=30,
         )
+        voice = s3_shots.NativeVoiceAnchor(Path("C:/jobs/J-1/shots/01.wav"))
 
-        request = s3_shots._dialogue_request_kwargs(shot, anchor)
+        request = s3_shots._dialogue_request_kwargs(
+            shot, anchor, native_voice_anchor=voice
+        )
 
-        self.assertEqual(request["reference_videos"], [anchor.video_url])
-        self.assertEqual(request["reference_video_duration_sec"], 30)
-        self.assertNotIn("reference_audios", request)
+        self.assertNotIn("reference_videos", request)
+        self.assertEqual(request["reference_audios"], [str(voice.audio_path)])
+
+    def test_same_scene_followup_uses_scene_video_and_voice_as_orthogonal_references(self):
+        speaker_history = s3_shots.DialogueAnchor(
+            video_url="https://cdn/old-scene-speaker.mp4", duration_sec=12,
+        )
+        scene_history = s3_shots.DialogueAnchor(
+            video_url="https://cdn/current-scene.mp4", duration_sec=10,
+        )
+        voice = s3_shots.NativeVoiceAnchor(Path("C:/jobs/J-1/shots/01.wav"))
+
+        request = s3_shots._dialogue_request_kwargs(
+            {"duration_sec": 8},
+            speaker_history,
+            native_voice_anchor=voice,
+            scene_video_anchor=scene_history,
+        )
+
+        self.assertEqual(request["reference_videos"], [scene_history.video_url])
+        self.assertEqual(request["reference_video_duration_sec"], 10)
+        self.assertEqual(request["reference_audios"], [str(voice.audio_path)])
 
     def test_reference_video_cost_includes_input_and_output_duration(self):
         estimate = s3_shots._estimated_request_cost_cents({
@@ -2109,6 +4115,20 @@ class Seedance25DialogueTests(unittest.TestCase):
         })
 
         self.assertEqual(estimate, 2448)
+
+    def test_720p_budget_estimate_covers_measured_seedance_25_token_bill(self):
+        measured = seedance.usage_cost_cents({
+            "completion_tokens": 173700,
+        })
+        preflight = seedance.estimate_cost_cents(8, "720p")
+        runtime_gate = s3_shots._estimated_request_cost_cents({
+            "duration": 8,
+            "resolution": "720p",
+        })
+
+        self.assertEqual(measured, 1216)
+        self.assertGreaterEqual(preflight, measured)
+        self.assertEqual(runtime_gate, preflight)
 
     def test_runtime_has_no_omnihuman_dependency(self):
         source = inspect.getsource(s3_shots._gen_dialogue)
@@ -2151,7 +4171,7 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         self.assertEqual(anchor.duration_sec, 4)
 
-    def test_short_dialogue_prompt_explicitly_pads_after_editorial_end(self):
+    def test_short_dialogue_prompt_normalizes_to_integer_provider_timeline(self):
         prompt = s3_shots._build_native_dialogue_prompt(
             {
                 "idx": 1,
@@ -2167,8 +4187,10 @@ class Seedance25DialogueTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("0.4-4.0秒", prompt)
-        self.assertIn("供本地剪辑裁切", prompt)
+        self.assertIn("0-1秒", prompt)
+        self.assertIn("1-2秒", prompt)
+        self.assertIn("2-4秒", prompt)
+        self.assertNotRegex(prompt, r"\d+\.\d+-\d+")
 
     def test_native_dialogue_prompt_drops_source_on_screen_text_instructions(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -2211,6 +4233,1672 @@ class Seedance25DialogueTests(unittest.TestCase):
 
 
 class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
+    async def _measure_broll_concurrency(
+        self, *, masters: list[dict], characters: list[dict] | None = None
+    ) -> tuple[int, list[str]]:
+        characters = list(characters or [])
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute("ALTER TABLE jobs ADD COLUMN characters_json TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN narrative_type TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN speaker_id TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN anchor_character TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN video_url TEXT")
+        storyboard = {
+            "masters": masters,
+            "shots": [],
+            "characters": characters,
+        }
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,"
+            "characters_json) VALUES(?,?,?,?,?,?)",
+            (
+                "J-BROLL-DEPS", "T-1", "broll dependencies",
+                "PRODUCTION_RUNNING", json.dumps(storyboard),
+                json.dumps(characters),
+            ),
+        )
+        for master in masters:
+            database.execute(
+                "INSERT INTO shots(job_id,idx,state,duration_sec,shot_type,"
+                "prompt,narrative_type,anchor_character) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    "J-BROLL-DEPS", master["idx"], "PENDING", 4,
+                    "broll", f"scene {master['idx']}", "broll",
+                    master.get("anchor_character"),
+                ),
+            )
+        database.commit()
+        active = 0
+        maximum_active = 0
+        paid_batch_ids: list[str] = []
+
+        async def generate(
+            _job_id, shot, _anchor_path, _sb_shot, _sem, **_kwargs
+        ):
+            nonlocal active, maximum_active
+            paid_batch_ids.append(str(_kwargs.get("paid_batch_id") or ""))
+            active += 1
+            maximum_active = max(maximum_active, active)
+            try:
+                await asyncio.sleep(0.04)
+                return shot["idx"], None
+            finally:
+                active -= 1
+
+        with (
+            patch.object(s3_shots, "MAX_CONCURRENT_SHOTS", 2),
+            patch.dict(
+                os.environ, {"SEEDANCE_MAX_CONCURRENT_MASTERS": "2"}
+            ),
+            patch.object(s3_shots, "conn", return_value=database),
+            patch.object(
+                s3_shots.character_assets, "apply_cached_bindings",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots, "_resolve_real_person_bindings",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots.scene_assets, "apply_continuity_metadata",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots, "_ensure_character_identity_anchors",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                s3_shots, "_ensure_scene_visual_anchors",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(s3_shots, "_assert_continuity_anchors_approved"),
+            patch.object(s3_shots, "_gen_broll", side_effect=generate),
+        ):
+            await s3_shots.run("J-BROLL-DEPS")
+        database.close()
+        return maximum_active, paid_batch_ids
+
+    async def test_same_scene_broll_masters_stay_sequential(self):
+        maximum_active, batch_ids = await self._measure_broll_concurrency(masters=[
+            {
+                "idx": 1, "type": "broll", "duration": 4,
+                "scene_anchor_key": "yard-a",
+            },
+            {
+                "idx": 2, "type": "broll", "duration": 4,
+                "scene_anchor_key": "yard-a",
+            },
+        ])
+
+        self.assertEqual(maximum_active, 1)
+        self.assertEqual(len(set(batch_ids)), 2)
+
+    async def test_broll_anchor_character_and_cast_identity_stay_sequential(self):
+        lead = {
+            "id": "lead", "name": "Lead", "generation_mode": "ai_generated",
+            "look": "young lead",
+        }
+        maximum_active, batch_ids = await self._measure_broll_concurrency(
+            characters=[lead],
+            masters=[
+                {
+                    "idx": 1, "type": "broll", "duration": 4,
+                    "scene_anchor_key": "yard-a", "anchor_character": "lead",
+                },
+                {
+                    "idx": 2, "type": "broll", "duration": 4,
+                    "scene_anchor_key": "office-b",
+                    "cast": [{"id": "lead", "name": "Lead"}],
+                },
+            ],
+        )
+
+        self.assertEqual(maximum_active, 1)
+        self.assertEqual(len(set(batch_ids)), 2)
+
+    async def test_unknown_in_first_wave_blocks_dependent_wave_before_post(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute("ALTER TABLE jobs ADD COLUMN characters_json TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN narrative_type TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN speaker_id TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN anchor_character TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN video_url TEXT")
+        masters = [
+            {
+                "idx": 1, "type": "broll", "duration": 4,
+                "scene_anchor_key": "yard-a",
+            },
+            {
+                "idx": 2, "type": "broll", "duration": 4,
+                "scene_anchor_key": "yard-a",
+            },
+        ]
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,"
+            "characters_json) VALUES(?,?,?,?,?,?)",
+            (
+                "J-WAVE-UNKNOWN", "T-1", "wave unknown",
+                "PRODUCTION_RUNNING",
+                json.dumps({"masters": masters, "shots": []}), "[]",
+            ),
+        )
+        for master in masters:
+            database.execute(
+                "INSERT INTO shots(job_id,idx,state,duration_sec,shot_type,"
+                "prompt,narrative_type) VALUES(?,?,?,?,?,?,?)",
+                (
+                    "J-WAVE-UNKNOWN", master["idx"], "PENDING", 4,
+                    "broll", f"scene {master['idx']}", "broll",
+                ),
+            )
+        database.commit()
+        posts = 0
+        batch_ids: list[str] = []
+        submit_lock = asyncio.Lock()
+
+        async def generate(
+            job_id, shot, _anchor_path, _sb_shot, _sem, **kwargs
+        ):
+            nonlocal posts
+            async with submit_lock:
+                posts += 1
+                batch_id = str(kwargs.get("paid_batch_id") or "")
+                batch_ids.append(batch_id)
+                reservation = provider_tasks.reserve_paid_submit(
+                    database,
+                    job_id=job_id,
+                    shot_idx=shot["idx"],
+                    provider="seedance",
+                    intent="generate",
+                    authorized_batch_id=batch_id,
+                )
+                provider_tasks.mark_action_required(
+                    database, reservation, message="submit result unknown"
+                )
+                return (
+                    shot["idx"],
+                    seedance.SeedanceSubmissionUnknownError(
+                        "submit result unknown"
+                    ),
+                )
+
+        with (
+            patch.object(s3_shots, "MAX_CONCURRENT_SHOTS", 2),
+            patch.object(s3_shots, "conn", return_value=database),
+            patch.object(
+                s3_shots.character_assets, "apply_cached_bindings",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots, "_resolve_real_person_bindings",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots.scene_assets, "apply_continuity_metadata",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots, "_ensure_character_identity_anchors",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                s3_shots, "_ensure_scene_visual_anchors",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(s3_shots, "_assert_continuity_anchors_approved"),
+            patch.object(s3_shots, "_gen_broll", side_effect=generate),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "shots failed"):
+                await s3_shots.run("J-WAVE-UNKNOWN")
+
+        self.assertEqual(posts, 1)
+        self.assertEqual(len(batch_ids), 1)
+        with self.assertRaises(provider_tasks.ProviderTaskGateError):
+            provider_tasks.begin_paid_submit_batch(database, "J-WAVE-UNKNOWN")
+        self.assertEqual(
+            len(provider_tasks.unresolved_task_ids(
+                database, "J-WAVE-UNKNOWN"
+            )),
+            1,
+        )
+        database.close()
+
+    async def test_run_overlaps_two_independent_masters_at_configured_concurrency(self):
+        """The shot semaphore must limit real tasks, not a serial for-loop."""
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute("ALTER TABLE jobs ADD COLUMN characters_json TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN narrative_type TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN speaker_id TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN anchor_character TEXT")
+        database.execute("ALTER TABLE shots ADD COLUMN video_url TEXT")
+        storyboard = {
+            "masters": [
+                {
+                    "idx": 1, "type": "broll", "duration": 4,
+                    "scene_anchor_key": "yard-a",
+                },
+                {
+                    "idx": 2, "type": "broll", "duration": 4,
+                    "scene_anchor_key": "office-b",
+                },
+            ],
+            "shots": [],
+        }
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,"
+            "characters_json) VALUES(?,?,?,?,?,?)",
+            (
+                "J-CONCURRENT-RUN", "T-1", "concurrency",
+                "PRODUCTION_RUNNING", json.dumps(storyboard), "[]",
+            ),
+        )
+        for idx in (1, 2):
+            database.execute(
+                "INSERT INTO shots(job_id,idx,state,duration_sec,"
+                "shot_type,prompt,narrative_type) VALUES(?,?,?,?,?,?,?)",
+                (
+                    "J-CONCURRENT-RUN", idx, "PENDING", 4,
+                    "broll", f"scene {idx}", "broll",
+                ),
+            )
+        database.commit()
+
+        active = 0
+        maximum_active = 0
+        both_started = asyncio.Event()
+
+        async def generate(
+            _job_id, shot, _anchor_path, _sb_shot, _sem, **_kwargs
+        ):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if active == 2:
+                both_started.set()
+            try:
+                await asyncio.wait_for(both_started.wait(), timeout=0.5)
+                await asyncio.sleep(0)
+                return shot["idx"], None
+            finally:
+                active -= 1
+
+        with (
+            patch.object(s3_shots, "MAX_CONCURRENT_SHOTS", 2),
+            patch.object(s3_shots, "conn", return_value=database),
+            patch.object(
+                s3_shots.character_assets, "apply_cached_bindings",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots, "_resolve_real_person_bindings",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots.scene_assets, "apply_continuity_metadata",
+                return_value=False,
+            ),
+            patch.object(
+                s3_shots, "_ensure_character_identity_anchors",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                s3_shots, "_ensure_scene_visual_anchors",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(s3_shots, "_assert_continuity_anchors_approved"),
+            patch.object(s3_shots, "_gen_broll", side_effect=generate),
+        ):
+            await asyncio.wait_for(
+                s3_shots.run("J-CONCURRENT-RUN"), timeout=1.0
+            )
+
+        self.assertEqual(maximum_active, 2)
+        database.close()
+
+    async def test_paid_batch_allows_two_sibling_reservations_concurrently(self):
+        """One batch may submit siblings without authorizing old unknown work."""
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "factory.db"
+            with patch.dict(
+                os.environ, {"FACTORY_DB_PATH": str(database_path)}
+            ):
+                setup = db.conn()
+                setup.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                    "VALUES('J-BATCH','T-1','batch','PRODUCTION_RUNNING','{}')"
+                )
+                setup.commit()
+                try:
+                    batch_id = provider_tasks.begin_paid_submit_batch(
+                        setup, "J-BATCH"
+                    )
+                finally:
+                    setup.close()
+
+                start = asyncio.Event()
+
+                async def reserve(idx):
+                    await start.wait()
+
+                    def blocking_reserve():
+                        database = db.conn()
+                        try:
+                            return provider_tasks.reserve_paid_submit(
+                                database,
+                                job_id="J-BATCH",
+                                shot_idx=idx,
+                                provider="seedance",
+                                intent="generate",
+                                authorized_batch_id=batch_id,
+                            )
+                        finally:
+                            database.close()
+
+                    return await asyncio.to_thread(blocking_reserve)
+
+                pending = [
+                    asyncio.create_task(reserve(1)),
+                    asyncio.create_task(reserve(2)),
+                ]
+                start.set()
+                reservations = await asyncio.gather(*pending)
+
+                verify = db.conn()
+                rows = verify.execute(
+                    "SELECT task_id,usage_json FROM provider_calls "
+                    "WHERE job_id='J-BATCH' ORDER BY shot_idx"
+                ).fetchall()
+                verify.close()
+
+        self.assertEqual(len(set(reservations)), 2)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(
+            json.loads(row["usage_json"])["batch_id"] == batch_id
+            for row in rows
+        ))
+
+    async def test_concurrent_batch_reservations_cannot_oversubscribe_job_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "factory.db"
+            with patch.dict(
+                os.environ, {"FACTORY_DB_PATH": str(database_path)}
+            ):
+                setup = db.conn()
+                setup.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,"
+                    "cost_cents) VALUES(?,?,?,?,?,0)",
+                    (
+                        "J-BATCH-BUDGET", "T-1", "batch budget",
+                        "PRODUCTION_RUNNING",
+                        json.dumps({"production_settings": {
+                            "budget_cents": 100,
+                        }}),
+                    ),
+                )
+                setup.commit()
+                batch_id = provider_tasks.begin_paid_submit_batch(
+                    setup, "J-BATCH-BUDGET"
+                )
+                setup.close()
+                start = asyncio.Event()
+
+                async def reserve(idx):
+                    await start.wait()
+
+                    def blocking_reserve():
+                        database = db.conn()
+                        try:
+                            return provider_tasks.reserve_paid_submit(
+                                database,
+                                job_id="J-BATCH-BUDGET",
+                                shot_idx=idx,
+                                provider="seedance",
+                                intent="generate",
+                                authorized_batch_id=batch_id,
+                                estimated_cost_cents=80,
+                                budget_limit_cents=100,
+                            )
+                        finally:
+                            database.close()
+
+                    try:
+                        return "ok", await asyncio.to_thread(blocking_reserve)
+                    except Exception as exc:
+                        return "error", exc
+
+                tasks = [
+                    asyncio.create_task(reserve(1)),
+                    asyncio.create_task(reserve(2)),
+                ]
+                start.set()
+                outcomes = await asyncio.gather(*tasks)
+                verify = db.conn()
+                reservations = verify.execute(
+                    "SELECT COUNT(*) FROM provider_calls "
+                    "WHERE job_id='J-BATCH-BUDGET'"
+                ).fetchone()[0]
+                verify.close()
+
+        self.assertEqual([item[0] for item in outcomes].count("ok"), 1)
+        failure = next(item[1] for item in outcomes if item[0] == "error")
+        self.assertIsInstance(
+            failure, provider_tasks.ProviderTaskBudgetError
+        )
+        self.assertEqual(reservations, 1)
+
+    async def test_cancelled_broll_does_not_leave_shot_generating(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-CANCEL-WAVE','T-1','cancel','PRODUCTION_RUNNING','{}')"
+        )
+        database.execute(
+            "INSERT INTO shots(job_id,idx,state,duration_sec,shot_type,prompt) "
+            "VALUES('J-CANCEL-WAVE',1,'PENDING',4,'broll','equipment')"
+        )
+        database.commit()
+        entered = asyncio.Event()
+
+        async def wait_forever(**_kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(
+                s3_shots, "conn", return_value=_NonClosingConnection(database)
+            ),
+            patch.object(
+                s3_shots, "_generate_seedance_video",
+                side_effect=wait_forever,
+            ),
+        ):
+            task = asyncio.create_task(s3_shots._gen_broll(
+                "J-CANCEL-WAVE",
+                {
+                    "idx": 1, "duration_sec": 4,
+                    "prompt": "equipment", "camera": "fixed",
+                },
+                None,
+                {},
+                asyncio.Semaphore(1),
+            ))
+            await asyncio.wait_for(entered.wait(), timeout=0.5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        state = database.execute(
+            "SELECT state FROM shots WHERE job_id='J-CANCEL-WAVE' AND idx=1"
+        ).fetchone()[0]
+        self.assertNotEqual(state, "GENERATING")
+        database.close()
+
+    async def test_batch_never_authorizes_an_older_unresolved_task(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,"
+            "intent,usage_json) VALUES(?,?,?,?,?,?)",
+            (
+                "task-old", "J-HISTORY", 9, "seedance", "generate",
+                json.dumps({"status": "unknown", "batch_id": "old-batch"}),
+            ),
+        )
+        database.commit()
+
+        with self.assertRaises(provider_tasks.ProviderTaskGateError):
+            provider_tasks.begin_paid_submit_batch(database, "J-HISTORY")
+
+        self.assertEqual(
+            provider_tasks.unresolved_task_ids(database, "J-HISTORY"),
+            ["task-old"],
+        )
+        database.close()
+
+    async def test_account_failure_blocks_a_waiting_sibling_before_post(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            database_path = Path(tmp) / "factory.db"
+            storyboard = {
+                "masters": [
+                    {"idx": 1, "type": "broll", "duration": 4},
+                    {"idx": 2, "type": "broll", "duration": 4},
+                ],
+                "shots": [],
+            }
+            with patch.dict(
+                os.environ, {"FACTORY_DB_PATH": str(database_path)}
+            ):
+                setup = db.conn()
+                setup.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,"
+                    "characters_json) VALUES(?,?,?,?,?,?)",
+                    (
+                        "J-ACCOUNT-WAVE", "T-1", "account wave",
+                        "PRODUCTION_RUNNING", json.dumps(storyboard), "[]",
+                    ),
+                )
+                for idx in (1, 2):
+                    setup.execute(
+                        "INSERT INTO shots(job_id,idx,state,duration_sec,"
+                        "shot_type,prompt,narrative_type) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (
+                            "J-ACCOUNT-WAVE", idx, "PENDING", 4,
+                            "broll", f"equipment {idx}", "broll",
+                        ),
+                    )
+                setup.commit()
+                setup.close()
+                posts = 0
+
+                async def account_failure(*_args, **_kwargs):
+                    nonlocal posts
+                    posts += 1
+                    raise seedance.SeedanceAccountUnavailableError(
+                        "account overdue"
+                    )
+
+                route = video_routing.VideoRoute(
+                    model="seedance-test", tier="seedance25",
+                    generate_audio=False, qa_required=False,
+                    fallback_model=None,
+                )
+                with (
+                    patch.object(s3_shots, "MAX_CONCURRENT_SHOTS", 1),
+                    patch.object(
+                        s3_shots.character_assets, "apply_cached_bindings",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        s3_shots, "_resolve_real_person_bindings",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        s3_shots.scene_assets, "apply_continuity_metadata",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        s3_shots, "_ensure_character_identity_anchors",
+                        AsyncMock(return_value={}),
+                    ),
+                    patch.object(
+                        s3_shots, "_ensure_scene_visual_anchors",
+                        AsyncMock(return_value={}),
+                    ),
+                    patch.object(
+                        s3_shots, "_assert_continuity_anchors_approved",
+                    ),
+                    patch.object(s3_shots, "select_route", return_value=route),
+                    patch.object(
+                        s3_shots.seedance, "text_to_video",
+                        side_effect=account_failure,
+                    ),
+                    patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "shots failed"):
+                        await s3_shots.run("J-ACCOUNT-WAVE")
+
+                verify = db.conn()
+                states = [
+                    row[0] for row in verify.execute(
+                        "SELECT state FROM shots WHERE job_id='J-ACCOUNT-WAVE' "
+                        "ORDER BY idx"
+                    ).fetchall()
+                ]
+                runtime = verify.execute(
+                    "SELECT status FROM provider_runtime "
+                    "WHERE provider='seedance'"
+                ).fetchone()[0]
+                verify.close()
+
+        self.assertEqual(posts, 1)
+        self.assertEqual(states, ["FAILED", "FAILED"])
+        self.assertEqual(runtime, "action_required")
+
+    async def test_dialogue_final_update_failure_rolls_back_before_failure_record(self):
+        await self._assert_final_accounting_failure_is_recoverable(
+            dialogue=True, fail_sql="UPDATE shots SET video_path="
+        )
+
+    async def test_broll_final_commit_failure_rolls_back_before_failure_record(self):
+        await self._assert_final_accounting_failure_is_recoverable(
+            dialogue=False, fail_commit=True
+        )
+
+    async def _assert_final_accounting_failure_is_recoverable(
+        self, *, dialogue: bool, fail_sql: str = "", fail_commit: bool = False
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "factory.db"
+            with patch.dict(os.environ, {"FACTORY_DB_PATH": str(database_path)}):
+                setup = db.conn()
+                setup.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+                    "VALUES('J-FINAL-TX','T-1','final tx','PRODUCTION_RUNNING','{}',0)"
+                )
+                setup.execute(
+                    "INSERT INTO shots(job_id,idx,state,cost_cents,duration_sec,prompt) "
+                    "VALUES('J-FINAL-TX',1,'GENERATING',0,4,'equipment')"
+                )
+                setup.execute(
+                    "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,"
+                    "usage_json,cost_cents) VALUES('task-staged','J-FINAL-TX',1,"
+                    "'seedance','generate',?,0)",
+                    (json.dumps({
+                        "status": "staged",
+                        "artifact_path": str(Path(tmp) / "candidate.mp4"),
+                    }),),
+                )
+                setup.commit()
+                setup.close()
+
+                candidate = Path(tmp) / "candidate.mp4"
+                candidate.write_bytes(b"video")
+                audio = Path(tmp) / "candidate.wav"
+                audio.write_bytes(b"audio")
+                result = s3_shots.SeedanceGenerationResult(
+                    video=b"video",
+                    video_path=candidate,
+                    video_url="https://assets/video.mp4",
+                    qa_note="{}",
+                    native_audio=dialogue,
+                    model="seedance-test",
+                    audio_path=audio if dialogue else None,
+                    cost_cents=29,
+                    provider_calls=({
+                        "task_id": "task-staged",
+                        "intent": "generate",
+                        "usage": {"status": "completed"},
+                        "cost_cents": 29,
+                    },),
+                )
+
+                final_raw = sqlite3.connect(database_path, timeout=0.02)
+                final_raw.row_factory = sqlite3.Row
+                failure_raw = sqlite3.connect(database_path, timeout=0.02)
+                failure_raw.row_factory = sqlite3.Row
+                final_connection = _InjectedFinalConnection(
+                    final_raw, fail_sql=fail_sql, fail_commit=fail_commit
+                )
+                failure_connection = _InjectedFinalConnection(failure_raw)
+                original = (
+                    "injected final commit failure" if fail_commit
+                    else "injected final accounting failure"
+                )
+                route = video_routing.VideoRoute(
+                    model="seedance-test", tier="seedance25",
+                    generate_audio=dialogue, qa_required=False,
+                    fallback_model=None,
+                )
+                patches = (
+                    patch.object(s3_shots, "conn", side_effect=[
+                        final_connection, failure_connection,
+                    ]),
+                    patch.object(s3_shots, "_mark_shot_generating"),
+                    patch.object(
+                        s3_shots, "_generate_seedance_video",
+                        new=AsyncMock(return_value=result),
+                    ),
+                    patch.object(s3_shots, "select_route", return_value=route),
+                    patch.object(s3_shots, "_persist_master_transcription"),
+                )
+                with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                    if dialogue:
+                        idx, caught, _anchor = await s3_shots._gen_dialogue(
+                            "J-FINAL-TX",
+                            {"idx": 1, "duration_sec": 4, "voiceover": "line"},
+                            {"id": "lead", "name": "Lead"},
+                            {"voiceover": "line"},
+                            asyncio.Semaphore(1),
+                        )
+                    else:
+                        idx, caught = await s3_shots._gen_broll(
+                            "J-FINAL-TX",
+                            {
+                                "idx": 1, "duration_sec": 4,
+                                "prompt": "equipment", "camera": "fixed",
+                            },
+                            None,
+                            {},
+                            asyncio.Semaphore(1),
+                        )
+
+                self.assertEqual(idx, 1)
+                self.assertIsInstance(caught, sqlite3.OperationalError)
+                self.assertIn(original, str(caught))
+                self.assertNotIn("locked", str(caught).casefold())
+                self.assertTrue(final_connection.rolled_back)
+                self.assertTrue(final_connection.closed)
+                self.assertTrue(failure_connection.closed)
+
+                verify = db.conn()
+                shot_row = verify.execute(
+                    "SELECT state,cost_cents,error FROM shots "
+                    "WHERE job_id='J-FINAL-TX' AND idx=1"
+                ).fetchone()
+                provider_row = verify.execute(
+                    "SELECT cost_cents,usage_json FROM provider_calls "
+                    "WHERE task_id='task-staged'"
+                ).fetchone()
+                self.assertEqual(shot_row["state"], "FAILED")
+                self.assertEqual(shot_row["cost_cents"], 0)
+                self.assertIn(original, shot_row["error"])
+                self.assertEqual(provider_row["cost_cents"], 0)
+                self.assertEqual(
+                    json.loads(provider_row["usage_json"])["status"], "staged"
+                )
+                with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                    provider_tasks.reserve_paid_submit(
+                        verify,
+                        job_id="J-FINAL-TX",
+                        shot_idx=1,
+                        provider="seedance",
+                        intent="generate",
+                    )
+                verify.close()
+
+    async def test_real_client_completed_callback_allows_authorized_qa_retry_once(self):
+        import httpx
+
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-REAL-RETRY','T-1','real retry','PRODUCTION_RUNNING','{}',0)"
+        )
+        database.execute(
+            "INSERT INTO shots(job_id,idx,state,cost_cents) "
+            "VALUES('J-REAL-RETRY',1,'GENERATING',0)"
+        )
+        database.commit()
+        counts = {"post": 0, "poll": 0, "download": 0}
+
+        def handler(provider_request):
+            if provider_request.method == "POST":
+                counts["post"] += 1
+                return httpx.Response(200, json={
+                    "id": f"task-real-{counts['post']}"
+                })
+            if "/tasks/task-real-" in provider_request.url.path:
+                counts["poll"] += 1
+                task_id = provider_request.url.path.rsplit("/", 1)[-1]
+                return httpx.Response(200, json={
+                    "status": "completed",
+                    "content": {
+                        "video_url": f"https://media.example/{task_id}.mp4"
+                    },
+                    "usage": {"completion_tokens": 1000},
+                })
+            counts["download"] += 1
+            return httpx.Response(200, content=b"video")
+
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(*_args, **kwargs):
+            return real_async_client(
+                transport=httpx.MockTransport(handler),
+                headers=kwargs.get("headers"),
+            )
+        failed = video_qa.QADecision(False, ("unexpected_readable_text",))
+        passed = video_qa.QADecision(True, ())
+        route = video_routing.VideoRoute(
+            model="seedance-test", tier="seedance25",
+            generate_audio=False, qa_required=True, fallback_model=None,
+        )
+        temp = tempfile.TemporaryDirectory()
+        tmp = temp.name
+        with (
+            patch.dict(os.environ, {
+                "ARK_API_KEY": "test-key", "SEEDANCE_MAX_AUTO_RETRIES": "1",
+                "PROVIDER_DOWNLOAD_TRUSTED_HOSTS": "media.example",
+            }),
+            patch(
+                "socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+            ),
+            patch.object(
+                seedance.httpx, "AsyncClient", side_effect=client_factory
+            ),
+            patch.object(seedance.asyncio, "sleep", new=AsyncMock()),
+            patch.object(s3_shots.tos, "upload", return_value="https://qa/video"),
+            patch.object(
+                s3_shots.video_qa, "analyze",
+                side_effect=[({"has_readable_text": True}, failed), ({}, passed)],
+            ),
+            patch.object(
+                s3_shots.video_qa, "evaluate", side_effect=[failed, passed]
+            ),
+        ):
+            result = await s3_shots._generate_seedance_video(
+                prompt="equipment",
+                route=route,
+                request_kwargs={"duration": 4, "resolution": "480p"},
+                out_path=Path(tmp) / "shot.mp4",
+                key_hint="real-retry",
+                job_id="J-REAL-RETRY",
+                shot_idx=1,
+                database=database,
+            )
+
+        self.assertEqual(counts, {"post": 2, "poll": 2, "download": 2})
+        self.assertEqual(result.cost_cents, 14)
+        staged_rows = database.execute(
+            "SELECT task_id,cost_cents,usage_json FROM provider_calls "
+            "ORDER BY task_id"
+        ).fetchall()
+        self.assertEqual(
+            [json.loads(row["usage_json"])["status"] for row in staged_rows],
+            ["staged", "staged"],
+        )
+        self.assertEqual([row["cost_cents"] for row in staged_rows], [0, 0])
+        for row in staged_rows:
+            usage = json.loads(row["usage_json"])
+            self.assertEqual(usage["remote_status"], "completed")
+            self.assertTrue(Path(usage["artifact_path"]).is_file())
+        blocked_submit = AsyncMock(return_value=b"must-not-submit")
+        with patch.object(
+            s3_shots.seedance, "text_to_video", new=blocked_submit
+        ):
+            with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                await s3_shots._generate_seedance_video(
+                    prompt="equipment",
+                    route=route,
+                    request_kwargs={"duration": 4, "resolution": "480p"},
+                    out_path=result.video_path,
+                    key_hint="crash-recovery",
+                    job_id="J-REAL-RETRY",
+                    shot_idx=1,
+                    database=database,
+                )
+        blocked_submit.assert_not_awaited()
+
+        first_delta = s3_shots._record_provider_calls(
+            database, "J-REAL-RETRY", 1, "seedance", result.provider_calls
+        )
+        database.execute(
+            "UPDATE shots SET state='OK',video_path=?,"
+            "cost_cents=cost_cents+? WHERE job_id='J-REAL-RETRY' AND idx=1",
+            (str(result.video_path), first_delta),
+        )
+        database.execute(
+            "UPDATE jobs SET cost_cents=cost_cents+? WHERE job_id='J-REAL-RETRY'",
+            (first_delta,),
+        )
+        database.commit()
+        second_delta = s3_shots._record_provider_calls(
+            database, "J-REAL-RETRY", 1, "seedance", result.provider_calls
+        )
+        rows = database.execute(
+            "SELECT task_id,cost_cents,usage_json FROM provider_calls "
+            "ORDER BY task_id"
+        ).fetchall()
+        self.assertEqual([row["task_id"] for row in rows], [
+            "task-real-1", "task-real-2",
+        ])
+        self.assertEqual((first_delta, second_delta), (14, 0))
+        self.assertEqual(sum(row["cost_cents"] for row in rows), 14)
+        self.assertEqual(
+            [json.loads(row["usage_json"])["status"] for row in rows],
+            ["completed", "completed"],
+        )
+        self.assertEqual(database.execute(
+            "SELECT cost_cents FROM shots WHERE job_id='J-REAL-RETRY' AND idx=1"
+        ).fetchone()[0], 14)
+        self.assertEqual(database.execute(
+            "SELECT cost_cents FROM jobs WHERE job_id='J-REAL-RETRY'"
+        ).fetchone()[0], 14)
+        temp.cleanup()
+        database.close()
+
+    async def test_real_client_single_attempt_has_one_cost_landing(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-REAL-SINGLE','T-1','real single',"
+            "'PRODUCTION_RUNNING','{}',0)"
+        )
+        database.execute(
+            "INSERT INTO shots(job_id,idx,state,cost_cents) "
+            "VALUES('J-REAL-SINGLE',1,'GENERATING',0)"
+        )
+        database.commit()
+        counts = {"post": 0, "poll": 0, "download": 0}
+
+        def handler(request):
+            if request.method == "POST":
+                counts["post"] += 1
+                return httpx.Response(200, json={"id": "task-real-single"})
+            if request.url.path.endswith("/tasks/task-real-single"):
+                counts["poll"] += 1
+                return httpx.Response(200, json={
+                    "status": "completed",
+                    "content": {
+                        "video_url": "https://media.example/single.mp4"
+                    },
+                    "usage": {"completion_tokens": 1000},
+                })
+            counts["download"] += 1
+            return httpx.Response(200, content=b"single-video")
+
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(*_args, **kwargs):
+            return real_async_client(
+                transport=httpx.MockTransport(handler),
+                headers=kwargs.get("headers"),
+            )
+        route = video_routing.VideoRoute(
+            model="seedance-test", tier="seedance25",
+            generate_audio=False, qa_required=False, fallback_model=None,
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {
+                "ARK_API_KEY": "test-key",
+                "PROVIDER_DOWNLOAD_TRUSTED_HOSTS": "media.example",
+            }
+        ), patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("8.8.8.8", 443))],
+        ), patch.object(
+            seedance.httpx, "AsyncClient", side_effect=client_factory
+        ), patch.object(
+            seedance.asyncio, "sleep", new=AsyncMock()
+        ), patch.object(
+            s3_shots.tos, "upload", return_value="https://qa/single"
+        ):
+            result = await s3_shots._generate_seedance_video(
+                prompt="equipment",
+                route=route,
+                request_kwargs={"duration": 4, "resolution": "480p"},
+                out_path=Path(tmp) / "shot.mp4",
+                key_hint="real-single",
+                job_id="J-REAL-SINGLE",
+                shot_idx=1,
+                database=database,
+            )
+
+        first_delta = s3_shots._record_provider_calls(
+            database, "J-REAL-SINGLE", 1, "seedance", result.provider_calls
+        )
+        database.execute(
+            "UPDATE shots SET state='OK',cost_cents=cost_cents+? "
+            "WHERE job_id='J-REAL-SINGLE' AND idx=1",
+            (first_delta,),
+        )
+        database.execute(
+            "UPDATE jobs SET cost_cents=cost_cents+? "
+            "WHERE job_id='J-REAL-SINGLE'",
+            (first_delta,),
+        )
+        database.commit()
+        second_delta = s3_shots._record_provider_calls(
+            database, "J-REAL-SINGLE", 1, "seedance", result.provider_calls
+        )
+        provider_sum = database.execute(
+            "SELECT COALESCE(SUM(cost_cents),0) FROM provider_calls "
+            "WHERE job_id='J-REAL-SINGLE'"
+        ).fetchone()[0]
+        shot_cost = database.execute(
+            "SELECT cost_cents FROM shots "
+            "WHERE job_id='J-REAL-SINGLE' AND idx=1"
+        ).fetchone()[0]
+        job_cost = database.execute(
+            "SELECT cost_cents FROM jobs WHERE job_id='J-REAL-SINGLE'"
+        ).fetchone()[0]
+
+        self.assertEqual(counts, {"post": 1, "poll": 1, "download": 1})
+        self.assertEqual(len(result.provider_calls), 1)
+        self.assertEqual(result.cost_cents, 7)
+        self.assertEqual(
+            (result.cost_cents, provider_sum, shot_cost, job_cost),
+            (7, 7, 7, 7),
+        )
+        self.assertEqual((first_delta, second_delta), (7, 0))
+        database.close()
+
+    async def test_s3_promotion_failure_keeps_remote_alias_and_blocks_repost(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        job_id = "J-S3-PROMOTE-FAIL"
+        remote_id = "seedance-promote-fail-1"
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES(?, 'T-1', 's3 promote fail', 'PRODUCTION_RUNNING', '{}', 0)",
+            (job_id,),
+        )
+        database.execute(
+            "INSERT INTO shots(job_id,idx,state,cost_cents) "
+            "VALUES(?,1,'GENERATING',0)",
+            (job_id,),
+        )
+        database.execute(
+            "CREATE TRIGGER fail_s3_remote_promotion "
+            "BEFORE INSERT ON provider_calls "
+            "WHEN NEW.task_id='seedance-promote-fail-1' "
+            "BEGIN SELECT RAISE(ABORT,'s3 remote insert failed'); END"
+        )
+        database.commit()
+        posts = 0
+
+        def handler(request):
+            nonlocal posts
+            posts += 1
+            return httpx.Response(200, json={"id": remote_id})
+
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(*_args, **kwargs):
+            return real_async_client(
+                transport=httpx.MockTransport(handler),
+                headers=kwargs.get("headers"),
+            )
+
+        route = video_routing.VideoRoute(
+            model="seedance-test", tier="seedance25",
+            generate_audio=False, qa_required=False, fallback_model=None,
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"ARK_API_KEY": "test-key"}
+        ), patch.object(
+            seedance.httpx, "AsyncClient", side_effect=client_factory
+        ):
+            kwargs = dict(
+                prompt="equipment",
+                route=route,
+                request_kwargs={"duration": 4, "resolution": "480p"},
+                out_path=Path(tmp) / "shot.mp4",
+                key_hint="s3-promote-fail",
+                job_id=job_id,
+                shot_idx=1,
+                database=database,
+            )
+            with self.assertRaises(seedance.SeedanceSubmissionUnknownError):
+                await s3_shots._generate_seedance_video(**kwargs)
+            with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                await s3_shots._generate_seedance_video(**kwargs)
+
+        row = database.execute(
+            "SELECT task_id,provider,intent,usage_json FROM provider_calls"
+        ).fetchone()
+        usage = json.loads(row["usage_json"])
+        self.assertEqual(posts, 1)
+        self.assertTrue(row["task_id"].startswith("local-submit:"))
+        self.assertEqual((row["provider"], row["intent"]), (
+            "seedance", "generate",
+        ))
+        self.assertEqual(usage["status"], "action_required")
+        self.assertEqual(usage["remote_task_id"], remote_id)
+        self.assertEqual(usage["provider"], "seedance")
+        self.assertEqual(usage["intent"], "generate")
+        database.close()
+
+    async def test_s3_rejects_remote_id_equal_to_local_reservation(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        job_id = "J-S3-SELF-PROMOTE"
+        reservation_id = f"local-submit:seedance:{job_id}:1:generate"
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES(?, 'T-1', 'self promote', 'PRODUCTION_RUNNING', '{}', 0)",
+            (job_id,),
+        )
+        database.execute(
+            "INSERT INTO shots(job_id,idx,state,cost_cents) "
+            "VALUES(?,1,'GENERATING',0)",
+            (job_id,),
+        )
+        database.commit()
+        posts = 0
+
+        def handler(request):
+            nonlocal posts
+            if request.method == "POST":
+                posts += 1
+            return httpx.Response(200, json={"id": reservation_id})
+
+        real_async_client = httpx.AsyncClient
+
+        def client_factory(*_args, **kwargs):
+            return real_async_client(
+                transport=httpx.MockTransport(handler),
+                headers=kwargs.get("headers"),
+            )
+
+        route = video_routing.VideoRoute(
+            model="seedance-test", tier="seedance25",
+            generate_audio=False, qa_required=False, fallback_model=None,
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"ARK_API_KEY": "test-key"}
+        ), patch.object(
+            seedance.httpx, "AsyncClient", side_effect=client_factory
+        ), patch.object(seedance.asyncio, "sleep", new=AsyncMock()):
+            kwargs = dict(
+                prompt="equipment",
+                route=route,
+                request_kwargs={
+                    "duration": 4, "resolution": "480p", "timeout": 5,
+                },
+                out_path=Path(tmp) / "shot.mp4",
+                key_hint="s3-self-promote",
+                job_id=job_id,
+                shot_idx=1,
+                database=database,
+            )
+            with self.assertRaises(seedance.SeedanceSubmissionUnknownError):
+                await s3_shots._generate_seedance_video(**kwargs)
+            with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                await s3_shots._generate_seedance_video(**kwargs)
+
+        row = database.execute(
+            "SELECT task_id,usage_json FROM provider_calls WHERE task_id=?",
+            (reservation_id,),
+        ).fetchone()
+        self.assertEqual(posts, 1)
+        self.assertIsNotNone(row)
+        usage = json.loads(row["usage_json"])
+        self.assertEqual(usage["remote_task_id"], reservation_id)
+        self.assertEqual(usage["status"], "action_required")
+        database.close()
+
+    async def test_real_video_client_cancellation_keeps_gate_closed(self):
+        import httpx
+
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-VIDEO-CANCEL','T-1','cancel','PRODUCTION_RUNNING','{}')"
+        )
+        database.commit()
+        posts = 0
+
+        def handler(_provider_request):
+            nonlocal posts
+            posts += 1
+            raise asyncio.CancelledError()
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        route = video_routing.VideoRoute(
+            model="seedance-test", tier="seedance25",
+            generate_audio=False, qa_required=False, fallback_model=None,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, {"ARK_API_KEY": "test-key"}),
+            patch.object(seedance.httpx, "AsyncClient", return_value=client),
+        ):
+            kwargs = dict(
+                prompt="equipment",
+                route=route,
+                request_kwargs={"duration": 4, "resolution": "480p"},
+                out_path=Path(tmp) / "shot.mp4",
+                key_hint="cancel",
+                job_id="J-VIDEO-CANCEL",
+                shot_idx=1,
+                database=database,
+            )
+            with self.assertRaises(asyncio.CancelledError):
+                await s3_shots._generate_seedance_video(**kwargs)
+            with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                await s3_shots._generate_seedance_video(**kwargs)
+
+        self.assertEqual(posts, 1)
+        row = database.execute("SELECT task_id,usage_json FROM provider_calls").fetchone()
+        self.assertTrue(row["task_id"].startswith("local-submit:"))
+        self.assertEqual(json.loads(row["usage_json"])["status"], "action_required")
+        database.close()
+
+    async def test_static_identity_disk_failure_keeps_staging_and_never_reposts(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-IMAGE-DISK','T-1','image disk','PRODUCTION_RUNNING','{}',0)"
+        )
+        database.commit()
+        character = {
+            "id": "lead", "name": "Lead", "generation_mode": "ai_generated",
+            "look": "worker in a blue jacket",
+        }
+        submit = AsyncMock(return_value=b"png")
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {"CHARACTER_ANCHOR_GENERATOR": "seedream_5_0"},
+            ),
+            patch.object(s3_shots, "conn", return_value=database),
+            patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),
+            patch.object(s3_shots.seedance, "text_to_image", new=submit),
+            patch.object(Path, "write_bytes", side_effect=OSError("disk full")),
+        ):
+            with self.assertRaises(OSError):
+                await s3_shots._ensure_character_identity_anchors(
+                    "J-IMAGE-DISK", [character]
+                )
+            with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                await s3_shots._ensure_character_identity_anchors(
+                    "J-IMAGE-DISK", [character]
+                )
+
+        self.assertEqual(submit.await_count, 1)
+        row = database.execute(
+            "SELECT usage_json FROM provider_calls"
+        ).fetchone()
+        self.assertEqual(json.loads(row["usage_json"])["status"], "action_required")
+        self.assertEqual(database.execute(
+            "SELECT cost_cents FROM jobs WHERE job_id='J-IMAGE-DISK'"
+        ).fetchone()[0], 0)
+        database.close()
+
+    async def test_static_identity_db_failure_keeps_staging_and_never_reposts(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-IMAGE-DB','T-1','image db','PRODUCTION_RUNNING','{}',0)"
+        )
+        database.commit()
+        character = {
+            "id": "lead", "name": "Lead", "generation_mode": "ai_generated",
+            "look": "worker in a blue jacket",
+        }
+        submit = AsyncMock(return_value=b"png")
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {"CHARACTER_ANCHOR_GENERATOR": "seedream_5_0"},
+            ),
+            patch.object(s3_shots, "conn", return_value=database),
+            patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),
+            patch.object(s3_shots.seedance, "text_to_image", new=submit),
+            patch.object(
+                s3_shots.provider_tasks, "upsert_final_call",
+                side_effect=sqlite3.OperationalError("db unavailable"),
+            ),
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                await s3_shots._ensure_character_identity_anchors(
+                    "J-IMAGE-DB", [character]
+                )
+            with self.assertRaises(provider_tasks.ProviderTaskGateError):
+                await s3_shots._ensure_character_identity_anchors(
+                    "J-IMAGE-DB", [character]
+                )
+
+        self.assertEqual(submit.await_count, 1)
+        row = database.execute("SELECT usage_json FROM provider_calls").fetchone()
+        self.assertEqual(json.loads(row["usage_json"])["status"], "action_required")
+        self.assertEqual(database.execute(
+            "SELECT cost_cents FROM jobs WHERE job_id='J-IMAGE-DB'"
+        ).fetchone()[0], 0)
+        database.close()
+
+    async def test_real_image_client_2xx_contract_failures_are_not_reposted(self):
+        import httpx
+
+        responses = (
+            ("malformed-json", lambda: httpx.Response(200, text="not-json")),
+            ("missing-url", lambda: httpx.Response(200, json={"data": []})),
+        )
+        for label, response_factory in responses:
+            with self.subTest(label=label):
+                database = sqlite3.connect(":memory:")
+                database.row_factory = sqlite3.Row
+                database.executescript(db.DDL)
+                database.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                    "VALUES('J-IMAGE-CONTRACT','T-1','image contract','PRODUCTION_RUNNING','{}')"
+                )
+                database.commit()
+                posts = 0
+
+                def handler(provider_request):
+                    nonlocal posts
+                    self.assertEqual(provider_request.method, "POST")
+                    posts += 1
+                    return response_factory()
+
+                client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+                kwargs = dict(
+                    job_id="J-IMAGE-CONTRACT",
+                    shot_idx=-2001,
+                    provider="seedream_scene",
+                    intent="scene_visual_anchor",
+                    task_id="seedream-scene:J-IMAGE-CONTRACT:yard",
+                    prompt="empty yard",
+                    resolution="1440x2560",
+                    model="seedream-test",
+                    usage={},
+                    cost_cents=29,
+                )
+                with (
+                    patch.dict(os.environ, {"ARK_API_KEY": "test-key"}),
+                    patch.object(seedance.httpx, "AsyncClient", return_value=client),
+                ):
+                    with self.assertRaises(seedance.SeedanceSubmissionUnknownError):
+                        await s3_shots._submit_paid_image(database, **kwargs)
+                    with self.assertRaisesRegex(Exception, "local-submit|核对"):
+                        await s3_shots._submit_paid_image(database, **kwargs)
+
+                self.assertEqual(posts, 1)
+                row = database.execute(
+                    "SELECT task_id,usage_json FROM provider_calls"
+                ).fetchone()
+                self.assertTrue(row["task_id"].startswith("local-submit:"))
+                self.assertEqual(
+                    json.loads(row["usage_json"])["status"], "action_required"
+                )
+                database.close()
+
+    async def test_real_image_client_cancellation_is_not_reposted(self):
+        import httpx
+
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-IMAGE-CANCEL','T-1','image cancel','PRODUCTION_RUNNING','{}')"
+        )
+        database.commit()
+        posts = 0
+
+        def handler(_provider_request):
+            nonlocal posts
+            posts += 1
+            raise asyncio.CancelledError()
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        kwargs = dict(
+            job_id="J-IMAGE-CANCEL",
+            shot_idx=-1001,
+            provider="seedream_identity",
+            intent="character_identity_anchor",
+            task_id="seedream-identity:J-IMAGE-CANCEL:lead",
+            prompt="portrait",
+            resolution="1440x2560",
+            model="seedream-test",
+            usage={},
+            cost_cents=29,
+        )
+        with (
+            patch.dict(os.environ, {"ARK_API_KEY": "test-key"}),
+            patch.object(seedance.httpx, "AsyncClient", return_value=client),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await s3_shots._submit_paid_image(database, **kwargs)
+            with self.assertRaisesRegex(Exception, "local-submit|核对"):
+                await s3_shots._submit_paid_image(database, **kwargs)
+
+        self.assertEqual(posts, 1)
+        row = database.execute("SELECT task_id,usage_json FROM provider_calls").fetchone()
+        self.assertTrue(row["task_id"].startswith("local-submit:"))
+        self.assertEqual(json.loads(row["usage_json"])["status"], "action_required")
+        database.close()
+
+    async def test_real_image_client_connect_failure_releases_reservation(self):
+        import httpx
+
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-IMAGE-CONNECT','T-1','image connect','PRODUCTION_RUNNING','{}')"
+        )
+        database.commit()
+
+        def handler(provider_request):
+            raise httpx.ConnectError("connection refused", request=provider_request)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with (
+            patch.dict(os.environ, {"ARK_API_KEY": "test-key"}),
+            patch.object(seedance.httpx, "AsyncClient", return_value=client),
+        ):
+            with self.assertRaises(seedance.SeedanceSubmissionUnknownError) as raised:
+                await s3_shots._submit_paid_image(
+                    database,
+                    job_id="J-IMAGE-CONNECT",
+                    shot_idx=-1001,
+                    provider="seedream_identity",
+                    intent="character_identity_anchor",
+                    task_id="seedream-identity:J-IMAGE-CONNECT:lead",
+                    prompt="portrait",
+                    resolution="1440x2560",
+                    model="seedream-test",
+                    usage={},
+                    cost_cents=29,
+                )
+
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(
+            database.execute("SELECT COUNT(*) FROM provider_calls").fetchone()[0], 0
+        )
+        database.close()
+
+    async def test_shared_paid_image_gate_blocks_pending_and_action_required_before_post(self):
+        for status in ("pending", "action_required"):
+            with self.subTest(status=status):
+                database = sqlite3.connect(":memory:")
+                database.row_factory = sqlite3.Row
+                database.executescript(db.DDL)
+                database.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                    "VALUES('J-IMAGE-GATE','T-1','image gate','PRODUCTION_RUNNING','{}')"
+                )
+                database.execute(
+                    "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) "
+                    "VALUES('remote-image','J-IMAGE-GATE',1,'seedream_scene','generate',?)",
+                    (json.dumps({"status": status}),),
+                )
+                database.commit()
+                submit = AsyncMock(return_value=b"must-not-submit")
+
+                with patch.object(s3_shots.seedance, "text_to_image", new=submit):
+                    with self.assertRaisesRegex(Exception, "remote-image|核对") as raised:
+                        await s3_shots._submit_paid_image(
+                            database,
+                            job_id="J-IMAGE-GATE",
+                            shot_idx=-2001,
+                            provider="seedream_scene",
+                            intent="scene_visual_anchor",
+                            task_id="seedream-scene:J-IMAGE-GATE:yard",
+                            prompt="empty equipment yard",
+                            resolution="1440x2560",
+                            model="seedream-test",
+                            usage={"anchor_key": "yard"},
+                            cost_cents=29,
+                        )
+
+                submit.assert_not_awaited()
+                self.assertEqual(
+                    getattr(raised.exception, "pause_state", None),
+                    "PROVIDER_ACTION_REQUIRED",
+                )
+                database.close()
+
+    async def test_paid_image_success_remains_staged_until_asset_commit(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-IMAGE-OK','T-1','image ok','PRODUCTION_RUNNING','{}')"
+        )
+        database.commit()
+
+        with patch.object(
+            s3_shots.seedance, "text_to_image", new=AsyncMock(return_value=b"png")
+        ) as submit:
+            image, reservation_id = await s3_shots._submit_paid_image(
+                database,
+                job_id="J-IMAGE-OK",
+                shot_idx=-1001,
+                provider="seedream_identity",
+                intent="character_identity_anchor",
+                task_id="seedream-identity:J-IMAGE-OK:lead",
+                prompt="portrait",
+                resolution="1440x2560",
+                model="seedream-test",
+                usage={"anchor_mode": "static_image"},
+                cost_cents=29,
+            )
+
+        self.assertEqual(image, b"png")
+        self.assertTrue(reservation_id.startswith("local-submit:"))
+        submit.assert_awaited_once()
+        rows = database.execute(
+            "SELECT task_id,cost_cents,usage_json FROM provider_calls ORDER BY task_id"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["task_id"], reservation_id)
+        self.assertEqual(rows[0]["cost_cents"], 0)
+        self.assertEqual(
+            json.loads(rows[0]["usage_json"])["status"], "action_required"
+        )
+        database.close()
+
+    async def test_paid_image_definite_failure_releases_reservation(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-IMAGE-FAIL','T-1','image fail','PRODUCTION_RUNNING','{}')"
+        )
+        database.commit()
+
+        with patch.object(
+            s3_shots.seedance, "text_to_image",
+            new=AsyncMock(side_effect=seedance.SeedanceParameterError("bad request")),
+        ):
+            with self.assertRaises(seedance.SeedanceParameterError):
+                await s3_shots._submit_paid_image(
+                    database,
+                    job_id="J-IMAGE-FAIL",
+                    shot_idx=-1001,
+                    provider="seedream_identity",
+                    intent="character_identity_anchor",
+                    task_id="seedream-identity:J-IMAGE-FAIL:lead",
+                    prompt="portrait",
+                    resolution="1440x2560",
+                    model="seedream-test",
+                    usage={},
+                    cost_cents=29,
+                )
+
+        self.assertEqual(
+            database.execute("SELECT COUNT(*) FROM provider_calls").fetchone()[0], 0
+        )
+        database.close()
+
+    async def test_paid_image_unknown_submit_stays_action_required_and_is_not_reposted(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-IMAGE-UNKNOWN','T-1','image unknown','PRODUCTION_RUNNING','{}')"
+        )
+        database.commit()
+        unknown = seedance.SeedanceSubmissionUnknownError("submit result unknown")
+        submit = AsyncMock(side_effect=unknown)
+        kwargs = dict(
+            job_id="J-IMAGE-UNKNOWN",
+            shot_idx=-2001,
+            provider="seedream_scene",
+            intent="scene_visual_anchor",
+            task_id="seedream-scene:J-IMAGE-UNKNOWN:yard",
+            prompt="empty yard",
+            resolution="1440x2560",
+            model="seedream-test",
+            usage={},
+            cost_cents=29,
+        )
+
+        with patch.object(s3_shots.seedance, "text_to_image", new=submit):
+            with self.assertRaises(seedance.SeedanceSubmissionUnknownError):
+                await s3_shots._submit_paid_image(database, **kwargs)
+            with self.assertRaisesRegex(Exception, "local-submit|核对"):
+                await s3_shots._submit_paid_image(database, **kwargs)
+
+        self.assertEqual(submit.await_count, 1)
+        row = database.execute(
+            "SELECT task_id,usage_json FROM provider_calls"
+        ).fetchone()
+        self.assertTrue(row["task_id"].startswith("local-submit:"))
+        self.assertEqual(json.loads(row["usage_json"])["status"], "action_required")
+        database.close()
+
+    async def test_shared_paid_submit_gate_blocks_cli_bypass_before_provider_post(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-CLI-GATE','T-1','cli gate','PRODUCTION_RUNNING','{}')"
+        )
+        database.execute(
+            "INSERT INTO shots(job_id,idx,state) "
+            "VALUES('J-CLI-GATE',1,'PENDING')"
+        )
+        database.execute(
+            "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) "
+            "VALUES('remote-pending','J-CLI-GATE',1,'seedance','generate',?)",
+            (json.dumps({"status": "pending"}),),
+        )
+        database.commit()
+        route = video_routing.VideoRoute(
+            model="seedance25", tier="seedance25",
+            generate_audio=False, qa_required=False,
+        )
+        submit = AsyncMock(return_value=b"must-not-submit")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            s3_shots.seedance, "text_to_video", new=submit
+        ):
+            with self.assertRaisesRegex(Exception, "remote-pending|核对") as raised:
+                await s3_shots._generate_seedance_video(
+                    prompt="equipment",
+                    route=route,
+                    request_kwargs={"duration": 4, "resolution": "480p"},
+                    out_path=Path(tmp) / "shot.mp4",
+                    key_hint="cli-bypass",
+                    job_id="J-CLI-GATE",
+                    shot_idx=1,
+                    database=database,
+                )
+
+        submit.assert_not_awaited()
+        self.assertEqual(
+            getattr(raised.exception, "pause_state", None),
+            "PROVIDER_ACTION_REQUIRED",
+        )
+        database.close()
     async def test_continuity_drift_is_merged_into_master_quality_gate(self):
         route = video_routing.VideoRoute(
             model="seedance25", tier="seedance25",
@@ -2268,9 +5956,10 @@ class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
             "missing_industry_subject", "meaningless_hand_closeup",
         ))
         with tempfile.TemporaryDirectory() as tmp:
-            master = Path(tmp) / "shot.mp4"
+            master = Path(tmp) / "J-REVIEW" / "shots" / "02.mp4"
+            master.parent.mkdir(parents=True)
             master.write_bytes(b"accepted-master")
-            with patch.object(
+            with patch.object(s3_shots, "ASSETS_DIR", Path(tmp)), patch.object(
                     s3_shots.seedance, "text_to_video",
                     new=AsyncMock(return_value=b"bad-candidate"),
                 ) as generate, patch.object(
@@ -2322,17 +6011,153 @@ class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
                 "INSERT INTO shots(job_id,idx,state) "
                 "VALUES('J-REVIEW',2,'PENDING')"
             )
-            s3_shots._record_failed_generation(
-                database, "J-REVIEW", 2, raised.exception
-            )
-            qa = json.loads(database.execute(
-                "SELECT video_qa FROM shots WHERE job_id='J-REVIEW' AND idx=2"
-            ).fetchone()[0])
+            with patch.object(s3_shots, "ASSETS_DIR", Path(tmp)):
+                s3_shots._record_failed_generation(
+                    database, "J-REVIEW", 2, raised.exception
+                )
+            recorded = database.execute(
+                "SELECT state,video_qa FROM shots "
+                "WHERE job_id='J-REVIEW' AND idx=2"
+            ).fetchone()
+            qa = json.loads(recorded["video_qa"])
             database.close()
-            self.assertEqual(
-                Path(qa["candidate_path"]), raised.exception.candidate_path
-            )
+            self.assertEqual(recorded["state"], "REVIEW_REQUIRED")
+            self.assertTrue(os.path.samefile(
+                qa["candidate_path"], raised.exception.candidate_path
+            ))
             self.assertEqual(qa["candidate_url"], "https://qa/candidate")
+
+    def test_quality_error_without_candidate_is_a_real_failure(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state) "
+            "VALUES('J-NO-CANDIDATE','T-1','no candidate','PRODUCTION_RUNNING')"
+        )
+        database.execute(
+            "INSERT INTO shots(job_id,idx,state) "
+            "VALUES('J-NO-CANDIDATE',1,'GENERATING')"
+        )
+        quality_error = s3_shots.SeedanceQualityError(
+            "quality analysis failed before preview was saved",
+            cost_cents=0,
+            provider_calls=(),
+            reasons=("qa_error",),
+            candidate_path=Path("definitely-missing-candidate.mp4"),
+        )
+        self.assertFalse(hasattr(quality_error, "pause_state"))
+        try:
+            s3_shots._record_failed_generation(
+                database,
+                "J-NO-CANDIDATE",
+                1,
+                quality_error,
+            )
+            shot = database.execute(
+                "SELECT state,video_qa,error FROM shots "
+                "WHERE job_id='J-NO-CANDIDATE' AND idx=1"
+            ).fetchone()
+        finally:
+            database.close()
+
+        self.assertEqual(shot["state"], "FAILED")
+        self.assertIsNone(shot["video_qa"])
+        self.assertIn("SeedanceQualityError", shot["error"])
+
+    def test_quality_error_rejects_url_only_and_outside_asset_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            controlled = assets / "J-CANDIDATE-RULE" / "shots" / "review"
+            controlled.mkdir(parents=True)
+            outside = Path(tmp) / "outside-candidate.mp4"
+            outside.write_bytes(b"paid-but-uncontrolled")
+            cases = (
+                (None, "https://cdn.example/url-only.mp4"),
+                (outside, "https://cdn.example/outside.mp4"),
+            )
+            for index, (candidate_path, candidate_url) in enumerate(cases, 1):
+                with self.subTest(candidate_path=candidate_path):
+                    database = sqlite3.connect(":memory:")
+                    database.row_factory = sqlite3.Row
+                    database.executescript(db.DDL)
+                    database.execute(
+                        "INSERT INTO jobs(job_id,topic_id,title,state) "
+                        "VALUES('J-CANDIDATE-RULE','T-1','candidate rule',"
+                        "'PRODUCTION_RUNNING')"
+                    )
+                    database.execute(
+                        "INSERT INTO shots(job_id,idx,state) "
+                        "VALUES('J-CANDIDATE-RULE',?,'GENERATING')",
+                        (index,),
+                    )
+                    quality_error = s3_shots.SeedanceQualityError(
+                        "soft QA without a controlled preview",
+                        cost_cents=600,
+                        provider_calls=(),
+                        reasons=("identity_drift",),
+                        candidate_path=candidate_path,
+                        candidate_url=candidate_url,
+                    )
+                    with patch.object(s3_shots, "ASSETS_DIR", assets):
+                        s3_shots._record_failed_generation(
+                            database, "J-CANDIDATE-RULE", index, quality_error
+                        )
+                    shot = database.execute(
+                        "SELECT state,video_qa FROM shots "
+                        "WHERE job_id='J-CANDIDATE-RULE' AND idx=?",
+                        (index,),
+                    ).fetchone()
+                    database.close()
+                    self.assertEqual(shot["state"], "FAILED")
+                    self.assertIsNone(shot["video_qa"])
+                    self.assertFalse(hasattr(quality_error, "pause_state"))
+
+    def test_quality_error_accepts_only_real_candidate_under_job_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            candidate = (
+                assets / "J-CONTROLLED-CANDIDATE" / "shots" / "review"
+                / "01-candidate.mp4"
+            )
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"controlled-preview")
+            database = sqlite3.connect(":memory:")
+            database.row_factory = sqlite3.Row
+            database.executescript(db.DDL)
+            database.execute(
+                "INSERT INTO jobs(job_id,topic_id,title,state) "
+                "VALUES('J-CONTROLLED-CANDIDATE','T-1','controlled',"
+                "'PRODUCTION_RUNNING')"
+            )
+            database.execute(
+                "INSERT INTO shots(job_id,idx,state) "
+                "VALUES('J-CONTROLLED-CANDIDATE',1,'GENERATING')"
+            )
+            quality_error = s3_shots.SeedanceQualityError(
+                "soft QA with controlled preview",
+                cost_cents=600,
+                provider_calls=(),
+                reasons=("identity_drift",),
+                candidate_path=candidate,
+                candidate_url="https://cdn.example/controlled.mp4",
+            )
+            with patch.object(s3_shots, "ASSETS_DIR", assets):
+                s3_shots._record_failed_generation(
+                    database, "J-CONTROLLED-CANDIDATE", 1, quality_error
+                )
+            shot = database.execute(
+                "SELECT state,video_qa FROM shots "
+                "WHERE job_id='J-CONTROLLED-CANDIDATE' AND idx=1"
+            ).fetchone()
+            database.close()
+
+        self.assertEqual(shot["state"], "REVIEW_REQUIRED")
+        self.assertEqual(
+            Path(json.loads(shot["video_qa"])["candidate_path"]).resolve(),
+            candidate.resolve(),
+        )
+        self.assertEqual(quality_error.pause_state, "PRODUCTION_REVIEW_REQUIRED")
 
     async def test_generation_qa_always_forbids_generated_readable_text(self):
         route = video_routing.VideoRoute(
@@ -2368,6 +6193,44 @@ class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(analyze.call_args.kwargs["forbid_readable_text"])
+
+    async def test_generation_can_skip_optional_asr_without_skipping_visual_qa(self):
+        route = video_routing.VideoRoute(
+            model="seedance25", tier="seedance25",
+            generate_audio=True, qa_required=True,
+        )
+        passed = video_qa.QADecision(True, ())
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(
+                    s3_shots.seedance, "text_to_video",
+                    new=AsyncMock(return_value=b"video"),
+                ), \
+                patch.object(
+                    s3_shots.tos, "upload", new=Mock(return_value="https://qa/video")
+                ), \
+                patch.object(
+                    s3_shots.video_qa, "analyze",
+                    new=Mock(return_value=({"visual_alignment": 0.95}, passed)),
+                ) as analyze, \
+                patch.object(
+                    s3_shots.ffmpeg, "extract_audio_wav", new=AsyncMock()
+                ), \
+                patch.object(
+                    s3_shots.bigasr, "transcribe_detailed", new=Mock()
+                ) as transcribe:
+            result = await s3_shots._generate_seedance_video(
+                prompt="presenter speaking",
+                route=route,
+                request_kwargs={"duration": 4, "resolution": "480p"},
+                out_path=Path(tmp) / "shot.mp4",
+                key_hint="job-shot-asr-off",
+                expected_text="a line that remains subtitle guidance",
+                asr_enabled=False,
+            )
+
+        self.assertEqual(analyze.call_count, 1)
+        transcribe.assert_not_called()
+        self.assertEqual(result.transcription.text, "")
 
     async def test_provider_usage_is_recorded_on_generation_result(self):
         route = video_routing.VideoRoute(
@@ -2416,8 +6279,10 @@ class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
             (b"first", "task-first", 100000),
             (b"retry", "task-retry", 200000),
         ])
+        submitted_prompts = []
 
         async def generate_with_usage(**kwargs):
+            submitted_prompts.append(kwargs["prompt"])
             video, task_id, tokens = next(generated)
             kwargs["metadata_out"].update({
                 "task_id": task_id,
@@ -2464,8 +6329,149 @@ class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
             [call["task_id"] for call in result.provider_calls],
             ["task-first", "task-retry"],
         )
+        self.assertTrue(submitted_prompts[0].startswith("machine close-up"))
+        self.assertIn("上一次画面出现了不应存在的可读文字", submitted_prompts[1])
+        self.assertIn("纯色无字", submitted_prompts[1])
         self.assertIn("task-first", result.qa_note)
         self.assertIn("task-retry", result.qa_note)
+
+    async def test_retry_soft_visual_mismatch_preserves_paid_candidate_for_review(self):
+        route = video_routing.VideoRoute(
+            model="seedance25", tier="seedance25",
+            generate_audio=False, qa_required=True,
+        )
+        generated = iter([
+            (b"hard-failure", "task-hard", 100000),
+            (b"soft-candidate", "task-soft", 200000),
+        ])
+
+        async def generate_with_usage(**kwargs):
+            video, task_id, tokens = next(generated)
+            kwargs["metadata_out"].update({
+                "task_id": task_id,
+                "usage": {"completion_tokens": tokens},
+            })
+            return video
+
+        hard = video_qa.QADecision(False, ("unexpected_readable_text",))
+        soft = video_qa.QADecision(False, ("visual_mismatch",))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            s3_shots.seedance, "text_to_video",
+            new=AsyncMock(side_effect=generate_with_usage),
+        ) as generate, patch.object(
+            s3_shots.tos, "upload",
+            new=Mock(side_effect=["https://qa/hard", "https://qa/soft"]),
+        ), patch.object(
+            s3_shots.video_qa, "analyze",
+            new=Mock(side_effect=[
+                ({"has_readable_text": True}, hard),
+                ({"visual_alignment": 0.2}, soft),
+            ]),
+        ):
+            with self.assertRaises(s3_shots.SeedanceQualityError) as raised:
+                await s3_shots._generate_seedance_video(
+                    prompt="equipment yard",
+                    route=route,
+                    request_kwargs={"duration": 4, "resolution": "480p"},
+                    out_path=Path(tmp) / "shot.mp4",
+                    key_hint="job-shot-soft-retry",
+                )
+
+            error = raised.exception
+            self.assertEqual(generate.await_count, 2)
+            self.assertEqual(error.pause_state, "PRODUCTION_REVIEW_REQUIRED")
+            self.assertEqual(error.reasons, ("visual_mismatch",))
+            self.assertEqual(error.cost_cents, 2100)
+            self.assertEqual(
+                [call["task_id"] for call in error.provider_calls],
+                ["task-hard", "task-soft"],
+            )
+            self.assertEqual(error.candidate_url, "https://qa/soft")
+            self.assertTrue(error.candidate_path.is_file())
+            self.assertEqual(error.candidate_path.read_bytes(), b"soft-candidate")
+
+    async def test_retry_account_error_keeps_first_paid_call_for_idempotent_billing(self):
+        route = video_routing.VideoRoute(
+            model="seedance25", tier="seedance25",
+            generate_audio=False, qa_required=True,
+        )
+
+        generation_count = 0
+
+        async def first_then_account_error(**kwargs):
+            nonlocal generation_count
+            generation_count += 1
+            if generation_count == 1:
+                kwargs["metadata_out"].update({
+                    "task_id": "task-first-paid",
+                    "usage": {"completion_tokens": 100000},
+                })
+                return b"first-paid"
+            raise seedance.SeedanceAccountUnavailableError("account overdue")
+
+        generate = AsyncMock(side_effect=first_then_account_error)
+        hard = video_qa.QADecision(False, ("unexpected_readable_text",))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            s3_shots.seedance, "text_to_video", new=generate,
+        ), patch.object(
+            s3_shots.tos, "upload", return_value="https://qa/first-paid",
+        ), patch.object(
+            s3_shots.video_qa, "analyze",
+            return_value=({"has_readable_text": True}, hard),
+        ):
+            with self.assertRaises(
+                seedance.SeedanceAccountUnavailableError
+            ) as raised:
+                await s3_shots._generate_seedance_video(
+                    prompt="equipment yard",
+                    route=route,
+                    request_kwargs={"duration": 4, "resolution": "480p"},
+                    out_path=Path(tmp) / "shot.mp4",
+                    key_hint="job-shot-account-retry",
+                )
+
+        error = raised.exception
+        self.assertEqual(error.pause_state, "PROVIDER_ACTION_REQUIRED")
+        self.assertEqual(error.cost_cents, 700)
+        self.assertEqual(
+            [call["task_id"] for call in error.provider_calls],
+            ["task-first-paid"],
+        )
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state) "
+            "VALUES('J-ACCOUNT-RETRY','T-1','account retry','PRODUCTION_RUNNING')"
+        )
+        database.execute(
+            "INSERT INTO shots(job_id,idx,state) "
+            "VALUES('J-ACCOUNT-RETRY',1,'GENERATING')"
+        )
+        try:
+            s3_shots._record_failed_generation(
+                database, "J-ACCOUNT-RETRY", 1, error
+            )
+            s3_shots._record_failed_generation(
+                database, "J-ACCOUNT-RETRY", 1, error
+            )
+            shot = database.execute(
+                "SELECT cost_cents FROM shots WHERE job_id='J-ACCOUNT-RETRY'"
+            ).fetchone()
+            job = database.execute(
+                "SELECT cost_cents FROM jobs WHERE job_id='J-ACCOUNT-RETRY'"
+            ).fetchone()
+            calls = database.execute(
+                "SELECT task_id,cost_cents FROM provider_calls"
+            ).fetchall()
+        finally:
+            database.close()
+        self.assertEqual(shot["cost_cents"], 700)
+        self.assertEqual(job["cost_cents"], 700)
+        self.assertEqual(
+            [(row["task_id"], row["cost_cents"]) for row in calls],
+            [("task-first-paid", 700)],
+        )
 
     async def test_visual_mismatch_requires_manual_review_without_retry(self):
         route = video_routing.VideoRoute(
@@ -2699,7 +6705,9 @@ class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("output_format", generate.await_args_list[1].kwargs)
         self.assertNotIn("task_intent", generate.await_args_list[1].kwargs)
         self.assertNotIn("reference_videos", generate.await_args_list[1].kwargs)
-        self.assertEqual(generate.await_args_list[1].kwargs["prompt"], "machine close-up")
+        retry_prompt = generate.await_args_list[1].kwargs["prompt"]
+        self.assertTrue(retry_prompt.startswith("machine close-up"))
+        self.assertIn("画面文字通道关闭", retry_prompt)
         self.assertTrue(result.native_audio)
         self.assertEqual(result.video, b"correct")
         self.assertEqual(result.video_path.suffix, ".mp4")
@@ -2933,8 +6941,84 @@ class LegacyRuntimeRemovalTests(unittest.TestCase):
 
         self.assertNotIn("volcengine", requirements.lower())
 
+    def test_removed_executor_bypasses_and_duration_blockers_cannot_return(self):
+        production_files = [
+            PROJECT_ROOT / "scripts/factory/production_planner.py",
+            PROJECT_ROOT / "scripts/factory/video_routing.py",
+            PROJECT_ROOT / "scripts/factory/steps/s3_shots.py",
+            PROJECT_ROOT / "scripts/factory/steps/s5_bgm.py",
+            PROJECT_ROOT / "scripts/factory/clients/music.py",
+            PROJECT_ROOT / "scripts/factory/management_api.py",
+        ]
+        source = "\n".join(
+            path.read_text(encoding="utf-8") for path in production_files
+        )
+        for forbidden in (
+            "_via_suno_legacy",
+            "_run_legacy",
+            "standard director pipeline allows at most 3 paid masters",
+            "standard director pipeline paid master duration exceeds 90s",
+            "script variant requires exactly 6 beats",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    def test_core_execution_delegates_contract_state_and_error_semantics(self):
+        planner_source = inspect.getsource(production_planner.compile_job_spec)
+        orchestrator_source = inspect.getsource(orchestrator._process_job)
+        self.assertIn("compile_production_spec", planner_source)
+        self.assertNotIn("UPDATE jobs SET state", orchestrator_source)
+        self.assertIn("transition(", orchestrator_source)
+        self.assertIn("describe_failure", orchestrator_source)
+
 
 class Seedance25StateMachineTests(unittest.TestCase):
+    def test_batch_query_excludes_all_terminal_and_human_pause_states(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        states = [
+            "PENDING", "REJECTED", "PRODUCTION_REVIEW_REQUIRED",
+            "PROVIDER_ACTION_REQUIRED", "FAILED", "BLOCKED", "PUBLISHED",
+        ]
+        for index, state in enumerate(states):
+            database.execute(
+                "INSERT INTO jobs(job_id,topic_id,title,state,priority) "
+                "VALUES(?,?,?,?,1)",
+                (f"J-BATCH-{index}", f"T-{index}", state, state),
+            )
+        database.commit()
+        processed = []
+
+        async def capture(job_id, semaphore):
+            processed.append(job_id)
+
+        with patch.object(orchestrator, "conn", return_value=database), \
+                patch.object(orchestrator, "_import_topics", return_value=0), \
+                patch.object(orchestrator, "_process_job", new=capture):
+            asyncio.run(orchestrator.run_batch("ignored.csv"))
+
+        self.assertEqual(processed, ["J-BATCH-0"])
+        self.assertIs(orchestrator.BATCH_EXCLUDED_STATES, models.TERMINAL_STATES)
+        database.close()
+    def test_business_pause_states_are_terminal_without_being_failures(self):
+        self.assertEqual(
+            models.State.PRODUCTION_REVIEW_REQUIRED.value,
+            "PRODUCTION_REVIEW_REQUIRED",
+        )
+        self.assertEqual(
+            models.State.PROVIDER_ACTION_REQUIRED.value,
+            "PROVIDER_ACTION_REQUIRED",
+        )
+        self.assertIn("PRODUCTION_REVIEW_REQUIRED", models.TERMINAL_STATES)
+        self.assertIn("PROVIDER_ACTION_REQUIRED", models.TERMINAL_STATES)
+        self.assertNotEqual(
+            models.State.PRODUCTION_REVIEW_REQUIRED, models.State.FAILED
+        )
+        self.assertNotEqual(
+            models.State.PROVIDER_ACTION_REQUIRED, models.State.BLOCKED
+        )
+
     def test_anchor_review_pause_is_not_recorded_as_generation_failure(self):
         database = sqlite3.connect(":memory:")
         database.row_factory = sqlite3.Row
@@ -2964,21 +7048,155 @@ class Seedance25StateMachineTests(unittest.TestCase):
                 "SELECT state,error FROM jobs WHERE job_id='J-PAUSE'"
             ).fetchone()
             self.assertEqual(row["state"], "ANCHOR_REVIEW_REQUIRED")
-            self.assertIsNone(row["error"])
+            self.assertEqual(
+                row["error"],
+                "人物与场景锚点已生成，请完成一致性审核",
+            )
         finally:
             database.close()
 
     def test_paid_quality_guard_stops_step_level_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / "candidate.mp4"
+            candidate.write_bytes(b"candidate")
+            quality_error = s3_shots.SeedanceQualityError(
+                "manual review",
+                cost_cents=406,
+                provider_calls=(),
+                reasons=("visual_mismatch",),
+                candidate_path=candidate,
+                candidate_url="https://assets/candidate.mp4",
+            )
+            aggregate = s3_shots._aggregate_shot_failures([
+                (2, quality_error),
+            ])
+
+        self.assertFalse(orchestrator._should_retry_step(aggregate))
+        self.assertEqual(
+            aggregate.pause_state, "PRODUCTION_REVIEW_REQUIRED"
+        )
+
+    def test_account_overdue_failure_stops_step_level_retry(self):
+        aggregate = s3_shots._aggregate_shot_failures([
+            (3, seedance.SeedanceAccountUnavailableError("账号欠费")),
+        ])
+
+        self.assertFalse(orchestrator._should_retry_step(aggregate))
+        self.assertEqual(
+            aggregate.pause_state, "PROVIDER_ACTION_REQUIRED"
+        )
+
+    def test_technical_failure_prevents_soft_review_pause(self):
         quality_error = s3_shots.SeedanceQualityError(
             "manual review",
             cost_cents=406,
             provider_calls=(),
+            reasons=("visual_mismatch",),
+            candidate_path=Path("candidate.mp4"),
+            candidate_url="https://assets/candidate.mp4",
         )
+
         aggregate = s3_shots._aggregate_shot_failures([
-            (2, quality_error),
+            (1, quality_error),
+            (2, RuntimeError("provider timeout")),
         ])
 
-        self.assertFalse(orchestrator._should_retry_step(aggregate))
+        self.assertFalse(hasattr(aggregate, "pause_state"))
+
+    def test_provider_action_has_priority_in_mixed_failures(self):
+        aggregate = s3_shots._aggregate_shot_failures([
+            (1, RuntimeError("provider timeout")),
+            (2, seedance.SeedanceAccountUnavailableError("AccountOverdueError")),
+        ])
+
+        self.assertEqual(aggregate.pause_state, "PROVIDER_ACTION_REQUIRED")
+
+    def test_soft_quality_job_pauses_without_incrementing_step_retry(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,retries) "
+            "VALUES('J-QUALITY-PAUSE','T-Q','quality review',"
+            "'PRODUCTION_RUNNING','{}',2)"
+        )
+        database.commit()
+        try:
+            temp = tempfile.TemporaryDirectory()
+            candidate = Path(temp.name) / "candidate.mp4"
+            candidate.write_bytes(b"candidate")
+            error = s3_shots._aggregate_shot_failures([(
+                1,
+                s3_shots.SeedanceQualityError(
+                    "visual_mismatch candidate requires review",
+                    cost_cents=406,
+                    provider_calls=(),
+                    reasons=("visual_mismatch",),
+                    candidate_path=candidate,
+                    candidate_url="https://assets/candidate.mp4",
+                ),
+            )])
+            with (
+                patch.object(orchestrator, "conn", return_value=database),
+                patch.object(
+                    orchestrator, "_run_step", new=AsyncMock(side_effect=error)
+                ),
+            ):
+                asyncio.run(orchestrator._process_job(
+                    "J-QUALITY-PAUSE", asyncio.Semaphore(1)
+                ))
+            row = database.execute(
+                "SELECT state,retries,error FROM jobs "
+                "WHERE job_id='J-QUALITY-PAUSE'"
+            ).fetchone()
+            self.assertEqual(row["state"], "PRODUCTION_REVIEW_REQUIRED")
+            self.assertEqual(row["retries"], 2)
+            self.assertEqual(
+                row["error"],
+                "母片已生成但需要人工复核，请处理候选母片",
+            )
+        finally:
+            temp.cleanup()
+            database.close()
+
+    def test_account_overdue_job_pauses_without_incrementing_step_retry(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,retries) "
+            "VALUES('J-ACCOUNT-PAUSE','T-A','account action',"
+            "'PRODUCTION_RUNNING','{}',1)"
+        )
+        database.commit()
+        error = s3_shots._aggregate_shot_failures([(
+            1,
+            seedance.SeedanceAccountUnavailableError(
+                "AccountOverdueError: recharge the Ark account"
+            ),
+        )])
+        try:
+            with (
+                patch.object(orchestrator, "conn", return_value=database),
+                patch.object(
+                    orchestrator, "_run_step", new=AsyncMock(side_effect=error)
+                ),
+            ):
+                asyncio.run(orchestrator._process_job(
+                    "J-ACCOUNT-PAUSE", asyncio.Semaphore(1)
+                ))
+            row = database.execute(
+                "SELECT state,retries,error FROM jobs "
+                "WHERE job_id='J-ACCOUNT-PAUSE'"
+            ).fetchone()
+            self.assertEqual(row["state"], "PROVIDER_ACTION_REQUIRED")
+            self.assertEqual(row["retries"], 1)
+            self.assertEqual(
+                row["error"],
+                "模型账号当前不可用，请处理账号后再恢复任务",
+            )
+        finally:
+            database.close()
 
     def test_transient_step_error_remains_retryable(self):
         self.assertTrue(
@@ -2986,13 +7204,11 @@ class Seedance25StateMachineTests(unittest.TestCase):
         )
 
     def test_successful_steps_clear_stale_retry_errors(self):
-        dialogue_source = inspect.getsource(s3_shots._gen_dialogue)
-        broll_source = inspect.getsource(s3_shots._gen_broll)
+        shot_commit_source = inspect.getsource(s3_shots._commit_generated_shot)
         orchestrator_source = inspect.getsource(orchestrator._process_job)
 
-        self.assertIn("error=NULL", dialogue_source)
-        self.assertIn("error=NULL", broll_source)
-        self.assertIn("error=NULL", orchestrator_source)
+        self.assertIn("error=NULL", shot_commit_source)
+        self.assertIn('"error": None', orchestrator_source)
 
     def test_state_machine_skips_voice_generation_step(self):
         step_names = [step for _, step, _ in models.TRANSITIONS]
@@ -3022,6 +7238,19 @@ class Seedance25StateMachineTests(unittest.TestCase):
 
 
 class HookOverlaySizingTests(unittest.TestCase):
+    def test_in_video_hook_overlay_is_opt_in(self):
+        storyboard = {
+            "hook": "暴雨夜抢修为什么不能只看高度",
+            "production_settings": {},
+        }
+
+        self.assertIsNone(s6_compose._in_video_hook_text(storyboard))
+        storyboard["production_settings"]["hook_overlay_enabled"] = True
+        self.assertEqual(
+            s6_compose._in_video_hook_text(storyboard),
+            "暴雨夜抢修为什么不能只看高度",
+        )
+
     def test_long_hook_font_size_fits_single_line(self):
         hook = "设备租赁？狗都不干！狗不干，我干。"
         size = ffmpeg._hook_font_size(hook, 1080)
@@ -3049,7 +7278,58 @@ class HookOverlaySizingTests(unittest.TestCase):
         )
 
 
+class SubtitleSemanticChunkingTests(unittest.TestCase):
+    def test_v2_timeline_is_refreshed_after_semantic_chunking_upgrade(self):
+        self.assertGreater(subtitles.SPEECH_TIMELINE_VERSION, 2)
+        self.assertTrue(s6_compose._speech_timeline_needs_refresh({
+            "speech_timeline_version": 2,
+        }))
+        self.assertFalse(s6_compose._speech_timeline_needs_refresh({
+            "speech_timeline_version": subtitles.SPEECH_TIMELINE_VERSION,
+        }))
+
+    def test_medium_clause_stays_intact_for_balanced_visual_wrapping(self):
+        phrases = subtitles.split_phrases(
+            "我选了一台28米级曲臂高空作业平台。", max_chars=14
+        )
+
+        self.assertEqual(phrases, ["我选了一台28米级曲臂高空作业平台"])
+        self.assertFalse(any(
+            left.endswith("作") and right.startswith("业")
+            for left, right in zip(phrases, phrases[1:])
+        ))
+
+    def test_enumeration_pause_is_a_subtitle_boundary(self):
+        self.assertEqual(
+            subtitles.split_phrases(
+                "但进场前要再确认支腿区域、风速和高空坠落防护。",
+                max_chars=14,
+            ),
+            ["但进场前要再确认支腿区域", "风速和高空坠落防护"],
+        )
+
+
 class ThumbnailEncodingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_continuity_cover_uses_first_stable_frame_without_overlay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            out = base / "thumbnail.jpg"
+
+            async def render(_args):
+                out.write_bytes(b"jpeg")
+
+            with patch.object(
+                ffmpeg, "_run", new=AsyncMock(side_effect=render)
+            ) as run:
+                await ffmpeg.generate_continuity_cover(
+                    base / "final.mp4", out
+                )
+
+        args = run.await_args.args[0]
+        self.assertEqual(float(args[args.index("-ss") + 1]), 0.04)
+        self.assertNotIn("-vf", args)
+        self.assertEqual(args[args.index("-frames:v") + 1], "1")
+
     async def test_thumbnail_uses_full_range_single_thread_mjpeg(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -3105,6 +7385,215 @@ class ThumbnailEncodingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.anchor_generators = patch.dict(os.environ, {
+            "CHARACTER_ANCHOR_GENERATOR": "seedream_5_0",
+            "SCENE_ANCHOR_GENERATOR": "seedream_5_0",
+        })
+        self.anchor_generators.start()
+
+    def tearDown(self):
+        self.anchor_generators.stop()
+
+    def test_distinct_subspaces_share_one_explicit_project_site_anchor(self):
+        storyboard = {
+            "masters": [
+                {
+                    "idx": 1,
+                    "scene": "沿海城市工厂装卸区，暴雨夜",
+                    "scene_anchor_key": "factory-loading-yard-night",
+                    "site_anchor_key": "coastal-factory-site",
+                    "site_anchor_description": "沿海城市工厂项目现场",
+                },
+                {
+                    "idx": 4,
+                    "scene": "工厂产线旁，傍晚",
+                    "scene_anchor_key": "factory-production-line-evening",
+                    "site_anchor_key": "coastal-factory-site",
+                    "site_anchor_description": "沿海城市工厂项目现场",
+                },
+            ]
+        }
+
+        plan = scene_assets.recurring_scene_anchors(storyboard)
+
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["anchor_key"], "coastal-factory-site")
+        self.assertEqual(plan[0]["anchor_scope"], "site")
+        self.assertEqual(plan[0]["master_indexes"], [1, 4])
+        self.assertEqual(
+            plan[0]["description"], "沿海城市工厂项目现场"
+        )
+
+    def test_exact_scene_reference_wins_then_falls_back_to_project_site(self):
+        master = {
+            "scene_anchor_key": "factory-loading-yard-night",
+            "site_anchor_key": "coastal-factory-site",
+        }
+
+        self.assertEqual(
+            scene_assets.reference_anchor_key(
+                master,
+                {"factory-loading-yard-night", "coastal-factory-site"},
+            ),
+            "factory-loading-yard-night",
+        )
+        self.assertEqual(
+            scene_assets.reference_anchor_key(
+                master, {"coastal-factory-site"}
+            ),
+            "coastal-factory-site",
+        )
+
+    def test_project_site_anchor_prompt_does_not_lock_child_scene_layout(self):
+        prompt = scene_assets.scene_anchor_prompt({
+            "anchor_key": "coastal-factory-site",
+            "anchor_scope": "site",
+            "description": "沿海城市工厂项目现场",
+        })
+
+        self.assertIn("WORLD / SITE CONTINUITY", prompt)
+        self.assertIn("Do not lock the exact subspace layout", prompt)
+        self.assertNotIn("Lock architecture, equipment placement", prompt)
+
+    def test_project_site_reference_has_world_duty_not_exact_scene_duty(self):
+        shot = {
+            "idx": 1,
+            "duration_sec": 4,
+            "voiceover": "开始检查设备。",
+            "_spatial_anchor_scope": "site",
+        }
+
+        request = s3_shots._dialogue_request_kwargs(
+            shot,
+            None,
+            character={"id": "engineer", "generation_mode": "ai_generated"},
+            scene_reference="https://assets.example/project-site.png",
+        )
+        prompt = s3_shots._build_native_dialogue_prompt(
+            shot,
+            {"id": "engineer", "generation_mode": "ai_generated"},
+            scene_anchored=True,
+            reference_manifest=request["reference_manifest"],
+        )
+
+        scene_reference = next(
+            item for item in request["reference_manifest"]
+            if item["uri"].endswith("project-site.png")
+        )
+        self.assertEqual(scene_reference["duty"], "site_continuity")
+        self.assertIn("PROJECT SITE CONTINUITY", prompt)
+        self.assertNotIn("固定场景键", prompt)
+
+    def test_generated_anchor_review_defaults_to_manual(self):
+        self.assertEqual(s3_shots.normalize_anchor_review_mode(None), "manual")
+        self.assertEqual(s3_shots.normalize_anchor_review_mode(""), "manual")
+        self.assertEqual(s3_shots.normalize_anchor_review_mode("auto"), "auto")
+
+    def test_auto_review_mode_approves_ready_generated_anchors(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute(
+            "INSERT INTO character_identity_anchors("
+            "job_id,identity_key,character_id,display_name,source_type,state,approval_state) "
+            "VALUES('J-AUTO','script:lead','lead','Lead','seedream_identity_image',"
+            "'READY','PENDING_REVIEW')"
+        )
+        database.execute(
+            "INSERT INTO scene_visual_anchors("
+            "job_id,anchor_key,description,master_indexes,state,approval_state) "
+            "VALUES('J-AUTO','yard','Yard','[1]','READY','PENDING_REVIEW')"
+        )
+        database.commit()
+        try:
+            approved = s3_shots._apply_anchor_review_mode(
+                database, "J-AUTO", "auto"
+            )
+            states = {
+                row[0] for row in database.execute(
+                    "SELECT approval_state FROM character_identity_anchors "
+                    "WHERE job_id='J-AUTO' UNION ALL SELECT approval_state "
+                    "FROM scene_visual_anchors WHERE job_id='J-AUTO'"
+                ).fetchall()
+            }
+        finally:
+            database.close()
+
+        self.assertEqual(approved, 2)
+        self.assertEqual(states, {"APPROVED"})
+    async def test_scene_anchor_can_use_seedance_clip_and_extracted_frame(self):
+        storyboard = {
+            "production_settings": {
+                "scene_anchor_generator": "seedance_2_5",
+                "budget_cents": 5000,
+            },
+            "masters": [
+                {"idx": 1, "scene": "设备检修车间", "scene_anchor_key": "bay"},
+                {"idx": 2, "scene": "设备检修车间", "scene_anchor_key": "bay"},
+            ],
+        }
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            database_path = base / "factory.db"
+            video_path = base / "scene.mp4"
+            video_path.write_bytes(b"video")
+            preview_path = base / "scene-frame.jpg"
+            preview_path.write_bytes(b"jpg")
+            result = s3_shots.SeedanceGenerationResult(
+                video=b"video", video_path=video_path,
+                video_url="https://assets/scene.mp4", qa_note="{}",
+                native_audio=False, model="doubao-seedance-2-5-260628",
+                audio_path=None, cost_cents=408,
+                provider_calls=({
+                    "task_id": "scene-s25", "intent": "scene_anchor",
+                    "usage": {}, "cost_cents": 408,
+                },),
+            )
+            with (
+                patch.dict(os.environ, {"FACTORY_DB_PATH": str(database_path)}),
+                patch.object(s3_shots, "ASSETS_DIR", base / "assets"),
+                patch.object(
+                    s3_shots, "_generate_seedance_video",
+                    new=AsyncMock(return_value=result),
+                ) as video_generate,
+                patch.object(
+                    s3_shots.seedance, "text_to_image", new=AsyncMock()
+                ) as image_generate,
+                patch.object(
+                    s3_shots.ffmpeg, "extract_frames",
+                    new=AsyncMock(return_value=[preview_path]),
+                ),
+                patch.object(
+                    s3_shots.tos, "upload",
+                    return_value="https://assets/scene-frame.jpg",
+                ),
+            ):
+                database = db.conn()
+                database.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                    "VALUES(?,?,?,?,?)",
+                    ("J-SCENE-S25", "T", "scene", "PRODUCTION_RUNNING",
+                     json.dumps(storyboard)),
+                )
+                database.commit()
+                anchors = await s3_shots._ensure_scene_visual_anchors(
+                    "J-SCENE-S25", storyboard
+                )
+                row = database.execute(
+                    "SELECT generator,model,video_path,image_path,cost_cents "
+                    "FROM scene_visual_anchors WHERE job_id='J-SCENE-S25'"
+                ).fetchone()
+
+        self.assertEqual(image_generate.await_count, 0)
+        self.assertEqual(video_generate.await_count, 1)
+        self.assertEqual(anchors, {"bay": "https://assets/scene-frame.jpg"})
+        self.assertEqual(row["generator"], "seedance_2_5")
+        self.assertEqual(row["model"], "doubao-seedance-2-5-260628")
+        self.assertEqual(row["video_path"], str(video_path))
+        self.assertEqual(row["image_path"], str(preview_path))
+        self.assertEqual(row["cost_cents"], 408)
+
     def test_continuity_qa_context_prefers_canonical_refs_and_same_scene_video(self):
         speaker = {"id": "lead", "generation_mode": "ai_generated"}
         cast = [{"id": "client", "generation_mode": "ai_generated"}]
@@ -3251,6 +7740,63 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
             "yard-a",
         )
 
+    def test_fixed_asset_background_is_not_treated_as_wardrobe_contract(self):
+        characters = [{
+            "id": "staff",
+            "name": "老大",
+            "script_character_name": "女工作人员",
+            "generation_mode": "fixed_asset",
+            "identity_type": "virtual_person",
+            "seedance_asset_uri": "asset://staff",
+            "look": "古装戏楼名伶，身穿汉服",
+            "background_description": "古代戏楼中的角色背景",
+        }]
+        storyboard = {
+            "characters": characters,
+            "masters": [{
+                "idx": 1,
+                "speaker": "staff",
+                "scene": "场景：户外工程设备停车场；出镜人物：老大；人物动作：检查设备",
+                "action": "老大佩戴安全帽和反光背心检查设备",
+            }],
+        }
+
+        scene_assets.apply_continuity_metadata(storyboard, characters)
+
+        wardrobe = storyboard["masters"][0]["continuity_contract"]["characters"][0]["wardrobe"]
+        self.assertEqual(
+            wardrobe,
+            "服装与职业装备服从本剧本场景；同一场景内保持一致",
+        )
+        self.assertNotIn("汉服", wardrobe)
+
+    def test_ai_character_placeholder_is_not_treated_as_wardrobe_contract(self):
+        characters = [{
+            "id": "client",
+            "name": "客户",
+            "script_character_name": "客户",
+            "generation_mode": "ai_generated",
+            "look": "待在视频制作设置中绑定角色资产",
+        }]
+        storyboard = {
+            "characters": characters,
+            "masters": [{
+                "idx": 1,
+                "speaker": "client",
+                "scene": "场景：设备停车场；出镜人物：客户；人物动作：客户检查设备",
+                "action": "客户穿灰色工作服检查设备",
+            }],
+        }
+
+        scene_assets.apply_continuity_metadata(storyboard, characters)
+
+        wardrobe = storyboard["masters"][0]["continuity_contract"]["characters"][0]["wardrobe"]
+        self.assertEqual(
+            wardrobe,
+            "服装与职业装备服从本剧本场景；同一场景内保持一致",
+        )
+        self.assertNotIn("绑定角色资产", wardrobe)
+
     def test_source_scene_metadata_locks_repeated_space_and_two_identities(self):
         characters = [
             {
@@ -3327,12 +7873,9 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             request["reference_videos"],
-            [
-                "https://cdn/scene-previous.mp4",
-                "https://cdn/speaker-previous.mp4",
-            ],
+            ["https://cdn/scene-previous.mp4"],
         )
-        self.assertEqual(request["reference_video_duration_sec"], 12)
+        self.assertEqual(request["reference_video_duration_sec"], 8)
 
     def test_dialogue_prompt_contains_locked_scene_blocking_contract(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -3362,6 +7905,42 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("screen-right", prompt)
         self.assertIn("180", prompt)
         self.assertIn("人物身份仍以定妆照或授权角色资产为准", prompt)
+
+    def test_reference_video_budget_is_a_product_attention_guard(self):
+        self.assertEqual(
+            seedance.capability_profile(seedance.DEFAULT_MODEL)[
+                "reference_limits"
+            ]["reference_video"],
+            10,
+        )
+        with patch.dict(
+            os.environ,
+            {"SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET": "3"},
+        ):
+            self.assertEqual(
+                s3_shots.production_reference_video_budget(), 3
+            )
+
+    def test_dialogue_prompt_separates_identity_voice_and_scene_duties(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 2,
+                "duration_sec": 8,
+                "voiceover": "我们继续检查现场。",
+                "scene": "暴雨抢修现场",
+                "action": "工程师沿设备侧面移动检查",
+            },
+            {"id": "linxia", "name": "林夏"},
+            anchored=True,
+            voice_anchored=True,
+            scene_anchored=True,
+            previous_scene_anchored=True,
+        )
+
+        self.assertIn("身份参考只负责锁定人物身份", prompt)
+        self.assertIn("音频参考只负责延续原生声线", prompt)
+        self.assertIn("前序同场景视频只负责延续空间", prompt)
+        self.assertNotIn("前序视频只延续原生声线", prompt)
 
     def test_dialogue_prompt_serializes_structured_continuity_contract(self):
         prompt = s3_shots._build_native_dialogue_prompt(
@@ -3468,6 +8047,423 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_candidate_asr_extends_terminal_edit_to_speech_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            base = assets / "J-ASR-BACKFILL"
+            master = base / "shots" / "03.mp4"
+            audio = master.with_suffix(".wav")
+            master.parent.mkdir(parents=True)
+            master.write_bytes(b"video")
+            audio.write_bytes(b"audio")
+            storyboard = {
+                "production_mode": "native_master_local_director",
+                "production_settings": {"asr_enabled": True},
+                "masters": [{"idx": 3, "type": "dialogue"}],
+                "shots": [{
+                    "idx": 4,
+                    "video_master_idx": 3,
+                    "audio_master_idx": 3,
+                    "video_start": 0,
+                    "audio_start": 0,
+                    "duration": 16.5,
+                    "subtitle": "林夏的末句必须完整说完。",
+                }],
+            }
+            database = sqlite3.connect(":memory:")
+            database.row_factory = sqlite3.Row
+            database.executescript(db.DDL)
+            database.execute(
+                "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                "VALUES('J-ASR-BACKFILL','T-1','asr','SHOTS_OK',?)",
+                (json.dumps(storyboard, ensure_ascii=False),),
+            )
+            database.execute(
+                "INSERT INTO shots(job_id,idx,state,video_path) "
+                "VALUES('J-ASR-BACKFILL',3,'OK',?)",
+                (str(master),),
+            )
+            database.commit()
+            rows = database.execute(
+                "SELECT idx,video_path FROM shots WHERE job_id='J-ASR-BACKFILL'"
+            ).fetchall()
+            transcription = bigasr.Transcription(
+                "林夏的末句必须完整说完。",
+                2060,
+                16740,
+                (bigasr.TimedUtterance(
+                    "林夏的末句必须完整说完。", 11060, 16740
+                ),),
+            )
+
+            self.assertTrue(hasattr(
+                s6_compose, "_refresh_director_speech_timeline"
+            ))
+            with patch.object(s6_compose, "ASSETS_DIR", assets), \
+                    patch.object(
+                        s6_compose.bigasr, "transcribe_detailed",
+                        return_value=transcription,
+                    ) as transcribe, patch.object(
+                        s6_compose.ffmpeg, "probe_duration",
+                        new=AsyncMock(return_value=17.056),
+                    ):
+                changed = await s6_compose._refresh_director_speech_timeline(
+                    "J-ASR-BACKFILL", storyboard, rows, database
+                )
+
+            stored = json.loads(database.execute(
+                "SELECT storyboard FROM jobs WHERE job_id='J-ASR-BACKFILL'"
+            ).fetchone()["storyboard"])
+            database.close()
+
+        self.assertTrue(changed)
+        transcribe.assert_called_once_with(audio)
+        self.assertEqual(storyboard["shots"][0]["duration"], 16.89)
+        self.assertEqual(storyboard["masters"][0]["duration"], 16.89)
+        self.assertIsNone(storyboard["shots"][0]["subtitle"])
+        self.assertEqual(
+            storyboard["shots"][0]["subtitle_cues"][-1]["end"], 16.74
+        )
+        self.assertEqual(stored, storyboard)
+
+    async def test_asr_backfill_extends_only_terminal_edit_for_shared_master(self):
+        storyboard = {
+            "production_mode": "native_master_local_director",
+            "production_settings": {"asr_enabled": True},
+            "masters": [{"idx": 2, "type": "dialogue"}],
+            "shots": [
+                {
+                    "idx": 2, "video_master_idx": 2,
+                    "audio_master_idx": 2, "audio_start": 0,
+                    "video_start": 0, "duration": 8.5,
+                    "subtitle": "第一句",
+                },
+                {
+                    "idx": 3, "video_master_idx": 3,
+                    "audio_master_idx": 2, "audio_start": 8.5,
+                    "video_start": 0, "duration": 11.0,
+                    "subtitle": "第二句",
+                },
+            ],
+        }
+        transcription = bigasr.Transcription(
+            "第一句。第二句。", 3060, 19880,
+            (
+                bigasr.TimedUtterance("第一句。", 3060, 9110),
+                bigasr.TimedUtterance("第二句。", 12840, 19880),
+            ),
+        )
+
+        self.assertTrue(hasattr(
+            s6_compose, "_extend_terminal_edit_for_speech"
+        ))
+        changed = s6_compose._extend_terminal_edit_for_speech(
+            storyboard, 2, transcription, available_duration=20.064
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(storyboard["shots"][0]["duration"], 8.5)
+        self.assertEqual(storyboard["shots"][1]["duration"], 11.53)
+
+    def test_internal_director_cut_snaps_to_asr_utterance_boundary(self):
+        storyboard = {
+            "production_mode": "native_master_local_director",
+            "shots": [
+                {
+                    "idx": 2, "audio_master_idx": 2,
+                    "audio_start": 0, "duration": 8.5,
+                },
+                {
+                    "idx": 3, "audio_master_idx": 2,
+                    "audio_start": 8.5, "duration": 11.53,
+                },
+            ],
+        }
+        transcription = bigasr.Transcription(
+            "故障这么复杂。这设备可咋整啊？别先猜设备。",
+            3060,
+            19880,
+            (
+                bigasr.TimedUtterance("故障这么复杂。这设备可咋整啊？", 3060, 9110),
+                bigasr.TimedUtterance("别先猜设备。", 9550, 11590),
+                bigasr.TimedUtterance("十分钟后给你方案。", 12840, 19880),
+            ),
+        )
+
+        self.assertTrue(hasattr(
+            s6_compose, "_align_internal_edits_to_speech_pauses"
+        ))
+        changed = s6_compose._align_internal_edits_to_speech_pauses(
+            storyboard, 2, transcription
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(storyboard["shots"][0]["duration"], 9.11)
+        self.assertEqual(storyboard["shots"][1]["audio_start"], 9.11)
+        self.assertEqual(storyboard["shots"][1]["duration"], 10.92)
+
+    def test_video_qa_rejects_explicit_lip_sync_failure(self):
+        decision = video_qa.evaluate(
+            {
+                "transcript": "林夏立即启动应急调度",
+                "confidence": 1.0,
+                "lip_sync": False,
+            },
+            expect_speech=True,
+            expected_text="林夏立即启动应急调度",
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertIn("lip_sync_mismatch", decision.reasons)
+
+    def test_video_qa_rejects_a_located_low_alignment_interval(self):
+        raw = {
+            "transcript": "林夏立即启动应急调度",
+            "confidence": 1.0,
+            "lip_sync": True,
+            "lip_sync_evidence": {
+                "overall_alignment": 0.86,
+                "confidence": 0.91,
+                "segments": [{
+                    "start_sec": 2.6,
+                    "end_sec": 4.4,
+                    "alignment": 0.52,
+                    "confidence": 0.94,
+                    "offset_ms": 280,
+                    "dialogue": "启动应急调度",
+                    "reason": "嘴型晚于语音",
+                }],
+            },
+        }
+
+        decision = video_qa.evaluate(
+            raw,
+            expect_speech=True,
+            expected_text="林夏立即启动应急调度",
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertIn("lip_sync_mismatch", decision.reasons)
+        self.assertEqual(
+            raw["lip_sync_evidence"]["segments"][0]["offset_ms"], 280
+        )
+        self.assertEqual(
+            raw["lip_sync_evidence"]["segments"][0]["severity"], "high"
+        )
+
+    def test_video_qa_ignores_low_confidence_lip_sync_guess(self):
+        raw = {
+            "transcript": "林夏立即启动应急调度",
+            "confidence": 1.0,
+            "lip_sync": True,
+            "lip_sync_evidence": {
+                "overall_alignment": 0.48,
+                "confidence": 0.31,
+                "segments": [{
+                    "start_sec": 2.6,
+                    "end_sec": 4.4,
+                    "alignment": 0.42,
+                    "confidence": 0.31,
+                    "offset_ms": 300,
+                }],
+            },
+        }
+
+        decision = video_qa.evaluate(
+            raw,
+            expect_speech=True,
+            expected_text="林夏立即启动应急调度",
+        )
+
+        self.assertTrue(decision.passed)
+        self.assertEqual(decision.reasons, ())
+
+    async def test_dialogue_quality_analysis_requests_lip_sync_evidence(self):
+        route = video_routing.VideoRoute(
+            model="seedance25", tier="seedance25",
+            generate_audio=True, qa_required=True,
+        )
+        analyze = Mock(return_value=({
+            "lip_sync": True,
+            "visual_comparison": {"alignment": 1.0},
+            "lip_sync_evidence": {
+                "overall_alignment": 0.96,
+                "confidence": 0.93,
+                "segments": [],
+            },
+        }, video_qa.QADecision(True, ())))
+
+        async def generated(**kwargs):
+            kwargs["metadata_out"].update({
+                "task_id": "task-lip-evidence",
+                "usage": {"completion_tokens": 1000},
+            })
+            return b"video"
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            s3_shots.seedance, "text_to_video",
+            new=AsyncMock(side_effect=generated),
+        ), patch.object(
+            s3_shots.tos, "upload", return_value="https://qa/dialogue",
+        ), patch.object(
+            s3_shots.video_qa, "analyze", new=analyze,
+        ), patch.object(
+            s3_shots.ffmpeg, "extract_audio_wav", new=AsyncMock(),
+        ):
+            await s3_shots._generate_seedance_video(
+                prompt="林夏面对镜头说话",
+                route=route,
+                request_kwargs={"duration": 8, "resolution": "480p"},
+                out_path=Path(tmp) / "dialogue.mp4",
+                key_hint="lip-evidence-dialogue",
+                expected_text="立即启动应急调度",
+                fixed_transcription=bigasr.Transcription(
+                    "立即启动应急调度"
+                ),
+            )
+
+        self.assertTrue(analyze.call_args.kwargs["expect_speech"])
+
+    def test_cinematic_dialogue_prompt_keeps_speaker_mouth_visible(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 3,
+                "duration_sec": 16.5,
+                "render_mode": "cinematic_character",
+                "speaker": "林夏",
+                "speakers": ["林夏"],
+                "voiceover": "立即启动应急调度",
+                "scene": "暴雨夜抢修现场",
+                "action": "林夏指挥抢修",
+                "camera": "环绕推进",
+            },
+            {"id": "林夏", "generation_mode": "ai_generated"},
+        )
+
+        self.assertIn("关键音节时间窗", prompt)
+        self.assertIn("保护口型可见性", prompt)
+        self.assertIn("其他同场人物始终闭嘴", prompt)
+
+    async def test_successful_compose_finalizes_pending_candidate_audit_idempotently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            base = assets / "J-FINALIZE-CANDIDATE"
+            master = base / "shots" / "01.mp4"
+            candidate = base / "shots" / "review" / "01-candidate.mp4"
+            backup = base / "shots" / "review" / "01-prior.mp4"
+            candidate.parent.mkdir(parents=True)
+            master.write_bytes(b"accepted")
+            candidate.write_bytes(b"stale-candidate")
+            backup.write_bytes(b"prior-master")
+            database = sqlite3.connect(":memory:")
+            database.row_factory = sqlite3.Row
+            database.executescript(db.DDL)
+            database.execute(
+                "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                "VALUES('J-FINALIZE-CANDIDATE','T-1','finalize','SHOTS_OK','{}')"
+            )
+            database.execute(
+                "INSERT INTO shots(job_id,idx,state,video_path,video_qa) "
+                "VALUES('J-FINALIZE-CANDIDATE',1,'OK',?,?)",
+                (str(master), json.dumps({
+                    "status": "candidate_accepted_pending",
+                    "human_decision": "accept_candidate",
+                    "candidate_path": str(candidate),
+                    "prior_backup_path": str(backup),
+                    "reasons": ["identity_drift"],
+                })),
+            )
+            database.commit()
+
+            async def write_final(_concat, _bgm, final, **_kwargs):
+                final.write_bytes(b"composed")
+
+            with patch.object(s6_compose, "ASSETS_DIR", assets), \
+                    patch.object(s6_compose, "conn", return_value=database), \
+                    patch.object(
+                        s6_compose, "_prep_shot",
+                        new=AsyncMock(return_value=master),
+                    ), patch.object(
+                        s6_compose.ffmpeg, "concat_shots", new=AsyncMock()
+                    ), patch.object(
+                        s6_compose.ffmpeg, "mix_bgm",
+                        new=AsyncMock(side_effect=write_final),
+                    ), patch.dict(os.environ, {
+                        "APPEND_CTA": "false",
+                        "GEN_THUMBNAIL": "false",
+                        "GEN_MARKETING_THUMBNAIL": "false",
+                    }, clear=False):
+                await s6_compose.run("J-FINALIZE-CANDIDATE")
+                await s6_compose.run("J-FINALIZE-CANDIDATE")
+
+            qa = json.loads(database.execute(
+                "SELECT video_qa FROM shots "
+                "WHERE job_id='J-FINALIZE-CANDIDATE'"
+            ).fetchone()["video_qa"])
+            database.close()
+
+        self.assertEqual(qa["status"], "candidate_accepted")
+        self.assertNotIn("candidate_path", qa)
+        self.assertNotIn("prior_backup_path", qa)
+        self.assertFalse(candidate.exists())
+        self.assertFalse(backup.exists())
+
+    async def test_compose_does_not_fail_when_background_stdout_is_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "assets"
+            base = assets / "J-CLOSED-STDOUT"
+            master = base / "shots" / "01.mp4"
+            master.parent.mkdir(parents=True)
+            master.write_bytes(b"master")
+            database = sqlite3.connect(":memory:")
+            database.row_factory = sqlite3.Row
+            database.executescript(db.DDL)
+            database.execute(
+                "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                "VALUES('J-CLOSED-STDOUT','T-1','closed stdout','BGM_OK','{}')"
+            )
+            database.execute(
+                "INSERT INTO shots(job_id,idx,state,video_path) "
+                "VALUES('J-CLOSED-STDOUT',1,'OK',?)",
+                (str(master),),
+            )
+            database.commit()
+
+            async def write_final(_concat, _bgm, final, **_kwargs):
+                final.write_bytes(b"composed")
+
+            async def write_cover(_final, thumbnail):
+                thumbnail.write_bytes(b"cover")
+
+            with patch.object(s6_compose, "ASSETS_DIR", assets), \
+                    patch.object(s6_compose, "conn", return_value=database), \
+                    patch.object(
+                        s6_compose, "_prep_shot",
+                        new=AsyncMock(return_value=master),
+                    ), patch.object(
+                        s6_compose.ffmpeg, "concat_shots", new=AsyncMock()
+                    ), patch.object(
+                        s6_compose.ffmpeg, "mix_bgm",
+                        new=AsyncMock(side_effect=write_final),
+                    ), patch.object(
+                        s6_compose.ffmpeg, "generate_continuity_cover",
+                        new=AsyncMock(side_effect=write_cover),
+                    ), patch("builtins.print", side_effect=OSError(22, "closed")), \
+                    patch.dict(os.environ, {
+                        "APPEND_CTA": "false",
+                        "GEN_THUMBNAIL": "true",
+                        "GEN_MARKETING_THUMBNAIL": "false",
+                    }, clear=False):
+                await s6_compose.run("J-CLOSED-STDOUT")
+
+            final_path = database.execute(
+                "SELECT final_path FROM jobs WHERE job_id='J-CLOSED-STDOUT'"
+            ).fetchone()["final_path"]
+            final_bytes = Path(final_path).read_bytes()
+            database.close()
+
+        self.assertEqual(final_bytes, b"composed")
+
     def test_asr_timings_replace_estimated_static_subtitles_in_director_shots(self):
         storyboard = {
             "production_mode": "native_master_local_director",
@@ -3509,12 +8505,17 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(storyboard["shots"][0]["subtitle"])
         self.assertEqual(
             storyboard["shots"][0]["subtitle_cues"],
-            [{"start": 2.37, "end": 3.65, "text": "狗不干？我干。"}],
+            [
+                {"start": 2.37, "end": 3.223, "text": "狗不干？"},
+                {"start": 3.223, "end": 3.65, "text": "我干"},
+            ],
         )
         self.assertEqual(
             storyboard["shots"][1]["subtitle_cues"],
-            [{"start": 0.01, "end": 2.83,
-              "text": "拼的不是腿，是信息和效率。"}],
+            [
+                {"start": 0.01, "end": 1.292, "text": "拼的不是腿"},
+                {"start": 1.292, "end": 2.83, "text": "是信息和效率"},
+            ],
         )
         self.assertEqual(storyboard["shots"][2]["subtitle"], "another master")
 
@@ -3535,8 +8536,89 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             storyboard["shots"][0]["subtitle_cues"],
-            [{"start": 0.5, "end": 3.2, "text": "真实台词。"}],
+            [{"start": 0.5, "end": 3.2, "text": "真实台词"}],
         )
+
+    def test_broll_request_includes_every_declared_cast_identity_and_scene_anchor(self):
+        lead = {"id": "林夏", "generation_mode": "ai_generated"}
+        partner = {"id": "Malik", "generation_mode": "ai_generated"}
+        anchors = {
+            character_assets.character_identity_key(lead): s3_shots.DialogueAnchor(
+                "https://cdn.example/linxia.mp4", 4
+            ),
+            character_assets.character_identity_key(partner): s3_shots.DialogueAnchor(
+                "https://cdn.example/malik.mp4", 4
+            ),
+        }
+
+        try:
+            request = s3_shots._broll_request_kwargs(
+                {"duration_sec": 8},
+                cast_characters=[lead, partner],
+                identity_anchors=anchors,
+                scene_reference="https://cdn.example/dispatch.png",
+            )
+        except TypeError as exc:
+            self.fail(f"B-roll continuity references are not supported: {exc}")
+
+        self.assertEqual(
+            request["reference_videos"],
+            [
+                "https://cdn.example/linxia.mp4",
+                "https://cdn.example/malik.mp4",
+            ],
+        )
+        self.assertEqual(
+            request["references"], ["https://cdn.example/dispatch.png"]
+        )
+
+    def test_long_asr_utterance_is_split_into_phrase_level_cues(self):
+        storyboard = {
+            "production_mode": "native_master_local_director",
+            "shots": [{
+                "idx": 1, "audio_master_idx": 1,
+                "audio_start": 0, "duration": 8,
+                "subtitle": "estimated",
+            }],
+        }
+
+        s3_shots._apply_master_transcription(
+            storyboard, 1,
+            bigasr.Transcription(
+                "暴雨还在下，设备已经到场，先确认支腿区域，再开始升臂。",
+                400, 7600,
+            ),
+        )
+
+        cues = storyboard["shots"][0]["subtitle_cues"]
+        self.assertGreaterEqual(len(cues), 4)
+        self.assertTrue(all(len(cue["text"]) <= 14 for cue in cues))
+        self.assertTrue(all(
+            left["end"] <= right["start"]
+            for left, right in zip(cues, cues[1:])
+        ))
+        self.assertEqual(cues[0]["start"], 0.4)
+        self.assertEqual(cues[-1]["end"], 7.6)
+
+    def test_director_segments_convert_legacy_static_subtitle_to_timed_phrases(self):
+        storyboard = {
+            "shots": [{
+                "idx": 1,
+                "video_master_idx": 1,
+                "audio_master_idx": 1,
+                "duration": 9,
+                "subtitle": "先确认作业高度，再核对水平距离，最后选择合适设备。",
+            }]
+        }
+
+        segment = s6_compose._director_segments(
+            storyboard, [{"idx": 1, "video_path": "master.mp4"}]
+        )[0]
+
+        self.assertIsNone(segment["subtitle"])
+        self.assertGreaterEqual(len(segment["subtitle_cues"]), 3)
+        self.assertEqual(segment["subtitle_cues"][0]["start"], 0.15)
+        self.assertEqual(segment["subtitle_cues"][-1]["end"], 8.85)
 
     def test_director_segments_preserve_timed_subtitle_cues(self):
         storyboard = {
@@ -3767,6 +8849,29 @@ class StandardDirectorPipelineTests(unittest.TestCase):
 
         s1_storyboard._validate(storyboard)
 
+    def test_standard_profile_does_not_cap_total_paid_master_duration(self):
+        storyboard = self._storyboard()
+        storyboard["masters"].extend([
+            {
+                "idx": 4,
+                "type": "broll",
+                "duration": 29,
+                "prompt": "A continuous equipment inspection sequence",
+            },
+            {
+                "idx": 5,
+                "type": "broll",
+                "duration": 29,
+                "prompt": "A continuous equipment delivery sequence",
+            },
+        ])
+
+        self.assertGreater(
+            sum(float(master["duration"]) for master in storyboard["masters"]),
+            90,
+        )
+        s1_storyboard._validate(storyboard)
+
     def test_generation_units_are_masters_not_final_edit_shots(self):
         self.assertTrue(hasattr(s1_storyboard, "_generation_units"))
         units = s1_storyboard._generation_units(self._storyboard())
@@ -3787,6 +8892,57 @@ class StandardDirectorPipelineTests(unittest.TestCase):
         self.assertEqual(cutaway["video_path"], "master-3.mp4")
         self.assertEqual(cutaway["native_audio"], "master-2.mp4")
         self.assertEqual(cutaway["audio_start"], 6)
+
+    def test_director_segments_apply_fades_only_to_explicit_scene_change(self):
+        storyboard = self._storyboard()
+        storyboard["shots"][0].update({
+            "continuity_relation": "opening",
+            "transition_type": "none",
+            "transition_duration_sec": 0,
+        })
+        storyboard["shots"][1].update({
+            "continuity_relation": "scene_change",
+            "transition_type": "dip_to_black",
+            "transition_duration_sec": 0.12,
+        })
+        storyboard["shots"][2].update({
+            "continuity_relation": "audio_bridge",
+            "transition_type": "cut",
+            "transition_duration_sec": 0,
+        })
+        rows = [
+            {"idx": 1, "video_path": "master-1.mp4"},
+            {"idx": 2, "video_path": "master-2.mp4"},
+            {"idx": 3, "video_path": "master-3.mp4"},
+        ]
+
+        segments = s6_compose._director_segments(storyboard, rows)
+
+        self.assertEqual(segments[0]["video_fade_out_sec"], 0.12)
+        self.assertEqual(segments[1]["video_fade_in_sec"], 0.12)
+        self.assertEqual(segments[1]["video_fade_out_sec"], 0)
+        self.assertEqual(segments[2]["video_fade_in_sec"], 0)
+        self.assertEqual(segments[2]["transition_type"], "cut")
+
+    def test_director_cut_encodes_requested_visual_boundary_fades(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            ffmpeg, "_run", new=AsyncMock()
+        ) as run:
+            asyncio.run(ffmpeg.cut_director_segment(
+                Path(tmp) / "video.mp4",
+                Path(tmp) / "audio.mp4",
+                Path(tmp) / "out.mp4",
+                video_start=0,
+                audio_start=0,
+                duration=4,
+                video_fade_in_sec=0.12,
+                video_fade_out_sec=0.12,
+            ))
+
+        args = run.await_args.args[0]
+        video_filter = args[args.index("-vf") + 1]
+        self.assertIn("fade=t=in:st=0:d=0.120", video_filter)
+        self.assertIn("fade=t=out:st=3.880:d=0.120", video_filter)
 
     def test_storyboard_prompt_defaults_to_standard_director_mode(self):
         prompt = prompts.storyboard_prompt(

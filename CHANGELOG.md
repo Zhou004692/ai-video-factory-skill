@@ -2,6 +2,47 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.0.2.0] - 2026-08-20
+
+### Added
+
+- Added the automatic topic discovery MVP for authorized RSS, Atom and JSON Feed hotspot/competitor sources, including per-source schedules, cross-feed deduplication, traceable candidate review and conversion into content projects.
+- Added bounded parallel generation for independent Seedance masters while preserving scene, character and continuity dependencies.
+- Added configurable reference-video attention budgets and task-first recovery evidence for paid provider calls.
+- Added cross-platform runtime profiles, external data-directory support, FFmpeg discovery, CJK font discovery and recoverable upgrade snapshots.
+
+### Changed
+
+- Changed character and recurring-scene anchor defaults to Seedance 2.5 dynamic anchors while keeping Seedream 5.0 as an explicit per-task option.
+- Improved Seedance 2.5 prompts, duration planning, native speech timelines and continuity reference selection around longer cinematic masters.
+- Improved management-console recovery guidance for provider account failures and policy-rejected jobs.
+- Improved subtitle segmentation so captions follow semantic speech phrases instead of splitting words at fixed character counts.
+- Versioned distributable archives and added desktop runtime/storage/media diagnostics without exposing credential values.
+
+### Fixed
+
+- Disabled provider image watermarks and in-video hook overlays by default while retaining marketing-thumbnail hooks.
+- Fixed duplicate or misattributed paid submissions, unsafe provider-result downloads, unresolved-task recovery gaps and concurrent budget oversubscription.
+- Fixed stalled review/reconciliation states, incomplete failure classification and dependent masters continuing after an unresolved provider task.
+
+## [3.0.1.0] - 2026-08-20
+
+### Added
+
+- Added a local end-to-end management console for source intake, briefs, script review, video production, publication, configuration, todo handling and character assets.
+- Added fixed, virtual and custom character assets, continuity anchors, configurable Seedream/Seedance anchor generation, native or external voice routing, and single-master lip-sync repair.
+- Added durable provider task accounting, account circuit breaking, manual quality review, crash-safe reconciliation, bounded independent-master concurrency and a release fault matrix.
+
+### Changed
+
+- Improved Seedance 2.5 cinematic master generation with adaptive durations, continuous integer speech timelines, scene and character continuity constraints, and safer retry behavior.
+- Improved subtitle timing, ASR segmentation, local director composition, BGM handling, source reconstruction and editable brief/script workflows.
+- Hardened provider downloads, API mutation guards, cost ownership, recovery state transitions and local management-server safety.
+
+### Fixed
+
+- Fixed stuck queued or review jobs, duplicate paid submissions, cost drift, invalid state recovery, incomplete media playback, inconsistent character/scene anchors, subtitle truncation and lip-sync repair handoff.
+
 ## [3.0.0.0] - 2026-08-12
 
 ### Added

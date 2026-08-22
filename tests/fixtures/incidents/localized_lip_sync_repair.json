@@ -1,0 +1,30 @@
+{
+  "incident_id": "localized-lip-sync-repair",
+  "kind": "localized_lip_sync_repair",
+  "input": {
+    "duration_sec": 8,
+    "baseline_cost_cents": 944,
+    "repair_cost_cents": 1079,
+    "dialogue": "今晚必须恢复供电",
+    "evidence": {
+      "overall_alignment": 0.61,
+      "confidence": 0.92,
+      "segments": [
+        {
+          "start_sec": 2.5,
+          "end_sec": 4.5,
+          "alignment": 0.48,
+          "confidence": 0.92,
+          "offset_ms": 240,
+          "dialogue": "今晚必须恢复供电",
+          "reason": "下颌动作比语音慢"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "suggested_start_sec": 2.25,
+    "suggested_end_sec": 4.75,
+    "comparison_additional_cost_cents": 1079
+  }
+}

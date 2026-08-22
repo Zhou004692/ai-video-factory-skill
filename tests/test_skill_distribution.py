@@ -15,6 +15,21 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 class SkillDistributionTests(unittest.TestCase):
+    def test_distributed_template_defaults_to_seedance_native_audio(self):
+        template = (ROOT / "templates" / "env.example").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("DIALOGUE_AUDIO_MODE=seedance_native", template)
+
+    def test_distributed_template_defaults_anchor_generation_to_seedance_25(self):
+        template = (ROOT / "templates" / "env.example").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("CHARACTER_ANCHOR_GENERATOR=seedance_2_5", template)
+        self.assertIn("SCENE_ANCHOR_GENERATOR=seedance_2_5", template)
+
     def test_build_distribution_contains_runtime_but_excludes_private_state(self):
         from distribute_skill import audit_distribution, build_distribution
 
@@ -182,7 +197,8 @@ class SkillDistributionTests(unittest.TestCase):
             root = Path(tmp)
             (root / "data").mkdir()
             (root / ".env").write_text(
-                "ARK_API_KEY=ark\nVOLC_ASR_API_KEY=asr-key\n"
+                "ARK_API_KEY=ark\nVOLC_TTS_APPID=tts-app\n"
+                "VOLC_TTS_API_KEY=tts-key\nVOLC_ASR_API_KEY=asr-key\n"
                 "VOLC_AK=ak\nVOLC_SK=sk\nTOS_BUCKET=bucket\n",
                 encoding="utf-8",
             )
@@ -190,6 +206,25 @@ class SkillDistributionTests(unittest.TestCase):
                 report = diagnose(root, profile="video")
 
         self.assertTrue(report["checks"]["credentials"]["ok"])
+
+    def test_doctor_video_native_audio_mode_does_not_require_tts(self):
+        from doctor import diagnose
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / ".env").write_text(
+                "DIALOGUE_AUDIO_MODE=seedance_native\n"
+                "ARK_API_KEY=ark\nVOLC_AK=ak\nVOLC_SK=sk\nTOS_BUCKET=bucket\n",
+                encoding="utf-8",
+            )
+            with patch("doctor.shutil.which", return_value="binary"):
+                report = diagnose(root, profile="video")
+
+        self.assertTrue(report["checks"]["credentials"]["ok"], report)
+        self.assertNotIn(
+            "VOLC_TTS_APPID", report["checks"]["credentials"]["detail"]
+        )
 
     def test_learning_profile_needs_no_model_credentials(self):
         from doctor import diagnose
@@ -227,6 +262,29 @@ class SkillDistributionTests(unittest.TestCase):
             self.assertEqual(report["missing_fields"], ["ARK_API_KEY"])
             self.assertEqual(report["paid_provider_calls"], 0)
             self.assertNotIn("SRC-", json.dumps(report))
+
+    def test_bootstrap_video_native_audio_mode_does_not_request_tts(self):
+        from bootstrap import bootstrap
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            (root / ".env").write_text(
+                "DIALOGUE_AUDIO_MODE=seedance_native\n"
+                "ARK_API_KEY=ark\nVOLC_AK=ak\nVOLC_SK=sk\nTOS_BUCKET=bucket\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {}, clear=True):
+                report = bootstrap(
+                    root,
+                    profile="video",
+                    ensure_install=False,
+                    python_executable=Path(sys.executable),
+                )
+
+        self.assertTrue(report["ready"], report)
+        self.assertNotIn("VOLC_TTS_APPID", report["missing_fields"])
 
     def test_installer_preserves_existing_env_and_initializes_runtime(self):
         from install import install
@@ -277,7 +335,8 @@ class SkillDistributionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             archive = build_archive(ROOT, Path(tmp))
 
-            self.assertEqual(archive.name, "ai-video-factory.zip")
+            version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+            self.assertEqual(archive.name, f"ai-video-factory-{version}.zip")
             self.assertTrue(archive.is_file())
             with zipfile.ZipFile(archive) as bundle:
                 names = set(bundle.namelist())

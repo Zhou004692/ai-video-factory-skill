@@ -62,22 +62,31 @@ def apply_continuity_metadata(
     alias_to_identity: dict[str, str] = {}
     for character in runtime_characters:
         identity_key = character_assets.character_identity_key(character)
+        explicit_wardrobe = str(
+            character.get("wardrobe") or character.get("costume") or ""
+        ).strip()
+        mapped_fixed_asset = (
+            character.get("generation_mode") == "fixed_asset"
+            and bool(character.get("script_character_name"))
+        )
+        look = str(character.get("look") or "").strip()
+        placeholder_look = (
+            not look or "待在视频制作设置中绑定角色资产" in look
+        )
+        wardrobe_contract = explicit_wardrobe or (
+            "服装与职业装备服从本剧本场景；同一场景内保持一致"
+            if mapped_fixed_asset or placeholder_look else look
+        )
         group = identity_groups.setdefault(identity_key, {
             "identity_key": identity_key,
             "display_name": str(
                 character.get("name") or character.get("id") or identity_key
             ),
             "character_ids": [],
-            "wardrobe": str(
-                character.get("wardrobe") or character.get("costume")
-                or character.get("look") or ""
-            ).strip(),
+            "wardrobe": wardrobe_contract,
         })
-        if not group["wardrobe"]:
-            group["wardrobe"] = str(
-                character.get("wardrobe") or character.get("costume")
-                or character.get("look") or ""
-            ).strip()
+        if explicit_wardrobe or not group["wardrobe"]:
+            group["wardrobe"] = wardrobe_contract
         for alias in (
             character.get("id"), character.get("name"),
             character.get("script_character_name"),
@@ -207,6 +216,7 @@ def recurring_scene_anchors(storyboard: dict) -> list[dict]:
             continue
         item = grouped.setdefault(key, {
             "anchor_key": key,
+            "anchor_scope": "scene",
             "description": str(
                 master.get("scene_anchor_description")
                 or master.get("scene") or ""
@@ -218,10 +228,55 @@ def recurring_scene_anchors(storyboard: dict) -> list[dict]:
             item["master_indexes"].append(idx)
         if not item["description"] and master.get("scene"):
             item["description"] = str(master["scene"]).strip()
-    return [
+    exact_scene_anchors = [
         item for item in grouped.values()
         if len(item["master_indexes"]) >= 2
     ]
+
+    site_groups: dict[str, dict] = {}
+    for master in storyboard.get("masters") or []:
+        key = str(master.get("site_anchor_key") or "").strip().casefold()
+        idx = int(master.get("idx") or 0)
+        if not key or not idx:
+            continue
+        item = site_groups.setdefault(key, {
+            "anchor_key": key,
+            "anchor_scope": "site",
+            "description": str(
+                master.get("site_anchor_description")
+                or master.get("scene_anchor_description")
+                or master.get("scene") or ""
+            ).strip(),
+            "master_indexes": [],
+            "child_scene_keys": [],
+            # A site-level reference never locks actor blocking across
+            # physically different child spaces.
+            "blocking_anchor": {},
+        })
+        if idx not in item["master_indexes"]:
+            item["master_indexes"].append(idx)
+        child_key = str(master.get("scene_anchor_key") or "").strip().casefold()
+        if child_key and child_key not in item["child_scene_keys"]:
+            item["child_scene_keys"].append(child_key)
+    project_site_anchors = [
+        item for item in site_groups.values()
+        if len(item["master_indexes"]) >= 2
+        and len(item["child_scene_keys"]) >= 2
+    ]
+    return [*exact_scene_anchors, *project_site_anchors]
+
+
+def reference_anchor_key(master: dict, available_keys) -> str:
+    """Prefer an exact scene anchor, then a broader project-site anchor."""
+    normalized = {
+        str(key or "").strip().casefold() for key in available_keys
+        if str(key or "").strip()
+    }
+    for field in ("scene_anchor_key", "site_anchor_key"):
+        key = str(master.get(field) or "").strip().casefold()
+        if key and key in normalized:
+            return key
+    return ""
 
 
 def anchor_token(anchor_key: str) -> str:
@@ -231,6 +286,19 @@ def anchor_token(anchor_key: str) -> str:
 
 
 def scene_anchor_prompt(spec: dict) -> str:
+    if str(spec.get("anchor_scope") or "scene").casefold() == "site":
+        return "\n".join([
+            "WORLD / SITE CONTINUITY REFERENCE.",
+            f"Project-site key: {spec['anchor_key']}.",
+            f"Shared site identity: {spec['description']}",
+            "Photorealistic vertical wide establishing frame that defines the "
+            "site's architecture family, materials, equipment language, safety "
+            "system and overall industrial identity.",
+            "Do not lock the exact subspace layout, actor blocking, weather, "
+            "time of day or shot composition; child scenes remain distinct.",
+            "No people, no faces, no text, no logo, no watermark, no collage.",
+            "This image is a broad project-world reference, not a finished shot.",
+        ])
     return "\n".join([
         "SCENE CONTINUITY / STATIC LOCATION REFERENCE.",
         f"Location key: {spec['anchor_key']}.",

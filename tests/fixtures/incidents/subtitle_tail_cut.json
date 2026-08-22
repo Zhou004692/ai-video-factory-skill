@@ -1,0 +1,13 @@
+{
+  "incident_id": "subtitle-audio-tail-cut",
+  "kind": "subtitle_timeline",
+  "input": {
+    "text": "先确认现场风速再检查设备状态最后完成安全交付",
+    "start": 0.15,
+    "end": 9.85,
+    "max_chars": 5
+  },
+  "expected": {
+    "min_cues": 3
+  }
+}

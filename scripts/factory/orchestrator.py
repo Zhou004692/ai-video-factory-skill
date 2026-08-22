@@ -3,10 +3,16 @@ import asyncio
 import csv
 import importlib
 import os
-import traceback
+import uuid
 
 from .db import conn, log
+from .error_registry import describe_failure, describe_retry_exhausted
 from .models import TRANSITIONS, TERMINAL_STATES
+from . import recovery_controller
+from .state_machine import transition
+
+
+BATCH_EXCLUDED_STATES = TERMINAL_STATES
 
 
 STEP_MODULES = {
@@ -21,15 +27,42 @@ MAX_CONCURRENT_JOBS  = int(os.getenv("MAX_CONCURRENT_JOBS", "4"))
 MAX_CONCURRENT_SHOTS = int(os.getenv("MAX_CONCURRENT_SHOTS", "3"))
 MAX_RETRIES          = int(os.getenv("MAX_RETRIES", "3"))
 
-
 async def _run_step(job_id: str, step: str):
     mod = importlib.import_module(STEP_MODULES[step])
     return await mod.run(job_id)
 
 
+async def _heartbeat_worker(job_id: str, lease_id: str) -> None:
+    while True:
+        await asyncio.sleep(10)
+        heartbeat_db = conn()
+        try:
+            if not recovery_controller.record_heartbeat(
+                heartbeat_db, job_id, lease_id
+            ):
+                return
+        finally:
+            heartbeat_db.close()
+
+
 def _should_retry_step(error: BaseException) -> bool:
     """Paid quality/budget guards require explicit human action."""
-    return not bool(getattr(error, "non_retryable", False))
+    if bool(getattr(error, "non_retryable", False)):
+        return False
+    return describe_failure(error).retry_policy == "auto"
+
+
+def _transition_event_for_step(step: str) -> str:
+    return {
+        "s1_storyboard": "preflight_passed",
+        "s3_shots": "all_masters_completed",
+        "s5_bgm": "bgm_completed",
+        "s6_compose": "composed",
+    }[step]
+
+
+def _event_id(job_id: str, step: str, outcome: str) -> str:
+    return f"{job_id}:{step}:{outcome}:{uuid.uuid4().hex}"
 
 
 async def _process_job(job_id: str, sem: asyncio.Semaphore):
@@ -53,56 +86,114 @@ async def _process_job(job_id: str, sem: asyncio.Semaphore):
                 return
 
             step, new_state = nxt
+            heartbeat_task = None
+            lease_id = ""
             try:
                 log(db, job_id, step, "INFO", f"start {step}")
+                if state == "PRODUCTION_RUNNING":
+                    lease_id = uuid.uuid4().hex
+                    if not recovery_controller.record_heartbeat(
+                        db, job_id, lease_id
+                    ):
+                        return
+                    heartbeat_task = asyncio.create_task(
+                        _heartbeat_worker(job_id, lease_id)
+                    )
                 await _run_step(job_id, step)
-                db.execute(
-                    "UPDATE jobs SET state=?, updated_at=CURRENT_TIMESTAMP, "
-                    "retries=0, error=NULL WHERE job_id=?",
-                    (new_state.value, job_id)
+                transition(
+                    db,
+                    job_id,
+                    _transition_event_for_step(step),
+                    event_id=_event_id(job_id, step, "completed"),
+                    target_state=new_state.value,
+                    updates={
+                        "retries": 0,
+                        "error": None,
+                        "failure_code": None,
+                    },
                 )
-                db.commit()
                 log(db, job_id, step, "INFO", f"done {step} → {new_state.value}")
             except Exception as e:
-                tb = traceback.format_exc(limit=4)
+                outcome = describe_failure(e, stage=step)
+                failure_code = outcome.code
                 pause_state = str(getattr(e, "pause_state", "") or "").strip()
                 if pause_state:
-                    db.execute(
-                        "UPDATE jobs SET state=?,error=NULL,"
-                        "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
-                        "WHERE job_id=?",
-                        (pause_state, job_id),
+                    pause_error = outcome.user_message
+                    event = (
+                        "provider_paused"
+                        if pause_state == "PROVIDER_ACTION_REQUIRED"
+                        else "review_required"
                     )
-                    db.commit()
-                    log(db, job_id, step, "INFO", f"paused for review: {e}")
+                    transition(
+                        db,
+                        job_id,
+                        event,
+                        event_id=_event_id(job_id, step, "paused"),
+                        target_state=pause_state,
+                        updates={
+                            "error": pause_error,
+                            "failure_code": failure_code,
+                            "production_worker_pid": None,
+                        },
+                    )
+                    log(
+                        db, job_id, step, "INFO",
+                        f"{outcome.code}: {outcome.technical_summary}",
+                    )
                     return
                 if not _should_retry_step(e):
-                    db.execute(
-                        "UPDATE jobs SET state='FAILED', error=? WHERE job_id=?",
-                        (f"{step}: {e}", job_id)
+                    transition(
+                        db,
+                        job_id,
+                        "failed",
+                        event_id=_event_id(job_id, step, "failed"),
+                        updates={
+                            "error": outcome.user_message,
+                            "failure_code": failure_code,
+                        },
                     )
-                    db.commit()
-                    log(db, job_id, step, "ERROR",
-                        f"stopped without step retry: {e}\n{tb}")
+                    log(
+                        db, job_id, step, "ERROR",
+                        f"{outcome.code}: {outcome.technical_summary}",
+                    )
                     return
                 next_retry = retries + 1
                 if next_retry >= MAX_RETRIES:
-                    db.execute(
-                        "UPDATE jobs SET state='FAILED', error=? WHERE job_id=?",
-                        (f"{step}: {e}", job_id)
+                    outcome = describe_retry_exhausted(outcome, stage=step)
+                    failure_code = outcome.code
+                    transition(
+                        db,
+                        job_id,
+                        "failed",
+                        event_id=_event_id(job_id, step, "retry-exhausted"),
+                        updates={
+                            "error": outcome.user_message,
+                            "failure_code": failure_code,
+                        },
                     )
-                    db.commit()
-                    log(db, job_id, step, "ERROR",
-                        f"permanently failed: {e}\n{tb}")
+                    log(
+                        db, job_id, step, "ERROR",
+                        f"{outcome.code}: {outcome.technical_summary}",
+                    )
                     return
                 db.execute(
                     "UPDATE jobs SET retries=retries+1, error=? WHERE job_id=?",
-                    (str(e), job_id)
+                    (outcome.user_message, job_id)
                 )
                 db.commit()
-                log(db, job_id, step, "WARN",
-                    f"retry {next_retry}/{MAX_RETRIES}: {e}")
+                log(
+                    db, job_id, step, "WARN",
+                    f"retry {next_retry}/{MAX_RETRIES}: "
+                    f"{outcome.code}: {outcome.technical_summary}",
+                )
                 await asyncio.sleep(min(2 ** retries, 30))
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
 
 
 def _import_topics(csv_path: str, batch_id: str | None = None):
@@ -136,11 +227,13 @@ async def run_batch(csv_path: str, batch_id: str | None = None):
     print(f"导入 {n} 条新主题")
 
     db = conn()
-    where = "state NOT IN ('PUBLISHED','FAILED','BLOCKED')"
-    params: tuple = ()
+    excluded = tuple(sorted(BATCH_EXCLUDED_STATES))
+    placeholders = ",".join("?" for _ in excluded)
+    where = f"state NOT IN ({placeholders})"
+    params: tuple = excluded
     if batch_id:
         where += " AND batch_id=?"
-        params = (batch_id,)
+        params = (*params, batch_id)
     pending = db.execute(
         f"SELECT job_id FROM jobs WHERE {where} "
         "ORDER BY priority DESC, created_at ASC",

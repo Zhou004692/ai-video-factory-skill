@@ -14,6 +14,10 @@ MANIFEST = (
 )
 
 
+@unittest.skipUnless(
+    MANIFEST.is_file(),
+    "local production benchmark assets are not present in this checkout",
+)
 class ProductionBenchmarkManifestTests(unittest.TestCase):
     def test_accepted_media_exists_and_duration_matches_ffprobe(self):
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))

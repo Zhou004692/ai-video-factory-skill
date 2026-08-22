@@ -1,0 +1,8 @@
+{
+  "status": 400,
+  "error": {
+    "code": "InvalidParameter",
+    "message": "Duration is outside the accepted range"
+  },
+  "provider_task_state": "rejected"
+}

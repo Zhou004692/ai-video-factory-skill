@@ -1,0 +1,14 @@
+{
+  "incident_id": "precision-sensitive-motion",
+  "kind": "precision_motion",
+  "input": {
+    "shot": {
+      "motion_control": "exact",
+      "scene": "设备仪表读数变化",
+      "action": "指针必须精确转到指定刻度"
+    }
+  },
+  "expected": {
+    "reason_contains": "deterministic"
+  }
+}

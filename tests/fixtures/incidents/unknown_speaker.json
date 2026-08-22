@@ -1,0 +1,34 @@
+{
+  "incident_id": "unknown-speaker-blocked-production",
+  "kind": "production_contract",
+  "input": {
+    "storyboard": {
+      "characters": [
+        {
+          "id": "lin_xia",
+          "name": "林夏",
+          "identity_type": "ai_generated",
+          "generation_mode": "ai_generated"
+        }
+      ],
+      "masters": [
+        {
+          "idx": 1,
+          "type": "dialogue",
+          "duration": 8,
+          "speaker": "非洲客户",
+          "performance_beats": [
+            {
+              "speaker": "非洲客户",
+              "dialogue": "设备已经安全抵达现场"
+            }
+          ],
+          "camera": "中景固定机位"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "issue_code": "speaker_unknown"
+  }
+}

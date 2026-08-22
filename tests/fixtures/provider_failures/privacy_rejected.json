@@ -1,0 +1,8 @@
+{
+  "status": 400,
+  "error": {
+    "code": "InputImagesSensitiveContentDetected",
+    "message": "Input image was rejected by the privacy policy"
+  },
+  "provider_task_state": "rejected"
+}

@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import shutil
 
+from ..media_runtime import resolve_binary, resolve_subtitle_font
+
 
 class FFmpegError(RuntimeError):
     pass
@@ -13,20 +15,7 @@ class FFmpegError(RuntimeError):
 
 def executable(name: str) -> str:
     """Resolve FFmpeg tools even when a Windows service lacks the user PATH."""
-    resolved = shutil.which(name)
-    if resolved:
-        return resolved
-    local_app_data = os.getenv("LOCALAPPDATA")
-    if local_app_data:
-        links = Path(local_app_data) / "Microsoft" / "WinGet" / "Links"
-        candidate = links / f"{name}.exe"
-        if candidate.is_file():
-            return str(candidate)
-    return name
-
-
-# 中文字幕字体(雅黑粗体,短视频清晰度好)。可用 SUBTITLE_FONT env 覆盖。
-SUBTITLE_FONT = os.getenv("SUBTITLE_FONT", "C:/Windows/Fonts/msyhbd.ttc")
+    return str(resolve_binary(name))
 # 品牌信息(片尾 CTA 用),可 env 覆盖
 BRAND_NAME = os.getenv("BRAND_NAME", "")
 BRAND_CTA = os.getenv("BRAND_CTA", "设备租赁不踩坑 · 关注了解更多")
@@ -42,7 +31,7 @@ def _drawtext(textfile: Path, *, fontsize: int, y: str,
               enable: str | None = None) -> str:
     """构造一个 drawtext filter 片段。中文走 textfile(避免命令行编码坑)。"""
     parts = [
-        f"fontfile='{_esc(SUBTITLE_FONT)}'",
+        f"fontfile='{_esc(resolve_subtitle_font())}'",
         f"textfile='{_esc(textfile)}'",
         f"fontcolor={color}",
         f"fontsize={fontsize}",
@@ -206,6 +195,32 @@ async def has_audio_stream(path: Path) -> bool:
     return "codec_type=audio" in out
 
 
+async def transcode_edit_mov_to_mp4(source: Path, target: Path) -> None:
+    """Convert a Seedance edit/extend MOV to a browser-safe MP4 atomically."""
+    source = Path(source)
+    target = Path(target)
+    if not source.is_file():
+        raise FFmpegError(f"Seedance MOV source does not exist: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.stem}.transcoding{target.suffix}")
+    temporary.unlink(missing_ok=True)
+    try:
+        await _run([
+            "-i", str(source),
+            "-map", "0:v:0", "-map", "0:a?",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(temporary),
+        ])
+        if not temporary.is_file() or temporary.stat().st_size <= 0:
+            raise FFmpegError("Seedance MOV conversion produced no MP4 output")
+        temporary.replace(target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 async def extract_audio_wav(video_path: Path, output_path: Path) -> None:
     """Extract a 16 kHz mono WAV suitable for ASR and speaker checks."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,6 +316,7 @@ async def cut_director_segment(
         video_start: float, audio_start: float, duration: float,
         subtitle: str | None = None, subtitle_cues: list[dict] | None = None,
         hook: str | None = None,
+        video_fade_in_sec: float = 0, video_fade_out_sec: float = 0,
         width: int = 1080, height: int = 1920) -> None:
     """Cut local picture and native audio from independently chosen masters.
 
@@ -335,6 +351,15 @@ async def cut_director_segment(
             color="yellow", border=6,
             enable=f"between(t,0,{min(duration, 3.0):.3f})",
         ))
+    fade_in = min(max(float(video_fade_in_sec), 0.0), duration / 2)
+    fade_out = min(max(float(video_fade_out_sec), 0.0), duration / 2)
+    if fade_in:
+        vf_chain.append(f"fade=t=in:st=0:d={fade_in:.3f}")
+    if fade_out:
+        fade_start = max(duration - fade_out, 0.0)
+        vf_chain.append(
+            f"fade=t=out:st={fade_start:.3f}:d={fade_out:.3f}"
+        )
 
     args = [
         "-ss", f"{max(video_start, 0):.3f}", "-i", str(video_path),
@@ -491,6 +516,63 @@ async def generate_thumbnail(video_path: Path, hook_text: str, out_path: Path,
     ])
     if not out_path.is_file() or out_path.stat().st_size <= 0:
         raise FFmpegError("ffmpeg generated no output thumbnail")
+
+
+async def generate_continuity_cover(
+    video_path: Path, out_path: Path, *, ts: float = 0.04
+) -> None:
+    """Extract the final video's first stable decoded frame as its default cover.
+
+    The default playback/publishing cover must be visually identical to the
+    start of the final timeline.  Branded or click-optimised artwork belongs in
+    a separate marketing asset; adding overlays here causes a visible flash as
+    soon as playback starts.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.unlink(missing_ok=True)
+    await _run([
+        "-ss", str(max(float(ts), 0.0)), "-i", str(video_path),
+        "-frames:v", "1",
+        "-update", "1",
+        "-q:v", "2",
+        "-pix_fmt", "yuvj420p",
+        "-threads", "1",
+        str(out_path),
+    ])
+
+
+async def assemble_timed_audio(
+    clips: list[tuple[Path, int]], out_path: Path, *, duration_sec: float
+) -> None:
+    """Place role-owned speech clips on one deterministic master timeline."""
+    if not clips:
+        raise ValueError("timed audio requires at least one speech clip")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    args: list[str] = []
+    filters: list[str] = []
+    labels: list[str] = []
+    for index, (clip, start_ms) in enumerate(clips):
+        args.extend(["-i", str(clip)])
+        label = f"voice{index}"
+        labels.append(f"[{label}]")
+        delay = max(0, int(start_ms))
+        filters.append(
+            f"[{index}:a]aresample=24000,adelay={delay}|{delay}[{label}]"
+        )
+    filters.append(
+        "".join(labels)
+        + f"amix=inputs={len(labels)}:duration=longest:normalize=0,"
+        + f"apad,atrim=duration={max(0.1, float(duration_sec)):.3f}[voice]"
+    )
+    await _run([
+        *args,
+        "-filter_complex", ";".join(filters),
+        "-map", "[voice]",
+        "-c:a", "pcm_s16le", "-ar", "24000", "-ac", "1",
+        str(out_path),
+    ])
+    if not out_path.is_file() or out_path.stat().st_size <= 0:
+        raise FFmpegError("ffmpeg generated no output continuity cover")
 
 
 async def concat_shots(shot_paths: list[Path], out_path: Path) -> None:

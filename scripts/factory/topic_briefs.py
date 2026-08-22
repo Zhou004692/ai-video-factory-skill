@@ -8,13 +8,13 @@ import re
 from typing import Callable
 
 from .clients import doubao_llm
-from . import creative_learning
+from . import creative_learning, script_sources
 
 
 SCORE_FIELDS = (
     "relevance", "story_potential", "evidence_quality", "production_fit",
 )
-BRIEF_PROMPT_VERSION = "creative-brief-v3-evidence-ledger"
+BRIEF_PROMPT_VERSION = "creative-brief-v4-flexible-angles-balanced-source"
 CREATIVE_TAG_DEFAULTS = {
     "hook_type": "pain_point",
     "narrative_pattern": "problem_solution",
@@ -176,8 +176,8 @@ def find_similar_topic(db, title: str, *, threshold: float = 0.72) -> dict | Non
 
 def _brief_prompt(sources: list[dict]) -> str:
     return (
-        "你是设备租赁行业短视频创意总监。只基于来源内容与机器分析提出三个明显"
-        "不同的创意角度，不得照抄来源标题，不得编造事实、金额、客户或产品能力。"
+        "你是设备租赁行业短视频创意总监。只基于来源内容与机器分析提出 1–3 个"
+        "真正有差异且可执行的创意角度，不得照抄来源标题，不得编造事实、金额、客户或产品能力。"
         "先提炼来源事实底稿：标记必须保留与辅助事实，逐条保留原文引句和 source_id。"
         "每个角度必须通过 fact_ids 关联事实底稿，并引用来源中已有证据；不得遗漏所有"
         " must_keep 事实。说明适合 Seedance 2.5 原生母片 + "
@@ -194,7 +194,9 @@ def _brief_prompt(sources: list[dict]) -> str:
         '"proof_type":"source_quote","cta_type":"consult"}}],'
         '"recommended_index":0,'
         '"recommendation_reason":"推荐理由"}\n\n来源：'
-        + json.dumps(sources, ensure_ascii=False)
+        + script_sources.compact_text_for_prompt(
+            json.dumps(sources, ensure_ascii=False), max_chars=100_000
+        )
     )
 
 
@@ -206,9 +208,9 @@ def _angle_count(raw: dict) -> int:
 def _repair_angle_prompt(sources: list[dict], previous_count: int) -> str:
     return (
         _brief_prompt(sources)
-        + f"\n\n契约修复要求：上一次响应只生成了 {previous_count} 个角度，"
-        "不符合要求。请重新生成完整 JSON；angles 必须恰好包含 3 个非空、"
-        "彼此明显不同且均有来源证据的创意角度，recommended_index 必须指向"
+        + f"\n\n契约修复要求：上一次响应生成了 {previous_count} 个可用角度，"
+        "请重新生成完整 JSON；angles 应包含 1—3 个非空、"
+        "彼此明显不同且均有来源证据的高质量创意角度，recommended_index 必须指向"
         "其中一个角度。不要解释失败原因。"
     )
 
@@ -335,7 +337,7 @@ def generate_brief(db, source_ids: list[str], *, force: bool = False,
             max_tokens=6000,
         )
     first_angle_count = _angle_count(raw)
-    if first_angle_count != 3:
+    if first_angle_count == 0:
         repaired_raw, repaired_usage = generate_json(
             _repair_angle_prompt(sources, first_angle_count), max_tokens=3000
         )

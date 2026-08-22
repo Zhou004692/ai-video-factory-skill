@@ -1,10 +1,12 @@
 """First-principles production planning, reuse, and economics tests."""
 from pathlib import Path
 import json
+import os
 import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 from click.testing import CliRunner
@@ -17,16 +19,79 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from factory import (  # noqa: E402
     asset_library,
     db,
+    master_risk,
     orchestrator,
     production_metrics,
     production_planner,
+    quality_canary,
 )
 from factory import prompts  # noqa: E402
 from factory.steps import s1_storyboard, s3_shots  # noqa: E402
 import cli as cli_module  # noqa: E402
 
 
+class MasterRiskTests(unittest.TestCase):
+    def test_long_single_speaker_low_action_master_is_medium_risk(self):
+        report = master_risk.assess_master({
+            "duration": 26,
+            "speaker": "linxia",
+            "dialogue": "暴雨还在继续，我们按计划完成最后一次安全检查",
+            "performance_beats": ["抬头", "确认设备"],
+        })
+
+        self.assertEqual(report["level"], "medium")
+        self.assertEqual(report["factors"]["speaking_role_count"], 1)
+
+    def test_long_three_speaker_action_master_is_high_risk(self):
+        report = master_risk.assess_master({
+            "duration": 26,
+            "dialogue_blocks": [
+                {"speaker": "a", "text": "先断电"},
+                {"speaker": "b", "text": "收到，正在固定吊篮"},
+                {"speaker": "c", "text": "风速回落，可以继续"},
+            ],
+            "performance_beats": ["奔跑", "拉闸", "攀爬", "固定", "回望"],
+            "scene_change_markers": ["楼顶", "吊篮"],
+        })
+
+        self.assertEqual(report["level"], "high")
+        self.assertGreaterEqual(report["factors"]["speaking_role_count"], 3)
+
+    def test_short_simple_master_is_low_risk(self):
+        report = master_risk.assess_master({
+            "duration": 12,
+            "speaker": "host",
+            "dialogue": "先确认安全，再开始作业",
+            "performance_beats": ["点头"],
+        })
+
+        self.assertEqual(report["level"], "low")
+
+
 class MinimumPaidMasterTests(unittest.TestCase):
+    def test_legacy_storyboard_has_no_fixed_shot_or_broll_count_gate(self):
+        storyboard = {
+            "characters": [{
+                "id": "host",
+                "name": "Host",
+                "gender": "female",
+                "look": "A fictional equipment-rental consultant",
+            }],
+            "hook": "A visual evidence montage",
+            "bgm": {"mood": "restrained", "prompt": "light rhythm"},
+            "shots": [
+                {
+                    "idx": idx,
+                    "type": "broll",
+                    "duration": 4,
+                    "prompt": f"Evidence detail {idx}",
+                }
+                for idx in range(1, 14)
+            ],
+        }
+
+        s1_storyboard._validate(storyboard)
+
     def test_single_dialogue_master_is_valid_when_it_covers_the_whole_story(self):
         storyboard = {
             "production_profile": "standard",
@@ -72,7 +137,8 @@ class MinimumPaidMasterTests(unittest.TestCase):
             duration=18,
         )
 
-        self.assertIn("1—3", prompt)
+        self.assertNotIn("1—3 条", prompt)
+        self.assertIn("不设置人为条数或整单总时长上限", prompt)
         self.assertIn("最少", prompt)
         self.assertIn("asset_tags", prompt)
         self.assertIn("素材库", prompt)
@@ -410,7 +476,7 @@ class ProductionMetricsTests(unittest.TestCase):
             with patch.object(cli_module, "conn", return_value=self.memory_db):
                 result = runner.invoke(
                     cli_module.cli,
-                    ["plan", str(path), "--budget", "1700"],
+                    ["plan", str(path), "--budget", "3000"],
                 )
 
         self.assertEqual(result.exit_code, 0, result.output)
@@ -423,15 +489,141 @@ class ProductionMetricsTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(calls, 0)
 
+    def test_reliability_summary_uses_only_structured_evidence(self):
+        jobs = [
+            ("J-PASS", "T-1", "pass", "COMPOSED", 100, None,
+             "2026-08-20 09:00:00", "2026-08-20 09:01:00"),
+            ("J-REVIEW", "T-2", "review", "PRODUCTION_REVIEW_REQUIRED", 200, None,
+             "2026-08-20 10:00:00", "2026-08-20 10:03:00"),
+            ("J-PAID-FAIL", "T-3", "paid fail", "FAILED", 300,
+             "input_privacy_rejected", "2026-08-20 11:00:00", "2026-08-20 11:05:00"),
+            ("J-STUCK", "T-4", "stuck", "RECOVERY_REQUIRED", 400, None,
+             "2026-08-20 12:00:00", "2026-08-20 12:10:00"),
+        ]
+        self.memory_db.executemany(
+            "INSERT INTO jobs(job_id,topic_id,title,state,cost_cents,failure_code,"
+            "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            jobs,
+        )
+        self.memory_db.executemany(
+            "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,"
+            "cost_cents,usage_json) VALUES(?,?,?,?,?,?,?)",
+            [
+                ("task-pass", "J-PASS", 1, "seedance", "generate", 100, "{}"),
+                ("task-review", "J-REVIEW", 1, "seedance", "generate", 200, "{}"),
+                ("task-policy", "J-PAID-FAIL", 1, "seedance", "generate", 300, "{}"),
+                ("task-dup", "J-STUCK", 1, "seedance", "generate", 400,
+                 json.dumps({"duplicate_submission": True})),
+            ],
+        )
+        self.memory_db.executemany(
+            "INSERT INTO job_transitions(event_id,job_id,event,from_state,to_state) "
+            "VALUES(?,?,?,?,?)",
+            [
+                ("e-review", "J-REVIEW", "review_required", "RUNNING", "PRODUCTION_REVIEW_REQUIRED"),
+                ("e-recovery-ok", "J-PASS", "recovery_requeue", "RECOVERY_REQUIRED", "QUEUED"),
+                ("e-recovery-fail", "J-STUCK", "recovery_required", "RUNNING", "RECOVERY_REQUIRED"),
+            ],
+        )
+        production_metrics.record_review(
+            self.memory_db, "J-PASS", "approved", first_pass=True,
+        )
+        production_metrics.record_review(
+            self.memory_db, "J-REVIEW", "local_recut", first_pass=False,
+        )
+
+        report = production_metrics.reliability_summary(
+            self.memory_db,
+            since="2026-08-20 00:00:00",
+            now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(report["created_jobs"], 4)
+        self.assertEqual(report["first_round_eligible_jobs"], 3)
+        self.assertAlmostEqual(report["first_round_progression_rate"], 1 / 3)
+        self.assertEqual(report["deterministic_post_paid_failures"], 1)
+        self.assertEqual(report["unknown_stuck_jobs"], 1)
+        self.assertAlmostEqual(report["recovery_success_rate"], 0.5)
+        self.assertAlmostEqual(report["manual_review_rate"], 0.25)
+        self.assertEqual(report["duplicate_paid_submissions"], 1)
+        self.assertEqual(report["duration_seconds"]["p50"], 240.0)
+        self.assertEqual(report["duration_seconds"]["p95"], 555.0)
+        self.assertEqual(report["cost_cents"]["p50"], 250)
+        self.assertEqual(report["cost_cents"]["p95"], 385)
+
+    def test_release_gate_needs_seven_clean_days_and_freezes_on_any_safety_event(self):
+        clean = [
+            {
+                "date": f"2026-08-{day:02d}",
+                "first_round_progression_rate": 0.96,
+                "duplicate_paid_submissions": 0,
+                "unknown_stuck_jobs": 0,
+                "deterministic_post_paid_failures": 0,
+            }
+            for day in range(14, 21)
+        ]
+        self.assertEqual(
+            quality_canary.evaluate_release_gate(clean)["status"], "pass"
+        )
+        self.assertEqual(
+            quality_canary.evaluate_release_gate(clean[:6])["status"],
+            "insufficient_data",
+        )
+        unsafe = [dict(row) for row in clean]
+        unsafe[-1]["duplicate_paid_submissions"] = 1
+        frozen = quality_canary.evaluate_release_gate(unsafe)
+        self.assertEqual(frozen["status"], "freeze")
+        self.assertIn("duplicate_paid_submission", frozen["reasons"])
+
+    def test_real_provider_canary_requires_explicit_confirmation_and_own_budget(self):
+        with self.assertRaisesRegex(ValueError, "explicit confirmation"):
+            quality_canary.prepare_explicit_run(
+                "single-speaker-8s-v1", confirmed=False, budget_cents=100,
+            )
+        with self.assertRaisesRegex(ValueError, "budget"):
+            quality_canary.prepare_explicit_run(
+                "single-speaker-8s-v1", confirmed=True, budget_cents=0,
+            )
+
+        contract = quality_canary.prepare_explicit_run(
+            "single-speaker-8s-v1", confirmed=True, budget_cents=2000,
+        )
+
+        self.assertEqual(contract["launch_mode"], "manual_confirmed")
+        self.assertFalse(contract["scheduler_allowed"])
+        self.assertFalse(contract["uses_production_real_assets"])
+        self.assertEqual(contract["job_budget_cents"], 1500)
+        self.assertEqual(contract["confirmed_budget_cents"], 2000)
+
+    def test_management_ui_renders_seven_and_thirty_day_reliability(self):
+        javascript = (PROJECT_ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8",
+        )
+
+        self.assertIn("function renderReliability", javascript)
+        self.assertIn("7 天可靠性", javascript)
+        self.assertIn("30 天趋势", javascript)
+        self.assertIn("重复付费", javascript)
+        self.assertIn("未知卡住", javascript)
+        self.assertIn("人工质量金丝雀", javascript)
+        self.assertIn("/api/quality-canary/jobs", javascript)
+        self.assertIn("quality-canary-confirm", javascript)
+
 
 class ProductionPlannerTests(unittest.TestCase):
     def setUp(self):
+        self.anchor_generators = patch.dict(os.environ, {
+            "CHARACTER_ANCHOR_GENERATOR": "seedream_5_0",
+            "SCENE_ANCHOR_GENERATOR": "seedream_5_0",
+        })
+        self.anchor_generators.start()
         self.memory_db = sqlite3.connect(":memory:")
         self.memory_db.row_factory = sqlite3.Row
         self.memory_db.executescript(db.DDL)
 
     def tearDown(self):
         self.memory_db.close()
+        self.anchor_generators.stop()
 
     def test_plan_reuses_broll_and_prices_only_paid_masters(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -464,7 +656,7 @@ class ProductionPlannerTests(unittest.TestCase):
         self.assertEqual(report["total_masters"], 2)
         self.assertEqual(report["paid_master_count"], 1)
         self.assertEqual(report["library_hits"][0]["asset_id"], "yard-001")
-        self.assertEqual(report["estimated_cost_cents"], 816)
+        self.assertEqual(report["estimated_cost_cents"], 1224)
         self.assertFalse(report["budget_ok"])
 
     def test_plan_flags_broll_without_tags_as_a_paid_risk(self):
@@ -476,8 +668,19 @@ class ProductionPlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(report["paid_master_count"], 1)
-        self.assertEqual(report["estimated_cost_cents"], 612)
+        self.assertEqual(report["estimated_cost_cents"], 918)
         self.assertTrue(any("asset_tags" in item for item in report["warnings"]))
+
+    def test_legacy_preflight_snapshot_matches_the_explicit_resolution(self):
+        with patch.dict(os.environ, {"ARK_VIDEO_RESOLUTION": "720p"}):
+            report = production_planner.analyze_storyboard(
+                self.memory_db,
+                {"masters": [{"idx": 1, "type": "broll", "duration": 4}]},
+                budget_cents=2500,
+                resolution="480p",
+            )
+
+        self.assertEqual(report["generation_snapshot"]["resolution"], "480p")
 
     def test_plan_estimates_only_remaining_masters_and_projects_total_cost(self):
         report = production_planner.analyze_storyboard(
@@ -537,6 +740,52 @@ class ProductionPlannerTests(unittest.TestCase):
         )
         self.assertEqual(report["paid_masters"][1]["reference_duration_sec"], 30)
         self.assertEqual(report["estimated_cost_cents"], 5304)
+
+    def test_paid_master_estimate_persists_calibration_dimensions(self):
+        report = production_planner.analyze_storyboard(
+            self.memory_db,
+            {
+                "characters": [{
+                    "id": "host",
+                    "name": "Host",
+                    "generation_mode": "ai_generated",
+                    "look": "a fictional presenter",
+                }],
+                "masters": [
+                    {
+                        "idx": 1, "type": "dialogue", "duration": 18,
+                        "speaker_id": "host", "render_mode": "presenter",
+                    },
+                    {
+                        "idx": 2, "type": "dialogue", "duration": 6,
+                        "speaker_id": "host", "render_mode": "presenter",
+                    },
+                    {"idx": 3, "type": "broll", "duration": 26},
+                ],
+            },
+            budget_cents=20000,
+            resolution="720p",
+        )
+
+        first, followup, long_broll = report["paid_masters"]
+        self.assertEqual(first["resolution"], "720p")
+        self.assertEqual(first["duration_bucket"], "13-24s")
+        self.assertEqual(first["reference_type"], "image")
+        self.assertEqual(
+            [item["duty"] for item in first["reference_manifest"]],
+            ["speaker_identity"],
+        )
+        self.assertEqual(followup["duration_bucket"], "4-12s")
+        self.assertEqual(followup["reference_type"], "mixed")
+        self.assertEqual(
+            [(item["kind"], item["duty"]) for item in followup["reference_manifest"]],
+            [
+                ("image", "speaker_identity"),
+                ("video", "speaker_identity"),
+            ],
+        )
+        self.assertEqual(long_broll["duration_bucket"], "25-30s")
+        self.assertEqual(long_broll["reference_type"], "none")
 
     def test_plan_prices_short_editorial_masters_at_provider_minimum(self):
         report = production_planner.analyze_storyboard(

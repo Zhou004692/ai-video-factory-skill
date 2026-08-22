@@ -66,12 +66,12 @@ AUDIT_RULES = {
     "credential-assignment": re.compile(
         r"(?im)(?:"
         r"^\s*[\"']?(?:ARK_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|VOLC_AK|"
-        r"VOLC_SK|VOLC_ASR_API_KEY|VOLC_ASR_TOKEN|KLING_SECRET_KEY|SUNO_API_KEY|"
+        r"VOLC_SK|VOLC_ASR_API_KEY|VOLC_ASR_TOKEN|VOLC_TTS_API_KEY|KLING_SECRET_KEY|SUNO_API_KEY|"
         r"DOUYIN_CLIENT_SECRET|API_KEY|CLIENT_SECRET)[\"']?\s*(?:=|:)\s*"
         r"(?:[\"'](?!<|\.\.\.|optional|required)[^\"'\r\n]{8,}[\"']|"
         r"(?!<|\.\.\.|optional|required)[A-Za-z0-9][A-Za-z0-9._/-]{7,})\s*(?:#.*)?$"
         r"|[\"'](?:ARK_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|VOLC_AK|"
-        r"VOLC_SK|VOLC_ASR_API_KEY|VOLC_ASR_TOKEN|KLING_SECRET_KEY|SUNO_API_KEY|"
+        r"VOLC_SK|VOLC_ASR_API_KEY|VOLC_ASR_TOKEN|VOLC_TTS_API_KEY|KLING_SECRET_KEY|SUNO_API_KEY|"
         r"DOUYIN_CLIENT_SECRET|API_KEY|CLIENT_SECRET)[\"']\s*:\s*"
         r"[\"'](?!<|\.\.\.|optional|required)[^\"'\r\n]{8,}[\"']"
         r")"
@@ -182,7 +182,12 @@ def build_archive(source_root: Path, output_root: Path) -> Path:
     report = audit_distribution(package)
     if not report["ok"]:
         raise ValueError(json.dumps(report, ensure_ascii=False))
-    archive = output_root.resolve() / f"{SKILL_NAME}.zip"
+    version = (source_root.resolve() / "VERSION").read_text(
+        encoding="utf-8"
+    ).strip()
+    if not re.fullmatch(r"[0-9A-Za-z._-]+", version):
+        raise ValueError("VERSION contains unsupported archive filename characters")
+    archive = output_root.resolve() / f"{SKILL_NAME}-{version}.zip"
     if archive.exists():
         archive.unlink()
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:

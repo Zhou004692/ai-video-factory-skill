@@ -1,0 +1,8 @@
+{
+  "status": 400,
+  "error": {
+    "code": "OutputVideoSensitiveContentDetected.PolicyViolation",
+    "message": "Generated output was rejected by the content policy"
+  },
+  "provider_task_state": "rejected"
+}

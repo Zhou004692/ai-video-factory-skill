@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AI Video Factory · 本地管理台</title>
-  <link rel="stylesheet" href="/styles.css?v=20260817-todo-center">
+  <link rel="stylesheet" href="/styles.css?v=20260817-scene-blocking">
 </head>
 <body data-page="overview">
   <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -119,6 +119,10 @@
             <div class="action-queue-title"><div><p class="section-no">DECISION QUEUE</p><h3>全流程决策队列</h3></div><span>正在加载需要人工处理的事项</span></div>
             <div class="todo-groups" aria-busy="true"></div>
           </section>
+          <section class="todo-activity-panel" aria-label="最新业务动态">
+            <header><div><p class="section-no">LATEST ACTIVITY</p><h3>最新动态</h3><p>业务里程碑，不展示模型调用与执行日志</p></div><span id="todo-activity-count">正在加载</span></header>
+            <div class="todo-activity-list" id="todo-recent-events" aria-busy="true"></div>
+          </section>
           <footer class="todo-page-foot"><span>内容决策 → 制作设置 → 人工复核 → 成片验收 → 发布 → 绩效录入</span><small>系统执行过程不会进入待办，避免把日志当任务</small></footer>
         </div>
       </section>
@@ -140,7 +144,7 @@
 
       <section class="page" id="page-videos">
         <div class="section-intro"><div><p class="section-no">02 / VIDEO PIPELINE</p><h2>原生母片生成 + 本地导演剪辑</h2><p>Seedance 2.5 负责画面、原生人声和口型；本地完成导演切镜、字幕、BGM 与包装</p></div><div class="budget-badge"><small>累计模型成本</small><strong id="total-cost">¥0.00</strong></div></div>
-        <div class="module-workbench video-module-workbench"><aside class="module-rail"><header><p class="section-no">PRODUCTION QUEUE</p><h3>制作队列</h3></header><div class="status-filter vertical" id="video-filters"><button class="active" data-state="all">全部任务</button><button data-state="STORYBOARDED">待生成</button><button data-state="in_progress">生成中</button><button data-state="REVIEW_REQUIRED">待复核</button><button data-state="COMPOSED">成品</button><button data-state="READY_TO_PUBLISH">已提交发布</button><button data-state="FAILED">其他异常</button></div><label class="table-search module-search"><span aria-hidden="true">⌕</span><input id="video-search" type="search" placeholder="搜索任务"></label></aside><section class="module-canvas"><header class="module-canvas-head"><div><p class="section-no">DIRECTOR DESK</p><h3>视频生产与验收</h3></div><span>任务状态、成本和下一步集中处理</span></header><section class="table-panel"><div class="data-table" id="video-table"></div></section></section><aside class="module-inspector"><header><p class="section-no">PRODUCTION CONTROL</p><h3>制作检查器</h3></header><div class="module-inspector-card accent"><b>标准生产方案</b><p>Seedance 2.5 原生母片，本地完成导演剪辑、字幕、BGM 与包装</p></div><div class="production-health" id="production-health"><span>正在读取生产队列…</span></div><div class="module-stat"><span>累计模型成本</span><strong id="video-inspector-cost">—</strong></div><ul class="module-check-list"><li>角色形象一致</li><li>口型与原生语音自然</li><li>字幕安全区无截断</li><li>成片必须人工验收</li></ul></aside></div>
+        <div class="module-workbench video-module-workbench"><aside class="module-rail"><header><p class="section-no">PRODUCTION QUEUE</p><h3>制作队列</h3></header><div class="status-filter vertical" id="video-filters"><button class="active" data-state="all">全部任务</button><button data-state="STORYBOARDED">待生成</button><button data-state="in_progress">生成中</button><button data-state="REVIEW_REQUIRED">待复核</button><button data-state="PROVIDER_ACTION_REQUIRED">待模型核对</button><button data-state="COMPOSED">成品</button><button data-state="READY_TO_PUBLISH">已提交发布</button><button data-state="FAILED">其他异常</button></div><label class="table-search module-search"><span aria-hidden="true">⌕</span><input id="video-search" type="search" placeholder="搜索任务"></label></aside><section class="module-canvas"><header class="module-canvas-head"><div><p class="section-no">DIRECTOR DESK</p><h3>视频生产与验收</h3></div><span>任务状态、成本和下一步集中处理</span></header><section class="table-panel"><div class="data-table" id="video-table"></div></section></section><aside class="module-inspector"><header><p class="section-no">PRODUCTION CONTROL</p><h3>制作检查器</h3></header><div class="module-inspector-card accent"><b>标准生产方案</b><p>Seedance 2.5 原生母片；对白可选固定火山声线或 Seedance 原生声线，本地完成导演剪辑、字幕、BGM 与包装</p></div><div class="production-health" id="production-health"><span>正在读取生产队列…</span></div><div class="module-stat"><span>累计模型成本</span><strong id="video-inspector-cost">—</strong></div><ul class="module-check-list"><li>角色形象一致</li><li>口型与所选声音方案自然</li><li>字幕安全区无截断</li><li>成片必须人工验收</li></ul></aside></div>
       </section>
 
       <section class="page" id="page-publishing">
@@ -159,10 +163,11 @@
       </section>
 
       <section class="page" id="page-config">
-        <div class="section-intro"><div><p class="section-no">06 / SYSTEM CONFIG</p><h2>先完成必要配置，其余保持默认</h2><p>普通用户只需配置三组账号信息。模型、画质、预算和并发等可选参数已固化默认值；密钥仅保存在本机且不会回显</p></div><button class="primary-action" id="save-config">保存配置</button></div>
+        <div class="section-intro"><div><p class="section-no">06 / SYSTEM CONFIG</p><h2>先完成当前方案所需配置，其余保持默认</h2><p>选择 Seedance 原生声线时无需配置 TTS；选择固定火山声线时才需补充 TTS 账号。密钥仅保存在本机且不会回显</p></div><button class="primary-action" id="save-config">保存配置</button></div>
         <div class="module-workbench config-module-workbench"><aside class="module-rail"><header><p class="section-no">READINESS</p><h3>能力就绪度</h3></header><div class="setup-copy"><p id="required-progress">正在检查必要配置…</p></div><div class="readiness-grid vertical" id="readiness"></div></aside><section class="module-canvas"><header class="module-canvas-head"><div><p class="section-no">SETTINGS DESK</p><h3>能力配置工作区</h3></div><span>必要配置优先，其余保持默认</span></header><div class="config-layout config-layout-full"><div class="config-main">
-            <section class="panel required-panel">
-              <div class="panel-head"><div><p class="section-no">REQUIRED / 3 STEPS</p><h3>必要配置</h3></div><span class="config-hint">按需完成，不必一次配齐</span></div>
+          <section class="panel" id="provider-runtime-status"></section>
+          <section class="panel required-panel">
+              <div class="panel-head"><div><p class="section-no">REQUIRED / BY MODE</p><h3>必要配置</h3></div><span class="config-hint">按所选声音方案动态判断</span></div>
               <div class="required-config-list" id="required-config"></div>
             </section>
             <details class="panel advanced-panel" id="advanced-config">
@@ -188,6 +193,6 @@
     <div class="drawer-body" id="drawer-body"></div>
   </aside>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="/app.js?v=20260817-todo-center"></script>
+  <script src="/app.js?v=20260819-audio-mode-v1"></script>
 </body>
 </html>

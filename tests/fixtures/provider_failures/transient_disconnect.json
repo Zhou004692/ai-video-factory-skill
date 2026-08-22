@@ -1,0 +1,8 @@
+{
+  "status": 503,
+  "error": {
+    "code": "RemoteProtocolError",
+    "message": "Connection closed before task confirmation"
+  },
+  "provider_task_state": "unknown"
+}

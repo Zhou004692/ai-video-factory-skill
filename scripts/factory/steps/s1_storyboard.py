@@ -80,8 +80,6 @@ def _validate_director_storyboard(sb: dict) -> None:
     masters = sb["masters"]
     if not isinstance(masters, list) or not masters:
         raise ValueError("standard director pipeline requires at least 1 paid master")
-    if sum(float(master.get("duration") or 0) for master in masters) > 90:
-        raise ValueError("standard director pipeline paid master duration exceeds 90s")
     master_by_idx = {master.get("idx"): master for master in masters}
     if len(master_by_idx) != len(masters) or None in master_by_idx:
         raise ValueError("master idx values must be present and unique")
@@ -95,6 +93,17 @@ def _validate_director_storyboard(sb: dict) -> None:
             if master.get("speaker") not in char_ids:
                 raise ValueError(
                     f"dialogue master speaker must be one of {char_ids}: {master}"
+                )
+            master_speakers = master.get("speakers") or [master.get("speaker")]
+            if not isinstance(master_speakers, list) or not master_speakers:
+                raise ValueError(
+                    f"dialogue master {master['idx']} speakers must be a non-empty list"
+                )
+            unknown_speakers = set(master_speakers) - char_ids
+            if unknown_speakers:
+                raise ValueError(
+                    f"dialogue master {master['idx']} has unknown speakers: "
+                    f"{sorted(unknown_speakers)}"
                 )
             render_mode = (master.get("render_mode") or "presenter").lower()
             if render_mode not in (
@@ -193,8 +202,8 @@ def _validate(sb: dict) -> None:
             )
         char_ids.add(ch["id"])
 
-    if not isinstance(sb["shots"], list) or not (2 <= len(sb["shots"]) <= 12):
-        raise ValueError(f"shots count out of range: {len(sb.get('shots', []))}")
+    if not isinstance(sb["shots"], list) or not sb["shots"]:
+        raise ValueError("storyboard must contain at least 1 generation unit")
 
     for shot in _generation_units(sb):
         if shot.get("type") not in ("dialogue", "broll"):
@@ -231,15 +240,6 @@ def _validate(sb: dict) -> None:
                     f"{char_ids} or null: {anchor}"
                 )
 
-    # 软约束:broll 镜头最多 6 个(放宽,允许 broll 主导特写蒙太奇主题)
-    # v2.4 之前 ≤1 是因为 broll 没角色感影响品牌记忆;
-    # 现在允许 broll 主导(如老司机验车 5 处),但仍需至少 2-3 dialogue 镜头保品牌人格
-    n_broll = sum(1 for s in sb["shots"] if s["type"] == "broll")
-    if n_broll > 6:
-        raise ValueError(
-            f"too many broll shots ({n_broll}); max 6 per video "
-            f"(30s 内 5s/broll × 6 = 全 broll 极限,再多没角色感观众记不住)"
-        )
 
 
 async def run(job_id: str) -> None:
