@@ -8392,12 +8392,18 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
             "production_mode": "native_master_local_director",
             "shots": [
                 {
-                    "idx": 2, "audio_master_idx": 2,
-                    "audio_start": 0, "duration": 8.5,
+                    "idx": 2,
+                    "video_master_idx": 2, "video_start": 0,
+                    "audio_master_idx": 2, "audio_start": 0,
+                    "duration": 8.5,
+                    "continuity_relation": "opening",
                 },
                 {
-                    "idx": 3, "audio_master_idx": 2,
-                    "audio_start": 8.5, "duration": 11.53,
+                    "idx": 3,
+                    "video_master_idx": 2, "video_start": 8.5,
+                    "audio_master_idx": 2, "audio_start": 8.5,
+                    "duration": 11.53,
+                    "continuity_relation": "same_master_continuous",
                 },
             ],
         }
@@ -8422,7 +8428,36 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(changed)
         self.assertEqual(storyboard["shots"][0]["duration"], 9.11)
         self.assertEqual(storyboard["shots"][1]["audio_start"], 9.11)
+        self.assertEqual(storyboard["shots"][1]["video_start"], 9.11)
         self.assertEqual(storyboard["shots"][1]["duration"], 10.92)
+
+    def test_native_picture_timeline_repairs_stale_same_master_boundaries(self):
+        storyboard = {
+            "shots": [
+                {
+                    "idx": 1,
+                    "video_master_idx": 1,
+                    "audio_master_idx": 1,
+                    "video_start": 1.9,
+                    "audio_start": 1.68,
+                    "continuity_relation": "same_master_continuous",
+                },
+                {
+                    "idx": 2,
+                    "video_master_idx": 3,
+                    "audio_master_idx": 1,
+                    "video_start": 0.4,
+                    "audio_start": 3.09,
+                    "continuity_relation": "audio_bridge",
+                },
+            ],
+        }
+
+        changed = s6_compose._synchronize_native_picture_timeline(storyboard)
+
+        self.assertTrue(changed)
+        self.assertEqual(storyboard["shots"][0]["video_start"], 1.68)
+        self.assertEqual(storyboard["shots"][1]["video_start"], 0.4)
 
     def test_video_qa_rejects_explicit_lip_sync_failure(self):
         decision = video_qa.evaluate(
@@ -9165,6 +9200,29 @@ class StandardDirectorPipelineTests(unittest.TestCase):
         video_filter = args[args.index("-vf") + 1]
         self.assertIn("fade=t=in:st=0:d=0.120", video_filter)
         self.assertIn("fade=t=out:st=3.880:d=0.120", video_filter)
+
+    def test_director_cut_enforces_zero_based_24fps_timeline_contract(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            ffmpeg, "_run", new=AsyncMock()
+        ) as run:
+            asyncio.run(ffmpeg.cut_director_segment(
+                Path(tmp) / "video.mp4",
+                Path(tmp) / "audio.mp4",
+                Path(tmp) / "out.mp4",
+                video_start=3.09,
+                audio_start=3.09,
+                duration=2.15,
+            ))
+
+        args = run.await_args.args[0]
+        video_filter = args[args.index("-vf") + 1]
+        audio_filter = args[args.index("-af") + 1]
+        self.assertIn("fps=24", video_filter)
+        self.assertIn("setpts=PTS-STARTPTS", video_filter)
+        self.assertIn("asetpts=PTS-STARTPTS", audio_filter)
+        self.assertIn("aresample=async=1:first_pts=0", audio_filter)
+        self.assertEqual(args[args.index("-r") + 1], "24")
+        self.assertEqual(args[args.index("-fps_mode") + 1], "cfr")
 
     def test_storyboard_prompt_defaults_to_standard_director_mode(self):
         prompt = prompts.storyboard_prompt(

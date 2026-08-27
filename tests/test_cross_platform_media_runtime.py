@@ -113,6 +113,90 @@ class CrossPlatformMediaRuntimeTests(unittest.TestCase):
 
 
 class RealMediaRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def _video_timing(self, ffmpeg, path: Path) -> tuple[dict, list[float]]:
+        stream = json.loads(await ffmpeg._ffprobe([
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate,avg_frame_rate",
+            "-of", "json",
+            str(path),
+        ]))["streams"][0]
+        raw_frames = await ffmpeg._ffprobe([
+            "-select_streams", "v:0",
+            "-show_entries", "frame=best_effort_timestamp_time",
+            "-of", "csv=p=0",
+            str(path),
+        ])
+        timestamps = [
+            float(line.split(",", 1)[0])
+            for line in raw_frames.splitlines()
+            if line.strip()
+        ]
+        return stream, timestamps
+
+    async def test_concat_shots_normalizes_mixed_inputs_to_contiguous_24fps(self):
+        from factory.clients import ffmpeg
+        from factory.media_runtime import MediaRuntimeError
+
+        try:
+            ffmpeg.executable("ffmpeg")
+            ffmpeg.executable("ffprobe")
+        except MediaRuntimeError as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            first = base / "first.mp4"
+            second = base / "second.mp4"
+            output = base / "joined.mp4"
+            await ffmpeg._run([
+                "-f", "lavfi", "-i", "color=c=red:s=320x240:r=24:d=1.17",
+                "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=44100:duration=1.17",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", str(first),
+            ])
+            await ffmpeg._run([
+                "-f", "lavfi", "-i", "color=c=blue:s=320x240:r=25:d=1.13",
+                "-f", "lavfi", "-i",
+                "sine=frequency=660:sample_rate=44100:duration=1.13",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-shortest", str(second),
+            ])
+
+            await ffmpeg.concat_shots([first, second], output)
+
+            stream, timestamps = await self._video_timing(ffmpeg, output)
+            deltas = [
+                current - previous
+                for previous, current in zip(timestamps, timestamps[1:])
+            ]
+            self.assertEqual(stream["r_frame_rate"], "24/1")
+            self.assertEqual(stream["avg_frame_rate"], "24/1")
+            self.assertGreater(len(timestamps), 40)
+            self.assertLessEqual(max(deltas), 0.05)
+
+    async def test_cta_card_uses_same_24fps_timeline_contract(self):
+        from factory.clients import ffmpeg
+        from factory.media_runtime import MediaRuntimeError
+
+        try:
+            ffmpeg.executable("ffmpeg")
+            ffmpeg.executable("ffprobe")
+            ffmpeg.resolve_subtitle_font()
+        except MediaRuntimeError as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "cta.mp4"
+            await ffmpeg.make_cta_card(
+                output, duration=0.6, brand="OB", cta="Continue"
+            )
+
+            stream, timestamps = await self._video_timing(ffmpeg, output)
+            self.assertEqual(stream["r_frame_rate"], "24/1")
+            self.assertEqual(stream["avg_frame_rate"], "24/1")
+            self.assertEqual(timestamps[0], 0.0)
+
     async def test_two_second_chinese_caption_media_is_playable(self):
         from factory.clients import ffmpeg
         from factory.media_runtime import MediaRuntimeError

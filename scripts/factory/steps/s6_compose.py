@@ -192,6 +192,43 @@ def _align_internal_edits_to_speech_pauses(
         left["duration"] = round(boundary - left_start, 3)
         right["audio_start"] = boundary
         right["duration"] = round(right_end - boundary, 3)
+        if (
+            str(right.get("continuity_relation") or "")
+            == "same_master_continuous"
+            and int(left.get("video_master_idx", -1)) == int(master_idx)
+            and int(right.get("video_master_idx", -1)) == int(master_idx)
+            and int(left.get("audio_master_idx", -2)) == int(master_idx)
+            and int(right.get("audio_master_idx", -2)) == int(master_idx)
+        ):
+            left["video_start"] = round(left_start, 3)
+            right["video_start"] = boundary
+        changed = True
+    return changed
+
+
+def _synchronize_native_picture_timeline(storyboard: dict) -> bool:
+    """Repair stale picture boundaries after native-audio cut alignment.
+
+    A same-master continuous edit is one native performance sliced into adjacent
+    director beats.  Its picture and audio therefore share one source clock.
+    Older storyboards moved ASR audio boundaries without moving video_start,
+    which repeated or skipped frames at every local edit.
+    """
+    changed = False
+    for edit in storyboard.get("shots") or []:
+        if str(edit.get("continuity_relation") or "") != (
+            "same_master_continuous"
+        ):
+            continue
+        video_idx = int(edit.get("video_master_idx", -1))
+        audio_idx = int(edit.get("audio_master_idx", video_idx))
+        if video_idx != audio_idx:
+            continue
+        audio_start = round(float(edit.get("audio_start") or 0), 3)
+        video_start = round(float(edit.get("video_start") or 0), 3)
+        if abs(audio_start - video_start) <= 0.001:
+            continue
+        edit["video_start"] = audio_start
         changed = True
     return changed
 
@@ -319,6 +356,7 @@ async def _refresh_director_speech_timeline(
                 )
                 changed = True
 
+    changed = _synchronize_native_picture_timeline(storyboard) or changed
     changed = _synchronize_master_contract_durations(storyboard) or changed
 
     if changed:

@@ -261,9 +261,11 @@ async def normalize_shot(in_path: Path, out_path: Path,
     duration: 该镜时长(算 fade-out 起点用);不传则不加 fade-out。
     """
     vf_chain = [
+        "setpts=PTS-STARTPTS",
         f"scale={width}:{height}:force_original_aspect_ratio=decrease",
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
         "setsar=1",
+        "fps=24",
     ]
     # 字幕(底部,距底 12%)
     if subtitle and subtitle.strip():
@@ -328,9 +330,11 @@ async def cut_director_segment(
         raise ValueError("director segment duration must be > 0")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     vf_chain = [
+        "setpts=PTS-STARTPTS",
         f"scale={width}:{height}:force_original_aspect_ratio=decrease",
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
         "setsar=1",
+        "fps=24",
     ]
     if subtitle_cues:
         vf_chain.extend(_timed_subtitle_filters(
@@ -367,9 +371,16 @@ async def cut_director_segment(
         "-t", f"{duration:.3f}",
         "-map", "0:v:0", "-map", "1:a:0",
         "-vf", ",".join(vf_chain),
+        "-af", (
+            "asetpts=PTS-STARTPTS,"
+            "aresample=async=1:first_pts=0,"
+            f"apad,atrim=duration={duration:.3f},asetpts=N/SR/TB"
+        ),
         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-        "-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart",
+        "-r", "24", "-fps_mode", "cfr",
+        "-pix_fmt", "yuv420p", "-video_track_timescale", "12288",
+        "-movflags", "+faststart",
         str(out_path),
     ]
     await _run(args)
@@ -445,12 +456,16 @@ async def make_cta_card(out_path: Path, *, width: int = 1080, height: int = 1920
         "fade=t=in:st=0:d=0.3",
     ])
     await _run([
-        "-f", "lavfi", "-i", f"color=c=0x1A2740:s={width}x{height}:d={duration}",
+        "-f", "lavfi", "-i",
+        f"color=c=0x1A2740:s={width}x{height}:r=24:d={duration}",
         "-f", "lavfi", "-i", "anullsrc=cl=stereo:r=44100",
-        "-vf", vf,
+        "-vf", f"setpts=PTS-STARTPTS,{vf},fps=24",
+        "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
         "-t", str(duration),
         "-c:v", "libx264", "-preset", "medium", "-crf", "20",
         "-c:a", "aac", "-b:a", "128k",
+        "-r", "24", "-fps_mode", "cfr",
+        "-video_track_timescale", "12288",
         "-pix_fmt", "yuv420p",
         str(out_path),
     ])
@@ -577,15 +592,34 @@ async def assemble_timed_audio(
 
 async def concat_shots(shot_paths: list[Path], out_path: Path) -> None:
     """concat demuxer 拼接。要求所有片段格式一致(请先 normalize_shot)。"""
-    list_file = out_path.parent / "concat.txt"
-    list_file.write_text(
-        "\n".join(f"file '{p.resolve().as_posix()}'" for p in shot_paths),
-        encoding="utf-8"
+    if not shot_paths:
+        raise ValueError("concat requires at least one shot")
+    inputs: list[str] = []
+    filters: list[str] = []
+    concat_inputs: list[str] = []
+    for index, path in enumerate(shot_paths):
+        inputs.extend(["-i", str(path)])
+        filters.extend([
+            f"[{index}:v:0]fps=24,setpts=PTS-STARTPTS[v{index}]",
+            (
+                f"[{index}:a:0]aresample=async=1:first_pts=0,"
+                f"asetpts=PTS-STARTPTS[a{index}]"
+            ),
+        ])
+        concat_inputs.extend([f"[v{index}]", f"[a{index}]"])
+    filters.append(
+        "".join(concat_inputs)
+        + f"concat=n={len(shot_paths)}:v=1:a=1[v][a]"
     )
     await _run([
-        "-f", "concat", "-safe", "0",
-        "-i", str(list_file),
-        "-c", "copy",
+        *inputs,
+        "-filter_complex", ";".join(filters),
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+        "-r", "24", "-fps_mode", "cfr",
+        "-pix_fmt", "yuv420p", "-video_track_timescale", "12288",
+        "-movflags", "+faststart",
         str(out_path),
     ])
 
