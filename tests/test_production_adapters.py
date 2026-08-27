@@ -101,6 +101,60 @@ class ProductionAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(output["master_idx"], 1)
 
+    async def test_master_adapter_overlays_only_mutable_runtime_cost_controls(self):
+        """Budget confirmation must affect execution without replacing creative IR."""
+        spec = json.loads(self.database.execute(
+            "SELECT production_spec_json FROM jobs WHERE job_id='J-ADAPTER'"
+        ).fetchone()[0])
+        spec["runtime_storyboard"]["production_settings"].update({
+            "generation_snapshot": {
+                "job_budget_cents": 10000,
+                "max_auto_retries": 1,
+                "auto_retry_budget_cents": 800,
+            },
+        })
+        live_storyboard = {
+            "title": "must not replace frozen title",
+            "masters": [{"idx": 99, "scene": "must not replace frozen master"}],
+            "production_settings": {
+                "budget_cents": 16000,
+                "generation_snapshot": {
+                    "job_budget_cents": 16000,
+                    "max_auto_retries": 0,
+                    "auto_retry_budget_cents": 0,
+                },
+            },
+        }
+        self.database.execute(
+            "UPDATE jobs SET storyboard=?,production_spec_json=? "
+            "WHERE job_id='J-ADAPTER'",
+            (json.dumps(live_storyboard), json.dumps(spec)),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,state,video_path) VALUES(?,?,?,?)",
+            ("J-ADAPTER", 1, "OK", "master-1.mp4"),
+        )
+        self.database.commit()
+        row = self.database.execute(
+            "SELECT * FROM production_nodes WHERE job_id='J-ADAPTER' "
+            "AND node_id='master:1'"
+        ).fetchone()
+
+        with mock.patch(
+            "factory.production_adapters.s3_shots.run",
+            new=mock.AsyncMock(),
+        ) as run:
+            await production_adapters.run_master_node(self.database, row)
+
+        runtime = run.await_args.kwargs["storyboard_override"]
+        self.assertEqual(runtime["title"], "frozen")
+        self.assertEqual(runtime["masters"], self.storyboard["masters"])
+        settings = runtime["production_settings"]
+        self.assertEqual(settings["budget_cents"], 16000)
+        self.assertEqual(settings["generation_snapshot"]["job_budget_cents"], 16000)
+        self.assertEqual(settings["generation_snapshot"]["max_auto_retries"], 0)
+        self.assertEqual(settings["generation_snapshot"]["auto_retry_budget_cents"], 0)
+
     async def test_master_adapter_projects_paid_candidate_to_review(self):
         row = self.database.execute(
             "SELECT * FROM production_nodes WHERE job_id='J-ADAPTER' "

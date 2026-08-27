@@ -22,6 +22,14 @@ _TRANSITIONS = {
     ("ACTION_REQUIRED", "resume"): "READY",
     ("RUNNING", "require_budget"): "BUDGET_REQUIRED",
     ("BUDGET_REQUIRED", "resume"): "READY",
+    # A provider result can arrive after a local pause was persisted. The paid
+    # remote artifact is authoritative and must converge to human review rather
+    # than remain stranded behind the obsolete pause state.
+    ("BUDGET_REQUIRED", "reconcile_review"): "REVIEW_REQUIRED",
+    ("ACTION_REQUIRED", "reconcile_review"): "REVIEW_REQUIRED",
+    ("FAILED", "reconcile_review"): "REVIEW_REQUIRED",
+    ("RUNNING", "reconcile_review"): "REVIEW_REQUIRED",
+    ("READY", "reconcile_review"): "REVIEW_REQUIRED",
     ("RUNNING", "fail"): "FAILED",
     ("READY", "skip"): "SKIPPED",
     ("FAILED", "retry"): "READY",

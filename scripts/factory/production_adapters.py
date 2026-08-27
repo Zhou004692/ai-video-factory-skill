@@ -16,6 +16,58 @@ class FrozenSpecMismatchError(RuntimeError):
     non_retryable = True
 
 
+_MUTABLE_RUNTIME_SNAPSHOT_FIELDS = (
+    "job_budget_cents",
+    "max_auto_retries",
+    "auto_retry_budget_cents",
+)
+
+
+def _overlay_mutable_runtime_controls(
+    database: sqlite3.Connection,
+    job_id: str,
+    frozen_storyboard: dict,
+) -> dict:
+    """Overlay the paid-call control plane without mutating frozen creative IR.
+
+    Production Spec v2 freezes what will be generated. Budget confirmation and
+    retry consent are operator controls that can legitimately change after that
+    freeze. Keeping them inside the immutable spec made resumed nodes execute
+    with stale limits, so only this explicit allow-list is read from the live
+    job at execution time.
+    """
+    runtime = deepcopy(frozen_storyboard)
+    row = database.execute(
+        "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
+    ).fetchone()
+    if row is None:
+        return runtime
+    try:
+        live_storyboard = json.loads(row["storyboard"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return runtime
+    live_settings = live_storyboard.get("production_settings")
+    if not isinstance(live_settings, dict):
+        return runtime
+    runtime_settings = runtime.setdefault("production_settings", {})
+    if not isinstance(runtime_settings, dict):
+        runtime_settings = {}
+        runtime["production_settings"] = runtime_settings
+    if "budget_cents" in live_settings:
+        runtime_settings["budget_cents"] = live_settings["budget_cents"]
+    live_snapshot = live_settings.get("generation_snapshot")
+    if not isinstance(live_snapshot, dict):
+        return runtime
+    runtime_snapshot = runtime_settings.setdefault("generation_snapshot", {})
+    if not isinstance(runtime_snapshot, dict):
+        runtime_snapshot = {}
+        runtime_settings["generation_snapshot"] = runtime_snapshot
+    for field in _MUTABLE_RUNTIME_SNAPSHOT_FIELDS:
+        if field in live_snapshot:
+            runtime_snapshot[field] = live_snapshot[field]
+    return runtime
+
+
 def _runtime_master_rows(spec) -> list[dict]:
     storyboard = dict(getattr(spec, "runtime_storyboard", {}) or {})
     return [
@@ -164,7 +216,11 @@ async def run_master_node(
         raise FrozenSpecMismatchError("master node has no valid index") from exc
     if master_idx <= 0 or str(node["node_id"]) != f"master:{master_idx}":
         raise FrozenSpecMismatchError("master node id and frozen input disagree")
-    storyboard = deepcopy(spec["runtime_storyboard"])
+    storyboard = _overlay_mutable_runtime_controls(
+        database,
+        str(node["job_id"]),
+        spec["runtime_storyboard"],
+    )
     characters = deepcopy(list(spec.get("characters") or []))
     await s3_shots.run(
         str(node["job_id"]),

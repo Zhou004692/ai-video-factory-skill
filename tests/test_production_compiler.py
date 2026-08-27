@@ -258,6 +258,109 @@ class ProductionCompilerTests(unittest.TestCase):
             for shot in runtime["shots"]
         ))
 
+    def test_runtime_director_timeline_keeps_broll_before_later_cta(self):
+        runtime_source = {
+            "title": "B-roll before CTA",
+            "production_mode": "native_master_local_director",
+            "characters": [{"id": "lead", "name": "Lead"}],
+            "masters": [
+                {
+                    "idx": 1,
+                    "type": "dialogue",
+                    "scene_anchor_key": "scene-repair",
+                    "scene": "repair point",
+                    "cast": ["lead"],
+                    "speaker": "lead",
+                    "duration": 6,
+                    "voiceover": "repair completed",
+                    "performance_beats": [{
+                        "source_beat_id": "beat-reversal",
+                        "beat": "reversal",
+                        "speaker": "lead",
+                        "dialogue": "repair completed",
+                        "duration": 6,
+                        "visual_intent": "the panel stops shaking",
+                    }],
+                },
+                {
+                    "idx": 2,
+                    "type": "dialogue",
+                    "scene_anchor_key": "scene-finish",
+                    "scene": "open production lane",
+                    "cast": ["lead"],
+                    "speaker": "lead",
+                    "duration": 6,
+                    "voiceover": "production resumes",
+                    "performance_beats": [{
+                        "source_beat_id": "beat-cta",
+                        "beat": "cta",
+                        "speaker": "lead",
+                        "dialogue": "production resumes",
+                        "duration": 6,
+                        "visual_intent": "the lane reopens",
+                    }],
+                },
+                {
+                    "idx": 3,
+                    "type": "broll",
+                    "scene_anchor_key": "scene-repair",
+                    "scene": "repair point",
+                    "cast": ["lead"],
+                    "duration": 6,
+                    "action": "close-up comparison of the stable panel",
+                },
+            ],
+            "shots": [
+                {
+                    "idx": 1,
+                    "source_beat_id": "beat-reversal",
+                    "beat": "reversal",
+                    "video_master_idx": 3,
+                    "audio_master_idx": 1,
+                    "video_start": 0,
+                    "audio_start": 0,
+                    "duration": 6,
+                    "subtitle": "repair completed",
+                    "visual_intent": "the panel stops shaking",
+                },
+                {
+                    "idx": 2,
+                    "source_beat_id": "beat-cta",
+                    "beat": "cta",
+                    "video_master_idx": 2,
+                    "audio_master_idx": 2,
+                    "video_start": 0,
+                    "audio_start": 0,
+                    "duration": 6,
+                    "subtitle": "production resumes",
+                    "visual_intent": "the lane reopens",
+                },
+            ],
+        }
+
+        result = production_compiler.compile_ir(
+            creative_ir.from_storyboard(runtime_source),
+            job_id="J-broll-before-cta",
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=10000,
+            runtime_storyboard=runtime_source,
+        )
+
+        self.assertTrue(result.compilable)
+        runtime = result.spec.runtime_storyboard
+        self.assertEqual(
+            [shot["source_beat_id"] for shot in runtime["shots"]],
+            ["beat-reversal", "beat-cta"],
+        )
+        self.assertEqual(
+            [shot["video_master_idx"] for shot in runtime["shots"]],
+            [3, 2],
+        )
+        self.assertEqual(
+            [shot["audio_master_idx"] for shot in runtime["shots"]],
+            [1, 2],
+        )
+
     def test_provider_capabilities_use_seedance_single_source_of_truth(self):
         from factory.clients import seedance
 

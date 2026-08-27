@@ -1094,6 +1094,86 @@ class ManagementService:
         except provider_tasks.ProviderTaskGateError as exc:
             raise ValueError(str(exc)) from exc
 
+    def _sync_graph_reconciled_master_candidate(
+        self,
+        job_id: str,
+        master_idx: int,
+        *,
+        task_id: str,
+        candidate_path: Path,
+        candidate_url: str | None,
+    ) -> bool:
+        """Converge a late paid provider result into the Graph v2 review gate."""
+        engine = self.database.execute(
+            "SELECT execution_engine FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if not engine or str(engine["execution_engine"] or "legacy") != "graph_v2":
+            return False
+        node_id = f"master:{int(master_idx)}"
+        node = self.database.execute(
+            "SELECT state,output_json FROM production_nodes "
+            "WHERE job_id=? AND node_id=?",
+            (job_id, node_id),
+        ).fetchone()
+        if node is None:
+            return False
+        current = str(node["state"] or "")
+        if current not in {
+            "SUCCEEDED", "REVIEW_REQUIRED", "BUDGET_REQUIRED",
+            "ACTION_REQUIRED", "FAILED", "RUNNING", "READY",
+        }:
+            raise ValueError(
+                f"reconciled master graph state is inconsistent: {node_id}={current}"
+            )
+        if current not in {"SUCCEEDED", "REVIEW_REQUIRED"}:
+            node_state_machine.transition_node_in_transaction(
+                self.database,
+                job_id,
+                node_id,
+                "reconcile_review",
+                event_id=f"{job_id}:{node_id}:provider-reconciled:{task_id}",
+                payload={
+                    "provider_task_id": str(task_id),
+                    "master_idx": int(master_idx),
+                    "candidate_path": str(candidate_path),
+                },
+            )
+        try:
+            output = json.loads(node["output_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            output = {}
+        for key in (
+            "stable_code", "error", "error_type", "current_cost_cents",
+            "pending_cost_cents", "next_estimate_cents", "budget_limit_cents",
+        ):
+            output.pop(key, None)
+        output.update({
+            "master_idx": int(master_idx),
+            "status": "manual_review_required",
+            "reasons": ["provider_task_reconciled"],
+            "candidate_path": str(candidate_path),
+            "candidate_url": str(candidate_url or ""),
+        })
+        provider_cost = int(self.database.execute(
+            "SELECT COALESCE(SUM(cost_cents),0) FROM provider_calls "
+            "WHERE job_id=? AND shot_idx=?",
+            (job_id, int(master_idx)),
+        ).fetchone()[0] or 0)
+        self.database.execute(
+            "UPDATE production_nodes SET actual_cost_cents=?,provider_task_id=?,"
+            "error_code=NULL,next_action='review_candidate',output_json=?,"
+            "lease_id=NULL,heartbeat_at=NULL,updated_at=CURRENT_TIMESTAMP "
+            "WHERE job_id=? AND node_id=?",
+            (
+                provider_cost,
+                str(task_id),
+                json.dumps(output, ensure_ascii=False, sort_keys=True),
+                job_id,
+                node_id,
+            ),
+        )
+        return True
+
     def _music_provider(self) -> str:
         return music.resolve_provider(_read_env(self.env_path))
 
@@ -1456,6 +1536,13 @@ class ManagementService:
                                 qa, "远端任务已完成，等待人工复核", delta,
                                 job_id, shot_idx,
                             ),
+                        )
+                        self._sync_graph_reconciled_master_candidate(
+                            job_id,
+                            shot_idx,
+                            task_id=str(task_id),
+                            candidate_path=candidate_path,
+                            candidate_url=str(inspected.get("video_url") or ""),
                         )
                     else:
                         self.database.execute(

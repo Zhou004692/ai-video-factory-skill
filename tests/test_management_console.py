@@ -8886,6 +8886,71 @@ class ManagementServiceTests(unittest.TestCase):
             "SELECT cost_cents FROM jobs WHERE job_id='J-RECONCILE'"
         ).fetchone()["cost_cents"], 700)
 
+    def test_graph_budget_node_reconciliation_converges_to_review_state(self):
+        """A paid remote result must supersede an obsolete local budget pause."""
+        job_id = "J-RECONCILE-GRAPH-BUDGET"
+        task_id = "seedance-remote-budget-finished"
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents,"
+            "error,execution_engine) VALUES(?,?,?,'PROVIDER_ACTION_REQUIRED',"
+            "'{}',0,'remote task needs reconciliation','graph_v2')",
+            (job_id, "T-1", "graph budget reconcile"),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,state,cost_cents,error) "
+            "VALUES(?,3,'FAILED',0,'submit result unknown')",
+            (job_id,),
+        )
+        self.database.execute(
+            "INSERT INTO production_nodes(job_id,node_id,node_type,paid,state,"
+            "spec_hash,input_json,idempotency_key,estimated_cost_cents,"
+            "actual_cost_cents,provider_task_id,error_code,next_action,output_json) "
+            "VALUES(?, 'master:3', 'master', 1, 'BUDGET_REQUIRED', 'spec', '{}',"
+            "'idem-master-3',408,0,?,'budget_confirmation_required',"
+            "'increase_job_budget',?)",
+            (
+                job_id,
+                task_id,
+                json.dumps({
+                    "stable_code": "budget_confirmation_required",
+                    "next_estimate_cents": 816,
+                }),
+            ),
+        )
+        self.database.execute(
+            "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,"
+            "usage_json,cost_cents) VALUES(?,?,3,'seedance','generate',?,0)",
+            (task_id, job_id, json.dumps({"status": "action_required"})),
+        )
+        self.database.commit()
+
+        inspected = {
+            "status": "completed", "video": b"remote-paid-video",
+            "video_url": "https://cdn/remote-paid.mp4",
+            "usage": {"completion_tokens": 96475}, "cost_cents": 675,
+        }
+        with mock.patch(
+            "factory.management_api.seedance.inspect_task",
+            new=mock.AsyncMock(return_value=inspected),
+        ):
+            result = self.service.reconcile_provider_task(job_id, task_id)
+
+        self.assertEqual(result["state"], "PRODUCTION_REVIEW_REQUIRED")
+        node = self.database.execute(
+            "SELECT state,actual_cost_cents,provider_task_id,error_code,"
+            "next_action,output_json FROM production_nodes "
+            "WHERE job_id=? AND node_id='master:3'",
+            (job_id,),
+        ).fetchone()
+        self.assertEqual(node["state"], "REVIEW_REQUIRED")
+        self.assertEqual(node["actual_cost_cents"], 675)
+        self.assertEqual(node["provider_task_id"], task_id)
+        self.assertIsNone(node["error_code"])
+        self.assertEqual(node["next_action"], "review_candidate")
+        output = json.loads(node["output_json"])
+        self.assertEqual(output["status"], "manual_review_required")
+        self.assertEqual(output["candidate_url"], "https://cdn/remote-paid.mp4")
+
     def test_provider_task_reconciliation_pending_keeps_job_paused(self):
         self.database.execute(
             "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "

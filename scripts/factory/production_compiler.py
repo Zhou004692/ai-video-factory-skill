@@ -468,6 +468,88 @@ def _compiled_runtime_shots(
     return shots
 
 
+def _remap_source_director_shots(
+    source: Mapping[str, object],
+    groups: list[list[_Unit]],
+    masters: tuple[MasterSpecV2, ...],
+) -> list[dict[str, object]] | None:
+    """Keep an existing dual-track edit plan when compilation is one-to-one.
+
+    The source storyboard may deliberately place a B-roll master over an
+    earlier dialogue master and then return to a later CTA. Rebuilding shots
+    by iterating compiled masters destroys that narrative order. Preserve the
+    authored timeline only when every source master maps unambiguously to one
+    compiled master and all referenced ranges still fit the compiled output;
+    otherwise the compiler must fall back to its self-contained projection.
+    """
+    raw_shots = [
+        deepcopy(dict(item))
+        for item in (source.get("shots") or [])
+        if isinstance(item, Mapping)
+    ]
+    if not raw_shots:
+        return None
+
+    compiled_by_source: dict[int, int] = {}
+    duration_by_compiled = {
+        int(master.idx): float(master.editorial_duration_sec)
+        for master in masters
+    }
+    for spec, group in zip(masters, groups):
+        source_indexes = tuple(dict.fromkeys(
+            int(unit.beat.extensions.get("source_master_idx") or 0)
+            for unit in group
+            if int(unit.beat.extensions.get("source_master_idx") or 0) > 0
+        ))
+        if len(source_indexes) != 1 or source_indexes[0] in compiled_by_source:
+            return None
+        compiled_by_source[source_indexes[0]] = int(spec.idx)
+
+    remapped: list[dict[str, object]] = []
+    for shot_index, raw_shot in enumerate(raw_shots, 1):
+        source_video_idx = int(raw_shot.get("video_master_idx") or 0)
+        source_audio_idx = int(
+            raw_shot.get("audio_master_idx") or source_video_idx
+        )
+        video_idx = compiled_by_source.get(source_video_idx)
+        audio_idx = compiled_by_source.get(source_audio_idx)
+        if video_idx is None or audio_idx is None:
+            return None
+        try:
+            duration = float(
+                raw_shot.get("duration")
+                or raw_shot.get("duration_sec")
+                or 0
+            )
+            video_start = float(raw_shot.get("video_start") or 0)
+            audio_start = float(raw_shot.get("audio_start") or 0)
+        except (TypeError, ValueError):
+            return None
+        if duration <= 0:
+            return None
+        tolerance = 0.05
+        if (
+            video_start < 0
+            or audio_start < 0
+            or video_start + duration
+            > duration_by_compiled.get(video_idx, 0) + tolerance
+            or audio_start + duration
+            > duration_by_compiled.get(audio_idx, 0) + tolerance
+        ):
+            return None
+        shot = deepcopy(raw_shot)
+        shot.update({
+            "idx": shot_index,
+            "duration": duration,
+            "video_master_idx": video_idx,
+            "audio_master_idx": audio_idx,
+            "video_start": round(video_start, 3),
+            "audio_start": round(audio_start, 3),
+        })
+        remapped.append(shot)
+    return remapped
+
+
 def ensure_director_timeline(storyboard: Mapping[str, object]) -> dict[str, object]:
     """Return a runnable director storyboard without dangling master refs."""
     runtime = deepcopy(dict(storyboard))
@@ -579,7 +661,10 @@ def _compiled_runtime_storyboard(
         })
         runtime_masters.append(base)
     storyboard["masters"] = runtime_masters
-    storyboard["shots"] = _compiled_runtime_shots(runtime_masters)
+    storyboard["shots"] = (
+        _remap_source_director_shots(source, groups, masters)
+        or _compiled_runtime_shots(runtime_masters)
+    )
     director_plan = deepcopy(dict(storyboard.get("director_plan") or {}))
     dialogue_master_count = sum(
         1 for master in runtime_masters if master.get("type") == "dialogue"
