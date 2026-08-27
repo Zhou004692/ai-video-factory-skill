@@ -1,0 +1,43 @@
+{
+  "fixture_schema_version": 1,
+  "scenario_id": "text_three_person_multiscene",
+  "source": {
+    "type": "manual",
+    "title": "白天高空车跨场景救援",
+    "content": "林夏在调度中心接警，高远在设备场检查高空车，周工在施工现场确认故障。三人分别发言，并从调度中心、设备场切换至白天施工现场完成抢修。"
+  },
+  "brief_result": {
+    "recommended_index": 0,
+    "angles": [
+      {"title": "三人接力抢修", "story_arc": "接警→检查→跨场调度→完成"},
+      {"title": "30分钟双保险", "story_arc": "风险→备机→协作→兑现"},
+      {"title": "高空车不停工", "story_arc": "故障→判断→换机→复工"}
+    ]
+  },
+  "script_result": {
+    "variants": [{
+      "title": "三人三地接力",
+      "beats": [
+        {"beat": "hook", "speaker": "林夏", "scene": "调度中心", "duration_sec": 6},
+        {"beat": "conflict", "speaker": "高远", "scene": "设备场", "duration_sec": 6},
+        {"beat": "solution", "speaker": "周工", "scene": "施工现场", "duration_sec": 6}
+      ]
+    }]
+  },
+  "character_anchors": ["林夏", "高远", "周工"],
+  "scene_anchors": ["调度中心", "设备场", "施工现场"],
+  "masters": [
+    {"idx": 1, "characters": ["林夏"], "scene": "调度中心", "duration_sec": 6},
+    {"idx": 2, "characters": ["高远"], "scene": "设备场", "duration_sec": 6},
+    {"idx": 3, "characters": ["周工"], "scene": "施工现场", "duration_sec": 6}
+  ],
+  "provider_sequences": {
+    "anchor": ["queued", "succeeded"],
+    "master": ["queued", "running", "succeeded"]
+  },
+  "expected": {
+    "director_timeline": [1, 2, 3],
+    "final_duration_sec": 18,
+    "recovery_actions": []
+  }
+}

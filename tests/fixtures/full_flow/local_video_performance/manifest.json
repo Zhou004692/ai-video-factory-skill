@@ -1,0 +1,35 @@
+{
+  "fixture_schema_version": 1,
+  "scenario_id": "local_video_performance",
+  "source": {
+    "type": "video",
+    "title": "设备租赁表演还原",
+    "content": "女销售快速挥手并提高音量说设备租赁狗都不干，随后压低语气解释回款与闲置风险；画外客户追问解决办法。"
+  },
+  "brief_result": {
+    "recommended_index": 0,
+    "angles": [
+      {"title": "情绪反差复刻", "story_arc": "强钩子→压低解释→画外追问→回答"},
+      {"title": "租赁风险拆解", "story_arc": "断言→证据→方法→行动"},
+      {"title": "销售现场还原", "story_arc": "手势→语气→冲突→转化"}
+    ]
+  },
+  "script_result": {
+    "variants": [{
+      "title": "口播表演高还原",
+      "beats": [
+        {"beat": "hook", "speaker": "女销售", "speech_mode": "on_screen", "emotion": "frustrated", "gesture": "挥手", "duration_sec": 4},
+        {"beat": "conflict", "speaker": "客户", "speech_mode": "off_screen", "tone": "questioning", "duration_sec": 4}
+      ]
+    }]
+  },
+  "character_anchors": ["女销售"],
+  "scene_anchors": ["新年主题直播间"],
+  "masters": [{"idx": 1, "characters": ["女销售"], "scene": "新年主题直播间", "duration_sec": 8}],
+  "provider_sequences": {"asr": ["succeeded"], "vision": ["succeeded"], "master": ["succeeded"]},
+  "expected": {
+    "director_timeline": [1],
+    "final_duration_sec": 8,
+    "recovery_actions": ["校正说话人与表演"]
+  }
+}

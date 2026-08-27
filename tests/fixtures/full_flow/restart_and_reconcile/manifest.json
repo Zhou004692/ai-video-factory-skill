@@ -1,0 +1,32 @@
+{
+  "fixture_schema_version": 1,
+  "scenario_id": "restart_and_reconcile",
+  "source": {
+    "type": "manual",
+    "title": "服务重启后继续生产",
+    "content": "母片已提交但服务在回调前重启，恢复后仅查询原任务并收敛到候选审核，不得重复提交或重复记账。"
+  },
+  "brief_result": {
+    "recommended_index": 0,
+    "angles": [
+      {"title": "断点恢复", "story_arc": "提交→中断→查询→恢复"},
+      {"title": "幂等生产", "story_arc": "任务→去重→收敛→验收"},
+      {"title": "零重复付费", "story_arc": "识别→恢复→核账→完成"}
+    ]
+  },
+  "script_result": {
+    "variants": [{
+      "title": "重启不重投",
+      "beats": [{"beat": "evidence", "speaker": "调度员", "scene": "调度中心", "duration_sec": 6}]
+    }]
+  },
+  "character_anchors": ["调度员"],
+  "scene_anchors": ["调度中心"],
+  "masters": [{"idx": 1, "characters": ["调度员"], "scene": "调度中心", "duration_sec": 6}],
+  "provider_sequences": {"master": ["queued", "running", "succeeded", "succeeded"]},
+  "expected": {
+    "director_timeline": [1],
+    "final_duration_sec": 6,
+    "recovery_actions": ["查询原任务", "恢复本地状态"]
+  }
+}

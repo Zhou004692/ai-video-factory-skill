@@ -1,0 +1,38 @@
+{
+  "fixture_schema_version": 1,
+  "scenario_id": "broll_before_cta",
+  "source": {
+    "type": "manual",
+    "title": "证据镜头先于行动号召",
+    "content": "先展示高空车检修、工单与现场复工证据，再由林夏面对镜头发出行动号召。"
+  },
+  "brief_result": {
+    "recommended_index": 0,
+    "angles": [
+      {"title": "先证据后转化", "story_arc": "问题→证据→复工→行动"},
+      {"title": "抢修闭环", "story_arc": "报修→调度→交付→行动"},
+      {"title": "双保险兑现", "story_arc": "风险→备机→证明→行动"}
+    ]
+  },
+  "script_result": {
+    "variants": [{
+      "title": "B-roll 在 CTA 之前",
+      "beats": [
+        {"beat": "evidence", "speaker": "", "scene": "施工现场", "duration_sec": 4, "broll_required": true},
+        {"beat": "cta", "speaker": "林夏", "scene": "施工现场", "duration_sec": 4}
+      ]
+    }]
+  },
+  "character_anchors": ["林夏"],
+  "scene_anchors": ["施工现场"],
+  "masters": [
+    {"idx": 1, "type": "broll", "scene": "施工现场", "duration_sec": 4},
+    {"idx": 2, "type": "dialogue", "characters": ["林夏"], "scene": "施工现场", "duration_sec": 4}
+  ],
+  "provider_sequences": {"master": ["queued", "succeeded"]},
+  "expected": {
+    "director_timeline": [1, 2],
+    "final_duration_sec": 8,
+    "recovery_actions": []
+  }
+}
