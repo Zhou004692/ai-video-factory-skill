@@ -2,6 +2,16 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.1.1.0] - 2026-08-27
+
+### Added
+
+- Added a product-focused GitHub README covering core capabilities, the end-to-end user workflow, configuration tiers, installation, security boundaries and current limitations.
+
+### Fixed
+
+- Brief generation now recovers a missing story arc when it can be derived from the angle's existing hook, evidence and promise, while preserving strict validation for malformed model output.
+
 ## [3.1.0.0] - 2026-08-27
 
 ### Added
