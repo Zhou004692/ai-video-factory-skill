@@ -26,6 +26,12 @@ class TimedUtterance:
     text: str
     start_ms: int
     end_ms: int
+    speaker_id: str = ""
+    speaker_confidence: float | None = None
+    emotion: str = ""
+    tone: str = ""
+    pace: str = ""
+    volume: str = ""
 
 
 @dataclass(frozen=True)
@@ -53,7 +59,50 @@ def parse_transcription(payload: dict) -> Transcription:
         ends.append(end_ms)
         text = str(utterance.get("text") or "").strip()
         if text:
-            utterances.append(TimedUtterance(text, start_ms, end_ms))
+            additions = utterance.get("additions") or {}
+            if not isinstance(additions, dict):
+                additions = {}
+            speaker_id = str(
+                utterance.get("speaker_id")
+                or utterance.get("voice_cluster_id")
+                or utterance.get("spk_id")
+                or utterance.get("speaker")
+                or additions.get("speaker_id")
+                or additions.get("speaker")
+                or ""
+            ).strip()
+            confidence_raw = (
+                utterance.get("speaker_confidence")
+                if utterance.get("speaker_confidence") is not None
+                else additions.get("speaker_confidence")
+            )
+            try:
+                speaker_confidence = min(1.0, max(0.0, float(confidence_raw)))
+            except (TypeError, ValueError):
+                speaker_confidence = None
+            utterances.append(TimedUtterance(
+                text=text,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                speaker_id=speaker_id,
+                speaker_confidence=speaker_confidence,
+                emotion=str(
+                    utterance.get("emotion") or additions.get("emotion") or ""
+                ).strip(),
+                tone=str(
+                    utterance.get("tone") or additions.get("tone") or ""
+                ).strip(),
+                pace=str(
+                    utterance.get("pace")
+                    or utterance.get("speech_rate")
+                    or additions.get("pace")
+                    or additions.get("speech_rate")
+                    or ""
+                ).strip(),
+                volume=str(
+                    utterance.get("volume") or additions.get("volume") or ""
+                ).strip(),
+            ))
     return Transcription(
         text=str(result.get("text") or "").strip(),
         speech_start_ms=min(starts) if starts else None,
@@ -108,13 +157,27 @@ def transcribe_detailed(
     else:
         headers["X-Api-App-Key"] = app_id
         headers["X-Api-Access-Key"] = access_token
+    request_options = {
+        "model_name": "bigmodel",
+        "enable_itn": True,
+        "enable_speaker_info": True,
+    }
+    if api_key:
+        # The standard submit/query API supports customer-service metadata.
+        # Keep these fields off the flash request because the flash contract
+        # explicitly removes emotion, volume and speech-rate options.
+        request_options.update({
+            "enable_emotion_detection": True,
+            "show_volume": True,
+            "show_speech_rate": True,
+        })
     payload = {
         "user": {"uid": api_key or app_id},
         "audio": {
             "data": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
             "format": audio_path.suffix.lower().lstrip(".") or "wav",
         },
-        "request": {"model_name": "bigmodel", "enable_itn": True},
+        "request": request_options,
     }
     with httpx.Client(timeout=timeout, transport=transport) as client:
         if api_key:

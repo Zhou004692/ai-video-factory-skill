@@ -197,20 +197,30 @@ class MediaSourceTests(unittest.IsolatedAsyncioTestCase):
         self.memory_db.close()
         self.tmp.cleanup()
 
-    async def test_audio_ingest_transcribes_and_deduplicates_the_same_media(self):
+    async def test_audio_ingest_reprocesses_the_same_media_as_a_new_source(self):
         source = Path(self.tmp.name) / "interview.mp3"
         source.write_bytes(b"same-media-bytes")
-        transcription = bigasr.Transcription(
-            "客户找设备时，最怕信息不透明。",
-            120,
-            2680,
-            (bigasr.TimedUtterance(
-                "客户找设备时，最怕信息不透明。", 120, 2680
-            ),),
+        transcriptions = (
+            bigasr.Transcription(
+                "客户找设备时，最怕信息不透明。",
+                120,
+                2680,
+                (bigasr.TimedUtterance(
+                    "客户找设备时，最怕信息不透明。", 120, 2680
+                ),),
+            ),
+            bigasr.Transcription(
+                "第二次上传必须保存本次重新解析的结果。",
+                80,
+                2380,
+                (bigasr.TimedUtterance(
+                    "第二次上传必须保存本次重新解析的结果。", 80, 2380
+                ),),
+            ),
         )
         with patch.object(
             media_sources.bigasr, "transcribe_detailed",
-            new=Mock(return_value=transcription),
+            new=Mock(side_effect=transcriptions),
         ) as transcribe:
             first = await media_sources.ingest_media(
                 self.memory_db, source, archive_dir=self.media_dir,
@@ -222,9 +232,9 @@ class MediaSourceTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(first.created)
-        self.assertFalse(second.created)
-        self.assertEqual(first.source_id, second.source_id)
-        self.assertEqual(transcribe.call_count, 1)
+        self.assertTrue(second.created)
+        self.assertNotEqual(first.source_id, second.source_id)
+        self.assertEqual(transcribe.call_count, 2)
         row = self.memory_db.execute(
             "SELECT * FROM script_sources WHERE source_id=?",
             (first.source_id,),
@@ -234,6 +244,16 @@ class MediaSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["content"], "客户找设备时，最怕信息不透明。")
         self.assertEqual(metadata["media_sha256"], first.media_sha256)
         self.assertEqual(metadata["utterances"][0]["start_ms"], 120)
+        second_row = self.memory_db.execute(
+            "SELECT content, metadata_json FROM script_sources WHERE source_id=?",
+            (second.source_id,),
+        ).fetchone()
+        self.assertEqual(
+            second_row["content"],
+            "第二次上传必须保存本次重新解析的结果。",
+        )
+        second_metadata = __import__("json").loads(second_row["metadata_json"])
+        self.assertEqual(second_metadata["utterances"][0]["start_ms"], 80)
         self.assertEqual(
             self.memory_db.execute(
                 "SELECT topic_id FROM topic_script_sources"
@@ -282,6 +302,55 @@ class MediaSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["source_type"], "video")
         self.assertEqual(metadata["duration_sec"], 11.2)
         self.assertEqual(len(metadata["frames"]), 4)
+
+    async def test_refresh_analysis_frames_rebuilds_temporal_evidence_manifest(self):
+        archived = self.media_dir / "source.mp4"
+        archived.parent.mkdir(parents=True, exist_ok=True)
+        archived.write_bytes(b"video")
+        result = script_sources.ingest_text(
+            self.memory_db,
+            "gesture transcript",
+            title="gesture",
+            source_type="video",
+            metadata={
+                "archived_path": str(archived),
+                "duration_sec": 4.0,
+                "utterances": [{
+                    "text": "gesture", "start_ms": 540, "end_ms": 2100,
+                }],
+                "frames": [],
+                "visual_observations": [{"frame_index": 1}],
+                "structure_analysis": {"segments": []},
+                "analysis_usage": {"input_tokens": 1},
+            },
+            deduplication_key="refresh-gesture",
+        )
+        async def extract_requested_frames(_source, _output_dir, timestamps):
+            return [
+                self.media_dir / "frames" / f"frame-{index:03d}.jpg"
+                for index in range(1, len(timestamps) + 1)
+            ]
+        with patch.object(
+            media_sources.ffmpeg,
+            "extract_frames",
+            new=AsyncMock(side_effect=extract_requested_frames),
+        ) as extract_frames:
+            frames = await media_sources.refresh_analysis_frames(
+                self.memory_db, result.source_id
+            )
+
+        timestamps = extract_frames.await_args.args[2]
+        self.assertIn(1.086, timestamps)
+        self.assertIn(1.866, timestamps)
+        self.assertEqual(len(frames), len(timestamps))
+        row = self.memory_db.execute(
+            "SELECT metadata_json FROM script_sources WHERE source_id=?",
+            (result.source_id,),
+        ).fetchone()
+        metadata = json.loads(row["metadata_json"])
+        self.assertNotIn("visual_observations", metadata)
+        self.assertNotIn("structure_analysis", metadata)
+        self.assertNotIn("analysis_usage", metadata)
 
     def test_media_context_exposes_frame_manifest_without_binary_content(self):
         result = script_sources.ingest_text(
@@ -484,6 +553,69 @@ class SourceAnalysisTests(unittest.TestCase):
             sorted({item["index"] for item in selected}),
         )
 
+    def test_performance_timestamps_cover_late_gesture_inside_utterance(self):
+        transcription = bigasr.Transcription(
+            "gesture",
+            utterances=(
+                bigasr.TimedUtterance("gesture", 540, 2100),
+            ),
+        )
+
+        timestamps = media_sources._performance_timestamps(
+            4.0, 4.0, transcription
+        )
+
+        self.assertIn(1.086, timestamps)
+        self.assertIn(1.866, timestamps)
+
+    def test_analysis_frame_selection_preserves_late_performance_evidence(self):
+        frames = [
+            {"index": index + 1, "timestamp_sec": timestamp,
+             "path": f"frame-{index + 1}.jpg"}
+            for index, timestamp in enumerate(
+                [0.0, 1.086, 1.866, 4.0, 8.0, 12.0]
+            )
+        ]
+
+        selected = source_analysis._select_analysis_frames(
+            frames,
+            utterances=[{"start_ms": 540, "end_ms": 2100}],
+            max_frames=4,
+        )
+
+        self.assertIn(1.866, [item["timestamp_sec"] for item in selected])
+
+    def test_structure_uses_positive_observed_gesture_over_negative_summary(self):
+        observations = [{
+            "frame_index": 2,
+            "timestamp_sec": 1.866,
+            "people": [{
+                "track_id": "person-a",
+                "gesture": "双臂在胸前交叉形成 X 形",
+                "body_action": "双臂由身体两侧快速抬起",
+            }],
+        }]
+        raw = {
+            "summary": "gesture evidence",
+            "segments": [{
+                "role": "hook",
+                "start_sec": 0,
+                "end_sec": 2.1,
+                "gesture": "无明显手势",
+                "body_action": "正面站立",
+                "evidence_frame_indices": [1, 2],
+            }],
+        }
+
+        report = source_analysis.normalize_structure_report(
+            raw, duration_sec=4.0, observations=observations
+        )
+
+        self.assertEqual(
+            report["segments"][0]["gesture"],
+            "双臂在胸前交叉形成 X 形",
+        )
+
     def test_analysis_merges_frame_observations_and_validates_story_roles(self):
         observations = [
             {"frame_index": 1, "timestamp_sec": 0.0,
@@ -564,6 +696,9 @@ class SourceAnalysisTests(unittest.TestCase):
                          "hook")
         self.assertEqual(metadata["analysis_usage"]["input_tokens"], 70)
         self.assertEqual(analyzer.call_count, 4)
+        self.assertGreaterEqual(
+            analyzer.call_args.kwargs.get("max_tokens", 0), 3200
+        )
 
         cached_analyzer = Mock(side_effect=AssertionError("must use cache"))
         cached = source_analysis.analyze_source(

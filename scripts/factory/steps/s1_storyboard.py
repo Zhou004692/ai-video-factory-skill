@@ -12,6 +12,18 @@ from ..db import conn
 from ..prompts import storyboard_prompt
 
 
+# Storyboard timings are serialized as decimal seconds, but Python evaluates
+# them as binary floats.  An edit that ends exactly at its master boundary
+# (for example 14.30 + 0.64 == 14.94) can therefore overshoot by a few machine
+# units.  This epsilon absorbs representation noise only; material overruns
+# remain invalid.
+_TIMELINE_EPSILON_SEC = 1e-6
+
+
+def _exceeds_timeline_boundary(start: float, duration: float, limit: float) -> bool:
+    return start + duration - limit > _TIMELINE_EPSILON_SEC
+
+
 def _long_scene_enabled() -> bool:
     configured = os.getenv("SEEDANCE25_LONG_SCENE_ENABLED")
     if configured is None:
@@ -149,9 +161,17 @@ def _validate_director_storyboard(sb: dict) -> None:
         audio_start = float(edit.get("audio_start") or 0)
         if min(video_start, audio_start) < 0:
             raise ValueError(f"edit shot {edit.get('idx')} start must be >= 0")
-        if video_start + duration > float(master_by_idx[video_idx]["duration"]):
+        if _exceeds_timeline_boundary(
+            video_start,
+            duration,
+            float(master_by_idx[video_idx]["duration"]),
+        ):
             raise ValueError(f"edit shot {edit.get('idx')} exceeds video master")
-        if audio_start + duration > float(master_by_idx[audio_idx]["duration"]):
+        if _exceeds_timeline_boundary(
+            audio_start,
+            duration,
+            float(master_by_idx[audio_idx]["duration"]),
+        ):
             raise ValueError(f"edit shot {edit.get('idx')} exceeds audio master")
         audio_ranges.setdefault(audio_idx, []).append((audio_start, duration))
 

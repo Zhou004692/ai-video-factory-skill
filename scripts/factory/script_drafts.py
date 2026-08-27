@@ -12,9 +12,17 @@ from . import creative_ir, production_config, script_sources
 from .clients import doubao_llm
 
 
-PROMPT_VERSION = "complete-script-v11-paid-broll-gate"
+PROMPT_VERSION = "complete-script-v12-voice-presence-performance-fidelity"
 BEAT_ORDER = ("hook", "conflict", "evidence", "reversal", "solution", "cta")
 MAX_PROVIDER_MASTER_DURATION_SEC = 30.0
+RELATIVE_SCENE_PREFIXES = (
+    "同上", "同前", "同一上述", "延续上", "承接上",
+)
+PERFORMANCE_TEXT_FIELDS = (
+    "emotion", "tone", "pace", "volume", "pause",
+    "facial_expression", "gaze", "gesture", "body_action",
+    "speaker_track_id", "voice_cluster_id", "speaker_resolution_status",
+)
 
 GENERATION_PREFERENCE_RULES = {
     "suggested_duration_sec": "建议总时长必须是正整数",
@@ -25,6 +33,17 @@ GENERATION_PREFERENCE_RULES = {
 
 def _text(value) -> str:
     return str(value or "").strip()
+
+
+def normalize_speech_mode(value, *, speaker: str = "") -> str:
+    """Return whether a line is spoken on camera, off camera, or as narration."""
+    return creative_ir.normalize_speech_mode(value, speaker=speaker)
+
+
+def _beat_speech_mode(beat: dict) -> str:
+    return normalize_speech_mode(
+        beat.get("speech_mode"), speaker=_text(beat.get("speaker"))
+    )
 
 
 def normalize_generation_preferences(raw: dict | None) -> dict:
@@ -124,7 +143,24 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
             "visual_intent": _text(beat.get("visual_intent")),
             "source_ids": source_ids,
             "broll_hint": _text(beat.get("broll_hint")),
+            "speech_mode": normalize_speech_mode(
+                beat.get("speech_mode"), speaker=_text(beat.get("speaker"))
+            ),
         }
+        for field in PERFORMANCE_TEXT_FIELDS:
+            value = _text(beat.get(field))
+            if value:
+                normalized[field] = value
+        confidence = beat.get("speaker_confidence")
+        if confidence not in (None, ""):
+            try:
+                normalized["speaker_confidence"] = round(
+                    min(1.0, max(0.0, float(confidence))), 4
+                )
+            except (TypeError, ValueError):
+                pass
+        if beat.get("speaker_review_required") is True:
+            normalized["speaker_review_required"] = True
         # Continuity metadata is optional.  When present it is a hard
         # production constraint, not prose for the model to reinterpret.
         for field in (
@@ -301,7 +337,8 @@ def _reconstruction_variant(sources: list[dict]) -> dict | None:
         return None
     analysis = source["structure_analysis"]
     beats: list[dict] = []
-    for segment in analysis.get("segments") or []:
+    previous_scene = ""
+    for segment_index, segment in enumerate(analysis.get("segments") or [], 1):
         start = max(0.0, float(segment.get("start_sec") or 0))
         end = max(start, float(segment.get("end_sec") or start))
         if end <= start:
@@ -311,33 +348,72 @@ def _reconstruction_variant(sources: list[dict]) -> dict | None:
             if _text(item)
         ]
         dialogue = _text(segment.get("dialogue"))
-        speaker = (
-            _text(segment.get("speaker"))
-            or (characters[0] if characters else "现场旁白")
+        speaker = _text(segment.get("speaker"))
+        if not speaker:
+            speaker = _text(segment.get("speaker_track_id"))
+        if not speaker:
+            voice_cluster_id = _text(segment.get("voice_cluster_id"))
+            stable_suffix = re.sub(
+                r"[^A-Za-z0-9_-]+", "-", voice_cluster_id
+            ).strip("-")
+            speaker = (
+                f"unresolved_voice_{stable_suffix}"
+                if stable_suffix else f"unresolved_speaker_{segment_index:03d}"
+            )
+        raw_scene = _text(segment.get("scene"))
+        compact_scene = re.sub(r"\s+", "", raw_scene)
+        relative_scene = compact_scene.startswith(RELATIVE_SCENE_PREFIXES)
+        scene = (
+            previous_scene
+            if previous_scene and (not raw_scene or relative_scene)
+            else raw_scene
         )
+        if scene:
+            previous_scene = scene
+        resolved_segment = {**segment, "scene": scene}
         supporting = "；".join(
             item for item in (
                 _text(segment.get("on_screen_text")),
                 _text(segment.get("audio")),
             ) if item
         )
-        beats.append({
+        reconstructed = {
             "beat": _text(segment.get("role")) or "other",
             "speaker": speaker,
             "dialogue": dialogue,
             "duration_sec": round(end - start, 3),
-            "visual_intent": _segment_visual_intent(segment),
+            "visual_intent": _segment_visual_intent(resolved_segment),
             "source_ids": [source["source_id"]],
             "broll_hint": supporting,
             "source_start_sec": round(start, 3),
             "source_end_sec": round(end, 3),
-            "scene": _text(segment.get("scene")),
+            "scene": scene,
             "characters": characters,
             "action": _text(segment.get("action")),
             "camera": _text(segment.get("camera")),
             "on_screen_text": _text(segment.get("on_screen_text")),
             "audio": _text(segment.get("audio")),
-        })
+            "speech_mode": normalize_speech_mode(
+                segment.get("speech_mode"), speaker=speaker
+            ),
+            "speaker_review_required": bool(
+                segment.get("speaker_review_required")
+                or not _text(segment.get("speaker"))
+            ),
+        }
+        for field in PERFORMANCE_TEXT_FIELDS:
+            value = _text(segment.get(field))
+            if value:
+                reconstructed[field] = value
+        confidence = segment.get("speaker_confidence")
+        if confidence not in (None, ""):
+            try:
+                reconstructed["speaker_confidence"] = round(
+                    min(1.0, max(0.0, float(confidence))), 4
+                )
+            except (TypeError, ValueError):
+                pass
+        beats.append(reconstructed)
     if not beats:
         return None
     total = round(sum(float(beat["duration_sec"]) for beat in beats), 3)
@@ -421,6 +497,17 @@ def _prompt(
                 "site_description": "同一具体项目现场的稳定描述；没有则留空",
                 "scene": "具体地点、时段与空间状态",
                 "characters": ["character_id"],
+                "emotion": "角色当下情绪",
+                "tone": "语气与表达方式",
+                "pace": "语速",
+                "volume": "音量",
+                "pause": "停顿位置与长度",
+                "facial_expression": "表情变化",
+                "gaze": "视线对象与变化",
+                "gesture": "手势",
+                "body_action": "身体动作与走位",
+                "speaker_confidence": 1.0,
+                "speaker_review_required": False,
                 "broll_required": False,
                 "broll_hint": "辅助画面建议",
             }],
@@ -445,6 +532,9 @@ def _prompt(
         "不得由 presenter 转述或代说；来源中的人物台词必须归属该人物。必要的事实串联可以使用旁白，"
         "但旁白不能抢走角色推动剧情的台词。"
         "每个 beat 必须有可直接朗读的中文台词、预计秒数、画面意图、来源 ID 和 B-roll 建议。"
+        "每个有人物表演的 beat 必须保留或明确 emotion、tone、pace、volume、pause、"
+        "facial_expression、gaze、gesture 与 body_action；本地视频来源已有这些字段时不得删减或泛化。"
+        "speaker_review_required=true 表示说话人仍未核实，不得擅自把该台词改分给第一个出镜人物。"
         "visual_intent 必须是可直接导演执行的画面，至少写清场景空间、人物走位、动作或技能展示、"
         "关键物件变化以及景别与运镜；不得只写‘人物讲解’或泛化氛围。"
         "多人剧情不得默认写成办公室站桩口播，必须让人物在剧情场景中行动并由镜头参与叙事；"
@@ -857,11 +947,41 @@ def _balanced_master_groups(
 def _storyboard(script: dict) -> dict:
     requested_beats = script["beats"]
     beats = deepcopy(requested_beats)
+    # Older cached reconstruction drafts can retain relative descriptions
+    # such as "同上述场景".  Resolve them before continuity grouping so a
+    # silent lead-in and its following line do not become separate paid
+    # masters, leaving the first one with an empty voiceover.
+    previous_scene = ""
+    for beat in beats:
+        beat["speech_mode"] = normalize_speech_mode(
+            beat.get("speech_mode"), speaker=_text(beat.get("speaker"))
+        )
+        raw_scene = _text(beat.get("scene") or beat.get("location"))
+        compact_scene = re.sub(r"\s+", "", raw_scene)
+        if previous_scene and (
+            not raw_scene
+            or compact_scene.startswith(RELATIVE_SCENE_PREFIXES)
+        ):
+            beat["scene"] = previous_scene
+        elif raw_scene:
+            beat["scene"] = raw_scene
+            previous_scene = raw_scene
     duration_adjustments = []
     for index, beat in enumerate(beats):
         requested_duration = float(beat["duration_sec"])
         minimum_duration = estimate_dialogue_duration(beat.get("dialogue"))
-        production_duration = max(requested_duration, minimum_duration)
+        source_timing_locked = bool(
+            script.get("reconstruction_mode") == "source_timeline"
+            or (
+                beat.get("source_start_sec") is not None
+                and beat.get("source_end_sec") is not None
+            )
+        )
+        production_duration = (
+            requested_duration
+            if source_timing_locked
+            else max(requested_duration, minimum_duration)
+        )
         beat["duration_sec"] = production_duration
         if production_duration > requested_duration + 1e-6:
             duration_adjustments.append({
@@ -871,14 +991,14 @@ def _storyboard(script: dict) -> dict:
                 "production_duration_sec": production_duration,
             })
     timeline_units = _provider_timeline_units(beats)
-    original_speakers = list(dict.fromkeys(
+    original_audio_speakers = list(dict.fromkeys(
         _text(beat["speaker"]) for beat in beats
     ))
     speaker_aliases: dict[str, str] = {}
     named_speakers = [
-        speaker for speaker in original_speakers if speaker != "presenter"
+        speaker for speaker in original_audio_speakers if speaker != "presenter"
     ]
-    if len(original_speakers) > 3 and "presenter" in original_speakers and named_speakers:
+    if len(original_audio_speakers) > 3 and "presenter" in original_audio_speakers and named_speakers:
         # A generic presenter is often emitted for the opening narration of a
         # multi-character story. It is not a fourth on-screen identity: keep
         # the narration in the first named character's continuous master.
@@ -888,8 +1008,23 @@ def _storyboard(script: dict) -> dict:
         speaker = _text(beat["speaker"])
         return speaker_aliases.get(speaker, speaker)
 
-    speakers = list(dict.fromkeys(effective_speaker(beat) for beat in beats))
-    cinematic_story = len(speakers) > 1
+    on_screen_speakers = list(dict.fromkeys(
+        effective_speaker(beat) for beat in beats
+        if _beat_speech_mode(beat) == "on_screen"
+    ))
+    declared_characters = list(dict.fromkeys(
+        _text(character.get("id") if isinstance(character, dict) else character)
+        for beat in beats
+        for character in (beat.get("characters") or beat.get("cast") or [])
+        if _text(character.get("id") if isinstance(character, dict) else character)
+    ))
+    visible_character_ids = list(dict.fromkeys(
+        [*declared_characters, *on_screen_speakers]
+    ))
+    cinematic_story = bool(
+        script.get("reconstruction_mode") == "source_timeline"
+        or len(visible_character_ids) > 1
+    )
     # A paid master is a continuous dramatic scene, not a speaker bucket and
     # not an arbitrary ten-second slice.  Seedance 2.5's 30 seconds is a hard
     # maximum.  Only explicit continuity changes or the provider limit split
@@ -905,25 +1040,37 @@ def _storyboard(script: dict) -> dict:
         scene_anchor_key = _scene_anchor_key(continuity_key)
         scene_anchor_description = _scene_description(group)
         site_anchor = _site_anchor_metadata(group)
+        group_audio_speakers = list(dict.fromkeys(
+            effective_speaker(beat) for beat in group
+        ))
         group_speakers = list(dict.fromkeys(
             effective_speaker(beat) for beat in group
+            if _beat_speech_mode(beat) == "on_screen"
         ))
         group_cast: list[str] = []
         for beat in group:
-            for character_id in [
-                *(beat.get("characters") or beat.get("cast") or []),
-                effective_speaker(beat),
-            ]:
+            cast_candidates = list(
+                beat.get("characters") or beat.get("cast") or []
+            )
+            if _beat_speech_mode(beat) == "on_screen":
+                cast_candidates.append(effective_speaker(beat))
+            for character_id in cast_candidates:
                 normalized = _text(
                     character_id.get("id")
                     if isinstance(character_id, dict) else character_id
                 )
                 if normalized and normalized not in group_cast:
                     group_cast.append(normalized)
-        speaker_id = group_speakers[0]
+        if not group_speakers and group_cast:
+            group_speakers = [group_cast[0]]
+        speaker_id = (
+            group_speakers[0] if group_speakers
+            else group_audio_speakers[0]
+        )
         for unit_index, _ in indexed_group:
             master_index_by_unit[unit_index] = master_idx
         voiceover = "".join(_text(beat["dialogue"]) for beat in group)
+        has_dialogue = bool(voiceover.strip())
         performance_beats = []
         master_cursor = 0.0
         for beat in group:
@@ -931,6 +1078,7 @@ def _storyboard(script: dict) -> dict:
             performance_beats.append({
                 "beat": beat["beat"],
                 "speaker": effective_speaker(beat),
+                "speech_mode": _beat_speech_mode(beat),
                 "source_beat_index": beat["_source_beat_index"],
                 "fragment_index": beat["_fragment_index"],
                 "fragment_count": beat["_fragment_count"],
@@ -939,6 +1087,22 @@ def _storyboard(script: dict) -> dict:
                 "dialogue": _text(beat["dialogue"]),
                 "visual_intent": _text(beat["visual_intent"]),
                 "broll_hint": _text(beat["broll_hint"]),
+                **({
+                    "source_start_sec": beat["source_start_sec"],
+                    "source_end_sec": beat["source_end_sec"],
+                } if beat.get("source_start_sec") is not None
+                and beat.get("source_end_sec") is not None else {}),
+                **{
+                    field: beat[field]
+                    for field in PERFORMANCE_TEXT_FIELDS
+                    if beat.get(field) not in (None, "")
+                },
+                **({
+                    "speaker_confidence": beat["speaker_confidence"]
+                } if beat.get("speaker_confidence") is not None else {}),
+                "speaker_review_required": bool(
+                    beat.get("speaker_review_required")
+                ),
             })
             master_cursor = round(master_cursor + duration, 2)
         if cinematic_story:
@@ -965,11 +1129,22 @@ def _storyboard(script: dict) -> dict:
             )
             scene = "明亮现代的设备租赁办公室，背景整洁，无可读文字、数字、商标或水印"
             action = "主讲人面对镜头自然讲解，随钩子、反转和行动号召做克制手势与表情变化"
+        if not has_dialogue:
+            render_mode = "broll"
+            shot_type = "电影化无对白场景镜头"
+            camera = "建立镜头、自然跟拍或克制推进，保留环境与人物动作连续性"
+            scene = "；随后转入：".join(
+                item["visual_intent"] for item in performance_beats
+            )
+            action = "；".join(
+                item["visual_intent"] for item in performance_beats
+            )
         masters.append({
             "idx": master_idx,
-            "type": "dialogue",
-            "speaker": speaker_id,
-            "speakers": group_speakers,
+            "type": "dialogue" if has_dialogue else "broll",
+            "speaker": speaker_id if has_dialogue else "",
+            "speakers": group_speakers if has_dialogue else [],
+            "audio_speakers": group_audio_speakers if has_dialogue else [],
             "cast": group_cast,
             "continuity_key": continuity_key,
             "scene_anchor_key": scene_anchor_key,
@@ -986,6 +1161,12 @@ def _storyboard(script: dict) -> dict:
             "voiceover": voiceover,
             "subtitle": _subtitle(voiceover),
             "performance_beats": performance_beats,
+            **({
+                "prompt": scene,
+                "anchor_character": (
+                    group_cast[0] if len(group_cast) == 1 else None
+                ),
+            } if not has_dialogue else {}),
         })
     broll_ranges: dict[int, tuple[int, float]] = {}
     broll_master_indexes: list[int] = []
@@ -1064,10 +1245,7 @@ def _storyboard(script: dict) -> dict:
                 ],
             })
     shots = []
-    cursors = {
-        master["idx"]: 0.0 for master in masters
-        if master["type"] == "dialogue"
-    }
+    cursors = {master["idx"]: 0.0 for master in masters}
     for index, beat in enumerate(timeline_units, 1):
         duration = float(beat["duration_sec"])
         speaker_id = effective_speaker(beat)
@@ -1093,6 +1271,17 @@ def _storyboard(script: dict) -> dict:
             "visual_intent": beat["visual_intent"],
             "broll_hint": beat["broll_hint"],
             "source_ids": beat["source_ids"],
+            **{
+                field: beat[field]
+                for field in PERFORMANCE_TEXT_FIELDS
+                if beat.get(field) not in (None, "")
+            },
+            **({
+                "speaker_confidence": beat["speaker_confidence"]
+            } if beat.get("speaker_confidence") is not None else {}),
+            "speaker_review_required": bool(
+                beat.get("speaker_review_required")
+            ),
         })
         cursors[master_idx] = round(cursor + duration, 2)
 
@@ -1174,7 +1363,7 @@ def _storyboard(script: dict) -> dict:
         if isinstance(item, dict) and _text(item.get("id"))
     }
     storyboard_characters = []
-    for speaker in speakers:
+    for speaker in visible_character_ids:
         profile = deepcopy(character_profiles.get(speaker) or {})
         profile["id"] = speaker
         profile["name"] = _text(profile.get("name")) or speaker
@@ -1196,11 +1385,16 @@ def _storyboard(script: dict) -> dict:
             "master_grouping": "content_continuity",
             "provider_max_master_duration_sec": MAX_PROVIDER_MASTER_DURATION_SEC,
             "strategy": (
-                "dialogue_plus_broll" if broll_master_indexes
+                "dialogue_plus_broll"
+                if any(master["type"] == "broll" for master in masters)
                 else "cinematic_dialogue_only"
             ),
-            "dialogue_master_count": len(master_groups),
-            "broll_master_count": len(broll_master_indexes),
+            "dialogue_master_count": sum(
+                master["type"] == "dialogue" for master in masters
+            ),
+            "broll_master_count": sum(
+                master["type"] == "broll" for master in masters
+            ),
             "paid_master_count": len(masters),
             "local_edit_shot_count": len(timeline_units),
             "speech_duration_adjusted": bool(duration_adjustments),
@@ -1299,12 +1493,16 @@ def approve_draft(db, draft_id: str) -> dict:
             f"production job must be PENDING before script approval, got {job_state}"
         )
     script = json.loads(row["script_json"])
-    creative = creative_ir.from_storyboard(script)
     storyboard = _storyboard(script)
     # Approval is the production hand-off boundary. Never persist a
     # Storyboard that the worker will reject after the job has been queued.
     from factory.steps import s1_storyboard
     s1_storyboard._validate(storyboard)
+    # The production-ready storyboard is the first artifact with a complete,
+    # canonical character table. Reconstruction scripts may intentionally
+    # keep identities only on beats, so deriving Creative IR from the raw
+    # script can leave every V2 beat pointing at an empty character table.
+    creative = creative_ir.from_storyboard(storyboard)
     storyboard_json = json.dumps(storyboard, ensure_ascii=False)
     db.execute(
         "UPDATE script_drafts SET status='rejected',updated_at=CURRENT_TIMESTAMP "

@@ -160,6 +160,46 @@ class ProductionCompilerTests(unittest.TestCase):
         self.assertEqual(plan["broll_master_count"], 0)
         self.assertEqual(plan["strategy"], "cinematic_dialogue_only")
 
+    def test_v2_compiler_keeps_offscreen_voice_out_of_cast_and_anchor_nodes(self):
+        source = {
+            "title": "画外质疑",
+            "characters": [{"id": "女博主", "name": "女博主"}],
+            "beats": [
+                {
+                    "id": "beat-1", "kind": "hook", "scene": "studio",
+                    "speaker": "女博主", "dialogue": "设备租赁。",
+                    "duration_sec": 2, "action": "女博主面对镜头说话",
+                    "characters": ["女博主"], "speech_mode": "on_screen",
+                },
+                {
+                    "id": "beat-2", "kind": "conflict", "scene": "studio",
+                    "speaker": "背景台词", "dialogue": "没客户，看你怎么干？",
+                    "duration_sec": 2, "action": "女博主闭嘴看向画外",
+                    "characters": ["女博主"], "speech_mode": "off_screen",
+                    "tone": "画外反问", "facial_expression": "女博主眉头微紧",
+                },
+            ],
+        }
+
+        result = production_compiler.compile_ir(
+            creative_ir.from_storyboard(source),
+            job_id="J-offscreen",
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=10000,
+            runtime_storyboard=source,
+        )
+
+        self.assertTrue(result.compilable)
+        self.assertEqual(result.spec.masters[0].character_ids, ("女博主",))
+        self.assertEqual(result.spec.masters[0].speaker_ids, ("女博主",))
+        runtime = result.spec.runtime_storyboard["masters"][0]
+        self.assertEqual(runtime["audio_speakers"], ["女博主", "背景台词"])
+        self.assertEqual(runtime["performance_beats"][1]["speech_mode"], "off_screen")
+        self.assertNotIn(
+            "character_anchor:背景台词",
+            {node.node_id for node in result.spec.nodes},
+        )
+
     def test_runtime_director_timeline_references_only_compiled_masters(self):
         creative_source = {
             "characters": [{"id": "lead", "name": "Lead"}],

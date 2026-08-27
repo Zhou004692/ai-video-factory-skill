@@ -12,7 +12,7 @@ from typing import Literal, Mapping
 
 from . import master_dependencies, production_complexity
 from .clients import music, seedance
-from .creative_ir import CreativeBeat, CreativeIR
+from .creative_ir import CreativeBeat, CreativeIR, normalize_speech_mode
 from .production_contract import ContractIssue
 
 
@@ -167,7 +167,11 @@ def _beat_cast(beat: CreativeBeat) -> tuple[str, ...]:
         for value in raw
         if str(value.get("id") if isinstance(value, Mapping) else value).strip()
     ]
-    cast.extend(speaker for speaker in beat.speakers if speaker not in cast)
+    if normalize_speech_mode(
+        beat.extensions.get("speech_mode"),
+        speaker=beat.speakers[0] if beat.speakers else "",
+    ) == "on_screen":
+        cast.extend(speaker for speaker in beat.speakers if speaker not in cast)
     return _unique(cast)
 
 
@@ -232,6 +236,10 @@ def _deterministic_issues(
                     message=f"创作节拍 {beat.beat_id} 的出镜人物 {character} 未出现在人物表中",
                 ))
         for speaker in beat.speakers:
+            if normalize_speech_mode(
+                beat.extensions.get("speech_mode"), speaker=speaker
+            ) != "on_screen":
+                continue
             if speaker.casefold() not in aliases:
                 issues.append(ContractIssue(
                     code="speaker_unknown",
@@ -541,6 +549,11 @@ def _compiled_runtime_storyboard(
             "narrative_type": "dialogue" if has_dialogue else "broll",
             "speaker": spec.speaker_ids[0] if spec.speaker_ids else "",
             "speakers": list(spec.speaker_ids),
+            "audio_speakers": list(_unique(
+                speaker
+                for unit in group
+                for speaker in unit.beat.speakers
+            )),
             "cast": list(spec.character_ids),
             "scene_anchor_key": spec.scene_key,
             "scene_anchor_description": spatial_anchor_description,
@@ -762,7 +775,17 @@ def compile_ir(
     previous_scene = ""
     for idx, group in enumerate(groups, 1):
         cast = _unique(character for unit in group for character in unit.character_ids)
-        speakers = _unique(speaker for unit in group for speaker in unit.beat.speakers)
+        speakers = _unique(
+            speaker
+            for unit in group
+            if normalize_speech_mode(
+                unit.beat.extensions.get("speech_mode"),
+                speaker=unit.beat.speakers[0] if unit.beat.speakers else "",
+            ) == "on_screen"
+            for speaker in unit.beat.speakers
+        )
+        if not speakers and cast:
+            speakers = (cast[0],)
         requirements = _unique(
             requirement
             for unit in group

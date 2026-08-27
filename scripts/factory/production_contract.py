@@ -1,7 +1,7 @@
 """Compile reviewed storyboards into deterministic production contracts."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import copy
 import hashlib
 import json
@@ -531,6 +531,55 @@ def compile_production_spec(
             if isinstance(raw_ir, dict)
             else creative_ir.from_storyboard(storyboard)
         )
+        # Compatibility for jobs approved before the Creative IR hand-off was
+        # derived from the production-ready storyboard.  Those rows can have
+        # valid beat references but an empty or incomplete character table.
+        # The runtime storyboard already contains the reviewed canonical
+        # identities, so restoring only those exact entries is deterministic
+        # and does not invent or remap creative intent.
+        creative_characters = list(creative.characters)
+        known_character_ids = {
+            str(character.get("id") or "").strip().casefold()
+            for character in creative_characters
+            if str(character.get("id") or "").strip()
+        }
+        restored_characters = []
+        for character in storyboard.get("characters") or []:
+            if not isinstance(character, dict):
+                continue
+            character_id = str(character.get("id") or "").strip()
+            if not character_id or character_id.casefold() in known_character_ids:
+                continue
+            restored = copy.deepcopy(character)
+            creative_characters.append(restored)
+            restored_characters.append(restored)
+            known_character_ids.add(character_id.casefold())
+        creative_repairs: list[ContractIssue] = []
+        if restored_characters:
+            creative = replace(
+                creative,
+                characters=tuple(creative_characters),
+            )
+            creative_repairs.append(ContractIssue(
+                code="creative_characters_restored",
+                severity="repair",
+                stage="creative_ir",
+                subject="characters",
+                message=(
+                    "已从审核后的运行时分镜恢复创作人物表："
+                    + "、".join(
+                        str(character.get("id") or "")
+                        for character in restored_characters
+                    )
+                ),
+                repair={
+                    "character_ids": [
+                        str(character.get("id") or "")
+                        for character in restored_characters
+                    ],
+                    "strategy": "restore_from_reviewed_runtime_storyboard",
+                },
+            ))
         plan = production_planner.analyze_storyboard(
             database,
             copy.deepcopy(storyboard),
@@ -544,6 +593,11 @@ def compile_production_spec(
             root=root,
             runtime_storyboard=storyboard,
         )
+        if creative_repairs:
+            compilation = replace(
+                compilation,
+                issues=tuple(creative_repairs) + tuple(compilation.issues),
+            )
         if persist:
             if compilation.spec is None:
                 database.execute(

@@ -718,7 +718,7 @@ class ManagementServiceTests(unittest.TestCase):
 
     @mock.patch("factory.management_api.source_analysis.analyze_source")
     @mock.patch("factory.management_api.media_sources.ingest_media", new_callable=mock.AsyncMock)
-    def test_duplicate_local_video_creates_a_new_content_project_while_reusing_media(
+    def test_duplicate_local_video_keeps_newly_parsed_source_without_reuse(
         self, ingest_media, analyze_source
     ):
         with (self.root / ".env").open("a", encoding="utf-8") as stream:
@@ -741,30 +741,18 @@ class ManagementServiceTests(unittest.TestCase):
         media = self.root / "same-video.mp4"
         media.write_bytes(b"same video")
         ingest_media.return_value = SimpleNamespace(
-            source_id="SRC-ORIGINAL", created=False,
+            source_id="SRC-REPARSED", created=True,
         )
 
         result = self.service.add_media_source(media, title="第二次项目")
 
-        self.assertTrue(result["created"])
-        self.assertTrue(result["reused_source"])
-        self.assertNotEqual(result["source_id"], "SRC-ORIGINAL")
-        rows = self.database.execute(
-            "SELECT source_id,title,content,metadata_json FROM script_sources "
-            "ORDER BY created_at,source_id"
-        ).fetchall()
-        self.assertEqual(len(rows), 2)
-        copied = next(row for row in rows if row["source_id"] == result["source_id"])
-        self.assertEqual(copied["title"], "第二次项目")
-        self.assertEqual(copied["content"], "完整视频转写与结构内容")
-        copied_metadata = json.loads(copied["metadata_json"])
-        self.assertEqual(copied_metadata["canonical_source_id"], "SRC-ORIGINAL")
-        self.assertEqual(
-            {item["project_id"] for item in self.service.content_projects()["projects"]},
-            {"SRC-ORIGINAL", result["source_id"]},
-        )
+        self.assertEqual(result, {
+            "source_id": "SRC-REPARSED",
+            "created": True,
+            "source_type": "video",
+        })
         analyze_source.assert_called_once_with(
-            self.database, result["source_id"]
+            self.database, "SRC-REPARSED"
         )
 
     @mock.patch("factory.management_api.topic_briefs.generate_brief")
@@ -811,13 +799,52 @@ class ManagementServiceTests(unittest.TestCase):
         )
         analyze_source.assert_called_once_with(self.database, "SRC-MEDIA")
 
+    @mock.patch("factory.management_api.source_analysis.analyze_source")
+    def test_force_video_analysis_refreshes_temporal_evidence_frames(
+        self, analyze_source
+    ):
+        self.database.execute(
+            "INSERT INTO script_sources(source_id,fingerprint,source_type,title,"
+            "source_uri,content,metadata_json) VALUES(?,?,?,?,?,?,?)",
+            (
+                "SRC-GESTURE", "fp-gesture", "video", "gesture video",
+                "local-media://gesture", "gesture transcript", "{}",
+            ),
+        )
+        self.database.commit()
+        analyze_source.return_value = {"segments": []}
+
+        with mock.patch(
+            "factory.management_api.media_sources.refresh_analysis_frames",
+            new_callable=mock.AsyncMock,
+            create=True,
+        ) as refresh_frames:
+            self.service.analyze_media_source("SRC-GESTURE", force=True)
+
+        refresh_frames.assert_awaited_once_with(
+            self.database, "SRC-GESTURE"
+        )
+        analyze_source.assert_called_once_with(
+            self.database, "SRC-GESTURE", force=True
+        )
+
     @mock.patch("factory.management_api.media_sources.ingest_media", new_callable=mock.AsyncMock)
     def test_local_media_source_rejects_unsupported_file_before_ingestion(self, ingest_media):
         media = self.root / "notes.txt"
         media.write_text("not media", encoding="utf-8")
 
-        with self.assertRaisesRegex(ValueError, "音视频格式"):
+        with self.assertRaisesRegex(ValueError, "视频格式"):
             self.service.add_media_source(media, title="不支持")
+
+        ingest_media.assert_not_awaited()
+
+    @mock.patch("factory.management_api.media_sources.ingest_media", new_callable=mock.AsyncMock)
+    def test_management_console_rejects_new_audio_sources(self, ingest_media):
+        media = self.root / "interview.mp3"
+        media.write_bytes(b"fake audio")
+
+        with self.assertRaisesRegex(ValueError, "已取消音频来源"):
+            self.service.add_media_source(media, title="客户录音")
 
         ingest_media.assert_not_awaited()
 
@@ -828,11 +855,94 @@ class ManagementServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "本地音视频转写需要先配置火山语音识别",
+            "本地视频转写需要先配置火山语音识别",
         ):
             self.service.add_media_source(media, title="客户访谈")
 
         ingest_media.assert_not_awaited()
+
+    def test_source_performance_review_resolves_speaker_without_reanalysis(self):
+        metadata = {
+            "structure_analysis": {
+                "performance_ir_version": 1,
+                "segments": [{
+                    "role": "conflict", "start_sec": 0, "end_sec": 3,
+                    "speaker": "", "speaker_track_id": "",
+                    "voice_cluster_id": "voice-a",
+                    "speaker_confidence": 0.41,
+                    "speaker_review_required": True,
+                    "dialogue": "现在必须断电。",
+                }],
+            }
+        }
+        self.database.execute(
+            "INSERT INTO script_sources(source_id,fingerprint,source_type,title,"
+            "source_uri,content,metadata_json) VALUES(?,?,?,?,?,?,?)",
+            (
+                "SRC-REVIEW", "fp-review", "video", "抢修对话",
+                "manual://review", "现在必须断电。",
+                json.dumps(metadata, ensure_ascii=False),
+            ),
+        )
+        self.database.commit()
+
+        result = self.service.review_source_performance(
+            "SRC-REVIEW",
+            {"assignments": [{
+                "segment_index": 0, "speaker": "林夏",
+                "speech_mode": "off_screen",
+                "emotion": "紧张", "tone": "压低声音、短促",
+                "gesture": "抬手制止", "body_action": "向前半步",
+            }]},
+        )
+
+        self.assertEqual(result["review_required_count"], 0)
+        row = self.database.execute(
+            "SELECT metadata_json FROM script_sources WHERE source_id='SRC-REVIEW'"
+        ).fetchone()
+        segment = json.loads(row["metadata_json"])["structure_analysis"]["segments"][0]
+        self.assertEqual(segment["speaker"], "林夏")
+        self.assertEqual(segment["speaker_confidence"], 1.0)
+        self.assertFalse(segment["speaker_review_required"])
+        self.assertEqual(segment["speaker_resolution_status"], "manual")
+        self.assertEqual(segment["speech_mode"], "off_screen")
+        self.assertEqual(segment["emotion"], "紧张")
+        self.assertEqual(segment["tone"], "压低声音、短促")
+        self.assertEqual(segment["gesture"], "抬手制止")
+        self.assertEqual(segment["body_action"], "向前半步")
+
+    def test_source_performance_review_resolves_original_media_and_frame_evidence(self):
+        media = self.root / "archive" / "source.mp4"
+        frame = self.root / "archive" / "frames" / "frame-003.jpg"
+        media.parent.mkdir(parents=True, exist_ok=True)
+        frame.parent.mkdir(parents=True, exist_ok=True)
+        media.write_bytes(b"video evidence")
+        frame.write_bytes(b"frame evidence")
+        metadata = {
+            "archived_path": str(media),
+            "frames": [{
+                "index": 3, "timestamp_sec": 2.4, "path": str(frame),
+            }],
+        }
+        self.database.execute(
+            "INSERT INTO script_sources(source_id,fingerprint,source_type,title,"
+            "source_uri,content,metadata_json) VALUES(?,?,?,?,?,?,?)",
+            (
+                "SRC-EVIDENCE", "fp-evidence", "video", "抢修现场",
+                "manual://evidence", "现在必须断电。",
+                json.dumps(metadata, ensure_ascii=False),
+            ),
+        )
+        self.database.commit()
+
+        self.assertEqual(
+            self.service.source_media_file("SRC-EVIDENCE"), media.resolve()
+        )
+        self.assertEqual(
+            self.service.source_frame_file("SRC-EVIDENCE", 3), frame.resolve()
+        )
+        with self.assertRaisesRegex(ValueError, "画面证据不存在"):
+            self.service.source_frame_file("SRC-EVIDENCE", 99)
 
     def test_config_status_never_returns_secret_value(self):
         status = self.service.config_status()
@@ -1366,6 +1476,14 @@ class ManagementServiceTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["title"], "行业访谈")
         self.assertEqual(row["source_type"], "manual")
+
+    def test_json_source_endpoint_cannot_create_an_audio_source(self):
+        with self.assertRaisesRegex(ValueError, "已取消音频来源"):
+            self.service.add_source(
+                source_type="audio",
+                title="客户录音",
+                content="一段被错误标记为音频的文字内容",
+            )
 
     def test_duplicate_manual_source_creates_an_independent_content_project(self):
         first = self.service.add_source(
@@ -1977,6 +2095,89 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual(characters["女性工作人员"]["generation_mode"], "fixed_asset")
         self.assertEqual(characters["非洲客户"]["generation_mode"], "ai_generated")
         self.assertEqual(characters["非洲客户"]["look"], "年轻男性客户")
+
+    def test_configure_does_not_request_character_mapping_for_offscreen_voice(self):
+        storyboard = {
+            "production_profile": "standard",
+            "production_mode": "native_master_local_director",
+            "characters": [{
+                "id": "女博主", "name": "女博主", "gender": "female",
+                "look": "年轻女博主",
+            }],
+            "masters": [{
+                "idx": 1, "type": "dialogue", "speaker": "女博主",
+                "speakers": ["女博主"],
+                "audio_speakers": ["女博主", "背景台词"],
+                "cast": ["女博主"], "duration": 4,
+                "performance_beats": [
+                    {"speaker": "女博主", "speech_mode": "on_screen", "dialogue": "设备租赁。"},
+                    {"speaker": "背景台词", "speech_mode": "off_screen", "dialogue": "没客户怎么干？"},
+                ],
+            }],
+            "shots": [], "hook": "设备租赁", "bgm": {},
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-OFFSCREEN','T-O','画外台词','STORYBOARDED',?)",
+            (json.dumps(storyboard, ensure_ascii=False),),
+        )
+        self.database.commit()
+
+        result = self.service.configure_video("J-OFFSCREEN", {
+            "character_mappings": {"女博主": ""},
+            "orientation": "9:16", "production_profile": "standard",
+            "subtitle_style": "clean", "asr_enabled": True,
+            "budget_cents": 3000,
+        })
+
+        self.assertEqual(
+            result["production_settings"]["character_mappings"], {"女博主": ""}
+        )
+        saved = json.loads(self.database.execute(
+            "SELECT storyboard FROM jobs WHERE job_id='J-OFFSCREEN'"
+        ).fetchone()[0])
+        self.assertEqual([item["id"] for item in saved["characters"]], ["女博主"])
+
+    def test_configure_filters_offscreen_voice_from_legacy_storyboard_cast(self):
+        storyboard = {
+            "production_profile": "standard",
+            "production_mode": "native_master_local_director",
+            "characters": [
+                {"id": "女博主", "name": "女博主", "look": "年轻女博主"},
+                {"id": "背景台词", "name": "背景台词", "look": "自动生成"},
+            ],
+            "masters": [{
+                "idx": 1, "type": "dialogue", "speaker": "女博主",
+                "speakers": ["女博主", "背景台词"],
+                "cast": ["女博主", "背景台词"], "duration": 4,
+                "performance_beats": [
+                    {"speaker": "女博主", "dialogue": "设备租赁。"},
+                    {"speaker": "背景台词", "dialogue": "没客户怎么干？"},
+                ],
+            }],
+            "shots": [], "hook": "设备租赁", "bgm": {},
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES('J-OFFSCREEN-LEGACY','T-OL','历史画外台词','STORYBOARDED',?)",
+            (json.dumps(storyboard, ensure_ascii=False),),
+        )
+        self.database.commit()
+
+        result = self.service.configure_video("J-OFFSCREEN-LEGACY", {
+            "character_mappings": {"女博主": ""},
+            "orientation": "9:16", "production_profile": "standard",
+            "subtitle_style": "clean", "asr_enabled": True,
+            "budget_cents": 3000,
+        })
+
+        self.assertEqual(
+            result["production_settings"]["character_mappings"], {"女博主": ""}
+        )
+        saved = json.loads(self.database.execute(
+            "SELECT storyboard FROM jobs WHERE job_id='J-OFFSCREEN-LEGACY'"
+        ).fetchone()[0])
+        self.assertEqual([item["id"] for item in saved["characters"]], ["女博主"])
 
     def test_configure_repairs_structured_speaker_missing_from_legacy_characters(self):
         storyboard = {
@@ -10053,7 +10254,7 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("openVideoJobId:''", js)
         self.assertIn("state.openVideoJobId=''", js)
         self.assertIn("state.openVideoJobId=job.job_id", js)
-        self.assertIn("state.page!=='videos'", poller)
+        self.assertIn("productionPollingPages.has(state.page)", poller)
         self.assertIn("document.visibilityState!=='visible'", poller)
         self.assertIn("hasActiveProductionJobs()", poller)
         self.assertIn("api('/api/videos')", poller)
@@ -10081,8 +10282,38 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("if(structureChanged)renderVideos()", patcher)
         self.assertIn("if(previousFingerprint===nextFingerprint)continue", patcher)
         self.assertIn("clearTimeout(state.productionPollTimer)", js)
-        self.assertIn("if(state.page!=='videos'||!hasActiveProductionJobs())return", js)
+        self.assertIn(
+            "if(!productionPollingPages.has(state.page)||!hasActiveProductionJobs())return",
+            js,
+        )
         self.assertIn("document.addEventListener('visibilitychange'", js)
+
+    def test_active_video_polling_also_follows_jobs_inside_project_studio(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        poller_start = js.find("async function pollActiveProduction")
+        poller_end = js.find("function scheduleActiveProductionPoll", poller_start)
+        poller = js[poller_start:poller_end]
+
+        self.assertIn(
+            "const productionPollingPages=new Set(['overview','videos'])", js
+        )
+        self.assertIn("productionPollingPages.has(state.page)", poller)
+        self.assertNotIn("state.page!=='videos'", poller)
+        self.assertIn("if(state.page==='overview')renderStudioTaskDrawer()", js)
+
+    def test_active_video_fingerprint_tracks_candidate_review_lifecycle(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        start = js.find("const videoJobFingerprint")
+        end = js.find(";", start) + 1
+        fingerprint = js[start:end]
+
+        self.assertIn("shot.quality_status", fingerprint)
+        self.assertIn("shot.review_resolved", fingerprint)
+        self.assertIn("shot.human_decision", fingerprint)
 
     def test_background_polling_excludes_human_waiting_and_unstarted_video_states(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -10295,7 +10526,10 @@ class ManagementUiContractTests(unittest.TestCase):
             ROOT / "scripts" / "management_ui" / "app.js"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("state.page!=='videos'", script)
+        self.assertIn(
+            "const productionPollingPages=new Set(['overview','videos'])", script
+        )
+        self.assertIn("productionPollingPages.has(state.page)", script)
         self.assertIn("hasActiveProductionJobs()", script)
         self.assertNotIn(
             "['overview','todos','videos','publishing'].includes(state.page)", script
@@ -10482,6 +10716,8 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("remaining_generation_count", js)
         self.assertIn("继续复核其余母片", js)
         self.assertIn("已接受候选，等待其余母片", js)
+        self.assertIn("已接受候选，正在生成成片", js)
+        self.assertIn("remainingPendingMasterCount", js)
 
     def test_ui_prioritizes_resolved_human_decision_over_old_quality_reasons(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -10635,16 +10871,20 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn('self.send_header("Cache-Control", "no-store")', server)
         self.assertIn('self.send_header("Pragma", "no-cache")', server)
 
-    def test_new_source_modal_supports_local_video_and_audio_upload_states(self):
+    def test_new_source_modal_supports_local_video_without_audio_source_option(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )
         for capability in (
-            'value="video"', 'value="audio"', 'id="source-file"',
+            'value="video"', 'id="source-file"',
             ".mp4,.mov,.webm", "uploadMediaSource", "正在上传", "正在转写",
             "video:'本地视频'", "audio:'本地音频'",
         ):
             self.assertIn(capability, js)
+        self.assertNotIn('<option value="audio">', js)
+        self.assertNotIn("audio/*,.wav,.mp3,.m4a,.aac,.flac,.ogg", js)
+        self.assertIn("const performanceReviewAllowed=source.source_type==='video'", js)
+        self.assertIn("const reprocessable=source.source_type==='video'", js)
 
     def test_new_source_flow_focuses_the_new_independent_content_project(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -10652,7 +10892,8 @@ class ManagementUiContractTests(unittest.TestCase):
         )
 
         self.assertIn("state.studioProjectId=result.source_id", js)
-        self.assertIn("已复用来源解析结果并新建独立内容项目", js)
+        self.assertNotIn("已复用来源解析结果", js)
+        self.assertIn("视频已重新转写、解析并独立归档", js)
 
     def test_video_source_drawer_exposes_reconstructed_script_content(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -10662,9 +10903,74 @@ class ManagementUiContractTests(unittest.TestCase):
         for capability in (
             "sourceAnalysisMarkup", "视频剧本解析", "场景", "人物与动作",
             "说话人", "镜头", "画面文字", "原声与台词", "重新解析视频",
-            "/analyze", "正在转写并解析画面", "视频已转写、解析并归档",
+            "/analyze", "正在转写并解析画面", "视频已重新转写、解析并独立归档",
+            "openSourcePerformanceReview", "校正说话人与表演",
+            "/performance-review", "speaker_review_required", "情绪与语气",
         ):
             self.assertIn(capability, js)
+
+    def test_performance_review_exposes_original_video_and_segment_evidence(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        for capability in (
+            "data-performance-media", "performance-segment-video", "播放此片段",
+            "evidence_frame_indices", "visual_observations", "解析依据",
+            "原识别说话人 / 声轨", "画面人物 #", "嘴部状态", "识别置信度", "/media", "/frames/",
+            "data-performance-play", "pausePerformancePlayers", "dataset.stopAt",
+        ):
+            self.assertIn(capability, js)
+        self.assertNotIn('id="source-performance-media"', js)
+        self.assertNotIn("performance-review-reference", js)
+
+        css = (ROOT / "scripts" / "management_ui" / "styles.css").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(".performance-segment-video", css)
+        self.assertIn("object-fit:contain", css)
+
+    def test_performance_review_is_a_visible_source_workflow_step(self):
+        ui_root = ROOT / "scripts" / "management_ui"
+        js = (ui_root / "app.js").read_text(encoding="utf-8")
+        css = (ui_root / "styles.css").read_text(encoding="utf-8")
+
+        for capability in (
+            "sourcePerformanceReviewState",
+            "performance-review-workflow",
+            "视频解析",
+            "人物与表演复核",
+            "生成选题简报",
+            "待确认片段",
+            "已人工校正",
+            "AI 已完成初判",
+            "复核并校正",
+            "保存校正并返回来源",
+            "稍后处理",
+            "操作顺序",
+            "原视频与解析证据",
+            "人工校正",
+        ):
+            self.assertIn(capability, js)
+
+        for selector in (
+            ".performance-review-workflow",
+            ".performance-review-flow",
+            ".performance-review-metrics",
+            ".performance-review-status",
+            ".performance-review-column-labels",
+        ):
+            self.assertIn(selector, css)
+
+    def test_video_source_stage_offers_direct_performance_review_entry(self):
+        ui_root = ROOT / "scripts" / "management_ui"
+        js = (ui_root / "app.js").read_text(encoding="utf-8")
+        css = (ui_root / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn('class="studio-source-review', js)
+        self.assertIn('id="studio-review-performance"', js)
+        self.assertIn("openSourcePerformanceReview(source)", js)
+        self.assertIn(".studio-source-review", css)
 
     def test_workbench_constrains_grid_row_so_long_stage_content_can_scroll(self):
         css = (ROOT / "scripts" / "management_ui" / "styles.css").read_text(
@@ -10776,6 +11082,68 @@ class ManagementUiContractTests(unittest.TestCase):
 
 
 class ManagementMediaServerTests(unittest.TestCase):
+    def test_source_review_media_and_frame_endpoints_serve_evidence(self):
+        service = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "source.mp4"
+            frame = Path(tmp) / "frame-003.jpg"
+            media.write_bytes(b"original-video")
+            frame.write_bytes(b"parsed-frame")
+            service.source_media_file.return_value = media
+            service.source_frame_file.return_value = frame
+            ConsoleHandler.service = service
+            server = ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                media_response = request.urlopen(
+                    f"{base}/api/sources/SRC-EVIDENCE/media"
+                )
+                frame_response = request.urlopen(
+                    f"{base}/api/sources/SRC-EVIDENCE/frames/3"
+                )
+                self.assertEqual(media_response.read(), b"original-video")
+                self.assertEqual(frame_response.read(), b"parsed-frame")
+                self.assertEqual(media_response.headers["Content-Type"], "video/mp4")
+                self.assertEqual(frame_response.headers["Content-Type"], "image/jpeg")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        service.source_media_file.assert_called_once_with("SRC-EVIDENCE")
+        service.source_frame_file.assert_called_once_with("SRC-EVIDENCE", 3)
+
+    def test_source_performance_review_endpoint_delegates_assignments(self):
+        service = mock.Mock()
+        service.review_source_performance.return_value = {
+            "source_id": "SRC-1", "review_required_count": 0,
+        }
+        ConsoleHandler.service = service
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        payload = {"assignments": [{"segment_index": 0, "speaker": "林夏"}]}
+        try:
+            response = request.urlopen(request.Request(
+                f"http://127.0.0.1:{server.server_port}"
+                "/api/sources/SRC-1/performance-review",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            ))
+            result = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(result["review_required_count"], 0)
+        service.review_source_performance.assert_called_once_with(
+            "SRC-1", payload
+        )
+
     def test_binary_upload_content_types_are_route_specific_and_exact(self):
         service = mock.Mock()
         service.add_media_source.return_value = {"source_id": "SRC-TYPE"}
@@ -10832,6 +11200,16 @@ class ManagementMediaServerTests(unittest.TestCase):
                     ))
                 self.assertEqual(inexact.exception.code, 415)
                 self.assertEqual(service.add_custom_character_image.call_count, 1)
+
+                with self.assertRaises(error.HTTPError) as audio_source:
+                    request.urlopen(request.Request(
+                        f"{base_url}/api/sources/media?filename=voice.mp3",
+                        data=b"audio payload",
+                        headers={"Content-Type": "audio/mpeg", "Origin": base_url},
+                        method="POST",
+                    ))
+                self.assertEqual(audio_source.exception.code, 415)
+                self.assertEqual(service.add_media_source.call_count, 1)
             finally:
                 server.shutdown()
                 server.server_close()
