@@ -205,6 +205,49 @@ def _angle_count(raw: dict) -> int:
     return len(angles) if isinstance(angles, list) else 0
 
 
+def _repair_derivable_angle_fields(raw: dict) -> dict:
+    """Repair model omissions only when the missing value is derivable.
+
+    Creative brief generation is an LLM boundary, so a structurally useful
+    response must not be discarded because one angle omitted its narrative
+    summary.  The story arc contains no new source fact: it can be composed
+    deterministically from that angle's hook, first evidence, and promise.
+    Other required fields remain strict because inventing them could change
+    the selected topic or its factual grounding.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    repaired = dict(raw)
+    raw_angles = raw.get("angles")
+    if not isinstance(raw_angles, list):
+        return repaired
+    repaired_angles: list = []
+    for angle in raw_angles:
+        if not isinstance(angle, dict):
+            repaired_angles.append(angle)
+            continue
+        repaired_angle = dict(angle)
+        if not _text(repaired_angle.get("story_arc")):
+            alias = _text(
+                repaired_angle.get("narrative_arc")
+                or repaired_angle.get("storyline")
+            )
+            if alias:
+                repaired_angle["story_arc"] = alias
+            else:
+                evidence = _string_list(repaired_angle.get("evidence"))
+                beats = [
+                    _text(repaired_angle.get("hook")),
+                    evidence[0] if evidence else "",
+                    _text(repaired_angle.get("promise")),
+                ]
+                if all(beats):
+                    repaired_angle["story_arc"] = " → ".join(beats)
+        repaired_angles.append(repaired_angle)
+    repaired["angles"] = repaired_angles
+    return repaired
+
+
 def _repair_angle_prompt(sources: list[dict], previous_count: int) -> str:
     return (
         _brief_prompt(sources)
@@ -347,6 +390,7 @@ def generate_brief(db, source_ids: list[str], *, force: bool = False,
             raise ValueError(
                 "模型连续两次未能生成可用创意角度；请补充来源内容后重试"
             )
+    raw = _repair_derivable_angle_fields(raw)
     brief = normalize_brief(raw, allowed_source_ids=set(unique_ids))
     brief = _backfill_source_digest(brief, sources)
     recommended_title = brief["angles"][brief["recommended_index"]]["title"]

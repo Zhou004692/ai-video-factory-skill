@@ -1034,6 +1034,33 @@ class TopicBriefTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(row), (80, 30))
 
+    def test_generate_brief_repairs_missing_story_arc_from_angle_content(self):
+        incomplete = self._raw_brief()
+        angle = incomplete["angles"][0]
+        hook = angle["hook"]
+        evidence = angle["evidence"][0]
+        promise = angle["promise"]
+        del angle["story_arc"]
+        generator = Mock(return_value=(
+            incomplete, {"input_tokens": 80, "output_tokens": 30}
+        ))
+
+        result = topic_briefs.generate_brief(
+            self.memory_db, [self.source.source_id], generate_json=generator
+        )
+
+        repaired = result["brief"]["angles"][0]["story_arc"]
+        self.assertEqual(repaired, " → ".join((hook, evidence, promise)))
+        self.assertEqual(generator.call_count, 1)
+
+    def test_angle_field_repair_preserves_invalid_angles_shape_for_validation(self):
+        raw = self._raw_brief()
+        raw["angles"] = "not-a-list"
+
+        repaired = topic_briefs._repair_derivable_angle_fields(raw)
+
+        self.assertEqual(repaired["angles"], "not-a-list")
+
     def test_generate_brief_accepts_two_strong_angles_without_second_model_call(self):
         available = self._raw_brief()
         available["angles"] = available["angles"][:2]
