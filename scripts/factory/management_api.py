@@ -21,7 +21,11 @@ import httpx
 
 from . import (
     anchor_generation, character_assets, character_voices, error_registry, master_dependencies, media_sources, performance_feedback, production_metrics, production_planner, quality_canary,
-    production_config, provider_capacity, provider_health, provider_tasks, recovery_controller, scene_assets, script_drafts, script_sources, source_analysis, source_scheduler, state_machine, topic_briefs,
+    node_state_machine, production_config, production_executor,
+    production_invariants, production_projection, provider_capacity,
+    provider_health, provider_tasks, recovery_controller, scene_assets,
+    script_drafts, script_sources, source_analysis, source_scheduler,
+    state_machine, topic_briefs,
 )
 from .clients import douyin, music, seedance, video_qa, volc_assets, volc_tts
 from .video_routing import AUDIO_MODE_FIXED_TTS, normalize_audio_mode
@@ -45,6 +49,9 @@ _DEFAULT_VIDEO_ACTIONS = {
     "STORYBOARDED": {"id": "confirm_budget", "label": "完成制作设置并预检"},
     "PRODUCTION_QUEUED": {"id": "view_progress", "label": "查看排队进度"},
     "PRODUCTION_RUNNING": {"id": "view_progress", "label": "查看生产进度"},
+    "BUDGET_CONFIRMATION_REQUIRED": {
+        "id": "increase_job_budget", "label": "确认预算并继续",
+    },
     "REVIEW_DECIDING": {"id": "view_progress", "label": "查看复核进度"},
     "ANCHOR_REVIEW_REQUIRED": {
         "id": "review_continuity_anchors", "label": "确认人物与场景锚点",
@@ -71,6 +78,7 @@ _VIDEO_STATE_REASONS = {
     "STORYBOARDED": "导演计划已就绪，等待确认制作设置与预算",
     "PRODUCTION_QUEUED": "任务已进入生产队列",
     "PRODUCTION_RUNNING": "人物、场景或母片正在生成",
+    "BUDGET_CONFIRMATION_REQUIRED": "下一次付费调用超过已确认预算，已在扣费前暂停",
     "REVIEW_DECIDING": "人工复核决定正在安全落盘",
     "ANCHOR_REVIEW_REQUIRED": "人物与场景锚点已生成，等待人工确认",
     "CHARACTER_OK": "人物资产已就绪，正在继续生产",
@@ -88,6 +96,42 @@ _VIDEO_STATE_REASONS = {
     "REJECTED": "任务已由人工终止",
     "PUBLISHED": "视频已发布",
 }
+
+_PRODUCTION_STAGE_DEFINITIONS = (
+    ("character", "人物定妆", frozenset({"character_anchor"})),
+    ("scene", "场景准备", frozenset({"scene_anchor"})),
+    ("master", "母片生成", frozenset({"master"})),
+    ("compose", "本地剪辑", frozenset({"bgm", "local_compose"})),
+    ("review", "成片验收", frozenset({"final_review"})),
+)
+_PRODUCTION_STAGE_STATE_PRIORITY = (
+    "ACTION_REQUIRED", "BUDGET_REQUIRED", "REVIEW_REQUIRED", "FAILED", "RUNNING", "READY",
+    "PENDING", "SUCCEEDED", "SKIPPED",
+)
+
+
+def _production_stage_projection(nodes: list[dict]) -> list[dict]:
+    stages: list[dict] = []
+    for stage_id, label, node_types in _PRODUCTION_STAGE_DEFINITIONS:
+        members = [
+            node for node in nodes if str(node.get("node_type")) in node_types
+        ]
+        states = {str(node.get("state") or "PENDING") for node in members}
+        stage_state = next((
+            state for state in _PRODUCTION_STAGE_STATE_PRIORITY
+            if state in states
+        ), "PENDING")
+        stages.append({
+            "id": stage_id,
+            "label": label,
+            "state": stage_state,
+            "completed": sum(
+                str(node.get("state")) in {"SUCCEEDED", "SKIPPED"}
+                for node in members
+            ),
+            "total": len(members),
+        })
+    return stages
 
 
 SECRET_KEYS = {
@@ -318,6 +362,7 @@ def _lip_sync_repair_suggestion(
 EDITABLE_CONFIG = {
     "DEFAULT_LLM_PROVIDER",
     "CLAUDE_MODEL",
+    "ARK_LLM_TIMEOUT_SEC",
     "ARK_API_KEY",
     "ARK_REGION",
     "ARK_VIDEO_PRIMARY_MODEL",
@@ -329,6 +374,7 @@ EDITABLE_CONFIG = {
     "SEEDANCE_AUTO_RETRY_BUDGET_CENTS",
     "SEEDANCE_JOB_BUDGET_CENTS",
     "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET",
+    "PRODUCTION_EXECUTION_ENGINE",
     "CHARACTER_ANCHOR_GENERATOR",
     "SCENE_ANCHOR_GENERATOR",
     "VOLC_ASR_API_KEY",
@@ -662,6 +708,8 @@ class ManagementService:
         root: Path,
         *,
         worker_mode: str = "child_process",
+        production_service=None,
+        production_read_model=None,
     ):
         self.database = database
         self.root = Path(root).resolve()
@@ -669,6 +717,25 @@ class ManagementService:
         if worker_mode not in {"child_process", "external"}:
             raise ValueError("worker_mode must be child_process or external")
         self.worker_mode = worker_mode
+        if production_service is None or production_read_model is None:
+            from .services import ProductionReadModel, ProductionService
+        self.production_service = (
+            production_service
+            if production_service is not None
+            else ProductionService(
+                self.database,
+                self.root,
+                start_handler=self._start_video_job_impl,
+                resume_handler=self._resume_failed_video_impl,
+                review_handler=self._review_video_impl,
+                reconcile_handler=self._reconcile_provider_task_impl,
+            )
+        )
+        self.production_read_model = (
+            production_read_model
+            if production_read_model is not None
+            else ProductionReadModel(self.database)
+        )
         self._production_workers: dict[str, subprocess.Popen] = {}
         self._last_provider_sweep = {
             "last_sweep_at": None,
@@ -729,9 +796,124 @@ class ManagementService:
         )
         self.database.commit()
         self._recover_review_operations()
+        self._repair_legacy_budget_pauses()
         self._repair_dangling_job_links()
         self._reconcile_orphaned_production_workers()
+        production_invariants.repair_all_safe(self.database)
         self._clear_stale_success_errors()
+
+    @staticmethod
+    def _budget_pause_details(message: str) -> dict[str, int] | None:
+        match = re.search(
+            r"current=(\d+),\s*pending=(\d+),\s*"
+            r"next_estimate=(\d+),\s*limit=(\d+)\s*cents",
+            str(message or ""),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return {
+            "current_cost_cents": int(match.group(1)),
+            "pending_cost_cents": int(match.group(2)),
+            "next_estimate_cents": int(match.group(3)),
+            "budget_limit_cents": int(match.group(4)),
+        }
+
+    def _repair_legacy_budget_pauses(self, job_id: str | None = None) -> int:
+        """Turn unpaid legacy budget failures into a recoverable pause."""
+        where = "n.state='FAILED' AND n.actual_cost_cents=0 "
+        params: list[object] = []
+        if job_id:
+            where += "AND n.job_id=? "
+            params.append(job_id)
+        rows = self.database.execute(
+            "SELECT n.job_id,n.node_id,n.provider_task_id,n.output_json,"
+            "e.payload_json FROM production_nodes n "
+            "LEFT JOIN production_node_events e ON e.rowid=("
+            "SELECT e2.rowid FROM production_node_events e2 "
+            "WHERE e2.job_id=n.job_id AND e2.node_id=n.node_id "
+            "ORDER BY e2.created_at DESC,e2.rowid DESC LIMIT 1) "
+            f"WHERE {where}",
+            params,
+        ).fetchall()
+        repaired = 0
+        for row in rows:
+            if str(row["provider_task_id"] or "").strip():
+                continue
+            try:
+                output = json.loads(row["output_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                output = {}
+            try:
+                event_payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                event_payload = {}
+            message = str(
+                output.get("error") or event_payload.get("error") or ""
+            )
+            details = self._budget_pause_details(message)
+            if not details and str(output.get("stable_code") or "") != (
+                "budget_confirmation_required"
+            ):
+                continue
+            output.update(details or {})
+            output.update({
+                "stable_code": "budget_confirmation_required",
+                "error": message,
+            })
+            current_job_id = str(row["job_id"])
+            node_id = str(row["node_id"])
+            updated = self.database.execute(
+                "UPDATE production_nodes SET state='BUDGET_REQUIRED',"
+                "error_code='budget_confirmation_required',"
+                "next_action='increase_job_budget',output_json=?,lease_id=NULL,"
+                "heartbeat_at=NULL,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND node_id=? AND state='FAILED' "
+                "AND actual_cost_cents=0 AND provider_task_id IS NULL",
+                (
+                    json.dumps(output, ensure_ascii=False, sort_keys=True),
+                    current_job_id, node_id,
+                ),
+            )
+            if int(updated.rowcount or 0) != 1:
+                continue
+            self.database.execute(
+                "INSERT OR IGNORE INTO production_node_events("
+                "job_id,event_id,node_id,event,from_state,to_state,payload_json) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    current_job_id,
+                    f"{current_job_id}:{node_id}:budget-pause-repair-v1",
+                    node_id, "repair_budget_pause", "FAILED",
+                    "BUDGET_REQUIRED",
+                    json.dumps(output, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            if node_id.startswith("master:"):
+                try:
+                    master_idx = int(node_id.split(":", 1)[1])
+                except ValueError:
+                    master_idx = 0
+                if master_idx:
+                    self.database.execute(
+                        "UPDATE shots SET state='PENDING',error=NULL "
+                        "WHERE job_id=? AND idx=? AND state='FAILED'",
+                        (current_job_id, master_idx),
+                    )
+            self.database.execute(
+                "UPDATE jobs SET state='BUDGET_CONFIRMATION_REQUIRED',"
+                "failure_code='budget_confirmation_required',"
+                "error='下一次付费调用超过已确认预算，已在扣费前暂停',"
+                "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state IN ("
+                "'FAILED','PRODUCTION_RUNNING','PRODUCTION_QUEUED','STORYBOARDED'"
+                ")",
+                (current_job_id,),
+            )
+            repaired += 1
+        if repaired:
+            self.database.commit()
+        return repaired
 
     def _recover_review_operations(self) -> None:
         """Recover durable review file operations left by a process exit."""
@@ -740,6 +922,7 @@ class ManagementService:
             "WHERE state='REVIEW_DECIDING' OR video_qa LIKE '%review_operation%'"
         ).fetchall()
         changed = False
+        repaired_graph_jobs: set[str] = set()
         for row in rows:
             try:
                 qa = json.loads(row["video_qa"] or "{}")
@@ -842,6 +1025,15 @@ class ManagementService:
                 continue
             if phase != "committed":
                 continue
+            if decision in {"accept_candidate", "keep_prior"}:
+                if self._sync_graph_master_review_decision(
+                    job_id,
+                    int(row["idx"]),
+                    decision=decision,
+                    operation_id=str(operation.get("operation_id") or "recovery"),
+                ):
+                    repaired_graph_jobs.add(job_id)
+                    changed = True
             if decision == "regenerate_master":
                 cleanup_ok = True
                 for key in ("archive_path", "archive_audio_path"):
@@ -879,6 +1071,19 @@ class ManagementService:
                         ),
                     )
                     changed = True
+        for job_id in repaired_graph_jobs:
+            report = production_projection.reconcile(self.database, job_id)
+            if (
+                report.current_job_state == "PRODUCTION_REVIEW_REQUIRED"
+                and report.projected_job_state != "PRODUCTION_REVIEW_REQUIRED"
+            ):
+                self.database.execute(
+                    "UPDATE jobs SET state=?,error=NULL,production_worker_pid=NULL,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=? "
+                    "AND state='PRODUCTION_REVIEW_REQUIRED'",
+                    (report.projected_job_state, job_id),
+                )
+                changed = True
         if changed:
             self.database.commit()
 
@@ -998,6 +1203,9 @@ class ManagementService:
         }
 
     def reconcile_provider_task(self, job_id: str, task_id: str) -> dict:
+        return self.production_service.reconcile(job_id, task_id)
+
+    def _reconcile_provider_task_impl(self, job_id: str, task_id: str) -> dict:
         """Inspect one known task, persist final evidence, then CAS-resume safely."""
         job = self.database.execute(
             "SELECT state,bgm_path FROM jobs WHERE job_id=?", (job_id,)
@@ -1529,6 +1737,145 @@ class ManagementService:
             "provider_recovery": dict(self._last_provider_sweep),
         }
 
+    def production_consistency(self, *, limit: int = 100) -> dict:
+        from . import production_projection
+
+        reports = production_projection.consistency_reports(
+            self.database, limit=limit,
+        )
+        affected = [report.as_dict() for report in reports if report.differences]
+        return {
+            "checked_count": len(reports),
+            "affected_count": len(affected),
+            "affected_jobs": affected,
+        }
+
+    def assign_execution_engine(self, job_id: str, engine: str) -> dict:
+        return self.production_service.assign_execution_engine(job_id, engine)
+
+    def compile_video_job(self, job_id: str) -> dict:
+        """Compile and explain v2 production without any provider submission."""
+        return self.production_service.compile(job_id)
+
+        # Kept temporarily below as a rollback reference during the gray period.
+        from . import production_graph
+
+        job = self.database.execute(
+            "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if not job:
+            raise ValueError("视频任务不存在")
+        try:
+            runtime_storyboard = json.loads(job["storyboard"] or "{}")
+        except json.JSONDecodeError:
+            runtime_storyboard = {}
+        runtime_settings = runtime_storyboard.setdefault(
+            "production_settings", {}
+        )
+        runtime_settings.setdefault(
+            "music_provider",
+            music.resolve_provider(configured=_read_env(self.env_path)),
+        )
+
+        compilation = production_planner.compile_job_spec(
+            self.database,
+            job_id,
+            self.root,
+            storyboard_override=runtime_storyboard,
+            persist=False,
+            target_version=2,
+        )
+        issue_payload = [{
+            "code": issue.code,
+            "severity": issue.severity,
+            "stage": issue.stage,
+            "subject": issue.subject,
+            "message": issue.message,
+        } for issue in compilation.issues]
+        if compilation.spec is None:
+            return {
+                "job_id": job_id,
+                "compilable": False,
+                "blockers": [
+                    issue for issue in issue_payload
+                    if issue["severity"] == "blocking"
+                ],
+                "decisions": [
+                    issue for issue in issue_payload
+                    if issue["severity"] == "decision"
+                ],
+                "required_content": list(compilation.required_content),
+            }
+        spec = compilation.spec
+        production_graph.persist_graph(self.database, spec)
+        adaptation_actions = list(dict.fromkeys(
+            action for master in spec.masters
+            for action in master.adaptation_actions
+        ))
+        preserved = list(dict.fromkeys(
+            item for master in spec.masters
+            for item in master.preserved_requirements
+        ))
+        node_counts = Counter(node.node_type for node in spec.nodes)
+        return {
+            "job_id": job_id,
+            "compilable": True,
+            "spec_hash": spec.spec_hash,
+            "version": spec.version,
+            "mode": spec.mode,
+            "reliability_commitment": spec.reliability_commitment,
+            "complexity": dict(spec.complexity),
+            "required_content": list(compilation.required_content),
+            "preserved_content": preserved,
+            "adaptation_actions": adaptation_actions,
+            "blockers": [],
+            "decisions": [
+                issue for issue in issue_payload
+                if issue["severity"] == "decision"
+            ],
+            "estimated_cost_cents": spec.estimated_cost_cents,
+            "budget_cents": spec.budget_cents,
+            "master_count": len(spec.masters),
+            "node_counts": dict(node_counts),
+            "nodes": [
+                {
+                    "node_id": node.node_id,
+                    "node_type": node.node_type,
+                    "paid": node.paid,
+                    "estimated_cost_cents": node.estimated_cost_cents,
+                    "quality_gates": list(node.quality_gates),
+                }
+                for node in spec.nodes
+            ],
+            "edges": [
+                {
+                    "from": edge.from_node_id,
+                    "to": edge.to_node_id,
+                    "type": edge.edge_type,
+                }
+                for edge in spec.edges
+            ],
+        }
+
+    def production_graph_detail(self, job_id: str) -> dict:
+        return self.production_read_model.graph_detail(job_id)
+
+        # Kept temporarily below as a rollback reference during the gray period.
+        nodes = _rows(self.database.execute(
+            "SELECT node_id,node_type,state,paid,estimated_cost_cents,"
+            "actual_cost_cents,provider_task_id,error_code,next_action "
+            "FROM production_nodes WHERE job_id=? ORDER BY node_type,node_id",
+            (job_id,),
+        ))
+        if not nodes:
+            raise ValueError("该任务尚未完成生产预检")
+        edges = _rows(self.database.execute(
+            "SELECT from_node_id,to_node_id,edge_type FROM production_edges "
+            "WHERE job_id=? ORDER BY from_node_id,to_node_id",
+            (job_id,),
+        ))
+        return {"job_id": job_id, "nodes": nodes, "edges": edges}
+
     def _clear_stale_success_errors(self) -> list[str]:
         rows = self.database.execute(
             "SELECT job_id,error FROM jobs WHERE state IN "
@@ -1646,6 +1993,12 @@ class ManagementService:
                 now=metric_now,
             ),
         }
+        canary_scorecard = quality_canary.summarize_acceptance_records(
+            quality_canary.load_acceptance_records(self.root)
+        )
+        production_compiler_v2 = production_metrics.production_v2_summary(
+            self.database
+        )
         return {
             "scripts": {
                 "sources": source_count,
@@ -1697,6 +2050,8 @@ class ManagementService:
                 "release_gate": quality_canary.evaluate_release_gate(
                     reliability_daily,
                 ),
+                "canary_scorecard": canary_scorecard,
+                "production_compiler_v2": production_compiler_v2,
                 "canary_profiles": [{
                     "id": str(profile["id"]),
                     "duration_sec": int(profile["duration_sec"]),
@@ -2613,7 +2968,8 @@ class ManagementService:
     def videos(self) -> dict:
         jobs = _rows(self.database.execute(
             "SELECT j.job_id,j.title,j.state,j.cost_cents,j.final_path,j.error,"
-            "j.failure_code,j.storyboard,j.created_at,j.updated_at "
+            "j.failure_code,j.storyboard,j.execution_engine,j.production_spec_json,"
+            "j.created_at,j.updated_at "
             "FROM jobs j WHERE NOT ("
             "j.state='PENDING' AND NOT EXISTS (SELECT 1 FROM script_drafts d "
             "WHERE d.approved_job_id=j.job_id AND d.status='approved') "
@@ -2635,6 +2991,67 @@ class ManagementService:
             )
             job["characters"] = storyboard.get("characters") or []
             job["production_settings"] = storyboard.get("production_settings") or {}
+            job["production_graph_nodes"] = []
+            job["production_stages"] = []
+            raw_production_spec = job.pop("production_spec_json", None)
+            production_spec = None
+            if raw_production_spec:
+                try:
+                    production_spec = json.loads(raw_production_spec)
+                except (TypeError, json.JSONDecodeError):
+                    production_spec = None
+            if str(job.get("execution_engine") or "legacy") == "graph_v2":
+                graph_nodes = _rows(self.database.execute(
+                    "SELECT node_id,node_type,state,paid,estimated_cost_cents,"
+                    "actual_cost_cents,provider_task_id,error_code,next_action,"
+                    "output_json "
+                    "FROM production_nodes WHERE job_id=? "
+                    "ORDER BY node_type,node_id",
+                    (job["job_id"],),
+                ))
+                job["production_graph_nodes"] = graph_nodes
+                job["production_stages"] = _production_stage_projection(
+                    graph_nodes
+                )
+                budget_nodes = [
+                    node for node in graph_nodes
+                    if str(node.get("state")) == "BUDGET_REQUIRED"
+                ]
+                budget_details: list[dict] = []
+                for node in budget_nodes:
+                    try:
+                        detail = json.loads(node.pop("output_json") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        detail = {}
+                    budget_details.append({
+                        "node_id": str(node.get("node_id") or ""),
+                        "estimated_cost_cents": int(
+                            node.get("estimated_cost_cents") or 0
+                        ),
+                        **(
+                            detail if isinstance(detail, dict) else {}
+                        ),
+                    })
+                for node in graph_nodes:
+                    node.pop("output_json", None)
+                if budget_details:
+                    job["budget_confirmation"] = {
+                        "nodes": budget_details,
+                        "current_cost_cents": int(job.get("cost_cents") or 0),
+                        "current_budget_cents": int(
+                            job["production_settings"].get("budget_cents") or 0
+                        ),
+                        "minimum_budget_without_retry_cents": (
+                            int(job.get("cost_cents") or 0)
+                            + sum(
+                                max(
+                                    int(item.get("estimated_cost_cents") or 0),
+                                    int(item.get("next_estimate_cents") or 0),
+                                )
+                                for item in budget_details
+                            )
+                        ),
+                    }
             confirmed_cost = job["production_settings"].get(
                 "confirmed_cost_estimate"
             )
@@ -2733,10 +3150,18 @@ class ManagementService:
                             "请人工核查 Provider 后处置，禁止重新提交"
                         )
                     job["unresolved_provider_tasks"].append(item)
-            planned_masters = list(
-                storyboard.get("masters") or storyboard.get("shots") or []
+            plan_storyboard = (
+                production_spec.get("runtime_storyboard")
+                if str(job.get("execution_engine") or "legacy") == "graph_v2"
+                and isinstance(production_spec, dict)
+                and isinstance(production_spec.get("runtime_storyboard"), dict)
+                else storyboard
             )
-            job["director_plan"] = storyboard.get("director_plan") or {
+            planned_masters = list(
+                plan_storyboard.get("masters")
+                or plan_storyboard.get("shots") or []
+            )
+            job["director_plan"] = plan_storyboard.get("director_plan") or {
                 "strategy": "legacy_dialogue_only",
                 "dialogue_master_count": sum(
                     1 for master in planned_masters
@@ -2747,6 +3172,29 @@ class ManagementService:
                 ),
                 "broll_beats": [],
             }
+            if str(job.get("execution_engine") or "legacy") == "graph_v2":
+                dialogue_master_count = sum(
+                    1 for master in planned_masters
+                    if (master.get("type") or "dialogue") == "dialogue"
+                )
+                broll_master_count = sum(
+                    1 for master in planned_masters
+                    if master.get("type") == "broll"
+                )
+                job["director_plan"] = {
+                    **job["director_plan"],
+                    "strategy": (
+                        "dialogue_plus_broll"
+                        if broll_master_count else "cinematic_dialogue_only"
+                    ),
+                    "dialogue_master_count": dialogue_master_count,
+                    "broll_master_count": broll_master_count,
+                    "paid_master_count": len(planned_masters),
+                    "broll_beats": (
+                        list(job["director_plan"].get("broll_beats") or [])
+                        if broll_master_count else []
+                    ),
+                }
             has_approved_script = bool(self.database.execute(
                 "SELECT 1 FROM script_drafts WHERE approved_job_id=? "
                 "AND status='approved' LIMIT 1",
@@ -2760,18 +3208,20 @@ class ManagementService:
                 and has_approved_script
             )
             job["planned_masters"] = planned_masters
-            job["director_timeline"] = _director_timeline(storyboard)
+            job["director_timeline"] = _director_timeline(plan_storyboard)
             shots = _rows(self.database.execute(
                 "SELECT idx,duration_sec,state,provider,cost_cents,video_path,"
                 "video_url,video_qa,error "
                 "FROM shots WHERE job_id=? ORDER BY idx", (job["job_id"],)
             ))
             previous_master_preview_url = None
+            qa_by_master_idx: dict[int, dict] = {}
             for shot in shots:
                 try:
                     qa = json.loads(shot.pop("video_qa") or "{}")
                 except (json.JSONDecodeError, TypeError):
                     qa = {}
+                qa_by_master_idx[int(shot["idx"])] = qa
                 shot["manual_review_required"] = (
                     qa.get("status") == "manual_review_required"
                 )
@@ -2913,7 +3363,7 @@ class ManagementService:
                                 or shot.get("duration_sec")
                                 or 0
                             ),
-                            qa,
+                            qa_by_master_idx.get(idx),
                         )
                     )
                 shot["repair_comparison"] = None
@@ -3108,9 +3558,11 @@ class ManagementService:
                     )
                     preview = str(persisted.get("preview_path") or "")
                     if preview and Path(preview).is_file():
+                        preview_revision = Path(preview).stat().st_mtime_ns
                         makeup["preview_url"] = (
                             f"/api/videos/{job['job_id']}/identities/"
                             f"{makeup['identity_token']}/preview"
+                            f"?v={preview_revision}"
                         )
                 if not makeup.get("preview_url"):
                     representative = next((
@@ -3138,9 +3590,27 @@ class ManagementService:
                     (job["job_id"],),
                 ).fetchall()
             }
+            graph_scene_keys = {
+                str(node.get("node_id") or "").split(":", 1)[1]
+                for node in job.get("production_graph_nodes") or []
+                if str(node.get("node_type") or "") == "scene_anchor"
+                and ":" in str(node.get("node_id") or "")
+            }
+            runtime_storyboard = (
+                production_spec.get("runtime_storyboard")
+                if isinstance(production_spec, dict)
+                and isinstance(production_spec.get("runtime_storyboard"), dict)
+                else storyboard
+            )
+            planned_scene_anchors = (
+                scene_assets.required_scene_anchors(
+                    runtime_storyboard, graph_scene_keys,
+                )
+                if graph_scene_keys
+                else scene_assets.recurring_scene_anchors(storyboard)
+            )
             scene_specs = {
-                item["anchor_key"]: item
-                for item in scene_assets.recurring_scene_anchors(storyboard)
+                item["anchor_key"]: item for item in planned_scene_anchors
             }
             job["scene_anchor_plan"] = []
             for anchor_key in dict.fromkeys([*scene_specs, *scene_rows]):
@@ -3194,9 +3664,11 @@ class ManagementService:
                 )
                 preview = Path(str(persisted.get("preview_path") or ""))
                 if preview.is_file():
+                    preview_revision = preview.stat().st_mtime_ns
                     entry["preview_url"] = (
                         f"/api/videos/{job['job_id']}/scenes/"
                         f"{entry['anchor_token']}/preview"
+                        f"?v={preview_revision}"
                     )
                 job["scene_anchor_plan"].append(entry)
             job["preflight"] = (
@@ -3218,6 +3690,24 @@ class ManagementService:
                 )
                 if job["state"] == "STORYBOARDED" else None
             )
+            if (
+                job["preflight"]
+                and isinstance(production_spec, dict)
+                and int(production_spec.get("version") or 0) == 2
+            ):
+                completed_node_ids = {
+                    str(node.get("node_id") or "")
+                    for node in job["production_graph_nodes"]
+                    if str(node.get("state") or "") in {"SUCCEEDED", "SKIPPED"}
+                }
+                job["preflight"] = (
+                    production_planner.align_preflight_with_compiled_spec(
+                        job["preflight"],
+                        production_spec,
+                        completed_node_ids=completed_node_ids,
+                        current_cost_cents=int(job.get("cost_cents") or 0),
+                    )
+                )
             if job["preflight"]:
                 estimated_makeup = {
                     item["identity_key"]: item
@@ -3276,6 +3766,13 @@ class ManagementService:
                             "继续生成剩余母片"
                             if job["resumable"] else "查看账号处理指引"
                         ),
+                    },
+                },
+                "BUDGET_CONFIRMATION_REQUIRED": {
+                    "label": "预算待确认",
+                    "next_action": {
+                        "id": "increase_job_budget",
+                        "label": "确认预算并继续",
                     },
                 },
                 "REJECTED_PENDING_RECONCILIATION": {
@@ -3530,6 +4027,9 @@ class ManagementService:
         }
 
     def resume_failed_video(self, job_id: str) -> dict:
+        return self.production_service.resume(job_id)
+
+    def _resume_failed_video_impl(self, job_id: str) -> dict:
         job = self.database.execute(
             "SELECT state,bgm_path,failure_code,cost_cents FROM jobs WHERE job_id=?",
             (job_id,),
@@ -4236,7 +4736,7 @@ class ManagementService:
 
     def configure_video(self, job_id: str, settings: dict) -> dict:
         row = self.database.execute(
-            "SELECT state,storyboard FROM jobs WHERE job_id=?", (job_id,),
+            "SELECT state,storyboard,execution_engine FROM jobs WHERE job_id=?", (job_id,),
         ).fetchone()
         if not row:
             raise ValueError("视频任务不存在")
@@ -4466,19 +4966,37 @@ class ManagementService:
             ),
         )
         self.database.commit()
-        return {
+        result = {
             "job_id": job_id,
             "production_settings": normalized,
             "master_dependency_graph": storyboard["master_dependency_graph"],
         }
+        if str(row["execution_engine"] or "legacy") == "graph_v2":
+            result["compilation"] = self.production_service.compile(job_id)
+        return result
 
     def review_video(
         self, job_id: str, *, decision: str, manual_minutes: float = 0,
         notes: str = "", first_pass: bool | None = None,
         checks: dict[str, bool] | None = None,
     ) -> dict:
+        return self.production_service.review(
+            job_id,
+            decision=decision,
+            manual_minutes=manual_minutes,
+            notes=notes,
+            first_pass=first_pass,
+            checks=checks,
+        )
+
+    def _review_video_impl(
+        self, job_id: str, *, decision: str, manual_minutes: float = 0,
+        notes: str = "", first_pass: bool | None = None,
+        checks: dict[str, bool] | None = None,
+    ) -> dict:
         row = self.database.execute(
-            "SELECT state,final_path FROM jobs WHERE job_id=?", (job_id,)
+            "SELECT state,final_path,execution_engine FROM jobs WHERE job_id=?",
+            (job_id,)
         ).fetchone()
         if not row:
             raise ValueError("视频任务不存在")
@@ -4521,6 +5039,26 @@ class ManagementService:
             first_pass=first_pass,
             checks=normalized_checks,
         )
+        if str(row["execution_engine"] or "legacy") == "graph_v2":
+            final_review = self.database.execute(
+                "SELECT state FROM production_nodes WHERE job_id=? "
+                "AND node_id='final_review'",
+                (job_id,),
+            ).fetchone()
+            if final_review and str(final_review["state"]) == "REVIEW_REQUIRED":
+                node_state_machine.transition_node(
+                    self.database,
+                    job_id,
+                    "final_review",
+                    "approve" if decision == "approved" else "reject",
+                    event_id=(
+                        f"{job_id}:final-review:{str(decision).strip()}"
+                    ),
+                    payload={
+                        "decision": str(decision),
+                        "notes": str(notes or "").strip(),
+                    },
+                )
         return {
             "job_id": job_id, "decision": decision,
             "publish_unlocked": decision == "approved",
@@ -4579,6 +5117,64 @@ class ManagementService:
             "restored_draft_id": restored_draft_id,
         }
 
+    def repair_execution_contract(self, job_id: str) -> dict:
+        """Repair disposable graph-v2 projections and resume without new spec."""
+        row = self.database.execute(
+            "SELECT state,execution_engine,failure_code FROM jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("视频任务不存在")
+        if str(row["execution_engine"] or "legacy") != "graph_v2":
+            raise ValueError("该任务未使用生产图执行引擎，不能执行此恢复操作")
+        state = str(row["state"] or "")
+        if state in {"PRODUCTION_QUEUED", "PRODUCTION_RUNNING"}:
+            return {
+                "job_id": job_id, "state": state, "recovered": True,
+                "repaired_codes": [], "dispatched_jobs": [],
+            }
+        if state != "FAILED" or str(
+            row["failure_code"] or ""
+        ) != "execution_contract_invalid":
+            raise ValueError("当前任务不处于生产数据恢复状态")
+
+        report = production_invariants.repair_safe_projections(
+            self.database, job_id,
+        )
+        if report.blockers:
+            raise ValueError(
+                "生产数据包含已付费或已生成媒体，系统已保留现场，"
+                "不能自动覆盖；请查看恢复诊断"
+            )
+        retried_nodes = production_executor.retry_repaired_contract_nodes(
+            self.database, job_id,
+        )
+        state_machine.transition(
+            self.database,
+            job_id,
+            "queued",
+            event_id=f"{job_id}:contract-repaired:{secrets.token_hex(8)}",
+            updates={
+                "error": None,
+                "failure_code": None,
+                "production_worker_pid": None,
+                "recovery_attempts": 0,
+            },
+            payload={
+                "repaired_codes": list(report.repaired_codes),
+                "retried_nodes": list(retried_nodes),
+            },
+        )
+        dispatch = self.dispatch_production_queue()
+        return {
+            "job_id": job_id,
+            "state": "PRODUCTION_QUEUED",
+            "recovered": True,
+            "repaired_codes": list(report.repaired_codes),
+            "retried_nodes": list(retried_nodes),
+            "dispatched_jobs": dispatch.get("dispatched_jobs", []),
+        }
+
     def _production_limit(self) -> int:
         value = _read_env(self.env_path).get("MAX_CONCURRENT_JOBS") or "1"
         try:
@@ -4591,6 +5187,17 @@ class ManagementService:
             "Scripts/python.exe" if os.name == "nt" else "bin/python"
         )
         python = runtime if runtime.exists() else Path(sys.executable)
+        row = self.database.execute(
+            "SELECT execution_engine FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        execution_engine = (
+            str(row["execution_engine"] or "legacy") if row else "legacy"
+        )
+        if execution_engine == "graph_v2":
+            return [
+                str(python), str(self.root / "scripts" / "cli.py"),
+                "produce-graph", job_id, "--dispatched",
+            ]
         return [
             str(python), str(self.root / "scripts" / "cli.py"),
             "produce-approved", job_id, "--yes", "--dispatched",
@@ -4846,6 +5453,57 @@ class ManagementService:
             raise ValueError(f"{label}不在当前任务受控目录或文件不存在")
         return path
 
+    def _sync_graph_master_review_decision(
+        self,
+        job_id: str,
+        master_idx: int,
+        *,
+        decision: str,
+        operation_id: str,
+    ) -> bool:
+        """Keep a committed shot review and its frozen graph node consistent."""
+        engine = self.database.execute(
+            "SELECT execution_engine FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if not engine or str(engine["execution_engine"] or "legacy") != "graph_v2":
+            return False
+        if decision not in {"accept_candidate", "keep_prior"}:
+            return False
+        node_id = f"master:{int(master_idx)}"
+        node = self.database.execute(
+            "SELECT state FROM production_nodes WHERE job_id=? AND node_id=?",
+            (job_id, node_id),
+        ).fetchone()
+        if not node:
+            return False
+        current = str(node["state"])
+        if current == "SUCCEEDED":
+            return False
+        if current != "REVIEW_REQUIRED":
+            raise ValueError(
+                f"reviewed master graph state is inconsistent: {node_id}={current}"
+            )
+        node_state_machine.transition_node_in_transaction(
+            self.database,
+            job_id,
+            node_id,
+            "approve",
+            event_id=(
+                f"{job_id}:{node_id}:candidate-{decision}:"
+                f"{str(operation_id or 'committed')}"
+            ),
+            payload={
+                "decision": decision,
+                "master_idx": int(master_idx),
+            },
+        )
+        self.database.execute(
+            "UPDATE production_nodes SET error_code=NULL,next_action=NULL,"
+            "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND node_id=?",
+            (job_id, node_id),
+        )
+        return True
+
     def review_master_candidate(
         self, job_id: str, master_idx: int, *, decision: str
     ) -> dict:
@@ -4855,7 +5513,8 @@ class ManagementService:
         }:
             raise ValueError("请选择接受候选、单条重做或终止任务")
         job = self.database.execute(
-            "SELECT state,final_path,bgm_path,storyboard FROM jobs WHERE job_id=?",
+            "SELECT state,final_path,bgm_path,storyboard,execution_engine "
+            "FROM jobs WHERE job_id=?",
             (job_id,),
         ).fetchone()
         shot = self.database.execute(
@@ -5195,6 +5854,12 @@ class ManagementService:
                 changed = self.database.execute(shot_sql, shot_params)
                 if int(changed.rowcount or 0) != 1:
                     raise ValueError("该视频任务已被人工终止或并发处理")
+                self._sync_graph_master_review_decision(
+                    job_id,
+                    int(master_idx),
+                    decision=normalized,
+                    operation_id=operation_id,
+                )
                 if regeneration_storyboard is not None:
                     self.database.execute(
                         "UPDATE jobs SET storyboard=? WHERE job_id=?",
@@ -5272,6 +5937,8 @@ class ManagementService:
                             "WHERE job_id=? AND state='FAILED'",
                             (job_id,),
                         )
+                elif str(job["execution_engine"] or "legacy") == "graph_v2":
+                    next_state = "PRODUCTION_QUEUED"
                 else:
                     needs_local_compose = bool(pending_accepts) or not (
                         final and final.is_file()
@@ -5859,6 +6526,14 @@ class ManagementService:
                     {"value": "seedance_native", "label": "Seedance 原生声线（默认）"},
                     {"value": "fixed_tts", "label": "固定火山声线"},
                 ]
+            if key == "PRODUCTION_EXECUTION_ENGINE":
+                field["value"] = production_config.resolve_default_execution_engine(
+                    {"PRODUCTION_EXECUTION_ENGINE": value}
+                )
+                field["options"] = [
+                    {"value": "graph_v2", "label": "Production Graph V2（正式）"},
+                    {"value": "legacy", "label": "Legacy（回滚）"},
+                ]
             fields.append(field)
         fields_by_key = {field["key"]: field for field in fields}
         required_groups = []
@@ -5962,6 +6637,10 @@ class ManagementService:
             value = str(raw_value or "").strip().replace("\r", "").replace("\n", "")
             if key in {"CHARACTER_ANCHOR_GENERATOR", "SCENE_ANCHOR_GENERATOR"}:
                 value = anchor_generation.normalize_generator(value, strict=True)
+            if key == "PRODUCTION_EXECUTION_ENGINE":
+                value = production_config.resolve_default_execution_engine(
+                    {"PRODUCTION_EXECUTION_ENGINE": value}
+                )
             if key == "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET":
                 try:
                     reference_budget = int(value)
@@ -6729,10 +7408,169 @@ class ManagementService:
         approved_budget_cents: int | None = None,
         high_risk_confirmed: bool = False,
     ) -> dict:
+        return self.production_service.start(
+            job_id,
+            confirmed=confirmed,
+            approved_budget_cents=approved_budget_cents,
+            high_risk_confirmed=high_risk_confirmed,
+        )
+
+    def confirm_video_budget(
+        self, job_id: str, *, confirmed: bool,
+        approved_budget_cents: int,
+        max_auto_retries: int = 0,
+    ) -> dict:
+        """Confirm a per-job budget and resume only unpaid paused nodes."""
+        if not confirmed:
+            raise ValueError("继续付费生成前必须明确确认任务预算")
+        self._repair_legacy_budget_pauses(job_id)
+        job = self.database.execute(
+            "SELECT state,storyboard,cost_cents FROM jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if not job:
+            raise ValueError("视频任务不存在")
+        if str(job["state"]) != "BUDGET_CONFIRMATION_REQUIRED":
+            raise ValueError("当前任务不在预算待确认状态")
+        self._assert_no_unresolved_provider_tasks(job_id)
+        try:
+            budget = int(approved_budget_cents)
+            retries = int(max_auto_retries)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("任务预算和自动重试次数必须是整数") from exc
+        if budget <= 0:
+            raise ValueError("任务预算必须大于 0")
+        if retries not in {0, 1}:
+            raise ValueError("自动重试次数只能为 0 或 1")
+        nodes = self.database.execute(
+            "SELECT node_id,estimated_cost_cents,actual_cost_cents,"
+            "provider_task_id,output_json FROM production_nodes "
+            "WHERE job_id=? AND state='BUDGET_REQUIRED' ORDER BY node_id",
+            (job_id,),
+        ).fetchall()
+        if not nodes:
+            raise ValueError("没有等待预算确认的生产节点")
+        if any(
+            int(row["actual_cost_cents"] or 0) > 0
+            or str(row["provider_task_id"] or "").strip()
+            for row in nodes
+        ):
+            raise ValueError("预算暂停节点存在远端任务或已记账成本，必须先核对")
+        required_additional = 0
+        resumed_indexes: list[int] = []
+        for row in nodes:
+            try:
+                output = json.loads(row["output_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                output = {}
+            single_attempt = max(0, int(row["estimated_cost_cents"] or 0))
+            guarded_estimate = max(
+                single_attempt,
+                int(output.get("next_estimate_cents") or 0),
+            )
+            # The runtime estimate already represents one concrete provider
+            # request, including billable reference-video duration.  Retry
+            # policy must not replace that amount with the cheaper frozen
+            # node estimate, otherwise confirmation immediately pauses again.
+            required_additional += guarded_estimate
+            node_id = str(row["node_id"])
+            if node_id.startswith("master:"):
+                try:
+                    resumed_indexes.append(int(node_id.split(":", 1)[1]))
+                except ValueError:
+                    pass
+        current_cost = max(0, int(job["cost_cents"] or 0))
+        required_total = current_cost + required_additional
+        if budget < required_total:
+            raise ValueError(
+                f"确认预算不足：至少需要 ¥{required_total / 100:.2f}"
+            )
+        try:
+            storyboard = json.loads(job["storyboard"] or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("任务制作设置已损坏，无法确认预算") from exc
+        settings = storyboard.setdefault("production_settings", {})
+        settings["budget_cents"] = budget
+        snapshot = settings.setdefault(
+            production_config.GENERATION_SNAPSHOT_KEY, {}
+        )
+        snapshot["job_budget_cents"] = budget
+        snapshot["max_auto_retries"] = retries
+        if retries == 0:
+            snapshot["auto_retry_budget_cents"] = 0
+        confirmed_cost = settings.get("confirmed_cost_estimate")
+        if isinstance(confirmed_cost, dict):
+            confirmed_cost["budget_cents"] = budget
+            confirmed_cost["projected_total_cost_cents"] = max(
+                int(confirmed_cost.get("projected_total_cost_cents") or 0),
+                required_total,
+            )
+        with self.database:
+            for row in nodes:
+                node_id = str(row["node_id"])
+                node_state_machine.transition_node_in_transaction(
+                    self.database, job_id, node_id, "resume",
+                    event_id=(
+                        f"{job_id}:{node_id}:budget-confirmed:"
+                        f"{budget}:{retries}:{secrets.token_hex(6)}"
+                    ),
+                    payload={
+                        "approved_budget_cents": budget,
+                        "max_auto_retries": retries,
+                    },
+                )
+                self.database.execute(
+                    "UPDATE production_nodes SET error_code=NULL,next_action=NULL,"
+                    "output_json='{}',updated_at=CURRENT_TIMESTAMP "
+                    "WHERE job_id=? AND node_id=? AND state='READY'",
+                    (job_id, node_id),
+                )
+            if resumed_indexes:
+                placeholders = ",".join("?" for _ in resumed_indexes)
+                self.database.execute(
+                    f"UPDATE shots SET state='PENDING',error=NULL "
+                    f"WHERE job_id=? AND idx IN ({placeholders})",
+                    (job_id, *resumed_indexes),
+                )
+            state_machine.transition(
+                self.database, job_id, "budget_confirmed",
+                event_id=(
+                    f"{job_id}:budget-confirmed:{budget}:{retries}:"
+                    f"{secrets.token_hex(6)}"
+                ),
+                updates={
+                    "storyboard": json.dumps(storyboard, ensure_ascii=False),
+                    "error": None,
+                    "failure_code": None,
+                    "production_worker_pid": None,
+                },
+                payload={
+                    "approved_budget_cents": budget,
+                    "max_auto_retries": retries,
+                    "required_total_cents": required_total,
+                    "resumed_master_indexes": sorted(resumed_indexes),
+                },
+            )
+        dispatch = self.dispatch_production_queue()
+        return {
+            "job_id": job_id,
+            "state": "PRODUCTION_QUEUED",
+            "approved_budget_cents": budget,
+            "max_auto_retries": retries,
+            "required_total_cents": required_total,
+            "resumed_master_indexes": sorted(resumed_indexes),
+            "dispatched_jobs": dispatch.get("dispatched_jobs", []),
+        }
+
+    def _start_video_job_impl(
+        self, job_id: str, *, confirmed: bool,
+        approved_budget_cents: int | None = None,
+        high_risk_confirmed: bool = False,
+    ) -> dict:
         if not confirmed:
             raise ValueError("开始付费生成前必须明确确认预算")
         job = self.database.execute(
-            "SELECT state FROM jobs WHERE job_id=?", (job_id,)
+            "SELECT state,execution_engine FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()
         if not job:
             raise ValueError("视频任务不存在")
@@ -6744,8 +7582,17 @@ class ManagementService:
         storyboard_row = self.database.execute(
             "SELECT storyboard,cost_cents FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()
+        if os.environ.get("FACTORY_V2_SHADOW", "").strip() == "1":
+            from . import production_shadow
+
+            production_shadow.compile_and_compare(
+                self.database, job_id, self.root,
+            )
+        execution_engine = str(job["execution_engine"] or "legacy")
+        target_spec_version = 2 if execution_engine == "graph_v2" else 1
         contract = production_planner.compile_job_spec(
-            self.database, job_id, self.root, persist=False
+            self.database, job_id, self.root, persist=False,
+            target_version=target_spec_version,
         )
         blockers = [
             issue for issue in contract.issues if issue.severity == "blocking"
@@ -6792,6 +7639,9 @@ class ManagementService:
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"分镜未通过生产校验：{exc}") from exc
         config = _read_env(self.env_path)
+        storyboard.setdefault("production_settings", {}).setdefault(
+            "music_provider", music.resolve_provider(configured=config)
+        )
         completed_master_indexes = {
             int(row["idx"])
             for row in self.database.execute(
@@ -6816,15 +7666,36 @@ class ManagementService:
             ),
             current_cost_cents=int(storyboard_row["cost_cents"] or 0),
         )
-        if (
-            preflight.get("requires_long_master_confirmation")
-            and not high_risk_confirmed
-        ):
+        if execution_engine == "graph_v2" and contract.spec is not None:
+            completed_node_ids = {
+                str(row["node_id"])
+                for row in self.database.execute(
+                    "SELECT node_id,state FROM production_nodes WHERE job_id=?",
+                    (job_id,),
+                ).fetchall()
+                if str(row["state"]) in {"SUCCEEDED", "SKIPPED"}
+            }
+            preflight = production_planner.align_preflight_with_compiled_spec(
+                preflight,
+                contract.spec,
+                completed_node_ids=completed_node_ids,
+                current_cost_cents=int(storyboard_row["cost_cents"] or 0),
+            )
+        requires_feasibility_confirmation = preflight.get(
+            "requires_master_feasibility_confirmation",
+            preflight.get("requires_long_master_confirmation"),
+        )
+        if requires_feasibility_confirmation and not high_risk_confirmed:
+            high_complexity_indexes = preflight.get(
+                "high_complexity_master_indexes",
+                preflight.get("high_risk_master_indexes", []),
+            )
             indexes = "、".join(
-                f"#{idx}" for idx in preflight["high_risk_master_indexes"]
+                f"#{idx}" for idx in high_complexity_indexes
             )
             raise ValueError(
-                f"长母片存在高风险（{indexes}）；请明确确认风险后再开始生成"
+                f"母片存在高复杂度生成风险（{indexes}）；"
+                "请明确确认可生成性风险后再开始生成"
             )
         if not preflight["budget_ok"]:
             try:
@@ -6877,10 +7748,20 @@ class ManagementService:
             job_id,
             self.root,
             storyboard_override=storyboard,
-            persist=True,
+            persist=(execution_engine != "graph_v2"),
+            target_version=target_spec_version,
         )
         if not final_contract.payable:
             raise ValueError("生产规格在预算确认后失效，请重新执行预检")
+        if execution_engine == "graph_v2":
+            self.production_service.persist_compiled_execution(
+                final_contract.spec,
+            )
+        executable_storyboard = (
+            final_contract.spec.runtime_storyboard
+            if execution_engine == "graph_v2"
+            else storyboard
+        )
         state_machine.transition(
             self.database,
             job_id,
@@ -6890,7 +7771,9 @@ class ManagementService:
                 f"{secrets.token_hex(8)}"
             ),
             updates={
-                "storyboard": json.dumps(storyboard, ensure_ascii=False),
+                "storyboard": json.dumps(
+                    executable_storyboard, ensure_ascii=False
+                ),
                 "error": None,
                 "failure_code": None,
             },
@@ -6904,7 +7787,8 @@ class ManagementService:
     ) -> dict:
         """Approve canonical makeup/location anchors and resume production."""
         job = self.database.execute(
-            "SELECT state FROM jobs WHERE job_id=?", (job_id,)
+            "SELECT state,execution_engine,storyboard,characters_json "
+            "FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()
         if not job:
             raise ValueError("视频任务不存在")
@@ -6922,6 +7806,38 @@ class ManagementService:
         review_rows = [*identity_rows, *scene_rows]
         if not review_rows:
             raise ValueError("没有需要审核的人物或场景锚点")
+        try:
+            storyboard = json.loads(job["storyboard"] or "{}")
+            characters = json.loads(job["characters_json"] or "[]")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("continuity anchor contract is invalid") from exc
+        units = storyboard.get("masters") or storyboard.get("shots") or []
+        required_ids = s3_shots._required_character_ids(units)
+        required_characters = [
+            character for character in characters
+            if str(character.get("id") or "") in required_ids
+        ]
+        required_identity_keys = {
+            entry["identity_key"]
+            for entry in character_assets.character_makeup_plan(required_characters)
+            if entry["requires_paid_call"]
+        }
+        materialized_identity_keys = {
+            str(row["identity_key"])
+            for row in self.database.execute(
+                "SELECT identity_key FROM character_identity_anchors "
+                "WHERE job_id=? AND source_type!='volc_asset'",
+                (job_id,),
+            ).fetchall()
+        }
+        missing_identity_keys = sorted(
+            required_identity_keys - materialized_identity_keys
+        )
+        if missing_identity_keys:
+            raise ValueError(
+                "missing required character anchors: "
+                + ", ".join(missing_identity_keys)
+            )
         if any(str(row["state"]) != "READY" for row in review_rows):
             raise ValueError("人物与场景锚点尚未全部生成完成")
 
@@ -6939,6 +7855,28 @@ class ManagementService:
             "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND state='READY'",
             (review_note, job_id),
         )
+        if str(job["execution_engine"] or "legacy") == "graph_v2":
+            review_nodes = self.database.execute(
+                "SELECT node_id,provider_task_id,actual_cost_cents "
+                "FROM production_nodes WHERE job_id=? "
+                "AND node_type IN ('character_anchor','scene_anchor') "
+                "AND state='REVIEW_REQUIRED' ORDER BY node_id",
+                (job_id,),
+            ).fetchall()
+            for node in review_nodes:
+                node_id = str(node["node_id"])
+                node_state_machine.transition_node(
+                    self.database,
+                    job_id,
+                    node_id,
+                    "approve",
+                    event_id=(
+                        f"{job_id}:{node_id}:anchor-approved:"
+                        f"{str(node['provider_task_id'] or 'local')}:"
+                        f"{int(node['actual_cost_cents'] or 0)}"
+                    ),
+                    payload={"review_note": review_note},
+                )
         queued = self.database.execute(
             "UPDATE jobs SET state='PRODUCTION_QUEUED',error=NULL,"
             "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "

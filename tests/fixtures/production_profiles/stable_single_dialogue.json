@@ -1,0 +1,28 @@
+{
+  "fixture_version": 1,
+  "profile_id": "stable_single_dialogue",
+  "title": "设备租赁服务承诺",
+  "target_duration_sec": 8,
+  "characters": [
+    {
+      "id": "linxia",
+      "name": "林夏",
+      "look": "成年女性设备租赁服务顾问，形象自然可信"
+    }
+  ],
+  "beats": [
+    {
+      "id": "beat-1",
+      "kind": "dialogue",
+      "scene_id": "service_center",
+      "scene": "设备租赁服务中心明亮接待区，单一连续空间",
+      "characters": ["linxia"],
+      "speaker": "linxia",
+      "dialogue": "设备不是租出去就结束，真正的服务，是让客户每一分钟都放心",
+      "action": "林夏从设备巡检表抬眼看向镜头，自然走近半步，结尾轻点头",
+      "emotion": "坚定、可信",
+      "must_preserve": ["完整台词", "单一角色", "单一连续空间"],
+      "may_adapt": ["景别", "轻微运镜", "动作节奏"]
+    }
+  ]
+}

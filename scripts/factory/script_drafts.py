@@ -8,11 +8,11 @@ import re
 from copy import deepcopy
 from typing import Callable
 
-from . import script_sources
+from . import creative_ir, production_config, script_sources
 from .clients import doubao_llm
 
 
-PROMPT_VERSION = "complete-script-v9-balanced-source-sampling"
+PROMPT_VERSION = "complete-script-v11-paid-broll-gate"
 BEAT_ORDER = ("hook", "conflict", "evidence", "reversal", "solution", "cta")
 MAX_PROVIDER_MASTER_DURATION_SEC = 30.0
 
@@ -155,17 +155,36 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
         raise ValueError("script variant.title is required")
     if not thesis:
         raise ValueError("script variant.creative_thesis is required")
+    characters: list[dict] = []
+    for item in raw.get("characters") or []:
+        if not isinstance(item, dict):
+            continue
+        character_id = _text(item.get("id") or item.get("name"))
+        if not character_id:
+            continue
+        characters.append({
+            "id": character_id,
+            "name": _text(item.get("name")) or character_id,
+            "gender": _text(item.get("gender")) or "unspecified",
+            "look": _text(item.get("look") or item.get("image_prompt")),
+            "background_description": _text(
+                item.get("background_description") or item.get("role")
+            ),
+        })
     total = round(sum(beat["duration_sec"] for beat in beats), 2)
     # The total is derived from normalized beats. Model-provided and manually
     # edited aggregate fields are hints, never an independent source of truth.
     declared = total
-    return {
+    result = {
         "title": title,
         "creative_thesis": thesis,
         "target_duration_sec": declared,
         "total_duration_sec": total,
         "beats": beats,
     }
+    if characters:
+        result["characters"] = characters
+    return result
 
 
 def normalize_response(raw: dict, *, allowed_source_ids: set[str]) -> dict:
@@ -383,6 +402,13 @@ def _prompt(
             "title": "剧本标题",
             "creative_thesis": "核心命题",
             "target_duration_sec": 24,
+            "characters": [{
+                "id": "character_id",
+                "name": "character name",
+                "gender": "male|female|unspecified",
+                "look": "age, ethnicity, hair, clothing and carried equipment",
+                "background_description": "role, responsibility, personality and relationships",
+            }],
             "beats": [{
                 "beat": "hook|conflict|evidence|reversal|solution|cta",
                 "speaker": "character_id",
@@ -428,7 +454,9 @@ def _prompt(
         "若多个 beat 明确发生在同一个具体项目现场、园区或建筑群，但属于装卸区、产线、调度室等不同子空间，"
         "必须复用同一个 site_id，并用 site_description 描述这个项目现场；这些 beat 的 scene 和 continuity_id 仍保持各自独立。"
         "只有泛称相似但并非同一具体现场的工厂、办公室或仓库，不得复用 site_id；不存在上层现场关系时 site_id 留空。"
-        "不要按说话人或固定秒数更换 continuity_id。broll_required 仅在证据、实物、流程或环境画面能提供台词之外的有效信息时设为 true。"
+        "不要按说话人或固定秒数更换 continuity_id。broll_hint 只是本地导演剪辑建议，不会自动创建付费母片。"
+        "broll_required=true 等价于授权新增一条独立付费 B-roll 母片；仅当该画面提供台词之外不可缺少的证据、实物或流程信息，"
+        "并且无法在对应对白母片的 visual_intent 中完成时才设为 true；只为补充景别、特写、环境空镜或重复对白母片已有动作时必须为 false。"
         "只允许引用提供的 source_id；不得编造事实、金额、客户、政策或产品能力；"
         "不得照抄竞品台词，只能借鉴抽象结构。目标为 Seedance 2.5 原生母片加本地导演剪辑。"
         "下方创作建议均为软约束：建议总时长用于调节各 beat 的台词密度和节奏，各 beat 秒数之和应尽量接近；"
@@ -593,10 +621,6 @@ def _broll_plan(beats: list[dict], *, max_duration: float = 12) -> list[tuple[in
         (
             (index, beat) for index, beat in enumerate(beats)
             if beat.get("broll_required") is True
-            or (
-                _text(beat.get("broll_hint"))
-                and _text(beat.get("beat")) in {"evidence", "reversal", "solution"}
-            )
         ),
         key=lambda item: (priority.get(_text(item[1].get("beat")), 99), item[0]),
     )
@@ -1144,15 +1168,27 @@ def _storyboard(script: dict) -> dict:
             shot["transition_reason"] = (
                 "场景发生变化，用极短暗场建立新空间"
             )
+    character_profiles = {
+        _text(item.get("id")): item
+        for item in (script.get("characters") or [])
+        if isinstance(item, dict) and _text(item.get("id"))
+    }
+    storyboard_characters = []
+    for speaker in speakers:
+        profile = deepcopy(character_profiles.get(speaker) or {})
+        profile["id"] = speaker
+        profile["name"] = _text(profile.get("name")) or speaker
+        profile["gender"] = _text(profile.get("gender")) or "unspecified"
+        profile["look"] = _text(profile.get("look")) or "按剧本人物设定自动定妆"
+        if _text(profile.get("background_description")):
+            profile["background_description"] = _text(
+                profile["background_description"]
+            )
+        storyboard_characters.append(profile)
     return {
         "production_profile": "standard",
         "production_mode": "native_master_local_director",
-        "characters": [{
-            "id": speaker,
-            "name": "主讲人" if speaker == "presenter" else speaker,
-            "gender": "unspecified",
-            "look": "待在视频制作设置中绑定角色资产",
-        } for speaker in speakers],
+        "characters": storyboard_characters,
         "hook": beats[0]["dialogue"],
         "masters": masters,
         "shots": shots,
@@ -1243,14 +1279,16 @@ def approve_draft(db, draft_id: str) -> dict:
     if not topic_id:
         raise ValueError("approved brief has no topic id")
     job_id = job_id or f"J-{topic_id}"
+    execution_engine = production_config.resolve_default_execution_engine()
     if not db.execute("SELECT 1 FROM jobs WHERE job_id=?", (job_id,)).fetchone():
         brief = json.loads(row["brief_json"] or "{}")
         db.execute(
-            "INSERT INTO jobs(job_id,topic_id,title,target_audience,priority) "
-            "VALUES(?,?,?,?,?)",
+            "INSERT INTO jobs(job_id,topic_id,title,target_audience,priority,"
+            "execution_engine) VALUES(?,?,?,?,?,?)",
             (
                 job_id, row["approved_topic_id"],
                 row["recommended_title"], str(brief.get("audience") or ""), 3,
+                execution_engine,
             ),
         )
     job_state = db.execute(
@@ -1260,7 +1298,9 @@ def approve_draft(db, draft_id: str) -> dict:
         raise ValueError(
             f"production job must be PENDING before script approval, got {job_state}"
         )
-    storyboard = _storyboard(json.loads(row["script_json"]))
+    script = json.loads(row["script_json"])
+    creative = creative_ir.from_storyboard(script)
+    storyboard = _storyboard(script)
     # Approval is the production hand-off boundary. Never persist a
     # Storyboard that the worker will reject after the job has been queued.
     from factory.steps import s1_storyboard
@@ -1282,9 +1322,16 @@ def approve_draft(db, draft_id: str) -> dict:
         (job_id, row["brief_id"]),
     )
     db.execute(
-        "UPDATE jobs SET storyboard=?,state='STORYBOARDED',"
+        "UPDATE jobs SET storyboard=?,creative_ir_json=?,creative_ir_version=?,"
+        "state='STORYBOARDED',execution_engine=?,"
         "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-        (storyboard_json, job_id),
+        (
+            storyboard_json,
+            json.dumps(creative.as_dict(), ensure_ascii=False),
+            creative.version,
+            execution_engine,
+            job_id,
+        ),
     )
     db.commit()
     approved = db.execute(

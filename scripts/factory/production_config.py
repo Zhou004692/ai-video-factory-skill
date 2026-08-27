@@ -16,6 +16,29 @@ from .video_routing import normalize_audio_mode
 GENERATION_SNAPSHOT_KEY = "generation_snapshot"
 GENERATION_SNAPSHOT_VERSION = 1
 DEFAULT_VIDEO_MODEL = "doubao-seedance-2-5-260628"
+DEFAULT_EXECUTION_ENGINE = "legacy"
+EXECUTION_ENGINES = ("legacy", "graph_v2")
+
+
+def resolve_default_execution_engine(
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the engine for jobs crossing the script-to-production boundary.
+
+    The fallback deliberately remains ``legacy`` so rollback is possible by
+    removing the opt-in configuration.  Formal deployments switch new jobs to
+    V2 with ``PRODUCTION_EXECUTION_ENGINE=graph_v2``; persisted jobs are never
+    migrated by this resolver.
+    """
+    env = os.environ if env is None else env
+    value = str(
+        env.get("PRODUCTION_EXECUTION_ENGINE") or DEFAULT_EXECUTION_ENGINE
+    ).strip()
+    if value not in EXECUTION_ENGINES:
+        raise ValueError(
+            "PRODUCTION_EXECUTION_ENGINE must be legacy or graph_v2"
+        )
+    return value
 
 
 def _positive_int(value: object, *, default: int, label: str) -> int:

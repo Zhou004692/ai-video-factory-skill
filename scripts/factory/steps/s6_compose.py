@@ -11,6 +11,7 @@
 最后 concat → 加 BGM(-12dB,有存在感不喧宾夺主)。
 """
 import asyncio
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -379,12 +380,16 @@ def _in_video_hook_text(storyboard: dict) -> str | None:
     return str(storyboard.get("hook") or "").strip() or None
 
 
-async def run(job_id: str) -> None:
+async def run(job_id: str, *, storyboard_override: dict | None = None) -> None:
     base = ASSETS_DIR / job_id
     db = conn()
     job = db.execute("SELECT storyboard FROM jobs WHERE job_id=?",
                      (job_id,)).fetchone()
-    sb = json.loads(job["storyboard"]) if job and job["storyboard"] else {}
+    sb = (
+        deepcopy(storyboard_override)
+        if storyboard_override is not None
+        else json.loads(job["storyboard"]) if job and job["storyboard"] else {}
+    )
     sb_shots = {s["idx"]: s for s in sb.get("shots", [])}
     hook_text = sb.get("hook", "")
     in_video_hook = _in_video_hook_text(sb)

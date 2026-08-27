@@ -184,6 +184,13 @@ class FreshInstallTests(unittest.TestCase):
         self.assertIn("--no-deps", script)
         self.assertNotIn("Write-Host", script)
 
+        installer = (ROOT / "scripts" / "install.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Gyan.FFmpeg", installer)
+        self.assertIn("CreateShortcut", installer)
+        self.assertIn("打开 AI 视频工厂.cmd", installer)
+
         app = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )

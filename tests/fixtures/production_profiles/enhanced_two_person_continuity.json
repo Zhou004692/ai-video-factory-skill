@@ -1,0 +1,51 @@
+{
+  "fixture_version": 1,
+  "profile_id": "enhanced_two_person_continuity",
+  "title": "夜间交付前的最后确认",
+  "target_duration_sec": 18,
+  "characters": [
+    {"id": "linxia", "name": "林夏", "look": "成年女性设备租赁服务顾问"},
+    {"id": "zhougong", "name": "周工", "look": "成年男性现场工程师"}
+  ],
+  "beats": [
+    {
+      "id": "beat-1",
+      "kind": "dialogue",
+      "scene_id": "equipment_yard",
+      "scene": "同一设备停放场，待检高空车位于两人右后方",
+      "characters": ["zhougong", "linxia"],
+      "speaker": "zhougong",
+      "dialogue": "客户今晚就要开工，这台高空车能准时到吗",
+      "action": "周工指向待检设备，快步走到林夏身侧",
+      "emotion": "焦急但克制",
+      "must_preserve": ["周工完整提问", "高空车固定方位", "两人身份"],
+      "may_adapt": ["提问景别", "走位速度"]
+    },
+    {
+      "id": "beat-2",
+      "kind": "dialogue",
+      "scene_id": "equipment_yard",
+      "scene": "延续同一设备停放场和人物轴线",
+      "characters": ["linxia", "zhougong"],
+      "speaker": "linxia",
+      "dialogue": "调度、验机和运输已经并行，交付时间提前了四十分钟",
+      "action": "林夏展示平板调度状态，两人并肩向设备移动",
+      "emotion": "冷静、自信",
+      "must_preserve": ["林夏完整回答", "同一高空车", "人物站位连续"],
+      "may_adapt": ["平板特写", "推进速度"]
+    },
+    {
+      "id": "beat-3",
+      "kind": "dialogue",
+      "scene_id": "equipment_yard",
+      "scene": "延续同一设备停放场和人物轴线",
+      "characters": ["zhougong", "linxia"],
+      "speaker": "zhougong",
+      "dialogue": "好，现场等的就是这个确定性",
+      "action": "周工确认屏幕信息，与林夏对视点头",
+      "emotion": "释然、认可",
+      "must_preserve": ["周工完整确认", "两人关系连续", "同一空间"],
+      "may_adapt": ["反应镜头", "结束构图"]
+    }
+  ]
+}

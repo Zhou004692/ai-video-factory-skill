@@ -41,6 +41,7 @@ class SkillDistributionTests(unittest.TestCase):
                 "VERSION",
                 "CHANGELOG.md",
                 "SKILL.md",
+                "安装 AI 视频工厂.cmd",
                 "agents/openai.yaml",
                 "scripts/cli.py",
                 "scripts/bootstrap.py",
@@ -57,6 +58,12 @@ class SkillDistributionTests(unittest.TestCase):
                 "references/characters/roster.yaml",
             ):
                 self.assertTrue((package / relative).is_file(), relative)
+
+            bootstrap_launcher = (package / "安装 AI 视频工厂.cmd").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("scripts\\install.ps1", bootstrap_launcher)
+            self.assertNotIn("C:\\Users\\", bootstrap_launcher)
 
             for relative in (
                 ".env",

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Literal
@@ -104,6 +105,30 @@ class ProductionCompilation:
         return self.spec is not None and not any(
             issue.severity == "blocking" for issue in self.issues
         )
+
+
+def persist_production_spec(
+    database: sqlite3.Connection,
+    spec: object,
+    *,
+    commit: bool = True,
+) -> None:
+    """Persist the job-side frozen spec inside or outside a caller transaction."""
+    database.execute(
+        "UPDATE jobs SET production_spec_json=?,production_spec_hash=?,"
+        "production_spec_version=? WHERE job_id=?",
+        (
+            json.dumps(
+                spec.as_dict(), ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ),
+            spec.spec_hash,
+            spec.version,
+            spec.job_id,
+        ),
+    )
+    if commit:
+        database.commit()
 
 
 def _character_aliases(characters: list[dict]) -> set[str]:
@@ -469,10 +494,19 @@ def compile_production_spec(
     *,
     storyboard_override: dict | None = None,
     persist: bool = True,
+    target_version: int | None = None,
 ) -> ProductionCompilation:
     """Return all deterministic blockers without creating paid work."""
+    if target_version is None:
+        try:
+            target_version = int(os.environ.get("FACTORY_PRODUCTION_SPEC_VERSION", "1"))
+        except ValueError:
+            target_version = 1
+    if target_version not in {1, 2}:
+        raise ValueError(f"unsupported production spec version: {target_version}")
     row = database.execute(
-        "SELECT storyboard,cost_cents FROM jobs WHERE job_id=?", (job_id,)
+        "SELECT storyboard,cost_cents,creative_ir_json FROM jobs WHERE job_id=?",
+        (job_id,),
     ).fetchone()
     if row is None:
         raise ValueError(f"video job not found: {job_id}")
@@ -483,6 +517,57 @@ def compile_production_spec(
             storyboard = json.loads(row["storyboard"] or "{}")
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError(f"video job storyboard is invalid: {job_id}") from exc
+    if target_version == 2:
+        from . import creative_ir, production_compiler
+
+        raw_ir = None
+        if storyboard_override is None and row["creative_ir_json"]:
+            try:
+                raw_ir = json.loads(row["creative_ir_json"])
+            except (TypeError, json.JSONDecodeError):
+                raw_ir = None
+        creative = (
+            creative_ir.from_dict(raw_ir)
+            if isinstance(raw_ir, dict)
+            else creative_ir.from_storyboard(storyboard)
+        )
+        plan = production_planner.analyze_storyboard(
+            database,
+            copy.deepcopy(storyboard),
+            current_cost_cents=int(row["cost_cents"] or 0),
+        )
+        compilation = production_compiler.compile_ir(
+            creative,
+            job_id=job_id,
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=int(plan["budget_cents"]),
+            root=root,
+            runtime_storyboard=storyboard,
+        )
+        if persist:
+            if compilation.spec is None:
+                database.execute(
+                    "UPDATE jobs SET production_spec_json=NULL,"
+                    "production_spec_hash=NULL,production_spec_version=0 "
+                    "WHERE job_id=?",
+                    (job_id,),
+                )
+            else:
+                database.execute(
+                    "UPDATE jobs SET production_spec_json=?,production_spec_hash=?,"
+                    "production_spec_version=? WHERE job_id=?",
+                    (
+                        json.dumps(
+                            compilation.spec.as_dict(), ensure_ascii=False,
+                            sort_keys=True, separators=(",", ":"),
+                        ),
+                        compilation.spec.spec_hash,
+                        compilation.spec.version,
+                        job_id,
+                    ),
+                )
+            database.commit()
+        return compilation
     characters = [
         dict(item) for item in (storyboard.get("characters") or [])
         if isinstance(item, dict)

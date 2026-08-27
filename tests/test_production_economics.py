@@ -18,9 +18,13 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from factory import (  # noqa: E402
     asset_library,
+    character_assets,
+    creative_ir,
     db,
     master_risk,
     orchestrator,
+    production_compiler,
+    production_graph,
     production_metrics,
     production_planner,
     quality_canary,
@@ -594,6 +598,197 @@ class ProductionMetricsTests(unittest.TestCase):
         self.assertFalse(contract["uses_production_real_assets"])
         self.assertEqual(contract["job_budget_cents"], 1500)
         self.assertEqual(contract["confirmed_budget_cents"], 2000)
+
+    def test_frozen_canaries_merge_multi_person_and_multi_scene_into_one_shape(self):
+        profiles = quality_canary.load_frozen_profiles()
+
+        self.assertEqual(len(profiles), 3)
+        self.assertEqual(
+            {profile["id"] for profile in profiles},
+            {
+                "single-speaker-8s-v1",
+                "two-person-continuous-18s-v1",
+                "multi-person-multi-scene-cinematic-30s-v1",
+            },
+        )
+
+    def test_combined_cinematic_canary_builds_three_people_across_two_scenes(self):
+        contract = quality_canary.prepare_explicit_run(
+            "multi-person-multi-scene-cinematic-30s-v1",
+            confirmed=True,
+            budget_cents=6000,
+        )
+
+        storyboard = quality_canary.build_isolated_storyboard(
+            "multi-person-multi-scene-cinematic-30s-v1", contract
+        )
+
+        self.assertEqual(len(storyboard["characters"]), 3)
+        self.assertEqual(
+            {item["id"] for item in storyboard["characters"]},
+            {"canary_character_1", "canary_character_2", "canary_character_3"},
+        )
+        self.assertEqual(len(storyboard["masters"]), 2)
+        self.assertEqual(
+            [master["duration"] for master in storyboard["masters"]],
+            [15.0, 15.0],
+        )
+        self.assertNotEqual(
+            storyboard["masters"][0]["scene"],
+            storyboard["masters"][1]["scene"],
+        )
+        self.assertEqual(
+            [shot["video_master_idx"] for shot in storyboard["shots"]],
+            [1, 1, 1, 2, 2, 2],
+        )
+        self.assertEqual(
+            [shot["video_start"] for shot in storyboard["shots"]],
+            [0.0, 5.0, 10.0, 0.0, 5.0, 10.0],
+        )
+        self.assertEqual(
+            [set(master["speakers"]) for master in storyboard["masters"]],
+            [
+                {"canary_character_1", "canary_character_2", "canary_character_3"},
+                {"canary_character_1", "canary_character_2", "canary_character_3"},
+            ],
+        )
+        self.assertEqual(
+            {speaker for master in storyboard["masters"] for speaker in master["speakers"]},
+            {"canary_character_1", "canary_character_2", "canary_character_3"},
+        )
+
+    def test_two_person_canary_freezes_both_identity_dependencies_and_request_duties(self):
+        contract = quality_canary.prepare_explicit_run(
+            "two-person-continuous-18s-v1",
+            confirmed=True,
+            budget_cents=3000,
+        )
+        storyboard = quality_canary.build_isolated_storyboard(
+            "two-person-continuous-18s-v1", contract
+        )
+        creative = creative_ir.from_storyboard(storyboard)
+        compilation = production_compiler.compile_ir(
+            creative,
+            job_id="J-CANARY-ZERO-COST",
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=3000,
+            runtime_storyboard=storyboard,
+        )
+        graph = production_graph.compile_graph(compilation.spec)
+        master = storyboard["masters"][0]
+        character_by_id = {
+            item["id"]: item for item in storyboard["characters"]
+        }
+        primary = character_by_id[master["speaker"]]
+        cast = s3_shots._scene_cast_characters(
+            master, character_by_id, master["speaker"]
+        )
+        anchors = {
+            character_assets.character_identity_key(character):
+                s3_shots.DialogueAnchor(
+                    image_reference=f"https://assets/{character['id']}.png",
+                    anchor_mode="static_image",
+                )
+            for character in storyboard["characters"]
+        }
+        request = s3_shots._dialogue_request_kwargs(
+            {**master, "duration_sec": master["duration"]},
+            None,
+            character=primary,
+            cast_characters=cast,
+            identity_anchors=anchors,
+        )
+
+        required_ids = {item["id"] for item in storyboard["characters"]}
+        self.assertEqual(
+            s3_shots._required_character_ids(storyboard["masters"]),
+            required_ids,
+        )
+        self.assertEqual(
+            {
+                node_id for node_id in graph.ancestors("master:1")
+                if node_id.startswith("character_anchor:")
+            },
+            {f"character_anchor:{character_id}" for character_id in required_ids},
+        )
+        self.assertEqual(
+            {item["id"] for item in cast}, required_ids - {primary["id"]}
+        )
+        self.assertEqual(
+            [item["duty"] for item in request["reference_manifest"]],
+            ["speaker_identity", "supporting_identity"],
+        )
+
+    def test_canary_scorecard_measures_reviewed_first_pass_quality_by_profile(self):
+        def record(run_id, *, first_pass, lip_sync, completion="complete"):
+            scores = {field: 4.5 for field in quality_canary.MANUAL_SCORE_FIELDS}
+            scores["lip_sync"] = lip_sync
+            return {
+                "run_id": run_id,
+                "classification": "canary",
+                "profile_id": "single-speaker-8s-v1",
+                "completion_status": completion,
+                "cost": {"actual_cents": 1000},
+                "quality": {
+                    "final_review": {
+                        "decision": "approved" if first_pass else "local_recut",
+                        "first_pass": int(first_pass),
+                    },
+                    "manual_scores": scores if completion == "complete" else None,
+                },
+            }
+
+        scorecard = quality_canary.summarize_acceptance_records(
+            [
+                record("pass", first_pass=True, lip_sync=4.5),
+                record("repair", first_pass=False, lip_sync=2.5),
+                record(
+                    "evidence-only",
+                    first_pass=False,
+                    lip_sync=0,
+                    completion="evidence_only",
+                ),
+            ],
+            minimum_reviewed_runs=2,
+            minimum_first_pass_rate=0.5,
+        )
+
+        profile = next(
+            item for item in scorecard["profiles"]
+            if item["profile_id"] == "single-speaker-8s-v1"
+        )
+        self.assertEqual(profile["runs"], 3)
+        self.assertEqual(profile["reviewed_runs"], 2)
+        self.assertEqual(profile["first_pass_usable_runs"], 1)
+        self.assertEqual(profile["first_pass_usable_rate"], 0.5)
+        self.assertEqual(profile["below_target_dimensions"], {"lip_sync": 1})
+        self.assertEqual(profile["status"], "pass")
+        self.assertEqual(scorecard["top_failure_dimensions"][0]["dimension"], "lip_sync")
+
+    def test_canary_scorecard_ignores_observational_and_unrecognized_records(self):
+        records = [{
+            "run_id": "observed",
+            "classification": "observational",
+            "profile_id": "single-speaker-8s-v1",
+            "completion_status": "complete",
+            "quality": {"manual_scores": {
+                field: 0 for field in quality_canary.MANUAL_SCORE_FIELDS
+            }},
+        }, {
+            "run_id": "unknown",
+            "classification": "canary",
+            "profile_id": "unknown-profile",
+            "completion_status": "complete",
+            "quality": {"manual_scores": {
+                field: 5 for field in quality_canary.MANUAL_SCORE_FIELDS
+            }},
+        }]
+
+        scorecard = quality_canary.summarize_acceptance_records(records)
+
+        self.assertEqual(scorecard["ignored_records"], 2)
+        self.assertEqual(scorecard["reviewed_runs"], 0)
+        self.assertEqual(scorecard["status"], "no_data")
 
     def test_management_ui_renders_seven_and_thirty_day_reliability(self):
         javascript = (PROJECT_ROOT / "scripts" / "management_ui" / "app.js").read_text(

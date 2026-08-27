@@ -433,7 +433,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", media_type)
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "private, max-age=3600")
+                self.send_header("Cache-Control", "no-cache, must-revalidate")
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -452,7 +452,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", media_type)
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "private, max-age=3600")
+                self.send_header("Cache-Control", "no-cache, must-revalidate")
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -542,7 +542,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "image/jpeg")
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "private, max-age=3600")
+                self.send_header("Cache-Control", "no-cache, must-revalidate")
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -617,6 +617,16 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
             query = parse_qs(parsed.query)
             status = query.get("status", ["candidate"])[0]
             return self._json(self.service.source_candidates(status=status or None))
+        if parsed.path == "/api/production/consistency":
+            limit = parse_qs(parsed.query).get("limit", ["100"])[0]
+            return self._json(self.service.production_consistency(limit=int(limit)))
+        if (parsed.path.startswith("/api/videos/")
+                and parsed.path.endswith("/production-graph")):
+            job_id = parsed.path.split("/")[3]
+            try:
+                return self._json(self.service.production_graph_detail(job_id))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 404)
         if parsed.path in endpoints:
             try:
                 return self._json(endpoints[parsed.path]())
@@ -647,6 +657,10 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 return self._json({"error": message}, status)
             if request_path == "/api/sources/media":
                 return self._media_upload()
+            if (request_path.startswith("/api/videos/")
+                    and request_path.endswith("/compile")):
+                job_id = request_path.split("/")[3]
+                return self._json(self.service.compile_video_job(job_id))
             if character_upload:
                 return self._character_image_upload(character_upload.group(1))
             payload = self._body()
@@ -830,6 +844,17 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                         payload.get("high_risk_confirmed") is True
                     ),
                 )
+            elif (request_path.startswith("/api/videos/")
+                  and request_path.endswith("/budget-confirmation")):
+                job_id = request_path.split("/")[3]
+                result = self.service.confirm_video_budget(
+                    job_id,
+                    confirmed=payload.get("confirmed") is True,
+                    approved_budget_cents=payload.get(
+                        "approved_budget_cents"
+                    ),
+                    max_auto_retries=payload.get("max_auto_retries", 0),
+                )
             elif (request_path.endswith("/upgrade-director")
                   and request_path.startswith("/api/videos/")):
                 job_id = request_path.split("/")[3]
@@ -838,6 +863,10 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                   and request_path.startswith("/api/videos/")):
                 job_id = request_path.split("/")[3]
                 result = self.service.rebuild_failed_director_plan(job_id)
+            elif (request_path.endswith("/execution-contract/repair")
+                  and request_path.startswith("/api/videos/")):
+                job_id = request_path.split("/")[3]
+                result = self.service.repair_execution_contract(job_id)
             elif self.path.endswith("/resume") and self.path.startswith("/api/videos/"):
                 job_id = self.path.split("/")[3]
                 result = self.service.resume_failed_video(job_id)

@@ -1,12 +1,15 @@
 """Side-effect-free cost planning for native-master productions."""
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import sqlite3
+from collections.abc import Mapping
 
 from . import (
-    anchor_generation, asset_library, character_assets, master_dependencies, master_risk, production_config,
+    anchor_generation, asset_library, character_assets, creative_ir,
+    master_dependencies, master_risk, production_complexity, production_config,
     reference_attention, scene_assets,
 )
 from .clients import seedance, volc_tts
@@ -30,6 +33,181 @@ def _nonnegative_int(value: str | int | None, default: int) -> int:
         return max(0, int(value)) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def _compiled_value(value: object, key: str, default=None):
+    if isinstance(value, Mapping):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def align_preflight_with_compiled_spec(
+    preflight: dict,
+    spec: object,
+    *,
+    completed_node_ids: set[str] | None = None,
+    current_cost_cents: int | None = None,
+) -> dict:
+    """Project one v2 frozen spec into the legacy preflight read model.
+
+    The compiler is authoritative for payable nodes and adapted masters.  The
+    legacy planner remains useful for reference manifests and UI explanation,
+    but it must never override the graph that will actually be executed.
+    """
+    result = deepcopy(preflight)
+    completed = {str(value) for value in (completed_node_ids or set())}
+    raw_nodes = list(_compiled_value(spec, "nodes", ()) or ())
+    nodes = [
+        {
+            "node_id": str(_compiled_value(node, "node_id", "")),
+            "node_type": str(_compiled_value(node, "node_type", "")),
+            "paid": bool(_compiled_value(node, "paid", False)),
+            "estimated_cost_cents": int(
+                _compiled_value(node, "estimated_cost_cents", 0) or 0
+            ),
+            "input": dict(_compiled_value(node, "input", {}) or {}),
+        }
+        for node in raw_nodes
+    ]
+    pending_paid_nodes = [
+        node for node in nodes
+        if node["paid"] and node["node_id"] not in completed
+    ]
+    raw_masters = list(_compiled_value(spec, "masters", ()) or ())
+    mode = str(_compiled_value(spec, "mode", "") or "")
+    compiled_complexity = dict(
+        _compiled_value(spec, "complexity", {}) or {}
+    )
+    risk_level = {
+        "experimental": "high",
+        "enhanced": "medium",
+        "stable": "low",
+    }.get(mode, "medium")
+    risk_recommendation = {
+        "high": (
+            "V2 编译判定为实验型复杂母片；开始前确认风险，生成后逐条复核"
+            "人物、口型、场景与站位"
+        ),
+        "medium": "生成后重点复核连续性与对白完整性",
+        "low": "按标准验收项复核成片",
+    }[risk_level]
+    masters = [{
+        "idx": int(_compiled_value(master, "idx", 0) or 0),
+        "editorial_duration_sec": float(
+            _compiled_value(master, "editorial_duration_sec", 0) or 0
+        ),
+        "generation_duration_sec": float(
+            _compiled_value(master, "generation_duration_sec", 0) or 0
+        ),
+    } for master in raw_masters]
+    masters_by_idx = {master["idx"]: master for master in masters}
+    pending_master_nodes = [
+        node for node in pending_paid_nodes if node["node_type"] == "master"
+    ]
+    paid_masters = []
+    for node in pending_master_nodes:
+        idx = int(node["input"].get("master_idx") or 0)
+        master = masters_by_idx.get(idx, {})
+        generation_duration = float(
+            master.get("generation_duration_sec") or 0
+        )
+        paid_masters.append({
+            "master_idx": idx,
+            "type": "compiled_v2",
+            "duration_sec": generation_duration,
+            "editorial_duration_sec": float(
+                master.get("editorial_duration_sec") or 0
+            ),
+            "generation_duration_sec": generation_duration,
+            "resolution": str(result.get("resolution") or "480p"),
+            "duration_bucket": _duration_bucket(generation_duration),
+            "reference_type": "compiled_graph",
+            "reference_manifest": [],
+            "estimated_cost_cents": node["estimated_cost_cents"],
+            "quality_risk": {
+                "level": risk_level,
+                "score": int(compiled_complexity.get("score") or 0),
+                "reasons": list(compiled_complexity.get("risk_codes") or []),
+                "recommendation": risk_recommendation,
+            },
+        })
+
+    identity_nodes = [
+        node for node in pending_paid_nodes
+        if node["node_type"] == "character_anchor"
+    ]
+    scene_nodes = [
+        node for node in pending_paid_nodes
+        if node["node_type"] == "scene_anchor"
+    ]
+    tts_nodes = [
+        node for node in pending_paid_nodes if node["node_type"] == "tts"
+    ]
+    additional_cost = sum(
+        node["estimated_cost_cents"] for node in pending_paid_nodes
+    )
+    current_cost = (
+        max(0, int(current_cost_cents))
+        if current_cost_cents is not None
+        else max(0, int(result.get("current_cost_cents") or 0))
+    )
+    budget = int(_compiled_value(spec, "budget_cents", 0) or 0)
+    projected = current_cost + additional_cost
+    high_complexity_indexes = (
+        [int(item["master_idx"]) for item in paid_masters]
+        if mode == "experimental" else []
+    )
+    old_total = int(result.get("total_masters") or 0)
+    reasons = list(result.get("reduction_reasons") or [])
+    if old_total and old_total != len(masters):
+        reasons.append(
+            f"Production Spec v2 adapted {old_total} planned masters to "
+            f"{len(masters)} executable masters"
+        )
+    result.update({
+        "preflight_authority": "production_spec_v2",
+        "spec_version": int(_compiled_value(spec, "version", 2) or 2),
+        "spec_hash": str(_compiled_value(spec, "spec_hash", "") or ""),
+        "complexity": compiled_complexity,
+        "production_mode": mode or result.get("production_mode"),
+        "reliability_commitment": str(
+            _compiled_value(spec, "reliability_commitment", "")
+            or result.get("reliability_commitment") or ""
+        ),
+        "total_masters": len(masters),
+        "paid_master_count": len(pending_master_nodes),
+        "estimated_paid_calls": len(pending_paid_nodes),
+        "estimated_tts_calls": len(tts_nodes),
+        "estimated_tts_cost_cents": sum(
+            node["estimated_cost_cents"] for node in tts_nodes
+        ),
+        "paid_identity_anchor_count": len(identity_nodes),
+        "identity_anchor_cost_cents": sum(
+            node["estimated_cost_cents"] for node in identity_nodes
+        ),
+        "paid_scene_anchor_count": len(scene_nodes),
+        "scene_anchor_cost_cents": sum(
+            node["estimated_cost_cents"] for node in scene_nodes
+        ),
+        "paid_duration_sec": sum(
+            float(item["duration_sec"]) for item in paid_masters
+        ),
+        "estimated_cost_cents": additional_cost,
+        "current_cost_cents": current_cost,
+        "projected_total_cost_cents": projected,
+        "budget_cents": budget,
+        "budget_ok": projected <= budget,
+        "paid_masters": paid_masters,
+        "high_complexity_master_indexes": high_complexity_indexes,
+        "requires_master_feasibility_confirmation": bool(
+            high_complexity_indexes
+        ),
+        "high_risk_master_indexes": high_complexity_indexes,
+        "requires_long_master_confirmation": bool(high_complexity_indexes),
+        "reduction_reasons": list(dict.fromkeys(reasons)),
+        "compiled_paid_nodes": pending_paid_nodes,
+    })
+    return result
 
 
 def _duration_bucket(duration_sec: float) -> str:
@@ -159,6 +337,9 @@ def analyze_storyboard(
     current_cost_cents: int = 0,
 ) -> dict:
     """Estimate paid Seedance work without submitting or mutating anything."""
+    complexity = production_complexity.analyze(
+        creative_ir.from_storyboard(storyboard)
+    )
     masters = list(storyboard.get("masters") or [])
     settings = storyboard.get("production_settings") or {}
     frozen_snapshot = settings.get(production_config.GENERATION_SNAPSHOT_KEY)
@@ -484,6 +665,13 @@ def analyze_storyboard(
         if item.get("quality_risk", {}).get("level") == "high"
     ]
     return {
+        "complexity": complexity.as_dict(),
+        "production_mode": complexity.mode,
+        "reliability_commitment": {
+            "stable": "standard",
+            "enhanced": "assisted",
+            "experimental": "best_effort",
+        }[complexity.mode],
         "generation_snapshot": snapshot,
         "master_dependency_graph": (
             storyboard.get("master_dependency_graph")
@@ -512,6 +700,9 @@ def analyze_storyboard(
         "resolution": resolved_resolution,
         "library_hits": library_hits,
         "paid_masters": paid_masters,
+        "high_complexity_master_indexes": high_risk_master_indexes,
+        "requires_master_feasibility_confirmation": bool(high_risk_master_indexes),
+        # Backward-compatible aliases for persisted jobs and older clients.
         "high_risk_master_indexes": high_risk_master_indexes,
         "requires_long_master_confirmation": bool(high_risk_master_indexes),
         "paid_identity_anchors": paid_identity_anchors,

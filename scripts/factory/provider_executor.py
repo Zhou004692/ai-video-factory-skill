@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+import os
 import sqlite3
 from typing import Awaitable, Callable, Generic, TypeVar
 
@@ -23,12 +26,48 @@ class ProviderSubmissionOutcomeUnknown(RuntimeError):
     submit_result_unknown = True
 
 
+class ProductionContractRequiredError(RuntimeError):
+    """Paid work is not owned by a READY/RUNNING frozen v2 node."""
+
+    pre_submit = True
+    non_retryable = True
+
+
 @dataclass(frozen=True)
 class PaidTaskOwner:
     job_id: str
     shot_idx: int
     provider: str
     intent: str
+    node_id: str | None = None
+    spec_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class FrozenNodeOwner:
+    job_id: str
+    node_id: str
+    spec_hash: str
+
+
+_FROZEN_NODE_OWNER: ContextVar[FrozenNodeOwner | None] = ContextVar(
+    "factory_frozen_node_owner", default=None,
+)
+
+
+@contextmanager
+def paid_task_owner_context(
+    *, job_id: str, node_id: str, spec_hash: str,
+):
+    """Bind all nested provider reservations to one immutable graph node."""
+    owner = FrozenNodeOwner(
+        job_id=str(job_id), node_id=str(node_id), spec_hash=str(spec_hash),
+    )
+    token = _FROZEN_NODE_OWNER.set(owner)
+    try:
+        yield owner
+    finally:
+        _FROZEN_NODE_OWNER.reset(token)
 
 
 @dataclass(frozen=True)
@@ -72,6 +111,8 @@ class ProviderExecutor:
             authorized_batch_id=self.authorized_batch_id,
             estimated_cost_cents=self.estimated_cost_cents,
             budget_limit_cents=self.budget_limit_cents,
+            owner_id=self.owner.node_id,
+            spec_hash=self.owner.spec_hash,
         )
         remote_task_id: str | None = None
 
@@ -121,7 +162,57 @@ class ProviderExecutor:
         )
 
 
+def assert_frozen_owner(
+    database: sqlite3.Connection,
+    *,
+    job_id: str,
+    owner_id: str,
+    spec_hash: str,
+) -> None:
+    row = database.execute(
+        "SELECT spec_hash,state,paid FROM production_nodes "
+        "WHERE job_id=? AND node_id=?",
+        (job_id, owner_id),
+    ).fetchone()
+    if (
+        row is None
+        or str(row["spec_hash"]) != str(spec_hash)
+        or str(row["state"]) not in {"READY", "RUNNING"}
+        or not bool(row["paid"])
+    ):
+        raise ProductionContractRequiredError("付费调用缺少已冻结生产节点")
+
+
 def reserve_paid_submit(database: sqlite3.Connection, **kwargs) -> str:
+    owner_id = str(kwargs.pop("owner_id", "") or "").strip()
+    spec_hash = str(kwargs.pop("spec_hash", "") or "").strip()
+    contextual_owner = _FROZEN_NODE_OWNER.get()
+    requested_job_id = str(kwargs.get("job_id") or "")
+    if contextual_owner is not None:
+        if contextual_owner.job_id != requested_job_id:
+            raise ProductionContractRequiredError(
+                "paid provider call crossed its frozen job boundary"
+            )
+        if owner_id and owner_id != contextual_owner.node_id:
+            raise ProductionContractRequiredError(
+                "paid provider call changed its frozen node owner"
+            )
+        if spec_hash and spec_hash != contextual_owner.spec_hash:
+            raise ProductionContractRequiredError(
+                "paid provider call changed its frozen spec hash"
+            )
+        owner_id = contextual_owner.node_id
+        spec_hash = contextual_owner.spec_hash
+    require_v2 = os.environ.get("FACTORY_REQUIRE_V2_CONTRACT", "").strip() == "1"
+    if owner_id or spec_hash or require_v2:
+        if not owner_id or not spec_hash:
+            raise ProductionContractRequiredError("付费调用缺少已冻结生产节点")
+        assert_frozen_owner(
+            database,
+            job_id=str(kwargs.get("job_id") or ""),
+            owner_id=owner_id,
+            spec_hash=spec_hash,
+        )
     return provider_tasks.reserve_paid_submit(database, **kwargs)
 
 
@@ -151,6 +242,16 @@ def bind_remote_task(
         provider=owner.provider,
         intent=owner.intent,
     )
+    if owner.node_id and owner.spec_hash:
+        _bind_frozen_node_task(
+            database,
+            FrozenNodeOwner(
+                job_id=owner.job_id,
+                node_id=owner.node_id,
+                spec_hash=owner.spec_hash,
+            ),
+            task_id,
+        )
     provider_tasks.promote_reservation(
         database,
         reservation_id,
@@ -162,12 +263,50 @@ def bind_remote_task(
     )
 
 
+def _bind_frozen_node_task(
+    database: sqlite3.Connection,
+    owner: FrozenNodeOwner,
+    task_id: str,
+) -> None:
+    updated = database.execute(
+        "UPDATE production_nodes SET provider_task_id=?,"
+        "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND node_id=? "
+        "AND spec_hash=? AND state='RUNNING' AND "
+        "(provider_task_id IS NULL OR provider_task_id=?)",
+        (
+            str(task_id), owner.job_id, owner.node_id, owner.spec_hash,
+            str(task_id),
+        ),
+    )
+    database.commit()
+    if int(updated.rowcount or 0) != 1:
+        raise ProductionContractRequiredError(
+            "remote provider task could not bind to its frozen node"
+        )
+
+
 def persist_remote_task_id(database: sqlite3.Connection, *args, **kwargs) -> None:
     provider_tasks.persist_remote_task_id(database, *args, **kwargs)
+    contextual_owner = _FROZEN_NODE_OWNER.get()
+    if contextual_owner is not None:
+        task_id = str(kwargs.get("remote_task_id") or "").strip()
+        if not task_id:
+            raise ProviderSubmissionOutcomeUnknown(
+                "provider returned an empty task id"
+            )
+        _bind_frozen_node_task(database, contextual_owner, task_id)
 
 
 def promote_reservation(database: sqlite3.Connection, *args, **kwargs) -> None:
     provider_tasks.promote_reservation(database, *args, **kwargs)
+    contextual_owner = _FROZEN_NODE_OWNER.get()
+    if contextual_owner is not None:
+        task_id = str(kwargs.get("task_id") or "").strip()
+        if not task_id:
+            raise ProviderSubmissionOutcomeUnknown(
+                "provider promotion has no remote task id"
+            )
+        _bind_frozen_node_task(database, contextual_owner, task_id)
 
 
 def mark_action_required(database: sqlite3.Connection, *args, **kwargs) -> None:
@@ -179,4 +318,21 @@ def release_reservation(database: sqlite3.Connection, *args, **kwargs) -> None:
 
 
 def upsert_final_call(database: sqlite3.Connection, **kwargs) -> int:
-    return provider_tasks.upsert_final_call(database, **kwargs)
+    delta = provider_tasks.upsert_final_call(database, **kwargs)
+    contextual_owner = _FROZEN_NODE_OWNER.get()
+    if contextual_owner is not None and delta:
+        updated = database.execute(
+            "UPDATE production_nodes SET actual_cost_cents="
+            "actual_cost_cents+?,updated_at=CURRENT_TIMESTAMP "
+            "WHERE job_id=? AND node_id=? AND spec_hash=?",
+            (
+                int(delta), contextual_owner.job_id,
+                contextual_owner.node_id, contextual_owner.spec_hash,
+            ),
+        )
+        database.commit()
+        if int(updated.rowcount or 0) != 1:
+            raise ProductionContractRequiredError(
+                "provider cost could not bind to its frozen node"
+            )
+    return delta

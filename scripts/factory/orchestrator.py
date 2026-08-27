@@ -119,11 +119,12 @@ async def _process_job(job_id: str, sem: asyncio.Semaphore):
                 pause_state = str(getattr(e, "pause_state", "") or "").strip()
                 if pause_state:
                     pause_error = outcome.user_message
-                    event = (
-                        "provider_paused"
-                        if pause_state == "PROVIDER_ACTION_REQUIRED"
-                        else "review_required"
-                    )
+                    if pause_state == "PROVIDER_ACTION_REQUIRED":
+                        event = "provider_paused"
+                    elif pause_state == "BUDGET_CONFIRMATION_REQUIRED":
+                        event = "budget_paused"
+                    else:
+                        event = "review_required"
                     transition(
                         db,
                         job_id,

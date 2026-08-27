@@ -4,6 +4,7 @@
   "profiles": [
     {
       "id": "single-speaker-8s-v1",
+      "creative_profile_id": "stable_single_dialogue",
       "duration_sec": 8,
       "budget_cents": 1500,
       "max_auto_retries": 0,
@@ -21,6 +22,7 @@
     },
     {
       "id": "two-person-continuous-18s-v1",
+      "creative_profile_id": "enhanced_two_person_continuity",
       "duration_sec": 18,
       "budget_cents": 3000,
       "max_auto_retries": 0,
@@ -49,37 +51,56 @@
       ]
     },
     {
-      "id": "multi-person-cinematic-26s-v1",
-      "duration_sec": 26,
-      "budget_cents": 4500,
+      "id": "multi-person-multi-scene-cinematic-30s-v1",
+      "creative_profile_id": "experimental_multi_character_multi_scene",
+      "duration_sec": 30,
+      "budget_cents": 6000,
       "max_auto_retries": 0,
       "requires_explicit_authorization": true,
       "characters": ["林夏", "周工", "Malik"],
-      "scene": "暴雨后的沿海工厂抢修现场，连续空间、固定设备方位和人物站位轴线",
+      "scene": "设备租赁服务中心切换至暴雨后的沿海工厂抢修现场，三人身份、服装、站位轴线和任务关系跨场景连续",
       "script": [
         {
-          "time": "0-7",
+          "time": "0-5",
           "speaker": "Malik",
-          "dialogue": "主塔停机每一分钟，整条产线都在损失",
-          "performance": "Malik穿过积水指向停机区域，远处警示灯闪烁"
+          "scene": "设备租赁服务中心调度区，白天，冷白顶光",
+          "dialogue": "港口主塔停机，现场只给我们三十分钟进场",
+          "performance": "Malik站在调度屏左侧指向故障坐标，林夏居中，周工在右侧检查设备清单"
         },
         {
-          "time": "7-16",
+          "time": "5-10",
           "speaker": "林夏",
-          "dialogue": "设备、工程师和备件已经到位，我们按同一套方案同步推进",
-          "performance": "林夏展开现场图，镜头沿图纸推进到真实设备，三人形成稳定三角站位"
+          "scene": "设备租赁服务中心调度区，白天，冷白顶光",
+          "dialogue": "设备、人员和运输窗口已经并行确认",
+          "performance": "林夏把平板转向两人，镜头由调度屏缓慢推进到三人的三角站位"
         },
         {
-          "time": "16-22",
+          "time": "10-15",
           "speaker": "周工",
-          "dialogue": "高空平台升起后，我先处理主电缆，再恢复控制系统",
-          "performance": "周工扣紧安全带登上平台，平台平稳升起"
+          "scene": "设备租赁服务中心调度区，白天，冷白顶光",
+          "dialogue": "高空平台验机通过，我们现在出发",
+          "performance": "周工确认设备编号，三人按左中右顺序转身走向出口，声音提前衔接雨声"
         },
         {
-          "time": "22-26",
+          "time": "15-20",
+          "speaker": "周工",
+          "scene": "夜间工厂抢修现场，雨后湿地面，暖色作业灯",
+          "dialogue": "设备到位，先恢复主电缆，再检查控制系统",
+          "performance": "以运输车门关闭动作匹配切入现场，周工保持右侧站位并扣紧安全带"
+        },
+        {
+          "time": "20-25",
+          "speaker": "林夏",
+          "scene": "夜间工厂抢修现场，雨后湿地面，暖色作业灯",
+          "dialogue": "现场图和调度状态一致，抢修窗口提前了十分钟",
+          "performance": "林夏保持中间站位核对平板，镜头横移带出左侧的Malik和右侧的周工"
+        },
+        {
+          "time": "25-30",
           "speaker": "Malik",
-          "dialogue": "这就是我们要的抢修效率",
-          "performance": "设备恢复运转，三人在同一现场回望亮起的产线"
+          "scene": "夜间工厂抢修现场，雨后湿地面，暖色作业灯",
+          "dialogue": "主塔恢复，这就是我们要的确定性",
+          "performance": "Malik保持左侧站位回望重新亮起的主塔，三人共同进入稳定收束画面"
         }
       ]
     }

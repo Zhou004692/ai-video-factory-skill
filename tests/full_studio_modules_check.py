@@ -31,30 +31,39 @@ with sync_playwright() as playwright:
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.goto("http://127.0.0.1:8765", wait_until="networkidle")
 
+    def open_module(module: str) -> None:
+        nav = page.locator(f'.nav-item[data-page="{module}"]')
+        if nav.is_visible():
+            nav.click()
+            return
+        page.locator("#open-advanced-nav").click()
+        page.locator(f'[data-advanced-page="{module}"]').click()
+
     for module, selector in MODULES.items():
-        page.locator(f'.nav-item[data-page="{module}"]').click()
+        open_module(module)
         page.wait_for_selector(f"#page-{module}.active {selector}")
         assert page.locator(f"{selector} > .module-rail").is_visible()
         assert page.locator(f"{selector} > .module-canvas").is_visible()
         assert page.locator(f"{selector} > .module-inspector").is_visible()
         page.screenshot(path=str(OUT / f"{module}.png"), full_page=False)
 
-    page.locator('.nav-item[data-page="scripts"]').click()
+    open_module("scripts")
     page.locator('[data-script-stage="sources"]').click()
     assert page.locator('[data-stage-board="sources"]').is_visible()
     assert page.locator('[data-stage-board="briefs"]').is_hidden()
 
-    page.locator('.nav-item[data-page="videos"]').click()
+    open_module("videos")
     page.locator('#video-filters [data-state="COMPOSED"]').click()
     assert page.locator("#video-table").is_visible()
 
-    page.locator('.nav-item[data-page="characters"]').click()
-    page.locator("#character-add-secondary").click()
+    open_module("characters")
+    page.locator("#character-add").click()
     assert page.locator("#char-submit").is_visible()
     page.locator("#modal-close").click()
 
-    page.locator('.nav-item[data-page="config"]').click()
-    assert page.locator("#save-config-secondary").is_visible()
+    open_module("config")
+    assert page.locator("#save-config").is_visible()
+    assert page.locator("#save-config-secondary").count() == 0
     assert not errors, errors
     browser.close()
 

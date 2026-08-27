@@ -30,9 +30,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     production_heartbeat_at TEXT,
     worker_lease_id TEXT,
     recovery_attempts INTEGER NOT NULL DEFAULT 0,
+    creative_ir_json TEXT,
+    creative_ir_version INTEGER NOT NULL DEFAULT 0,
     production_spec_json TEXT,
     production_spec_hash TEXT,
     production_spec_version INTEGER NOT NULL DEFAULT 0,
+    execution_engine TEXT NOT NULL DEFAULT 'legacy',
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -84,6 +87,89 @@ CREATE INDEX IF NOT EXISTS idx_shots_job   ON shots(job_id);
 CREATE INDEX IF NOT EXISTS idx_events_job  ON events(job_id);
 CREATE INDEX IF NOT EXISTS idx_provider_calls_job
     ON provider_calls(job_id, shot_idx);
+
+CREATE TABLE IF NOT EXISTS production_nodes (
+    job_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    paid INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'PENDING',
+    spec_hash TEXT NOT NULL,
+    input_json TEXT NOT NULL DEFAULT '{}',
+    output_json TEXT NOT NULL DEFAULT '{}',
+    idempotency_key TEXT NOT NULL,
+    provider_task_id TEXT,
+    estimated_cost_cents INTEGER NOT NULL DEFAULT 0,
+    actual_cost_cents INTEGER NOT NULL DEFAULT 0,
+    lease_id TEXT,
+    heartbeat_at TEXT,
+    error_code TEXT,
+    next_action TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(job_id, node_id),
+    UNIQUE(idempotency_key),
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS production_edges (
+    job_id TEXT NOT NULL,
+    from_node_id TEXT NOT NULL,
+    to_node_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    PRIMARY KEY(job_id, from_node_id, to_node_id),
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS production_node_events (
+    job_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    event TEXT NOT NULL,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(job_id, event_id),
+    FOREIGN KEY(job_id, node_id) REFERENCES production_nodes(job_id, node_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_nodes_state
+    ON production_nodes(job_id, state, node_type);
+CREATE INDEX IF NOT EXISTS idx_production_edges_target
+    ON production_edges(job_id, to_node_id);
+CREATE INDEX IF NOT EXISTS idx_production_node_events_node
+    ON production_node_events(job_id, node_id, created_at);
+
+CREATE TABLE IF NOT EXISTS production_compilation_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    v1_spec_hash TEXT,
+    v2_spec_hash TEXT,
+    diff_codes_json TEXT NOT NULL DEFAULT '[]',
+    blockers_json TEXT NOT NULL DEFAULT '[]',
+    mode TEXT,
+    error TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_compilation_runs_job
+    ON production_compilation_runs(job_id, created_at);
+
+CREATE TABLE IF NOT EXISTS production_interventions (
+    intervention_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    intervention_type TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_interventions_job
+    ON production_interventions(job_id, created_at);
 
 CREATE TABLE IF NOT EXISTS provider_runtime (
     provider       TEXT PRIMARY KEY,
@@ -616,9 +702,15 @@ def conn() -> sqlite3.Connection:
         ("production_heartbeat_at", "TEXT"),
         ("worker_lease_id", "TEXT"),
         ("recovery_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("creative_ir_json", "TEXT"),
+        ("creative_ir_version", "INTEGER NOT NULL DEFAULT 0"),
         ("production_spec_json", "TEXT"),
         ("production_spec_hash", "TEXT"),
         ("production_spec_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("execution_engine", "TEXT NOT NULL DEFAULT 'legacy'"),
+    ])
+    _add_cols_if_missing(db, "production_nodes", [
+        ("paid", "INTEGER NOT NULL DEFAULT 0"),
     ])
     _add_cols_if_missing(db, "character_asset_bindings", [
         ("identity_type", "TEXT NOT NULL DEFAULT 'real_person'"),
