@@ -3,10 +3,16 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import re
 from typing import Mapping
 
 
 CREATIVE_IR_VERSION = 1
+SPEECH_MODES = ("on_screen", "off_screen", "narration")
+OFFSCREEN_SPEAKER_HINTS = (
+    "背景台词", "画外音", "画外台词", "画外对白", "offscreen", "off_screen",
+)
+NARRATION_SPEAKER_HINTS = ("旁白", "narrator", "narration", "voiceover", "voice_over")
 
 _ROOT_FIELDS = frozenset({
     "fixture_version", "profile_id", "title", "target_duration_sec",
@@ -22,6 +28,19 @@ _BEAT_FIELDS = frozenset({
 
 def _text(value: object) -> str:
     return str(value or "").strip()
+
+
+def normalize_speech_mode(value: object, *, speaker: str = "") -> str:
+    """Normalize the relationship between a voice and visible characters."""
+    explicit = _text(value).lower()
+    if explicit in SPEECH_MODES:
+        return explicit
+    compact_speaker = re.sub(r"\s+", "", _text(speaker)).lower()
+    if any(hint in compact_speaker for hint in NARRATION_SPEAKER_HINTS):
+        return "narration"
+    if any(hint in compact_speaker for hint in OFFSCREEN_SPEAKER_HINTS):
+        return "off_screen"
+    return "on_screen"
 
 
 def _tuple_text(values: object) -> tuple[str, ...]:

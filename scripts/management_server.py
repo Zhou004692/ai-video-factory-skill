@@ -284,7 +284,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
         if binary_kind == "media":
             accepted = (
                 media_type == "application/octet-stream"
-                or re.fullmatch(r"(?:audio|video)/[^/\s]+", media_type)
+                or re.fullmatch(r"video/[^/\s]+", media_type)
                 is not None
             )
         elif binary_kind == "character_image":
@@ -359,6 +359,34 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
         with self.service_lock:
             return self._do_GET()
 
+    def _serve_binary_file(self, path: Path, *, cache_control: str) -> None:
+        size = path.stat().st_size
+        byte_range = self.headers.get("Range")
+        start, end = (0, size - 1)
+        if byte_range:
+            start, end = parse_byte_range(byte_range, size)
+        length = end - start + 1
+        media_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        self.send_response(
+            HTTPStatus.PARTIAL_CONTENT if byte_range else HTTPStatus.OK
+        )
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", cache_control)
+        if byte_range:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        with path.open("rb") as stream:
+            stream.seek(start)
+            remaining = length
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
     def _do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path in {"/healthz", "/readyz"}:
@@ -389,6 +417,26 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 )
             except Exception as exc:
                 return self._html("抖音绑定失败", str(exc), 400)
+        if (parsed.path.startswith("/api/sources/")
+                and parsed.path.endswith("/media")):
+            try:
+                source_id = parsed.path.split("/")[3]
+                return self._serve_binary_file(
+                    self.service.source_media_file(source_id),
+                    cache_control="no-store",
+                )
+            except (IndexError, ValueError) as exc:
+                return self._json({"error": str(exc)}, 404)
+        if (parsed.path.startswith("/api/sources/")
+                and "/frames/" in parsed.path):
+            try:
+                parts = parsed.path.split("/")
+                return self._serve_binary_file(
+                    self.service.source_frame_file(parts[3], int(parts[5])),
+                    cache_control="private, max-age=3600",
+                )
+            except (IndexError, ValueError) as exc:
+                return self._json({"error": str(exc)}, 404)
         if (parsed.path.startswith("/api/characters/")
                 and "/images/" in parsed.path):
             try:
@@ -741,6 +789,11 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     raise ValueError("请确认后再调用 AI 解析视频内容")
                 result = self.service.analyze_media_source(
                     request_path.split("/")[3], force=True
+                )
+            elif (request_path.startswith("/api/sources/")
+                  and request_path.endswith("/performance-review")):
+                result = self.service.review_source_performance(
+                    request_path.split("/")[3], payload
                 )
             elif self.path.endswith("/generate-brief") and self.path.startswith("/api/sources/"):
                 if payload.get("confirmed") is not True:

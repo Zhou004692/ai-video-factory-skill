@@ -18,6 +18,7 @@ import shutil
 from .. import (
     ASSETS_DIR, SKILL_ROOT, anchor_generation, asset_library,
     character_assets, character_voices, master_dependencies,
+    creative_ir,
     production_config, provider_capacity, provider_health,
     provider_executor as provider_tasks,
     reference_attention, scene_assets, subtitles,
@@ -2199,8 +2200,25 @@ def _scene_cast_characters(
     ).casefold()
     resolved: list[dict] = []
     seen: set[str] = set()
+    explicit_on_screen = {
+        str(beat.get("speaker") or "").strip().casefold()
+        for beat in (shot.get("performance_beats") or [])
+        if isinstance(beat, dict)
+        and str(beat.get("speaker") or "").strip()
+        and creative_ir.normalize_speech_mode(
+            beat.get("speech_mode"),
+            speaker=str(beat.get("speaker") or "").strip(),
+        ) == "on_screen"
+    }
     for character_id, character in characters.items():
         if character_id == speaker_id:
+            continue
+        if (
+            character_id.casefold() not in explicit_on_screen
+            and creative_ir.normalize_speech_mode(
+                None, speaker=character_id
+            ) != "on_screen"
+        ):
             continue
         names = {
             str(value).strip().casefold()
@@ -3655,12 +3673,38 @@ def _cinematic_director_time_beats(
             beat.get("speaker") or shot.get("speaker") or "当前人物"
         ).strip()
         dialogue = str(beat.get("dialogue") or "").strip()
+        speech_mode = creative_ir.normalize_speech_mode(
+            beat.get("speech_mode"), speaker=speaker
+        )
         clauses = [f"{start}-{end}秒"]
         if visual:
             clauses.append(f"画面与动作：{visual}")
         if camera:
             clauses.append(f"运镜：{camera}")
-        if dialogue:
+        performance_labels = (
+            ("emotion", "情绪"), ("tone", "语气"), ("pace", "语速"),
+            ("volume", "音量"), ("pause", "停顿"),
+            ("facial_expression", "表情"), ("gaze", "视线"),
+            ("gesture", "手势"), ("body_action", "身体动作"),
+        )
+        clauses.extend(
+            f"{label}：{str(beat.get(field)).strip()}"
+            for field, label in performance_labels
+            if str(beat.get(field) or "").strip()
+        )
+        if any(str(beat.get(field) or "").strip() for field, _ in performance_labels):
+            clauses.append(
+                "以上表演信息来自原片逐段观察：严格按所列先后顺序、强度和节奏复现，"
+                "不得用通用微笑、默认站姿或泛化口播动作替代"
+            )
+        if dialogue and speech_mode in {"off_screen", "narration"}:
+            voice_label = "旁白" if speech_mode == "narration" else "画外音"
+            clauses.extend([
+                f"{voice_label}{speaker}说出 {{台词：{dialogue}}}",
+                "该声音不入镜、不需要人物形象、不做口型；"
+                "画面内人物全程闭嘴，只按动作、表情和视线做无声反应",
+            ])
+        elif dialogue:
             clauses.extend([
                 f"角色 {speaker} 说出 {{台词：{dialogue}}}",
                 "说话者面部与嘴部保持清晰可见，表演和运镜服务剧情，"
@@ -3808,7 +3852,9 @@ def _build_native_dialogue_prompt(
         == "cinematic_character"
     )
     master_speakers = [
-        str(item).strip() for item in (shot.get("speakers") or [])
+        str(item).strip() for item in (
+            shot.get("audio_speakers") or shot.get("speakers") or []
+        )
         if str(item).strip()
     ] or [str(shot.get("speaker") or character.get("id") or "").strip()]
     multi_speaker = len(master_speakers) > 1
@@ -4185,21 +4231,42 @@ def _required_character_ids(units: list[dict]) -> set[str]:
     """Return every character that can appear or speak in the target masters."""
     required: set[str] = set()
 
-    def add(value: object) -> None:
+    def add(value: object, *, explicit_on_screen: set[str]) -> None:
         if isinstance(value, dict):
             value = value.get("id") or value.get("speaker")
         normalized = str(value or "").strip()
-        if normalized:
+        if (
+            normalized
+            and (
+                normalized.casefold() in explicit_on_screen
+                or creative_ir.normalize_speech_mode(
+                    None, speaker=normalized
+                ) == "on_screen"
+            )
+        ):
             required.add(normalized)
 
     for unit in units:
+        explicit_on_screen = {
+            str(beat.get("speaker") or "").strip().casefold()
+            for beat in (unit.get("performance_beats") or [])
+            if isinstance(beat, dict)
+            and str(beat.get("speaker") or "").strip()
+            and creative_ir.normalize_speech_mode(
+                beat.get("speech_mode"),
+                speaker=str(beat.get("speaker") or "").strip(),
+            ) == "on_screen"
+        }
         for field in ("speaker", "anchor_character"):
-            add(unit.get(field))
+            add(unit.get(field), explicit_on_screen=explicit_on_screen)
         for field in ("speakers", "cast"):
             for member in unit.get(field) or []:
-                add(member)
+                add(member, explicit_on_screen=explicit_on_screen)
         for block in unit.get("dialogue_blocks") or []:
-            add(block.get("speaker") if isinstance(block, dict) else None)
+            add(
+                block.get("speaker") if isinstance(block, dict) else None,
+                explicit_on_screen=explicit_on_screen,
+            )
     return required
 
 

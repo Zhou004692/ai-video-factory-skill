@@ -2196,6 +2196,7 @@ class BigASRTests(unittest.IsolatedAsyncioTestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             captured["url"] = str(request.url)
             captured["resource"] = request.headers["X-Api-Resource-Id"]
+            captured["request"] = json.loads(request.content)["request"]
             return httpx.Response(
                 200,
                 headers={"X-Api-Status-Code": "20000000"},
@@ -2215,6 +2216,10 @@ class BigASRTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "原生台词")
         self.assertTrue(captured["url"].endswith("/recognize/flash"))
         self.assertEqual(captured["resource"], "volc.bigasr.auc_turbo")
+        self.assertTrue(captured["request"]["enable_speaker_info"])
+        self.assertNotIn("enable_emotion_detection", captured["request"])
+        self.assertNotIn("show_volume", captured["request"])
+        self.assertNotIn("show_speech_rate", captured["request"])
 
     def test_bigasr_uses_asr_specific_environment_credentials(self):
         import httpx
@@ -2282,7 +2287,10 @@ class BigASRTests(unittest.IsolatedAsyncioTestCase):
         requests = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            requests.append((str(request.url), request.headers["X-Api-Resource-Id"]))
+            requests.append((
+                str(request.url), request.headers["X-Api-Resource-Id"],
+                json.loads(request.content or b"{}"),
+            ))
             if str(request.url).endswith("/submit"):
                 return httpx.Response(
                     200, headers={"X-Api-Status-Code": "20000000"}, json={}
@@ -2303,13 +2311,44 @@ class BigASRTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "新版识别")
         self.assertEqual(
-            [url.rsplit("/", 1)[-1] for url, _ in requests],
+            [url.rsplit("/", 1)[-1] for url, _, _ in requests],
             ["submit", "query"],
         )
-        self.assertTrue(all(resource == "volc.seedasr.auc" for _, resource in requests))
+        self.assertTrue(all(
+            resource == "volc.seedasr.auc" for _, resource, _ in requests
+        ))
+        request_options = requests[0][2]["request"]
+        self.assertTrue(request_options["enable_speaker_info"])
+        self.assertTrue(request_options["enable_emotion_detection"])
+        self.assertTrue(request_options["show_volume"])
+        self.assertTrue(request_options["show_speech_rate"])
 
 
 class Seedance25DialogueTests(unittest.TestCase):
+    def test_legacy_offscreen_voice_is_not_used_as_an_identity_anchor(self):
+        unit = {
+            "speaker": "女博主",
+            "speakers": ["女博主", "背景台词"],
+            "cast": ["女博主", "背景台词"],
+            "performance_beats": [
+                {"speaker": "女博主", "dialogue": "设备租赁。"},
+                {"speaker": "背景台词", "dialogue": "没客户怎么干？"},
+            ],
+        }
+
+        required = s3_shots._required_character_ids([unit])
+        cast = s3_shots._scene_cast_characters(
+            unit,
+            {
+                "女博主": {"id": "女博主", "name": "女博主"},
+                "背景台词": {"id": "背景台词", "name": "背景台词"},
+            },
+            "女博主",
+        )
+
+        self.assertEqual(required, {"女博主"})
+        self.assertEqual(cast, [])
+
     def setUp(self):
         self.anchor_generators = patch.dict(os.environ, {
             "CHARACTER_ANCHOR_GENERATOR": "seedream_5_0",
@@ -3381,6 +3420,67 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertEqual(prompt.count("还要保留水平作业半径。"), 1)
         self.assertIn("嘴部保持清晰可见", prompt)
         self.assertIn("运镜服务剧情", prompt)
+
+    def test_cinematic_prompt_keeps_offscreen_voice_out_of_frame_and_preserves_performance(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "speaker": "女博主",
+                "speakers": ["女博主"],
+                "audio_speakers": ["女博主", "背景台词"],
+                "duration_sec": 4,
+                "render_mode": "cinematic_character",
+                "scene": "室内新年主题布景",
+                "camera": "中景固定机位",
+                "action": "女博主讲话后转向画外右侧",
+                "voiceover": "设备租赁。没客户，看你怎么干？",
+                "performance_beats": [
+                    {
+                        "speaker": "女博主",
+                        "speech_mode": "on_screen",
+                        "duration": 2,
+                        "dialogue": "设备租赁。",
+                        "visual_intent": "女博主面对镜头张嘴说话",
+                        "emotion": "兴奋",
+                        "tone": "轻快有力",
+                        "pace": "稍快",
+                        "volume": "中高",
+                        "facial_expression": "张嘴说话、面带微笑",
+                        "gaze": "看向镜头",
+                        "gesture": "右手抬起竖指",
+                        "body_action": "正面站立朝向镜头",
+                    },
+                    {
+                        "speaker": "背景台词",
+                        "speech_mode": "off_screen",
+                        "duration": 2,
+                        "dialogue": "没客户，看你怎么干？",
+                        "visual_intent": "女博主闭嘴转向画面右侧反应",
+                        "emotion": "质疑",
+                        "tone": "画外反问",
+                        "facial_expression": "女博主眉头微紧",
+                        "gaze": "女博主看向画外右侧",
+                        "gesture": "女博主停下手势",
+                        "body_action": "女博主上半身轻微转向右侧",
+                    },
+                ],
+                "cast": [{"id": "女博主", "name": "女博主", "look": "年轻亚洲女性"}],
+            },
+            {"id": "女博主", "name": "女博主", "look": "年轻亚洲女性"},
+        )
+
+        for expected in (
+            "画外音背景台词",
+            "不入镜、不需要人物形象、不做口型",
+            "女博主闭嘴转向画面右侧反应",
+            "情绪：质疑",
+            "语气：画外反问",
+            "表情：女博主眉头微紧",
+            "视线：女博主看向画外右侧",
+            "手势：女博主停下手势",
+            "身体动作：女博主上半身轻微转向右侧",
+        ):
+            self.assertIn(expected, prompt)
 
     def test_cinematic_prompt_without_performance_beats_still_has_one_canonical_line(self):
         dialogue = "两小时内安排设备到场。"

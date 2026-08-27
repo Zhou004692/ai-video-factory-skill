@@ -153,6 +153,33 @@ class ProductionService:
             runtime_storyboard = json.loads(job["storyboard"] or "{}")
         except json.JSONDecodeError:
             runtime_storyboard = {}
+        if (
+            runtime_storyboard.get("production_mode")
+            == "native_master_local_director"
+        ):
+            # The management preflight is the earliest user-visible production
+            # boundary.  Validate the same executable storyboard here that the
+            # paid-start path will validate later, so an invalid timeline is a
+            # repairable blocker before the user confirms cost—not a surprise
+            # after clicking Start.
+            from ..steps import s1_storyboard
+
+            try:
+                s1_storyboard._validate(runtime_storyboard)
+            except (TypeError, ValueError) as exc:
+                return {
+                    "job_id": job_id,
+                    "compilable": False,
+                    "blockers": [{
+                        "code": "director_storyboard_invalid",
+                        "severity": "blocking",
+                        "stage": "storyboard",
+                        "subject": job_id,
+                        "message": f"分镜时间线无效：{exc}",
+                    }],
+                    "decisions": [],
+                    "required_content": [],
+                }
         runtime_settings = runtime_storyboard.setdefault(
             "production_settings", {}
         )

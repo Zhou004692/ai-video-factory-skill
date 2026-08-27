@@ -77,6 +77,193 @@ def _variant(index: int, source_id: str) -> dict:
 
 
 class ScriptDraftGenerationTests(unittest.TestCase):
+    @staticmethod
+    def _decimal_boundary_storyboard() -> dict:
+        return {
+            "production_profile": "standard",
+            "production_mode": "native_master_local_director",
+            "characters": [{
+                "id": "presenter",
+                "name": "presenter",
+                "gender": "female",
+                "look": "adult presenter",
+            }],
+            "hook": "decimal boundary regression",
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": 14.94,
+                "speaker": "presenter",
+                "speakers": ["presenter"],
+                "render_mode": "cinematic_character",
+                "voiceover": "continuous dialogue",
+                "scene": "studio",
+                "action": "presenter speaks",
+            }],
+            "shots": [{
+                "idx": 1,
+                "duration": 14.3,
+                "video_master_idx": 1,
+                "audio_master_idx": 1,
+                "video_start": 0,
+                "audio_start": 0,
+            }, {
+                "idx": 2,
+                "duration": 0.64,
+                "video_master_idx": 1,
+                "audio_master_idx": 1,
+                "video_start": 14.3,
+                "audio_start": 14.3,
+            }],
+            "bgm": {},
+        }
+
+    def test_director_validation_allows_exact_decimal_master_boundary(self):
+        storyboard = self._decimal_boundary_storyboard()
+
+        s1_storyboard._validate(storyboard)
+
+    def test_director_validation_still_rejects_real_master_overrun(self):
+        storyboard = self._decimal_boundary_storyboard()
+        storyboard["shots"][1]["duration"] = 0.65
+
+        with self.assertRaisesRegex(ValueError, "exceeds video master"):
+            s1_storyboard._validate(storyboard)
+
+    def test_reconstruction_inherits_relative_scene_for_silent_opening(self):
+        source = {
+            "source_id": "SRC-video",
+            "source_type": "video",
+            "title": "测试视频",
+            "structure_analysis": {
+                "summary": "同一室内场景中的连续口播",
+                "segments": [
+                    {
+                        "role": "other",
+                        "start_sec": 0,
+                        "end_sec": 0.5,
+                        "scene": "室内新年主题装饰场景",
+                        "characters": ["女主播"],
+                        "speaker": "女主播",
+                        "action": "女主播准备开口",
+                        "camera": "中景固定机位",
+                        "dialogue": "",
+                    },
+                    {
+                        "role": "hook",
+                        "start_sec": 0.5,
+                        "end_sec": 2.5,
+                        "scene": "同上述新年主题场景",
+                        "characters": ["女主播"],
+                        "speaker": "女主播",
+                        "action": "女主播抬手说话",
+                        "camera": "中景固定机位",
+                        "dialogue": "设备租赁，狗都不干！",
+                    },
+                ],
+            },
+        }
+
+        reconstruction = script_drafts._reconstruction_variant([source])
+        self.assertEqual(
+            [beat["scene"] for beat in reconstruction["beats"]],
+            ["室内新年主题装饰场景", "室内新年主题装饰场景"],
+        )
+
+        storyboard = script_drafts._storyboard(reconstruction)
+        dialogue_masters = [
+            master for master in storyboard["masters"]
+            if master["type"] == "dialogue"
+        ]
+        self.assertEqual(len(dialogue_masters), 1)
+        self.assertEqual(
+            dialogue_masters[0]["voiceover"], "设备租赁，狗都不干！"
+        )
+        s1_storyboard._validate(storyboard)
+
+    def test_standalone_silent_scene_builds_a_broll_master(self):
+        script = {
+            "title": "静默建立镜头后进入对白",
+            "creative_thesis": "保留无台词画面",
+            "target_duration_sec": 5,
+            "beats": [
+                {
+                    "beat": "establishing",
+                    "speaker": "presenter",
+                    "dialogue": "",
+                    "duration_sec": 2,
+                    "visual_intent": "雨夜设备场空镜",
+                    "source_ids": ["SRC-1"],
+                    "broll_hint": "",
+                    "scene": "雨夜设备场",
+                    "characters": ["presenter"],
+                },
+                {
+                    "beat": "hook",
+                    "speaker": "presenter",
+                    "dialogue": "抢修现在开始。",
+                    "duration_sec": 3,
+                    "visual_intent": "调度员进入指挥室下令",
+                    "source_ids": ["SRC-1"],
+                    "broll_hint": "",
+                    "scene": "应急指挥室",
+                    "characters": ["presenter"],
+                },
+            ],
+        }
+
+        storyboard = script_drafts._storyboard(script)
+
+        self.assertEqual(
+            [master["type"] for master in storyboard["masters"]],
+            ["broll", "dialogue"],
+        )
+        self.assertEqual(storyboard["shots"][0]["audio_master_idx"], 1)
+        self.assertEqual(storyboard["shots"][0]["subtitle"], "")
+        self.assertEqual(storyboard["director_plan"]["dialogue_master_count"], 1)
+        self.assertEqual(storyboard["director_plan"]["broll_master_count"], 1)
+        s1_storyboard._validate(storyboard)
+
+    def test_cached_reconstruction_resolves_relative_scene_before_grouping(self):
+        script = {
+            "title": "缓存中的高还原剧本",
+            "creative_thesis": "连续保留原片",
+            "target_duration_sec": 3,
+            "beats": [
+                {
+                    "beat": "other",
+                    "speaker": "女主播",
+                    "dialogue": "",
+                    "duration_sec": 1,
+                    "visual_intent": "女主播准备开口",
+                    "source_ids": ["SRC-1"],
+                    "broll_hint": "",
+                    "scene": "室内新年主题装饰场景",
+                    "characters": ["女主播"],
+                },
+                {
+                    "beat": "hook",
+                    "speaker": "女主播",
+                    "dialogue": "设备租赁，狗都不干！",
+                    "duration_sec": 2,
+                    "visual_intent": "女主播抬手说话",
+                    "source_ids": ["SRC-1"],
+                    "broll_hint": "",
+                    "scene": "同上述新年主题场景",
+                    "characters": ["女主播"],
+                },
+            ],
+        }
+
+        storyboard = script_drafts._storyboard(script)
+
+        self.assertEqual(len(storyboard["masters"]), 1)
+        self.assertEqual(storyboard["masters"][0]["type"], "dialogue")
+        self.assertEqual(
+            storyboard["masters"][0]["voiceover"], "设备租赁，狗都不干！"
+        )
+        s1_storyboard._validate(storyboard)
+
     def test_broll_hint_alone_does_not_create_a_paid_master(self):
         beats = _variant(0, "SRC-1")["beats"]
 
@@ -505,7 +692,8 @@ class ScriptDraftGenerationTests(unittest.TestCase):
             "broll_hint 只是本地导演剪辑建议，不会自动创建付费母片", prompt
         )
         self.assertEqual(
-            script_drafts.PROMPT_VERSION, "complete-script-v11-paid-broll-gate"
+            script_drafts.PROMPT_VERSION,
+            "complete-script-v12-voice-presence-performance-fidelity"
         )
 
     def test_video_structure_is_passed_to_reconstruction_prompt(self):
@@ -758,7 +946,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("确实只有单一视角时无需硬凑多人", prompt)
         self.assertEqual(
             script_drafts.PROMPT_VERSION,
-            "complete-script-v11-paid-broll-gate",
+            "complete-script-v12-voice-presence-performance-fidelity",
         )
 
     def test_generation_prompt_samples_head_middle_and_tail_of_long_sources(self):
@@ -799,7 +987,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("不得由 presenter 转述或代说", prompt)
         self.assertEqual(
             script_drafts.PROMPT_VERSION,
-            "complete-script-v11-paid-broll-gate",
+            "complete-script-v12-voice-presence-performance-fidelity",
         )
 
     def test_normalization_rejects_missing_speaker_instead_of_adding_presenter(self):
@@ -1014,6 +1202,50 @@ class ScriptDraftApprovalTests(unittest.TestCase):
             [beat["dialogue"] for beat in source_script["beats"]],
         )
         self.assertTrue(job["storyboard"])
+
+    def test_approve_derives_creative_characters_for_v2_from_storyboard(self):
+        draft_id = self.draft_ids[0]
+        row = self.database.execute(
+            "SELECT script_json FROM script_drafts WHERE draft_id=?",
+            (draft_id,),
+        ).fetchone()
+        script = json.loads(row["script_json"])
+        script.pop("characters", None)
+        for beat in script["beats"]:
+            beat["speaker"] = "女博主"
+            beat["characters"] = ["女博主"]
+        self.database.execute(
+            "UPDATE script_drafts SET script_json=? WHERE draft_id=?",
+            (json.dumps(script, ensure_ascii=False), draft_id),
+        )
+        self.database.commit()
+
+        script_drafts.approve_draft(self.database, draft_id)
+
+        job = self.database.execute(
+            "SELECT creative_ir_json FROM jobs WHERE job_id=?",
+            (self.job_id,),
+        ).fetchone()
+        creative = json.loads(job["creative_ir_json"])
+        self.assertEqual(
+            [character["id"] for character in creative["characters"]],
+            ["女博主"],
+        )
+
+        from factory.production_contract import compile_production_spec
+
+        compilation = compile_production_spec(
+            self.database,
+            self.job_id,
+            PROJECT_ROOT,
+            persist=False,
+            target_version=2,
+        )
+        self.assertTrue(compilation.payable)
+        self.assertEqual(
+            [character["id"] for character in compilation.spec.characters],
+            ["女博主"],
+        )
 
     def test_ai_generated_character_does_not_default_to_female(self):
         result = script_drafts.approve_draft(self.database, self.draft_ids[0])
@@ -1289,6 +1521,77 @@ class ScriptDraftApprovalTests(unittest.TestCase):
             [0, 4, 8, 12, 16, 20],
         )
         s1_storyboard._validate(storyboard)
+
+    def test_offscreen_dialogue_is_not_promoted_to_an_on_screen_character(self):
+        script = _variant(0, self.source_id)
+        script["reconstruction_mode"] = "source_timeline"
+        script["beats"] = [
+            {
+                "beat": "hook",
+                "speaker": "女博主",
+                "speech_mode": "on_screen",
+                "dialogue": "设备租赁，狗都不干！",
+                "duration_sec": 2.1,
+                "visual_intent": "女博主面对镜头张嘴说话",
+                "source_ids": [self.source_id],
+                "broll_hint": "",
+                "scene": "室内新年主题布景",
+                "characters": ["女博主"],
+            },
+            {
+                "beat": "conflict",
+                "speaker": "背景台词",
+                "speech_mode": "off_screen",
+                "dialogue": "没客户，看你怎么干？",
+                "duration_sec": 1.0,
+                "visual_intent": "女博主闭嘴转向画面右侧，做出被质疑后的反应",
+                "source_ids": [self.source_id],
+                "broll_hint": "",
+                "scene": "室内新年主题布景",
+                "characters": ["女博主"],
+                "emotion": "质疑",
+                "tone": "画外反问",
+                "facial_expression": "女博主眉头微紧",
+                "gaze": "女博主看向画外右侧",
+                "gesture": "女博主停下手势",
+                "body_action": "女博主上半身轻微转向右侧",
+            },
+        ]
+        script["target_duration_sec"] = 3.1
+
+        storyboard = script_drafts._storyboard(script)
+        master = storyboard["masters"][0]
+
+        self.assertEqual(
+            [character["id"] for character in storyboard["characters"]],
+            ["女博主"],
+        )
+        self.assertEqual(master["cast"], ["女博主"])
+        self.assertEqual(master["speakers"], ["女博主"])
+        self.assertEqual(master["audio_speakers"], ["女博主", "背景台词"])
+        self.assertEqual(
+            master["performance_beats"][1]["speech_mode"], "off_screen"
+        )
+        s1_storyboard._validate(storyboard)
+
+    def test_source_timeline_keeps_observed_performance_timing(self):
+        script = _variant(0, self.source_id)
+        script["reconstruction_mode"] = "source_timeline"
+        script["beats"] = [script["beats"][0]]
+        script["beats"][0].update({
+            "speaker": "女博主",
+            "characters": ["女博主"],
+            "dialogue": "设备租赁，狗都不干！",
+            "duration_sec": 2.1,
+            "source_start_sec": 0,
+            "source_end_sec": 2.1,
+        })
+        script["target_duration_sec"] = 2.1
+
+        storyboard = script_drafts._storyboard(script)
+
+        self.assertEqual(storyboard["masters"][0]["duration"], 2.1)
+        self.assertFalse(storyboard["director_plan"]["speech_duration_adjusted"])
 
     def test_three_speaker_continuous_scene_uses_one_ensemble_master(self):
         draft_id = self.draft_ids[0]

@@ -20,6 +20,90 @@ from factory.management_api import ManagementService  # noqa: E402
 
 
 class ProductionContractTests(unittest.TestCase):
+    def test_v2_restores_missing_creative_characters_from_runtime_storyboard(self):
+        from factory.production_contract import compile_production_spec
+
+        storyboard = {
+            "title": "本地视频高还原剧本",
+            "characters": [{
+                "id": "女博主",
+                "name": "女博主",
+                "identity_type": "ai_generated",
+                "generation_mode": "ai_generated",
+            }],
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": 4,
+                "speaker": "女博主",
+                "scene": "室内新年主题场景",
+                "scene_anchor_key": "new-year-room",
+                "cast": ["女博主"],
+                "performance_beats": [{
+                    "beat": "hook",
+                    "speaker": "女博主",
+                    "dialogue": "设备租赁，狗都不干！",
+                    "duration": 4,
+                    "visual_intent": "女博主抬手说话",
+                }],
+            }],
+        }
+        stale_creative = {
+            "version": 1,
+            "title": storyboard["title"],
+            "target_duration_sec": 4,
+            "characters": [],
+            "beats": [{
+                "beat_id": "beat-1",
+                "kind": "hook",
+                "scene": "室内新年主题场景",
+                "speakers": ["女博主"],
+                "dialogue": "设备租赁，狗都不干！",
+                "action": "女博主抬手说话",
+                "emotion": "",
+                "camera_intent": "中景固定机位",
+                "must_preserve": [],
+                "may_adapt": [],
+                "extensions": {
+                    "characters": ["女博主"],
+                    "duration_sec": 4,
+                },
+            }],
+            "extensions": {},
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,"
+            "creative_ir_json,creative_ir_version) VALUES(?,?,?,?,?,?,?)",
+            (
+                "J-V2-STALE-CHARACTERS",
+                "T-V2-STALE-CHARACTERS",
+                storyboard["title"],
+                "STORYBOARDED",
+                json.dumps(storyboard, ensure_ascii=False),
+                json.dumps(stale_creative, ensure_ascii=False),
+                1,
+            ),
+        )
+        self.database.commit()
+
+        result = compile_production_spec(
+            self.database,
+            "J-V2-STALE-CHARACTERS",
+            self.root,
+            persist=False,
+            target_version=2,
+        )
+
+        self.assertTrue(result.payable)
+        self.assertIn(
+            "creative_characters_restored",
+            [issue.code for issue in result.issues],
+        )
+        self.assertEqual(
+            [character["id"] for character in result.spec.characters],
+            ["女博主"],
+        )
+
     def test_compile_supports_explicit_v2_without_changing_v1_default(self):
         from factory.production_contract import compile_production_spec
 

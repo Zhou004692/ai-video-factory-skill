@@ -53,6 +53,64 @@ class ProductionServiceTests(unittest.TestCase):
         self.assertEqual(result["execution_engine"], "graph_v2")
         self.assertTrue(graph["nodes"])
 
+    def test_compile_surfaces_invalid_director_timeline_before_paid_start(self):
+        source = load_profile_fixture("stable_single_dialogue")
+        source.update({
+            "production_profile": "standard",
+            "production_mode": "native_master_local_director",
+            "hook": "preflight timeline validation",
+            "bgm": {},
+            "characters": [{
+                **source["characters"][0],
+                "gender": "female",
+            }],
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": 8,
+                "speaker": "linxia",
+                "speakers": ["linxia"],
+                "render_mode": "cinematic_character",
+                "voiceover": "continuous dialogue",
+                "scene": "service center",
+                "action": "presenter speaks",
+            }],
+            "shots": [{
+                "idx": 1,
+                "duration": 8.01,
+                "video_master_idx": 1,
+                "audio_master_idx": 1,
+                "video_start": 0,
+                "audio_start": 0,
+            }],
+        })
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+            "VALUES(?,?,?,?,?)",
+            (
+                "J-INVALID-TIMELINE", "T-INVALID", "invalid timeline",
+                "STORYBOARDED", json.dumps(source),
+            ),
+        )
+        self.database.commit()
+
+        result = ProductionService(self.database, self.root).compile(
+            "J-INVALID-TIMELINE"
+        )
+
+        self.assertFalse(result["compilable"])
+        self.assertEqual(
+            result["blockers"][0]["code"], "director_storyboard_invalid"
+        )
+        self.assertIn("exceeds video master", result["blockers"][0]["message"])
+        self.assertEqual(
+            self.database.execute(
+                "SELECT COUNT(*) FROM production_nodes "
+                "WHERE job_id='J-INVALID-TIMELINE'"
+            ).fetchone()[0],
+            0,
+        )
+
     def test_v2_spec_is_the_authoritative_budget_and_master_preflight(self):
         legacy = {
             "total_masters": 3,

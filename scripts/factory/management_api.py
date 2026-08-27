@@ -2476,6 +2476,8 @@ class ManagementService:
 
     def add_source(self, *, source_type: str, title: str, content: str) -> dict:
         kind = str(source_type or "manual").strip().lower()
+        if kind == "audio":
+            raise ValueError("已取消音频来源，仅支持人工文本、公开网页和本地视频")
         value = str(content or "").strip()
         if not value:
             raise ValueError("来源内容不能为空")
@@ -2508,14 +2510,16 @@ class ManagementService:
         media_path = Path(path).resolve()
         suffix = media_path.suffix.lower()
         if suffix not in media_sources.MEDIA_EXTENSIONS:
-            raise ValueError("仅支持常见音视频格式")
+            raise ValueError("仅支持常见视频格式")
+        if suffix not in media_sources.VIDEO_EXTENSIONS:
+            raise ValueError("已取消音频来源，仅支持本地视频来源")
         env = _read_env(self.env_path)
         api_key = str(env.get("VOLC_ASR_API_KEY") or "").strip()
         app_id = str(env.get("VOLC_ASR_APPID") or "").strip()
         access_token = str(env.get("VOLC_ASR_TOKEN") or "").strip()
         if not api_key and not (app_id and access_token):
             raise ValueError(
-                "本地音视频转写需要先配置火山语音识别："
+                "本地视频转写需要先配置火山语音识别："
                 "请优先填写新版 VOLC_ASR_API_KEY，或填写旧版 AppID 和 Token"
             )
         credentials = (
@@ -2527,25 +2531,14 @@ class ManagementService:
             self.database, media_path, title=str(title or "").strip() or None,
             **credentials,
         ))
-        reused_source = not result.created
         source_id = result.source_id
-        if reused_source:
-            instance = script_sources.instantiate_content_source(
-                self.database, source_id, title=str(title or "").strip()
-            )
-            source_id = instance.source_id
-        if suffix in media_sources.VIDEO_EXTENSIONS:
-            self._load_runtime_env()
-            source_analysis.analyze_source(self.database, source_id)
+        self._load_runtime_env()
+        source_analysis.analyze_source(self.database, source_id)
         response = {
             "source_id": source_id,
             "created": True,
-            "source_type": (
-                "video" if suffix in media_sources.VIDEO_EXTENSIONS else "audio"
-            ),
+            "source_type": "video",
         }
-        if reused_source:
-            response["reused_source"] = True
         return response
 
     def analyze_media_source(self, source_id: str, *, force: bool = True) -> dict:
@@ -2558,11 +2551,125 @@ class ManagementService:
             raise ValueError("内容来源不存在")
         if row["source_type"] not in {"video", "audio"}:
             raise ValueError("仅音视频来源支持结构解析")
+        if force and row["source_type"] == "video":
+            asyncio.run(media_sources.refresh_analysis_frames(
+                self.database, source_id
+            ))
         self._load_runtime_env()
         report = source_analysis.analyze_source(
             self.database, source_id, force=force
         )
         return {"source_id": source_id, "analysis": report}
+
+    def _source_media_metadata(self, source_id: str) -> tuple[str, dict]:
+        source_id = str(source_id or "").strip()
+        row = self.database.execute(
+            "SELECT source_type,metadata_json FROM script_sources WHERE source_id=?",
+            (source_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("内容来源不存在")
+        source_type = str(row["source_type"] or "")
+        if source_type not in {"video", "audio"}:
+            raise ValueError("该来源没有可预览的原始音视频")
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("来源解析元数据无效") from exc
+        return source_type, metadata
+
+    def source_media_file(self, source_id: str) -> Path:
+        """Return the archived original media used by performance review."""
+        _, metadata = self._source_media_metadata(source_id)
+        path = Path(str(metadata.get("archived_path") or "")).resolve()
+        if not path.is_file():
+            raise ValueError("原始音视频文件不存在，请重新上传解析")
+        return path
+
+    def source_frame_file(self, source_id: str, frame_index: int) -> Path:
+        """Return one declared analysis frame without exposing arbitrary paths."""
+        _, metadata = self._source_media_metadata(source_id)
+        expected = int(frame_index)
+        frame = next(
+            (
+                item for item in metadata.get("frames") or []
+                if int(item.get("index") or -1) == expected
+            ),
+            None,
+        )
+        if not frame:
+            raise ValueError("画面证据不存在，请重新解析视频")
+        path = Path(str(frame.get("path") or "")).resolve()
+        if not path.is_file():
+            raise ValueError("画面证据不存在，请重新解析视频")
+        return path
+
+    def review_source_performance(self, source_id: str, payload: dict) -> dict:
+        """Persist human speaker resolution without rerunning paid analysis."""
+        source_id = str(source_id or "").strip()
+        row = self.database.execute(
+            "SELECT source_type,metadata_json FROM script_sources WHERE source_id=?",
+            (source_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("内容来源不存在")
+        if row["source_type"] not in {"video", "audio"}:
+            raise ValueError("仅音视频来源支持人物表演校正")
+        metadata = json.loads(row["metadata_json"] or "{}")
+        analysis = metadata.get("structure_analysis") or {}
+        segments = analysis.get("segments") or []
+        assignments = payload.get("assignments") or []
+        if not isinstance(assignments, list) or not assignments:
+            raise ValueError("请至少校正一个说话人")
+        for assignment in assignments:
+            if not isinstance(assignment, dict):
+                raise ValueError("说话人校正格式无效")
+            try:
+                segment_index = int(assignment.get("segment_index"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("说话人校正缺少有效分段序号") from exc
+            if segment_index < 0 or segment_index >= len(segments):
+                raise ValueError("说话人校正分段不存在")
+            speaker = str(assignment.get("speaker") or "").strip()
+            if not speaker:
+                raise ValueError("说话人不能为空")
+            segment = segments[segment_index]
+            segment["speaker"] = speaker
+            segment["speech_mode"] = script_drafts.normalize_speech_mode(
+                assignment.get("speech_mode"), speaker=speaker
+            )
+            speaker_track_id = str(
+                assignment.get("speaker_track_id") or ""
+            ).strip()
+            if speaker_track_id:
+                segment["speaker_track_id"] = speaker_track_id
+            for field in script_drafts.PERFORMANCE_TEXT_FIELDS:
+                if field not in assignment:
+                    continue
+                value = str(assignment.get(field) or "").strip()
+                if value:
+                    segment[field] = value
+                else:
+                    segment.pop(field, None)
+            segment["speaker_confidence"] = 1.0
+            segment["speaker_review_required"] = False
+            segment["speaker_resolution_status"] = "manual"
+        analysis["performance_ir_version"] = 2
+        metadata["structure_analysis"] = analysis
+        self.database.execute(
+            "UPDATE script_sources SET metadata_json=? WHERE source_id=?",
+            (json.dumps(metadata, ensure_ascii=False), source_id),
+        )
+        self.database.commit()
+        review_required_count = sum(
+            1 for segment in segments
+            if segment.get("speaker_review_required") is True
+        )
+        return {
+            "source_id": source_id,
+            "analysis": analysis,
+            "review_required_count": review_required_count,
+        }
 
     def _load_runtime_env(self) -> None:
         """Make values saved by the console visible to provider clients immediately."""
@@ -4746,32 +4853,74 @@ class ManagementService:
             storyboard = json.loads(row["storyboard"] or "{}")
         except json.JSONDecodeError:
             storyboard = {}
+        performance_beats = [
+            beat
+            for master in storyboard.get("masters") or []
+            for beat in (master.get("performance_beats") or [])
+            if isinstance(beat, dict)
+        ]
+        explicit_on_screen = {
+            str(beat.get("speaker") or "").strip()
+            for beat in performance_beats
+            if str(beat.get("speaker") or "").strip()
+            and script_drafts.normalize_speech_mode(
+                beat.get("speech_mode"),
+                speaker=str(beat.get("speaker") or "").strip(),
+            ) == "on_screen"
+        }
+        voice_only = {
+            str(beat.get("speaker") or "").strip()
+            for beat in performance_beats
+            if str(beat.get("speaker") or "").strip()
+            and script_drafts.normalize_speech_mode(
+                beat.get("speech_mode"),
+                speaker=str(beat.get("speaker") or "").strip(),
+            ) != "on_screen"
+        } - explicit_on_screen
+
+        def visible_candidate(value: object) -> str:
+            candidate = str(value or "").strip()
+            if not candidate or candidate in voice_only:
+                return ""
+            if (
+                candidate not in explicit_on_screen
+                and script_drafts.normalize_speech_mode(
+                    None, speaker=candidate
+                ) != "on_screen"
+            ):
+                return ""
+            return candidate
+
         speaker_candidates: list[str] = [
-            str(item.get("id") or "").strip()
+            visible_candidate(item.get("id"))
             for item in (storyboard.get("characters") or [])
-            if str(item.get("id") or "").strip()
+            if visible_candidate(item.get("id"))
         ]
         for master in storyboard.get("masters") or []:
             if master.get("type") != "dialogue":
                 continue
-            speaker_candidates.append(str(master.get("speaker") or "").strip())
+            speaker_candidates.append(visible_candidate(master.get("speaker")))
             speaker_candidates.extend(
-                str(speaker or "").strip()
+                visible_candidate(speaker)
                 for speaker in (master.get("speakers") or [])
             )
             speaker_candidates.extend(
-                str(beat.get("speaker") or "").strip()
+                visible_candidate(beat.get("speaker"))
                 for beat in (master.get("performance_beats") or [])
                 if isinstance(beat, dict)
+                and script_drafts.normalize_speech_mode(
+                    beat.get("speech_mode"),
+                    speaker=str(beat.get("speaker") or "").strip(),
+                ) == "on_screen"
             )
         speakers = list(dict.fromkeys(
             speaker for speaker in speaker_candidates if speaker
         ))
         if not speakers:
             speakers = [
-                str(item.get("id") or "").strip()
+                visible_candidate(item.get("id"))
                 for item in (storyboard.get("characters") or [])
-                if str(item.get("id") or "").strip()
+                if visible_candidate(item.get("id"))
             ]
         raw_mappings = settings.get("character_mappings") or {}
         if not isinstance(raw_mappings, dict):
