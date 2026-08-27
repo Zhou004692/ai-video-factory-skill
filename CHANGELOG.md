@@ -2,6 +2,25 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.1.0.0] - 2026-08-27
+
+### Added
+
+- Added segment-level performance reconstruction for local videos, including speaker evidence, speech-screen relationships, emotion, tone, pace, volume, expression, gaze, gesture and body action.
+- Added an in-console performance review flow with synchronized source-video clips and editable corrections before script generation.
+
+### Changed
+
+- Changed local-video ingestion to run a fresh structural analysis for each content project instead of reusing stale source-analysis results.
+- Passed reviewed source-performance evidence through script generation, production contracts and Seedance cinematic director prompts so generated performances preserve the source video's timing and character intent.
+- Distinguished on-screen dialogue, off-screen speech and narration throughout casting, character anchors, master planning and video prompts.
+
+### Fixed
+
+- Fixed background dialogue being forced onto visible characters or generating unnecessary character anchors and lip-sync requirements.
+- Fixed legacy approved projects failing compilation when their Creative IR character table was incomplete, while preserving reviewed runtime identities.
+- Fixed floating-point timeline boundary errors and stale runtime-master mismatches that could block otherwise valid production jobs.
+
 ## [3.0.2.0] - 2026-08-20
 
 ### Added
