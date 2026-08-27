@@ -10,6 +10,8 @@ import os
 
 import httpx
 
+from .. import provider_runtime
+
 from .claude import _extract_json  # JSON 抽取容错,公用
 
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
@@ -32,10 +34,6 @@ def complete_json(prompt: str, system: str | None = None,
                   max_tokens: int = 4000,
                   model: str | None = None) -> tuple[dict, dict]:
     """同步调用,返回 (JSON, usage_dict)。签名与 claude.complete_json 完全一致。"""
-    key = os.environ.get("ARK_API_KEY")
-    if not key:
-        raise RuntimeError("ARK_API_KEY not set in .env")
-
     payload = {
         "model": model or DEFAULT_MODEL,
         "max_tokens": max_tokens,
@@ -47,6 +45,24 @@ def complete_json(prompt: str, system: str | None = None,
         ],
         "response_format": {"type": "json_object"},
     }
+
+    runtime = provider_runtime.from_environment()
+    if runtime.mode == "replay":
+        replay = runtime.lookup("doubao.llm.complete_json", payload)
+        result = replay.get("result")
+        usage = replay.get("usage")
+        if not isinstance(result, dict) or not isinstance(usage, dict):
+            raise provider_runtime.ReplayFixtureMissing(
+                "Doubao LLM replay response requires result and usage objects"
+            )
+        return result, {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+        }
+
+    key = os.environ.get("ARK_API_KEY")
+    if not key:
+        raise RuntimeError("ARK_API_KEY not set in .env")
 
     with httpx.Client(timeout=_timeout_seconds()) as cli:
         r = cli.post(

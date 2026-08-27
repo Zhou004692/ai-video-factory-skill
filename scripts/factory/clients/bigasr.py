@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import time
 import uuid
 
 import httpx
+
+from .. import provider_runtime
 
 
 FLASH_URL = (
@@ -115,6 +118,23 @@ def parse_transcript(payload: dict) -> str:
     return parse_transcription(payload).text
 
 
+def replay_request(audio_path: str | Path) -> dict:
+    """Build a credential-free, content-addressed ASR fixture request."""
+    path = Path(audio_path)
+    return {
+        "audio_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "format": path.suffix.lower().lstrip(".") or "wav",
+        "request": {
+            "model_name": "bigmodel",
+            "enable_itn": True,
+            "enable_speaker_info": True,
+            "enable_emotion_detection": True,
+            "show_volume": True,
+            "show_speech_rate": True,
+        },
+    }
+
+
 def transcribe_detailed(
     audio_path: str | Path,
     *,
@@ -126,6 +146,19 @@ def transcribe_detailed(
     poll_interval: float = 0.5,
     max_wait_seconds: int = 120,
 ) -> Transcription:
+    audio_path = Path(audio_path)
+    runtime = provider_runtime.from_environment()
+    if runtime.mode == "replay":
+        replay = runtime.lookup(
+            "volc.asr.transcribe", replay_request(audio_path)
+        )
+        result = replay.get("result")
+        if not isinstance(result, dict):
+            raise provider_runtime.ReplayFixtureMissing(
+                "ASR replay response requires a result object"
+            )
+        return parse_transcription({"result": result})
+
     explicit_legacy = bool(app_id and access_token)
     api_key = api_key or (
         None if explicit_legacy else os.environ.get("VOLC_ASR_API_KEY")
@@ -143,7 +176,6 @@ def transcribe_detailed(
             "VOLC_ASR_API_KEY or VOLC_ASR_APPID / VOLC_ASR_TOKEN not set"
         )
 
-    audio_path = Path(audio_path)
     request_id = str(uuid.uuid4())
     headers = {
         "X-Api-Resource-Id": (

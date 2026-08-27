@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -13,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from factory import provider_runtime  # noqa: E402
+from factory.provider_replay import fingerprint  # noqa: E402
 
 
 class ProviderRuntimeTests(unittest.TestCase):
@@ -48,6 +50,37 @@ class ProviderRuntimeTests(unittest.TestCase):
         }, clear=False):
             with self.assertRaisesRegex(ValueError, "FACTORY_PROVIDER_MODE"):
                 provider_runtime.from_environment()
+
+    def test_replay_sequence_survives_runtime_reconstruction(self):
+        request = {"task_id": "replay:video:sequence"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.json").write_text(json.dumps({
+                "fixture_schema_version": 1,
+                "fixture_id": "runtime-sequence",
+                "operations": [{
+                    "operation": "video.inspect",
+                    "request_hash": fingerprint("video.inspect", request),
+                    "responses": [
+                        {"status": "queued"},
+                        {"status": "succeeded"},
+                    ],
+                }],
+            }), encoding="utf-8")
+            environment = {
+                "FACTORY_PROVIDER_MODE": "replay",
+                "FACTORY_REPLAY_FIXTURE_ROOT": str(root),
+            }
+
+            first = provider_runtime.from_environment(environment).lookup(
+                "video.inspect", request
+            )
+            second = provider_runtime.from_environment(environment).lookup(
+                "video.inspect", request
+            )
+
+        self.assertEqual(first["status"], "queued")
+        self.assertEqual(second["status"], "succeeded")
 
 
 if __name__ == "__main__":

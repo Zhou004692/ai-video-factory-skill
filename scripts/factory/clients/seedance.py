@@ -30,6 +30,7 @@ import re
 
 import httpx
 
+from .. import provider_runtime
 from . import provider_downloads
 
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
@@ -656,6 +657,34 @@ async def text_to_video(
         task_intent=task_intent,
     )
 
+    runtime = provider_runtime.from_environment()
+    if runtime.mode == "replay":
+        replay = runtime.lookup("seedance.video.generate", payload)
+        task_id = str(replay.get("task_id") or "").strip()
+        if not task_id:
+            raise provider_runtime.ReplayFixtureMissing(
+                "Seedance video replay response is missing task_id"
+            )
+        media_path = Path(str(replay.get("media_path") or ""))
+        if not media_path.is_file():
+            raise provider_runtime.ReplayFixtureMissing(
+                "Seedance video replay response is missing media"
+            )
+        if metadata_out is not None:
+            metadata_out.update({
+                "task_id": task_id,
+                "usage": replay.get("usage") or {},
+                "fixture_id": replay.get("fixture_id"),
+                "request_hash": replay.get("request_hash"),
+                "mode": "replay",
+                "paid": False,
+            })
+        if on_task_created is not None:
+            on_task_created(task_id)
+        if on_task_updated is not None:
+            on_task_updated(task_id, "completed", replay)
+        return media_path.read_bytes()
+
     async with httpx.AsyncClient(timeout=timeout, headers=_headers()) as cli:
         # 1. 提交任务
         try:
@@ -800,6 +829,36 @@ async def inspect_task(task_id: str) -> dict:
     normalized_id = str(task_id or "").strip()
     if not normalized_id:
         raise ValueError("Seedance task_id is required")
+    runtime = provider_runtime.from_environment()
+    if runtime.mode == "replay":
+        replay = runtime.lookup(
+            "seedance.video.inspect", {"task_id": normalized_id}
+        )
+        raw_status = str(replay.get("status") or "").strip().casefold()
+        status = (
+            "completed" if raw_status in {"completed", "succeeded"}
+            else "failed" if raw_status == "failed"
+            else "pending" if raw_status in {"pending", "queued", "running"}
+            else "unknown"
+        )
+        result = {
+            **replay,
+            "status": status,
+            "task_id": normalized_id,
+            "usage": replay.get("usage") or {},
+            "cost_cents": 0,
+            "paid": False,
+        }
+        if status != "completed":
+            return result
+        media_path = Path(str(replay.get("media_path") or ""))
+        if not media_path.is_file():
+            return {**result, "status": "unknown"}
+        return {
+            **result,
+            "video_url": media_path.as_uri(),
+            "video": media_path.read_bytes(),
+        }
     async with httpx.AsyncClient(timeout=120, headers=_headers()) as cli:
         try:
             response = await cli.get(
@@ -860,6 +919,15 @@ async def text_to_image(prompt: str, resolution: str = "1024x1536",
     }
     if seed is not None:
         payload["seed"] = seed
+    runtime = provider_runtime.from_environment()
+    if runtime.mode == "replay":
+        replay = runtime.lookup("seedance.image.generate", payload)
+        media_path = Path(str(replay.get("media_path") or ""))
+        if not media_path.is_file():
+            raise provider_runtime.ReplayFixtureMissing(
+                "Seedance image replay response is missing media"
+            )
+        return media_path.read_bytes()
     async with httpx.AsyncClient(timeout=120, headers=_headers()) as cli:
         try:
             r = await cli.post(f"{ARK_BASE}/images/generations", json=payload)

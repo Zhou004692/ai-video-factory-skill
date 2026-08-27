@@ -6,6 +6,7 @@ before any production client has a chance to construct an outbound request.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import os
 from pathlib import Path
 from typing import Literal, Mapping
@@ -23,6 +24,14 @@ class ReplayFixtureMissing(RuntimeError):
     retryable = False
 
 
+@lru_cache(maxsize=16)
+def _shared_replay_store(fixture_root: Path):
+    """Keep stateful fixture sequences stable across runtime reconstruction."""
+    from .provider_replay import ReplayStore
+
+    return ReplayStore(fixture_root)
+
+
 @dataclass(frozen=True)
 class ProviderRuntime:
     mode: ProviderMode
@@ -36,9 +45,7 @@ class ProviderRuntime:
                 "replay fixture root does not exist: "
                 f"{self.fixture_root or '<not configured>'}"
             )
-        from .provider_replay import ReplayStore
-
-        return ReplayStore(self.fixture_root).lookup(operation, request)
+        return _shared_replay_store(self.fixture_root).lookup(operation, request)
 
 
 def from_environment(
