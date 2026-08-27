@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ob-ai-video.local/schemas/provider-replay-v1.json",
+  "title": "AI Video Factory provider replay fixture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["fixture_schema_version", "fixture_id", "operations"],
+  "properties": {
+    "fixture_schema_version": {"const": 1},
+    "fixture_id": {"type": "string", "minLength": 1},
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation", "request_hash", "responses"],
+        "properties": {
+          "operation": {"type": "string", "minLength": 1},
+          "request_hash": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "responses": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "object"}
+          }
+        }
+      }
+    }
+  }
+}
