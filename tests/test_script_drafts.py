@@ -16,7 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 
-from factory import db, script_drafts, script_sources, topic_briefs  # noqa: E402
+from factory import (  # noqa: E402
+    db,
+    production_config,
+    script_drafts,
+    script_sources,
+    topic_briefs,
+)
 from factory.steps import s1_storyboard  # noqa: E402
 import cli as cli_module  # noqa: E402
 
@@ -71,6 +77,48 @@ def _variant(index: int, source_id: str) -> dict:
 
 
 class ScriptDraftGenerationTests(unittest.TestCase):
+    def test_broll_hint_alone_does_not_create_a_paid_master(self):
+        beats = _variant(0, "SRC-1")["beats"]
+
+        selected = script_drafts._broll_plan(beats)
+
+        self.assertEqual(selected, [])
+
+    def test_normalization_preserves_character_identity_profiles(self):
+        raw = {
+            "variants": [{
+                "title": "三人雨夜救援",
+                "creative_thesis": "三人协同完成抢修",
+                "characters": [{
+                    "id": "林夏",
+                    "name": "林夏",
+                    "gender": "female",
+                    "look": "28岁亚洲女性，深蓝防水夹克、低马尾、银色对讲机",
+                    "background_description": "应急调度负责人，冷静果断",
+                }],
+                "beats": [{
+                    "beat": "hook",
+                    "speaker": "林夏",
+                    "dialogue": "立即启动双站救援",
+                    "duration_sec": 4,
+                    "visual_intent": "林夏在调度中心按下确认键",
+                    "source_ids": ["SRC-1"],
+                }],
+            }],
+            "recommended_index": 0,
+        }
+
+        result = script_drafts.normalize_response(
+            raw, allowed_source_ids={"SRC-1"}
+        )
+
+        self.assertEqual(result["variants"][0]["characters"][0], {
+            "id": "林夏",
+            "name": "林夏",
+            "gender": "female",
+            "look": "28岁亚洲女性，深蓝防水夹克、低马尾、银色对讲机",
+            "background_description": "应急调度负责人，冷静果断",
+        })
     def setUp(self):
         self.database = sqlite3.connect(":memory:")
         self.database.row_factory = sqlite3.Row
@@ -453,8 +501,11 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("景别与运镜", prompt)
         self.assertIn("不要按说话人或固定秒数更换 continuity_id", prompt)
         self.assertIn('"broll_required": false', prompt)
+        self.assertIn(
+            "broll_hint 只是本地导演剪辑建议，不会自动创建付费母片", prompt
+        )
         self.assertEqual(
-            script_drafts.PROMPT_VERSION, "complete-script-v9-balanced-source-sampling"
+            script_drafts.PROMPT_VERSION, "complete-script-v11-paid-broll-gate"
         )
 
     def test_video_structure_is_passed_to_reconstruction_prompt(self):
@@ -707,7 +758,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("确实只有单一视角时无需硬凑多人", prompt)
         self.assertEqual(
             script_drafts.PROMPT_VERSION,
-            "complete-script-v9-balanced-source-sampling",
+            "complete-script-v11-paid-broll-gate",
         )
 
     def test_generation_prompt_samples_head_middle_and_tail_of_long_sources(self):
@@ -748,7 +799,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("不得由 presenter 转述或代说", prompt)
         self.assertEqual(
             script_drafts.PROMPT_VERSION,
-            "complete-script-v9-balanced-source-sampling",
+            "complete-script-v11-paid-broll-gate",
         )
 
     def test_normalization_rejects_missing_speaker_instead_of_adding_presenter(self):
@@ -879,7 +930,22 @@ class ScriptDraftApprovalTests(unittest.TestCase):
     def tearDown(self):
         self.database.close()
 
+    def _require_broll(self, draft_id: str, beat_type: str = "evidence") -> None:
+        row = self.database.execute(
+            "SELECT script_json FROM script_drafts WHERE draft_id=?", (draft_id,)
+        ).fetchone()
+        script = json.loads(row["script_json"])
+        next(
+            beat for beat in script["beats"] if beat["beat"] == beat_type
+        )["broll_required"] = True
+        self.database.execute(
+            "UPDATE script_drafts SET script_json=? WHERE draft_id=?",
+            (json.dumps(script, ensure_ascii=False), draft_id),
+        )
+        self.database.commit()
+
     def test_approve_builds_dialogue_and_broll_masters_with_dual_track_edit(self):
+        self._require_broll(self.draft_ids[1])
         result = script_drafts.approve_draft(self.database, self.draft_ids[1])
         storyboard = result["storyboard"]
 
@@ -928,6 +994,27 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         self.assertEqual(json.loads(job["storyboard"]), storyboard)
         self.assertEqual(job["state"], "STORYBOARDED")
 
+    def test_approve_persists_lossless_creative_ir_alongside_storyboard(self):
+        source_script = json.loads(self.database.execute(
+            "SELECT script_json FROM script_drafts WHERE draft_id=?",
+            (self.draft_ids[0],),
+        ).fetchone()[0])
+
+        script_drafts.approve_draft(self.database, self.draft_ids[0])
+
+        job = self.database.execute(
+            "SELECT storyboard,creative_ir_json,creative_ir_version "
+            "FROM jobs WHERE job_id=?", (self.job_id,),
+        ).fetchone()
+        creative = json.loads(job["creative_ir_json"])
+        self.assertEqual(job["creative_ir_version"], 1)
+        self.assertEqual(creative["title"], source_script["title"])
+        self.assertEqual(
+            [beat["dialogue"] for beat in creative["beats"]],
+            [beat["dialogue"] for beat in source_script["beats"]],
+        )
+        self.assertTrue(job["storyboard"])
+
     def test_ai_generated_character_does_not_default_to_female(self):
         result = script_drafts.approve_draft(self.database, self.draft_ids[0])
 
@@ -937,6 +1024,39 @@ class ScriptDraftApprovalTests(unittest.TestCase):
             for character in result["storyboard"]["characters"]
         ))
 
+    def test_approve_uses_script_character_profiles_for_ai_makeup(self):
+        draft_id = self.draft_ids[0]
+        row = self.database.execute(
+            "SELECT script_json FROM script_drafts WHERE draft_id=?", (draft_id,)
+        ).fetchone()
+        script = json.loads(row["script_json"])
+        speaker = script["beats"][0]["speaker"]
+        script["characters"] = [{
+            "id": speaker,
+            "name": "林夏",
+            "gender": "female",
+            "look": "28岁亚洲女性，深蓝防水夹克、低马尾、银色对讲机",
+            "background_description": "应急调度负责人，冷静果断",
+        }]
+        self.database.execute(
+            "UPDATE script_drafts SET script_json=? WHERE draft_id=?",
+            (json.dumps(script, ensure_ascii=False), draft_id),
+        )
+        self.database.commit()
+
+        result = script_drafts.approve_draft(self.database, draft_id)
+
+        character = next(
+            item for item in result["storyboard"]["characters"]
+            if item["id"] == speaker
+        )
+        self.assertEqual(character["name"], "林夏")
+        self.assertEqual(character["gender"], "female")
+        self.assertIn("深蓝防水夹克", character["look"])
+        self.assertEqual(
+            character["background_description"], "应急调度负责人，冷静果断"
+        )
+
     def test_approve_balances_continuous_story_over_thirty_seconds(self):
         draft_id = self.draft_ids[0]
         row = self.database.execute(
@@ -945,6 +1065,9 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         script = json.loads(row["script_json"])
         for beat in script["beats"]:
             beat["duration_sec"] = 6
+        next(
+            beat for beat in script["beats"] if beat["beat"] == "evidence"
+        )["broll_required"] = True
         script["target_duration_sec"] = 36
         script["total_duration_sec"] = 36
         self.database.execute(
@@ -1071,6 +1194,53 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         self.assertEqual(brief["approved_job_id"], self.job_id)
         self.assertTrue(job["storyboard"])
 
+    def test_approve_switches_existing_unpaid_job_to_configured_engine(self):
+        draft_id = self.draft_ids[0]
+
+        with patch.dict(
+            "os.environ", {"PRODUCTION_EXECUTION_ENGINE": "graph_v2"}, clear=False
+        ):
+            script_drafts.approve_draft(self.database, draft_id)
+
+        job = self.database.execute(
+            "SELECT execution_engine FROM jobs WHERE job_id=?", (self.job_id,)
+        ).fetchone()
+        self.assertEqual(job["execution_engine"], "graph_v2")
+
+    def test_approve_creates_new_job_with_configured_engine(self):
+        draft_id = self.draft_ids[0]
+        self.database.execute("DELETE FROM jobs WHERE job_id=?", (self.job_id,))
+        self.database.execute(
+            "UPDATE topic_briefs SET approved_job_id=NULL WHERE brief_id=?",
+            (self.brief_id,),
+        )
+        self.database.commit()
+
+        with patch.dict(
+            "os.environ", {"PRODUCTION_EXECUTION_ENGINE": "graph_v2"}, clear=False
+        ):
+            script_drafts.approve_draft(self.database, draft_id)
+
+        job = self.database.execute(
+            "SELECT execution_engine FROM jobs WHERE job_id=?", (self.job_id,)
+        ).fetchone()
+        self.assertEqual(job["execution_engine"], "graph_v2")
+
+    def test_default_execution_engine_is_reversible_and_validated(self):
+        self.assertEqual(
+            production_config.resolve_default_execution_engine({}), "legacy"
+        )
+        self.assertEqual(
+            production_config.resolve_default_execution_engine(
+                {"PRODUCTION_EXECUTION_ENGINE": "graph_v2"}
+            ),
+            "graph_v2",
+        )
+        with self.assertRaisesRegex(ValueError, "legacy or graph_v2"):
+            production_config.resolve_default_execution_engine(
+                {"PRODUCTION_EXECUTION_ENGINE": "unknown"}
+            )
+
     def test_same_scene_multiple_speakers_share_one_native_master(self):
         draft_id = self.draft_ids[0]
         row = self.database.execute(
@@ -1080,6 +1250,9 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         speakers = ["sales", "boss", "sales", "boss", "sales", "boss"]
         for beat, speaker in zip(script["beats"], speakers):
             beat["speaker"] = speaker
+        next(
+            beat for beat in script["beats"] if beat["beat"] == "evidence"
+        )["broll_required"] = True
         self.database.execute(
             "UPDATE script_drafts SET script_json=? WHERE draft_id=?",
             (json.dumps(script, ensure_ascii=False), draft_id),
@@ -1149,7 +1322,7 @@ class ScriptDraftApprovalTests(unittest.TestCase):
             dialogue_masters[0]["render_mode"], "cinematic_character"
         )
         self.assertEqual(
-            storyboard["director_plan"]["strategy"], "dialogue_plus_broll"
+            storyboard["director_plan"]["strategy"], "cinematic_dialogue_only"
         )
         s1_storyboard._validate(storyboard)
 
@@ -1343,6 +1516,9 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         script = _variant(0, self.source_id)
         for beat, scene in zip(script["beats"], ["a", "a", "b", "b", "c", "c"]):
             beat["scene"] = scene
+        next(
+            beat for beat in script["beats"] if beat["beat"] == "evidence"
+        )["broll_required"] = True
 
         storyboard = script_drafts._storyboard(script)
 
@@ -1412,7 +1588,11 @@ class ScriptDraftApprovalTests(unittest.TestCase):
         ))
 
     def test_broll_picture_change_uses_continuous_audio_bridge(self):
-        storyboard = script_drafts._storyboard(_variant(0, self.source_id))
+        script = _variant(0, self.source_id)
+        next(
+            beat for beat in script["beats"] if beat["beat"] == "evidence"
+        )["broll_required"] = True
+        storyboard = script_drafts._storyboard(script)
         broll_shots = [
             shot for shot in storyboard["shots"]
             if shot["video_master_idx"] != shot["audio_master_idx"]

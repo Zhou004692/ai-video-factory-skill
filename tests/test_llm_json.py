@@ -65,6 +65,47 @@ class StructuredJsonRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(json.JSONDecodeError, "truncated"):
                 doubao_llm.complete_json("prompt", max_tokens=100)
 
+    def test_doubao_uses_configurable_timeout_for_complex_script_generation(self):
+        observed_timeouts = []
+        body = {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": '{"variants":[]}'},
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+
+        class Response:
+            status_code = 200
+
+            def json(self):
+                return body
+
+        class Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def post(self, *args, **kwargs):
+                return Response()
+
+        def client_factory(*, timeout):
+            observed_timeouts.append(timeout)
+            return Client()
+
+        with patch.dict(
+            os.environ,
+            {"ARK_API_KEY": "test-key", "ARK_LLM_TIMEOUT_SEC": "300"},
+        ), patch(
+            "factory.clients.doubao_llm.httpx.Client",
+            side_effect=client_factory,
+        ):
+            doubao_llm.complete_json("prompt", max_tokens=6000)
+
+        self.assertEqual(observed_timeouts, [300.0])
+
 
 if __name__ == "__main__":
     unittest.main()

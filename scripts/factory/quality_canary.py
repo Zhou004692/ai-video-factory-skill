@@ -34,6 +34,171 @@ def load_frozen_profiles(path: Path = PROFILE_PATH) -> list[dict[str, Any]]:
     return deepcopy(profiles)
 
 
+def load_acceptance_records(root: Path) -> list[dict[str, Any]]:
+    """Load portable local acceptance records; malformed files stay non-fatal."""
+    acceptance_root = Path(root) / "data" / "acceptance"
+    if not acceptance_root.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in sorted(acceptance_root.glob("*/acceptance.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
+
+
+def summarize_acceptance_records(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    minimum_reviewed_runs: int = 3,
+    minimum_first_pass_rate: float = 0.8,
+    dimension_target: float = 4.0,
+) -> dict[str, Any]:
+    """Measure first-pass usability only from frozen, manually scored canaries."""
+    if minimum_reviewed_runs <= 0:
+        raise ValueError("minimum_reviewed_runs must be > 0")
+    if not 0 <= minimum_first_pass_rate <= 1:
+        raise ValueError("minimum_first_pass_rate must be between 0 and 1")
+    if not 0 <= dimension_target <= 5:
+        raise ValueError("dimension_target must be between 0 and 5")
+
+    profiles = load_frozen_profiles()
+    profile_ids = [str(profile["id"]) for profile in profiles]
+    buckets: dict[str, dict[str, Any]] = {
+        profile_id: {
+            "profile_id": profile_id,
+            "runs": 0,
+            "reviewed_runs": 0,
+            "first_pass_usable_runs": 0,
+            "costs": [],
+            "score_totals": {field: 0.0 for field in MANUAL_SCORE_FIELDS},
+            "below_target_dimensions": {
+                field: 0 for field in MANUAL_SCORE_FIELDS
+            },
+        }
+        for profile_id in profile_ids
+    }
+    ignored_records = 0
+    for record in records:
+        profile_id = str(record.get("profile_id") or "")
+        if (
+            str(record.get("classification") or "") != "canary"
+            or profile_id not in buckets
+        ):
+            ignored_records += 1
+            continue
+        bucket = buckets[profile_id]
+        bucket["runs"] += 1
+        try:
+            bucket["costs"].append(int(
+                (record.get("cost") or {}).get("actual_cents") or 0
+            ))
+        except (TypeError, ValueError):
+            bucket["costs"].append(0)
+        quality = record.get("quality") or {}
+        if str(record.get("completion_status") or "") != "complete":
+            continue
+        try:
+            scores = _validated_scores(quality.get("manual_scores"))
+        except (TypeError, ValueError):
+            continue
+        if scores is None:
+            continue
+        bucket["reviewed_runs"] += 1
+        for field, score in scores.items():
+            bucket["score_totals"][field] += score
+            if score < dimension_target:
+                bucket["below_target_dimensions"][field] += 1
+        final_review = quality.get("final_review") or {}
+        if (
+            str(final_review.get("decision") or "") == "approved"
+            and bool(final_review.get("first_pass"))
+            and all(score >= dimension_target for score in scores.values())
+        ):
+            bucket["first_pass_usable_runs"] += 1
+
+    profile_results = []
+    dimension_failures = {field: 0 for field in MANUAL_SCORE_FIELDS}
+    for profile_id in profile_ids:
+        bucket = buckets[profile_id]
+        reviewed = int(bucket["reviewed_runs"])
+        first_pass = int(bucket["first_pass_usable_runs"])
+        rate = first_pass / reviewed if reviewed else 0.0
+        below_target = {
+            field: int(count)
+            for field, count in bucket["below_target_dimensions"].items()
+            if int(count) > 0
+        }
+        for field, count in below_target.items():
+            dimension_failures[field] += count
+        status = "no_data"
+        if reviewed:
+            status = "collecting" if reviewed < minimum_reviewed_runs else (
+                "pass" if rate >= minimum_first_pass_rate else "fail"
+            )
+        costs = list(bucket["costs"])
+        profile_results.append({
+            "profile_id": profile_id,
+            "runs": int(bucket["runs"]),
+            "reviewed_runs": reviewed,
+            "first_pass_usable_runs": first_pass,
+            "first_pass_usable_rate": round(rate, 4),
+            "below_target_dimensions": below_target,
+            "mean_scores": {
+                field: round(float(total) / reviewed, 3) if reviewed else None
+                for field, total in bucket["score_totals"].items()
+            },
+            "mean_actual_cost_cents": (
+                int(round(sum(costs) / len(costs))) if costs else 0
+            ),
+            "status": status,
+        })
+
+    reviewed_runs = sum(item["reviewed_runs"] for item in profile_results)
+    first_pass_runs = sum(
+        item["first_pass_usable_runs"] for item in profile_results
+    )
+    ready_profiles = sum(
+        item["status"] in {"pass", "fail"} for item in profile_results
+    )
+    covered_profiles = sum(item["reviewed_runs"] > 0 for item in profile_results)
+    if not reviewed_runs:
+        status = "no_data"
+    elif ready_profiles < len(profile_results):
+        status = "collecting"
+    elif any(item["status"] == "fail" for item in profile_results):
+        status = "fail"
+    else:
+        status = "pass"
+    return {
+        "status": status,
+        "runs": sum(item["runs"] for item in profile_results),
+        "reviewed_runs": reviewed_runs,
+        "first_pass_usable_runs": first_pass_runs,
+        "first_pass_usable_rate": round(
+            first_pass_runs / reviewed_runs if reviewed_runs else 0.0, 4
+        ),
+        "covered_profiles": covered_profiles,
+        "required_profiles": len(profile_results),
+        "ready_profiles": ready_profiles,
+        "minimum_reviewed_runs": minimum_reviewed_runs,
+        "minimum_first_pass_rate": minimum_first_pass_rate,
+        "dimension_target": dimension_target,
+        "top_failure_dimensions": [
+            {"dimension": field, "count": count}
+            for field, count in sorted(
+                dimension_failures.items(), key=lambda item: (-item[1], item[0])
+            )
+            if count > 0
+        ],
+        "ignored_records": ignored_records,
+        "profiles": profile_results,
+    }
+
+
 def _canonical_digest(value: Mapping[str, Any]) -> str:
     encoded = json.dumps(
         dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -106,9 +271,7 @@ def build_isolated_storyboard(profile_id: str, contract: Mapping[str, Any]) -> d
     timeline = list(profile.get("script") or [])
     if not timeline:
         raise ValueError("quality canary profile script is empty")
-    dialogue_blocks = []
-    edits = []
-    voiceover_parts = []
+    normalized_beats = []
     for index, beat in enumerate(timeline, start=1):
         raw_range = str(beat.get("time") or "").split("-", 1)
         if len(raw_range) != 2:
@@ -121,18 +284,62 @@ def build_isolated_storyboard(profile_id: str, contract: Mapping[str, Any]) -> d
         if not speaker:
             raise ValueError("quality canary profile references an unknown speaker")
         dialogue = str(beat.get("dialogue") or "").strip()
-        dialogue_blocks.append({"speaker": speaker, "text": dialogue})
-        voiceover_parts.append(dialogue)
-        edits.append({
+        normalized_beats.append({
             "idx": index,
-            "video_master_idx": 1,
-            "audio_master_idx": 1,
-            "video_start": start,
-            "audio_start": start,
+            "start": start,
+            "end": end,
             "duration": duration,
-            "subtitle": dialogue,
+            "speaker": speaker,
+            "dialogue": dialogue,
+            "performance": str(beat.get("performance") or ""),
+            "scene": str(beat.get("scene") or profile["scene"]),
         })
-    primary = dialogue_blocks[0]["speaker"]
+    scene_groups: list[list[dict[str, Any]]] = []
+    for beat in normalized_beats:
+        if not scene_groups or scene_groups[-1][-1]["scene"] != beat["scene"]:
+            scene_groups.append([beat])
+        else:
+            scene_groups[-1].append(beat)
+    masters = []
+    edits = []
+    for master_idx, group in enumerate(scene_groups, start=1):
+        group_start = float(group[0]["start"])
+        group_end = float(group[-1]["end"])
+        dialogue_blocks = [
+            {"speaker": beat["speaker"], "text": beat["dialogue"]}
+            for beat in group
+        ]
+        speakers = list(dict.fromkeys(
+            str(beat["speaker"]) for beat in group
+        ))
+        masters.append({
+            "idx": master_idx,
+            "type": "dialogue",
+            "speaker": speakers[0],
+            "speakers": speakers,
+            "render_mode": "cinematic_character",
+            "duration": group_end - group_start,
+            "scene": str(group[0]["scene"]),
+            "action": "；".join(
+                str(beat["performance"]) for beat in group
+                if str(beat["performance"]).strip()
+            ),
+            "voiceover": " ".join(
+                str(beat["dialogue"]) for beat in group
+                if str(beat["dialogue"]).strip()
+            ),
+            "dialogue_blocks": dialogue_blocks,
+        })
+        for beat in group:
+            edits.append({
+                "idx": int(beat["idx"]),
+                "video_master_idx": master_idx,
+                "audio_master_idx": master_idx,
+                "video_start": float(beat["start"]) - group_start,
+                "audio_start": float(beat["start"]) - group_start,
+                "duration": float(beat["duration"]),
+                "subtitle": str(beat["dialogue"]),
+            })
     production_settings = {
         "budget_cents": int(contract["confirmed_budget_cents"]),
         "max_auto_retries": int(contract["max_auto_retries"]),
@@ -162,18 +369,7 @@ def build_isolated_storyboard(profile_id: str, contract: Mapping[str, Any]) -> d
         "production_settings": production_settings,
         "characters": characters,
         "hook": "固定短剧本真实 Provider 质量金丝雀",
-        "masters": [{
-            "idx": 1,
-            "type": "dialogue",
-            "speaker": primary,
-            "speakers": [character["id"] for character in characters],
-            "render_mode": "cinematic_character",
-            "duration": float(profile["duration_sec"]),
-            "scene": str(profile["scene"]),
-            "action": "；".join(str(beat.get("performance") or "") for beat in timeline),
-            "voiceover": " ".join(voiceover_parts),
-            "dialogue_blocks": dialogue_blocks,
-        }],
+        "masters": masters,
         "shots": edits,
         "bgm": {"mood": "restrained", "prompt": "克制、轻量、不覆盖对白"},
     }

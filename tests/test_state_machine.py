@@ -157,18 +157,61 @@ class ProductionStateMachineTests(unittest.TestCase):
         ))
         database.close()
 
+    def test_budget_pause_has_a_dedicated_transition(self):
+        database = self.connection()
+        transition(
+            database, "J-1", "production_started", event_id="E-start-budget",
+        )
+        result = transition(
+            database,
+            "J-1",
+            "budget_paused",
+            event_id="E-budget-pause",
+            updates={
+                "error": "下一次付费调用超过已确认预算",
+                "failure_code": "budget_confirmation_required",
+                "production_worker_pid": None,
+            },
+        )
+        self.assertEqual(result.state, "BUDGET_CONFIRMATION_REQUIRED")
+        row = database.execute(
+            "SELECT state,error,failure_code FROM jobs WHERE job_id='J-1'"
+        ).fetchone()
+        self.assertEqual(tuple(row), (
+            "BUDGET_CONFIRMATION_REQUIRED",
+            "下一次付费调用超过已确认预算",
+            "budget_confirmation_required",
+        ))
+        database.close()
+
     def test_orchestrator_delegates_all_job_state_changes(self):
         source = inspect.getsource(orchestrator)
         self.assertNotIn("UPDATE jobs SET state", source)
         self.assertIn("transition(", source)
 
     def test_core_management_entries_delegate_job_state_changes(self):
-        for name in (
-            "start_video_job",
-            "dispatch_production_queue",
-            "resume_failed_video",
-            "review_master_candidate",
-        ):
+        service_backed_entries = {
+            "start_video_job": "_start_video_job_impl",
+            "resume_failed_video": "_resume_failed_video_impl",
+        }
+        for public_name, implementation_name in service_backed_entries.items():
+            with self.subTest(entry=public_name):
+                public_source = inspect.getsource(
+                    getattr(ManagementService, public_name)
+                )
+                implementation_source = inspect.getsource(
+                    getattr(ManagementService, implementation_name)
+                )
+                self.assertNotIn("UPDATE jobs SET state", public_source)
+                self.assertIn("self.production_service.", public_source)
+                self.assertNotIn(
+                    "UPDATE jobs SET state", implementation_source
+                )
+                self.assertIn(
+                    "state_machine.transition(", implementation_source
+                )
+
+        for name in ("dispatch_production_queue", "review_master_candidate"):
             with self.subTest(entry=name):
                 source = inspect.getsource(getattr(ManagementService, name))
                 self.assertNotIn("UPDATE jobs SET state", source)

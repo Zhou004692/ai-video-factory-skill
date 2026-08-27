@@ -1,0 +1,64 @@
+{
+  "fixture_version": 1,
+  "profile_id": "enhanced_multi_scene",
+  "title": "从调度中心到暴雨抢修现场",
+  "target_duration_sec": 30,
+  "characters": [
+    {"id": "linxia", "name": "林夏", "look": "成年女性设备租赁服务顾问"},
+    {"id": "zhougong", "name": "周工", "look": "成年男性现场工程师"}
+  ],
+  "beats": [
+    {
+      "id": "beat-1",
+      "kind": "dialogue",
+      "scene_id": "dispatch_center",
+      "scene": "白天的设备租赁调度中心，冷白顶光",
+      "characters": ["linxia", "zhougong"],
+      "speaker": "linxia",
+      "dialogue": "客户现场突发停机，我们先确认设备、人员和运输窗口",
+      "action": "林夏查看调度大屏，把现场信息递给周工",
+      "emotion": "紧迫、冷静",
+      "must_preserve": ["调度中心", "林夏发起任务", "完整台词"],
+      "may_adapt": ["大屏画面", "递交动作"]
+    },
+    {
+      "id": "beat-2",
+      "kind": "dialogue",
+      "scene_id": "dispatch_center",
+      "scene": "延续白天调度中心",
+      "characters": ["zhougong", "linxia"],
+      "speaker": "zhougong",
+      "dialogue": "高空平台已经完成验机，我现在带队出发",
+      "action": "周工接过平板确认设备编号，两人走向出口",
+      "emotion": "果断",
+      "must_preserve": ["完成验机", "周工带队出发", "人物身份连续"],
+      "may_adapt": ["出口方向", "镜头跟随"]
+    },
+    {
+      "id": "beat-3",
+      "kind": "dialogue",
+      "scene_id": "night_repair_site",
+      "scene": "夜间工厂抢修现场，雨后湿地面，暖色作业灯",
+      "characters": ["zhougong"],
+      "speaker": "zhougong",
+      "dialogue": "设备到位，先恢复主电缆，再检查控制系统",
+      "action": "周工从运输车旁走向高空平台，扣紧安全带",
+      "emotion": "专业、专注",
+      "must_preserve": ["夜间抢修现场", "主电缆优先", "周工身份连续"],
+      "may_adapt": ["运输车方位", "安全带特写"]
+    },
+    {
+      "id": "beat-4",
+      "kind": "dialogue",
+      "scene_id": "night_repair_site",
+      "scene": "延续夜间工厂抢修现场",
+      "characters": ["linxia", "zhougong"],
+      "speaker": "linxia",
+      "dialogue": "从调度到进场，全链路比计划提前二十分钟",
+      "action": "林夏与周工确认进度，镜头后移展示恢复运行的设备",
+      "emotion": "笃定、欣慰",
+      "must_preserve": ["林夏身份连续", "提前二十分钟", "设备恢复运行"],
+      "may_adapt": ["后移幅度", "设备景别"]
+    }
+  ]
+}

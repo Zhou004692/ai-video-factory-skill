@@ -5,6 +5,7 @@
 - broll → 仅画面，不生成随机人声
 """
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -484,6 +485,34 @@ class SeedanceBudgetError(RuntimeError):
     """The next paid provider call would exceed the confirmed job budget."""
 
     non_retryable = True
+    pause_state = "BUDGET_CONFIRMATION_REQUIRED"
+    stable_code = "budget_confirmation_required"
+
+    def __init__(
+        self, message: str, *, current_cost_cents: int = 0,
+        pending_cost_cents: int = 0, next_estimate_cents: int = 0,
+        budget_limit_cents: int = 0,
+    ):
+        super().__init__(message)
+        if not any((
+            current_cost_cents, pending_cost_cents,
+            next_estimate_cents, budget_limit_cents,
+        )):
+            parsed = re.search(
+                r"current=(\d+),\s*(?:pending|reserved)=(\d+),\s*"
+                r"next_estimate=(\d+),\s*limit=(\d+)\s*cents",
+                str(message or ""),
+                flags=re.IGNORECASE,
+            )
+            if parsed:
+                current_cost_cents = int(parsed.group(1))
+                pending_cost_cents = int(parsed.group(2))
+                next_estimate_cents = int(parsed.group(3))
+                budget_limit_cents = int(parsed.group(4))
+        self.current_cost_cents = max(0, int(current_cost_cents or 0))
+        self.pending_cost_cents = max(0, int(pending_cost_cents or 0))
+        self.next_estimate_cents = max(0, int(next_estimate_cents or 0))
+        self.budget_limit_cents = max(0, int(budget_limit_cents or 0))
 
 
 class SeedanceManualReviewPendingError(RuntimeError):
@@ -716,7 +745,11 @@ def _assert_paid_call_within_job_budget(
         raise SeedanceBudgetError(
             "Seedance job budget exceeded before paid call: "
             f"current={current}, pending={pending}, "
-            f"next_estimate={estimate}, limit={limit} cents"
+            f"next_estimate={estimate}, limit={limit} cents",
+            current_cost_cents=current,
+            pending_cost_cents=pending,
+            next_estimate_cents=estimate,
+            budget_limit_cents=limit,
         )
 
 
@@ -767,6 +800,32 @@ def _aggregate_shot_failures(
     ]
     if "PROVIDER_ACTION_REQUIRED" in pause_states:
         aggregate.pause_state = "PROVIDER_ACTION_REQUIRED"
+    elif pause_states and all(
+        state == "BUDGET_CONFIRMATION_REQUIRED" for state in pause_states
+    ):
+        aggregate.pause_state = "BUDGET_CONFIRMATION_REQUIRED"
+        budget_errors = [
+            error for _, error in failed
+            if str(getattr(error, "pause_state", "") or "")
+            == "BUDGET_CONFIRMATION_REQUIRED"
+        ]
+        if budget_errors:
+            aggregate.current_cost_cents = max(
+                int(getattr(error, "current_cost_cents", 0) or 0)
+                for error in budget_errors
+            )
+            aggregate.pending_cost_cents = sum(
+                int(getattr(error, "pending_cost_cents", 0) or 0)
+                for error in budget_errors
+            )
+            aggregate.next_estimate_cents = sum(
+                int(getattr(error, "next_estimate_cents", 0) or 0)
+                for error in budget_errors
+            )
+            aggregate.budget_limit_cents = max(
+                int(getattr(error, "budget_limit_cents", 0) or 0)
+                for error in budget_errors
+            )
     elif pause_states and all(
         state == "PRODUCTION_REVIEW_REQUIRED" for state in pause_states
     ):
@@ -1044,7 +1103,11 @@ def _assert_fixed_cost_within_job_budget(
         raise SeedanceBudgetError(
             "identity image budget exceeded before paid call: "
             f"current={current}, next_estimate={estimate_cents}, "
-            f"limit={limit} cents"
+            f"limit={limit} cents",
+            current_cost_cents=current,
+            pending_cost_cents=0,
+            next_estimate_cents=estimate_cents,
+            budget_limit_cents=limit,
         )
 
 
@@ -1150,6 +1213,7 @@ async def _ensure_character_identity_anchors(
     characters: list[dict],
     *,
     storyboard: dict | None = None,
+    existing_only: bool = False,
 ) -> dict[str, DialogueAnchor]:
     """Prepare every non-Volc character before any paid scene generation.
 
@@ -1224,6 +1288,13 @@ async def _ensure_character_identity_anchors(
                     anchor_mode="dynamic_video",
                 )
                 continue
+            if not entry["requires_paid_call"]:
+                continue
+
+        if existing_only:
+            raise RuntimeError(
+                f"frozen character anchor is not ready: {identity_key}"
+            )
 
         if not entry["requires_paid_call"]:
             database.execute(
@@ -1599,18 +1670,31 @@ async def _fallback_static_identity_anchors(
 async def _ensure_scene_visual_anchors(
     job_id: str,
     storyboard: dict,
+    *,
+    anchor_keys: set[str] | None = None,
+    existing_only: bool = False,
 ) -> dict[str, str]:
-    """Generate one empty-location anchor for each explicitly repeated scene.
+    """Generate the empty-location anchors required by this execution.
 
+    Legacy callers without ``anchor_keys`` retain the conservative repeated-
+    scene plan.  A compiled graph passes explicit keys; those are frozen
+    execution requirements and must be materialized even for a single master.
     Seedream returns the image directly. Seedance creates a four-second silent
     location clip and the canonical image contract uses its extracted frame.
     """
     database = conn()
     generation_snapshot = production_config.generation_snapshot(storyboard)
     resolved: dict[str, str] = {}
-    for ordinal, spec in enumerate(
-        scene_assets.recurring_scene_anchors(storyboard), start=1
-    ):
+    normalized_keys = {
+        str(value or "").strip().casefold() for value in (anchor_keys or set())
+        if str(value or "").strip()
+    }
+    anchor_specs = (
+        scene_assets.required_scene_anchors(storyboard, normalized_keys)
+        if normalized_keys
+        else scene_assets.recurring_scene_anchors(storyboard)
+    )
+    for ordinal, spec in enumerate(anchor_specs, start=1):
         spec = anchor_generation.decorate_scene_anchor(
             spec,
             storyboard,
@@ -1632,6 +1716,8 @@ async def _ensure_scene_visual_anchors(
         ):
             resolved[key] = str(existing["image_url"])
             continue
+        if existing_only:
+            raise RuntimeError(f"frozen scene anchor is not ready: {key}")
         database.execute(
             "INSERT INTO scene_visual_anchors("
             "job_id,anchor_key,description,master_indexes,state,approval_state,error) "
@@ -2091,7 +2177,11 @@ def _scene_cast_characters(
     those names is safer than the previous behaviour of injecting every story
     character into every shot.
     """
-    explicit = shot.get("cast") or []
+    explicit = list(shot.get("cast") or [])
+    explicit.extend(shot.get("speakers") or [])
+    for block in shot.get("dialogue_blocks") or []:
+        if isinstance(block, dict) and block.get("speaker"):
+            explicit.append(block["speaker"])
     explicit_names: set[str] = set()
     for item in explicit:
         if isinstance(item, dict):
@@ -4091,29 +4181,83 @@ async def _gen_broll(job_id: str, shot: dict,
             raise
 
 
-async def run(job_id: str) -> None:
+def _required_character_ids(units: list[dict]) -> set[str]:
+    """Return every character that can appear or speak in the target masters."""
+    required: set[str] = set()
+
+    def add(value: object) -> None:
+        if isinstance(value, dict):
+            value = value.get("id") or value.get("speaker")
+        normalized = str(value or "").strip()
+        if normalized:
+            required.add(normalized)
+
+    for unit in units:
+        for field in ("speaker", "anchor_character"):
+            add(unit.get(field))
+        for field in ("speakers", "cast"):
+            for member in unit.get(field) or []:
+                add(member)
+        for block in unit.get("dialogue_blocks") or []:
+            add(block.get("speaker") if isinstance(block, dict) else None)
+    return required
+
+
+async def run(
+    job_id: str,
+    *,
+    storyboard_override: dict | None = None,
+    characters_override: list[dict] | None = None,
+    target_master_indexes: set[int] | None = None,
+    prepare_anchors: bool = True,
+) -> None:
     db = conn()
     job = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
-    sb = json.loads(job["storyboard"])
-    chars = {c["id"]: c for c in json.loads(job["characters_json"])}
+    if not job:
+        raise ValueError(f"video job not found: {job_id}")
+    frozen_input = storyboard_override is not None
+    sb = (
+        deepcopy(storyboard_override)
+        if frozen_input else json.loads(job["storyboard"])
+    )
+    if characters_override is not None:
+        characters = deepcopy(list(characters_override))
+    else:
+        characters = json.loads(job["characters_json"])
+    chars = {c["id"]: c for c in characters}
     characters = list(chars.values())
     generation_units = sb.get("masters") or sb["shots"]
+    target_indexes = {
+        int(value) for value in (target_master_indexes or set())
+        if int(value) > 0
+    }
+    target_units = [
+        unit for unit in generation_units
+        if not target_indexes or int(unit.get("idx") or 0) in target_indexes
+    ]
+    if target_indexes and {
+        int(unit.get("idx") or 0) for unit in target_units
+    } != target_indexes:
+        raise ValueError("frozen master selection is not present in storyboard")
     generation_snapshot = production_config.generation_snapshot(sb)
     audio_mode = normalize_audio_mode(
         generation_snapshot.get("audio_mode")
         or os.getenv("DIALOGUE_AUDIO_MODE")
     )
-    bindings_changed = character_assets.apply_cached_bindings(db, characters)
-    bindings_changed = (
-        _resolve_real_person_bindings(db, characters) or bindings_changed
-    )
-    if audio_mode == AUDIO_MODE_FIXED_TTS:
+    bindings_changed = False
+    if not frozen_input:
+        bindings_changed = character_assets.apply_cached_bindings(db, characters)
+        bindings_changed = (
+            _resolve_real_person_bindings(db, characters) or bindings_changed
+        )
+    if audio_mode == AUDIO_MODE_FIXED_TTS and not frozen_input:
         bindings_changed = (
             _resolve_speaking_voice_bindings(db, characters, generation_units)
             or bindings_changed
         )
-    continuity_changed = scene_assets.apply_continuity_metadata(
-        sb, characters
+    continuity_changed = (
+        False if frozen_input
+        else scene_assets.apply_continuity_metadata(sb, characters)
     )
     dependency_graph = master_dependencies.build_master_dependency_graph(
         generation_units
@@ -4121,7 +4265,7 @@ async def run(job_id: str) -> None:
     if sb.get("master_dependency_graph") != dependency_graph:
         sb["master_dependency_graph"] = dependency_graph
         continuity_changed = True
-    if bindings_changed or continuity_changed:
+    if (bindings_changed or continuity_changed) and not frozen_input:
         db.execute(
             "UPDATE jobs SET storyboard=?,characters_json=? WHERE job_id=?",
             (
@@ -4142,12 +4286,17 @@ async def run(job_id: str) -> None:
     # Seedance submission. Matched rows become OK and disappear from the
     # pending-generation query below.
     if sb.get("production_mode") == "native_master_local_director":
-        asset_library.reuse_broll_assets(db, job_id, generation_units)
+        asset_library.reuse_broll_assets(db, job_id, target_units)
 
     all_pending_rows = db.execute(
         "SELECT * FROM shots WHERE job_id=? AND state!='OK' ORDER BY idx",
         (job_id,)
     ).fetchall()
+    if target_indexes:
+        all_pending_rows = [
+            row for row in all_pending_rows
+            if int(row["idx"]) in target_indexes
+        ]
     review_rows = [
         row for row in all_pending_rows
         if _is_manual_review_pending(dict(row))
@@ -4166,14 +4315,30 @@ async def run(job_id: str) -> None:
         db, "seedance", configured_limit=configured_concurrency
     ))
     results: list[tuple[int, Exception | None]] = []
+    required_character_ids = _required_character_ids(target_units)
+    required_scene_keys: set[str] = set()
+    for unit in target_units:
+        for field in ("scene_anchor_key", "site_anchor_key"):
+            value = str(unit.get(field) or "").strip().casefold()
+            if value:
+                required_scene_keys.add(value)
+    anchor_characters = [
+        character for character in characters
+        if not required_character_ids
+        or str(character.get("id") or "") in required_character_ids
+    ]
     identity_anchors = (
         await _ensure_character_identity_anchors(
-            job_id, characters, storyboard=sb
+            job_id, anchor_characters, storyboard=sb,
+            existing_only=not prepare_anchors,
         )
         if rows else {}
     )
     scene_anchors = (
-        await _ensure_scene_visual_anchors(job_id, sb) if rows else {}
+        await _ensure_scene_visual_anchors(
+            job_id, sb, anchor_keys=required_scene_keys,
+            existing_only=not prepare_anchors,
+        ) if rows else {}
     )
     if rows:
         _apply_anchor_review_mode(

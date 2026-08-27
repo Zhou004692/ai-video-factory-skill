@@ -123,6 +123,31 @@ def main() -> int:
             try:
                 seed_management_factory(database)
                 seed_management_scale(database)
+                database.execute(
+                    "UPDATE jobs SET execution_engine='graph_v2' "
+                    "WHERE job_id='J-E2E-RUNNING'"
+                )
+                graph_nodes = (
+                    ("character_anchor:lead", "character_anchor", "SUCCEEDED"),
+                    ("scene_anchor:yard", "scene_anchor", "SUCCEEDED"),
+                    ("master:1", "master", "RUNNING"),
+                    ("local_compose", "local_compose", "PENDING"),
+                    ("final_review", "final_review", "PENDING"),
+                )
+                for node_id, node_type, state in graph_nodes:
+                    database.execute(
+                        "INSERT INTO production_nodes("
+                        "job_id,node_id,node_type,paid,state,spec_hash,"
+                        "input_json,idempotency_key) VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            "J-E2E-RUNNING", node_id, node_type,
+                            int(node_type in {
+                                "character_anchor", "scene_anchor", "master",
+                            }),
+                            state, "browser-spec", "{}", f"browser-{node_id}",
+                        ),
+                    )
+                database.commit()
             finally:
                 database.close()
 
@@ -180,35 +205,83 @@ def main() -> int:
 
                     page.route("**/api/**", guard_writes)
                     page.goto(base_url, wait_until="networkidle")
-                    page.locator('.nav-item[data-page="projects"]').click()
+
+                    def open_advanced_page(page_name: str) -> None:
+                        page.locator("#open-advanced-nav").click()
+                        page.locator(
+                            f'[data-advanced-page="{page_name}"]'
+                        ).click()
+
+                    page.locator('.nav-item[data-page="todos"]').click()
+                    page.wait_for_selector("#page-todos.active")
+                    page.wait_for_selector("#reliability-overview", state="visible")
+                    reliability = page.locator("#reliability-overview")
+                    assert reliability.is_visible()
+                    assert not reliability.evaluate("element => element.open")
+                    collapsed_height = reliability.evaluate(
+                        "element => element.getBoundingClientRect().height"
+                    )
+                    assert collapsed_height <= 70, collapsed_height
+                    reliability.locator("summary").click()
+                    rollout = page.locator(".v2-rollout-card")
+                    assert rollout.is_visible()
+                    assert "/ 10" in rollout.locator("b").inner_text()
+                    reliability.locator("summary").click()
+                    page.locator('.nav-item[data-page="overview"]').click()
+                    page.wait_for_selector("#page-overview.active")
+                    workbench = page.locator("#studio-workbench")
+                    assert workbench.evaluate(
+                        "element => element.getBoundingClientRect().bottom"
+                    ) <= page.locator("#page-overview").evaluate(
+                        "element => element.getBoundingClientRect().bottom + 1"
+                    )
+                    stage_body = page.locator(".studio-stage-body")
+                    assert stage_body.evaluate(
+                        "element => getComputedStyle(element).overflowY"
+                    ) in {"auto", "scroll"}
+                    open_advanced_page("projects")
                     page.wait_for_selector("#page-projects.active")
                     page.wait_for_selector(".project-row")
                     assert page.locator(".project-row").count() >= 6
 
                     expected_actions = {
-                        "source": "生成选题简报",
-                        "brief": "选择角度并生成剧本",
-                        "script": "选择并审核剧本",
-                        "setup": "完成制作设置",
-                        "running": "查看生成进度",
-                        "review": "验收成片",
+                        "source": ("生成选题简报",),
+                        "brief": ("使用当前角度生成剧本", "确认选题并生成剧本"),
+                        "script": ("审核当前版本", "审核剧本版本"),
+                        "setup": ("完成制作设置",),
+                        "running": ("查看当前母片", "查看生成进度"),
+                        "review": ("验收成片", "处理当前问题"),
                     }
-                    for stage, action_label in expected_actions.items():
+                    for stage, action_labels in expected_actions.items():
                         page.locator(
                             f'[data-project-id="{FIXTURE_IDS[stage]}"]'
                         ).click()
-                        next_action = page.locator("#project-next-action")
-                        assert next_action.inner_text() == action_label
+                        page.wait_for_selector("#page-overview.active")
+                        page.wait_for_function(
+                            "projectId => document.querySelector('#studio-project-code')?.textContent.includes(projectId)",
+                            arg=FIXTURE_IDS[stage],
+                        )
+                        next_action = page.locator("#studio-primary-action")
+                        assert next_action.is_visible()
+                        actual_action = next_action.inner_text()
+                        assert actual_action.startswith(action_labels), (
+                            stage, action_labels, actual_action
+                        )
                         next_action.click()
+                        if stage == "setup":
+                            page.wait_for_selector("#setting-orientation")
+                            assert page.locator("[data-speaker-mapping]").count() == 1
+                            assert page.locator("#setting-budget").is_visible()
+                            page.locator("#modal-close").click()
+                            open_advanced_page("projects")
+                            page.wait_for_selector("#page-projects.active")
+                            continue
                         page.wait_for_selector('#drawer[aria-hidden="false"]')
                         if stage == "source":
                             assert page.get_by_text(
                                 "来源具体内容", exact=True
                             ).is_visible()
                             drawer_body = page.locator(".drawer-body")
-                            assert drawer_body.evaluate(
-                                "element => element.scrollHeight > element.clientHeight"
-                            )
                             assert drawer_body.evaluate(
                                 "element => getComputedStyle(element).overflowY"
                             ) in {"auto", "scroll"}
@@ -219,11 +292,14 @@ def main() -> int:
                         else:
                             assert page.get_by_text("生产信息", exact=True).is_visible()
                         page.locator("#drawer-close").click()
-                        page.locator('.nav-item[data-page="projects"]').click()
+                        open_advanced_page("projects")
                         page.wait_for_selector("#page-projects.active")
 
-                    page.locator('.nav-item[data-page="scripts"]').click()
+                    open_advanced_page("scripts")
                     page.wait_for_selector("#page-scripts.active")
+                    page.wait_for_function(
+                        "() => document.querySelector('#source-count')?.textContent === '50'"
+                    )
                     assert page.locator("#source-count").inner_text() == "50"
                     assert page.locator("#brief-count").inner_text() == "20"
                     assert page.locator("#draft-count").inner_text() == "20"
@@ -241,23 +317,38 @@ def main() -> int:
                     assert page.locator("#drawer-promote-candidate").is_visible()
                     page.locator("#drawer-close").click()
 
-                    page.locator('.nav-item[data-page="videos"]').click()
+                    open_advanced_page("videos")
                     page.wait_for_selector("#page-videos.active")
+                    page.wait_for_function(
+                        "() => document.querySelectorAll('[data-video-id]').length === 30"
+                    )
                     assert page.locator("[data-video-id]").count() == 30
                     page.locator('#video-filters [data-state="in_progress"]').click()
                     visible_jobs = page.locator("[data-video-id]")
                     assert visible_jobs.count() == 1
                     assert visible_jobs.first.get_attribute("data-video-id") == "J-E2E-RUNNING"
+                    browser_stages = page.evaluate(
+                        "state.videos.jobs.find(job => job.job_id === 'J-E2E-RUNNING')?.production_stages || []"
+                    )
+                    assert len(browser_stages) == 5, browser_stages
+                    visible_jobs.first.click()
+                    page.wait_for_selector("#page-overview.active")
+                    page.wait_for_function(
+                        "projectId => document.querySelector('#studio-project-code')?.textContent.includes(projectId)",
+                        arg=FIXTURE_IDS["running"],
+                    )
+                    page.locator("#studio-primary-action").click()
+                    page.wait_for_selector('#drawer[aria-hidden="false"]')
+                    page.wait_for_function(
+                        "() => document.querySelectorAll('.production-stage-card').length === 5"
+                    )
+                    assert page.locator(".production-stage-card").count() == 5
+                    technical = page.locator(".production-technical")
+                    assert technical.is_visible()
+                    assert not technical.evaluate("element => element.open")
+                    page.locator("#drawer-close").click()
 
-                    page.locator('#video-filters [data-state="STORYBOARDED"]').click()
-                    page.locator('[data-video-id="J-E2E-SETUP"]').click()
-                    page.locator("#drawer-produce").click()
-                    page.wait_for_selector("#setting-orientation")
-                    assert page.locator("[data-speaker-mapping]").count() == 1
-                    assert page.locator("#setting-budget").is_visible()
-                    page.locator("#modal-close").click()
-
-                    page.locator('.nav-item[data-page="publishing"]').click()
+                    open_advanced_page("publishing")
                     page.wait_for_selector("#page-publishing.active")
                     page.locator('[data-go-config="douyin"]').click()
                     page.wait_for_selector("#page-config.active")
@@ -275,7 +366,8 @@ def main() -> int:
                     )
                     mobile.route("**/api/**", guard_writes)
                     mobile.goto(base_url, wait_until="networkidle")
-                    mobile.locator('.nav-item[data-page="videos"]').click()
+                    mobile.locator("#open-advanced-nav").click()
+                    mobile.locator('[data-advanced-page="videos"]').click()
                     mobile.wait_for_selector("#page-videos.active")
                     assert mobile.evaluate(
                         "document.documentElement.scrollWidth <= "

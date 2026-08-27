@@ -17,6 +17,7 @@ ROOT_FILES = (
     "CHANGELOG.md",
     "SKILL.md",
     "VERSION",
+    "安装 AI 视频工厂.cmd",
 )
 
 DIRECTORY_RULES = {
@@ -59,7 +60,7 @@ EXCLUDED_PARTS = {
 }
 
 TEXT_EXTENSIONS = {
-    ".md", ".yaml", ".yml", ".json", ".py", ".ps1", ".txt", ".example",
+    ".md", ".yaml", ".yml", ".json", ".py", ".ps1", ".cmd", ".txt", ".example",
 }
 
 AUDIT_RULES = {

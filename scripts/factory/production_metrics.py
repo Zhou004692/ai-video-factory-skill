@@ -22,6 +22,10 @@ RECOVERY_SUCCESS_EVENTS = frozenset({
 RECOVERY_ATTEMPT_EVENTS = RECOVERY_SUCCESS_EVENTS | frozenset({
     "recovery_failed", "recovery_required",
 })
+ENGINEERING_INTERVENTION_TYPES = frozenset({
+    "database_edit", "standalone_script_restart", "manual_file_injection",
+    "engineering_recovery_command",
+})
 
 
 def record_review(
@@ -328,3 +332,189 @@ def reliability_trends(
         report["date"] = start.date().isoformat()
         result.append(report)
     return result
+
+
+def record_engineering_intervention(
+    database: sqlite3.Connection,
+    job_id: str,
+    intervention_type: str,
+    *,
+    description: str = "",
+) -> None:
+    if intervention_type not in ENGINEERING_INTERVENTION_TYPES:
+        raise ValueError("unknown engineering intervention type")
+    database.execute(
+        "INSERT INTO production_interventions("
+        "job_id,intervention_type,description) VALUES(?,?,?)",
+        (job_id, intervention_type, str(description or "")),
+    )
+    database.commit()
+
+
+def production_v2_summary(database: sqlite3.Connection) -> dict[str, Any]:
+    """Release metrics for graph_v2 jobs and their latest compilation mode."""
+    jobs = database.execute(
+        "SELECT job_id,state,cost_cents,failure_code,created_at,updated_at,"
+        "production_started_at,production_heartbeat_at "
+        "FROM jobs WHERE execution_engine='graph_v2' ORDER BY created_at,job_id"
+    ).fetchall()
+    job_ids = [str(row["job_id"]) for row in jobs]
+    if not job_ids:
+        return {
+            "total_real_jobs": 0,
+            "compilation_success_rate": 0.0,
+            "first_pass_usable_rate": 0.0,
+            "unknown_stuck_jobs": 0,
+            "deterministic_runtime_escape": 0,
+            "manual_review_rate": 0.0,
+            "recovery_success_rate": 1.0,
+            "duplicate_paid_submissions": 0,
+            "cost_variance_cents": 0,
+            "duration_seconds": {"p50": 0.0, "p95": 0.0},
+            "modes": {},
+            "switch_gate": {"eligible": False, "failed": ["total_real_jobs"]},
+        }
+    placeholders = ",".join("?" for _ in job_ids)
+    compilation_rows = database.execute(
+        "SELECT c.job_id,c.status,c.mode FROM production_compilation_runs c "
+        "JOIN (SELECT job_id,MAX(run_id) run_id FROM production_compilation_runs "
+        f"WHERE job_id IN ({placeholders}) GROUP BY job_id) latest "
+        "ON latest.run_id=c.run_id",
+        job_ids,
+    ).fetchall()
+    compilation = {str(row["job_id"]): row for row in compilation_rows}
+    reviews = database.execute(
+        "SELECT job_id,decision,first_pass FROM review_events "
+        f"WHERE job_id IN ({placeholders}) ORDER BY id",
+        job_ids,
+    ).fetchall()
+    review_by_job: dict[str, list[sqlite3.Row]] = {}
+    for row in reviews:
+        review_by_job.setdefault(str(row["job_id"]), []).append(row)
+    interventions = {
+        str(row["job_id"]) for row in database.execute(
+            "SELECT DISTINCT job_id FROM production_interventions "
+            f"WHERE job_id IN ({placeholders})",
+            job_ids,
+        ).fetchall()
+    }
+    calls = database.execute(
+        "SELECT job_id,usage_json FROM provider_calls "
+        f"WHERE job_id IN ({placeholders})",
+        job_ids,
+    ).fetchall()
+    transitions = database.execute(
+        "SELECT job_id,event FROM job_transitions "
+        f"WHERE job_id IN ({placeholders})",
+        job_ids,
+    ).fetchall()
+    recovery_events = [
+        str(row["event"]) for row in transitions
+        if str(row["event"]) in RECOVERY_ATTEMPT_EVENTS
+    ]
+    recovery_successes = sum(
+        event in RECOVERY_SUCCESS_EVENTS for event in recovery_events
+    )
+    reviewed_jobs = set(review_by_job)
+    first_pass_usable = {
+        job_id for job_id, job_reviews in review_by_job.items()
+        if job_id not in interventions and any(
+            str(row["decision"]) == "approved"
+            and int(row["first_pass"] or 0) == 1
+            for row in job_reviews
+        )
+    }
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(seconds=120)
+    unknown_stuck = 0
+    for row in jobs:
+        state = str(row["state"] or "")
+        if state == "RECOVERY_REQUIRED":
+            unknown_stuck += 1
+        elif state == "PRODUCTION_RUNNING":
+            heartbeat = _parse_timestamp(
+                row["production_heartbeat_at"] or row["production_started_at"]
+            )
+            if heartbeat is not None and heartbeat < stale_cutoff:
+                unknown_stuck += 1
+    deterministic_escapes = sum(
+        str(row["failure_code"] or "") in DETERMINISTIC_FAILURE_CODES
+        for row in jobs
+    )
+    duplicate_submissions = sum(
+        bool(_usage(row["usage_json"]).get("duplicate_submission"))
+        for row in calls
+    )
+    estimated = int(database.execute(
+        "SELECT COALESCE(SUM(estimated_cost_cents),0) FROM production_nodes "
+        f"WHERE job_id IN ({placeholders}) AND paid=1",
+        job_ids,
+    ).fetchone()[0])
+    actual = sum(int(row["cost_cents"] or 0) for row in jobs)
+    durations = []
+    for row in jobs:
+        created = _parse_timestamp(row["created_at"])
+        updated = _parse_timestamp(row["updated_at"])
+        if created and updated:
+            durations.append(max(0.0, (updated - created).total_seconds()))
+    modes: dict[str, dict[str, object]] = {}
+    for mode in ("stable", "enhanced", "experimental"):
+        mode_jobs = {
+            job_id for job_id, row in compilation.items()
+            if str(row["mode"] or "") == mode
+        }
+        mode_reviewed = mode_jobs & reviewed_jobs
+        explicit_decisions = {
+            job_id for job_id in mode_reviewed if review_by_job.get(job_id)
+        }
+        modes[mode] = {
+            "jobs": len(mode_jobs),
+            "first_pass_usable_rate": _ratio(
+                len(mode_jobs & first_pass_usable), len(mode_reviewed)
+            ),
+            "explicit_human_decision_rate": _ratio(
+                len(explicit_decisions), len(mode_jobs)
+            ),
+        }
+    report = {
+        "total_real_jobs": len(job_ids),
+        "compilation_success_rate": _ratio(
+            sum(
+                str(row["status"]) in {"match", "compatible_difference"}
+                for row in compilation_rows
+            ),
+            len(job_ids),
+        ),
+        "first_pass_usable_rate": _ratio(
+            len(first_pass_usable), len(reviewed_jobs)
+        ),
+        "unknown_stuck_jobs": int(unknown_stuck),
+        "deterministic_runtime_escape": int(deterministic_escapes),
+        "manual_review_rate": _ratio(len(reviewed_jobs), len(job_ids)),
+        "recovery_success_rate": (
+            _ratio(recovery_successes, len(recovery_events))
+            if recovery_events else 1.0
+        ),
+        "duplicate_paid_submissions": int(duplicate_submissions),
+        "cost_variance_cents": actual - estimated,
+        "duration_seconds": {
+            "p50": round(_percentile(durations, 0.50), 3),
+            "p95": round(_percentile(durations, 0.95), 3),
+        },
+        "modes": modes,
+    }
+    checks = {
+        "total_real_jobs": report["total_real_jobs"] >= 10,
+        "unknown_stuck_jobs": report["unknown_stuck_jobs"] == 0,
+        "deterministic_runtime_escape": report["deterministic_runtime_escape"] == 0,
+        "duplicate_paid_submissions": report["duplicate_paid_submissions"] == 0,
+        "recovery_success_rate": report["recovery_success_rate"] == 1.0,
+        "stable_first_pass_usable_rate": modes["stable"]["first_pass_usable_rate"] >= 0.90,
+        "enhanced_first_pass_usable_rate": modes["enhanced"]["first_pass_usable_rate"] >= 0.75,
+        "experimental_jobs_have_explicit_human_decision": modes["experimental"]["explicit_human_decision_rate"] == 1.0,
+    }
+    report["switch_gate"] = {
+        "eligible": all(checks.values()),
+        "checks": checks,
+        "failed": [name for name, passed in checks.items() if not passed],
+    }
+    return report

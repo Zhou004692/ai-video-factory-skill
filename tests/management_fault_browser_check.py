@@ -482,7 +482,10 @@ def run_lip_sync_evidence_repair(browser, base_url: str) -> None:
     page.locator("#confirm-lip-sync-repair").click()
     page.wait_for_timeout(200)
 
-    assert posts == [{
+    repair_posts = [
+        item for item in posts if item["path"].endswith("/lip-sync-repair")
+    ]
+    assert repair_posts == [{
         "path": "/api/videos/J-BROWSER-LIP-SYNC/masters/1/lip-sync-repair",
         "body": {
             "repair_start_sec": 2.4,
@@ -490,6 +493,14 @@ def run_lip_sync_evidence_repair(browser, base_url: str) -> None:
             "reason": "\u53ea\u4fee\u590d\u8be5\u53e5\u53e3\u578b",
         },
     }], posts
+    compile_posts = [
+        item for item in posts if item["path"].endswith("/compile")
+    ]
+    assert compile_posts == [{
+        "path": "/api/videos/J-BROWSER-LIP-SYNC/compile",
+        "body": {},
+    }], posts
+    assert len(posts) == len(repair_posts) + len(compile_posts), posts
     assert not any(item["path"].endswith("/produce") for item in posts)
     assert not any(item["path"].endswith("/candidate-review") for item in posts)
     assert_clean(page, errors, bad)
@@ -568,9 +579,16 @@ def run_provider_recovery_ready(browser, base_url: str) -> None:
     assert duplicate_ids == [], duplicate_ids
     page.locator("#drawer-next-action").click()
     page.wait_for_timeout(150)
-    assert posts == [{
-        "path": "/api/videos/J-BROWSER-PROVIDER-RECOVER/resume", "body": {},
-    }], posts
+    assert posts == [
+        {
+            "path": "/api/videos/J-BROWSER-PROVIDER-RECOVER/resume",
+            "body": {},
+        },
+        {
+            "path": "/api/videos/J-BROWSER-PROVIDER-RECOVER/compile",
+            "body": {},
+        },
+    ], posts
     assert page.get_by_text("生产预检与成本确认", exact=True).is_visible()
     assert page.get_by_text("模型账号与远端任务待处理", exact=True).count() == 0
     assert_clean(page, errors, bad)

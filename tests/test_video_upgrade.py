@@ -7395,6 +7395,83 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.anchor_generators.stop()
 
+    def test_explicit_required_scene_anchor_includes_single_master_scene(self):
+        storyboard = {
+            "masters": [{
+                "idx": 1,
+                "scene": "single-use equipment yard",
+                "scene_anchor_key": "yard-a",
+                "scene_anchor_description": "single-use equipment yard",
+                "blocking_anchor": {"axis": "preserve-180-degree-axis"},
+            }]
+        }
+
+        plan = scene_assets.required_scene_anchors(storyboard, {"yard-a"})
+
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["anchor_key"], "yard-a")
+        self.assertEqual(plan[0]["anchor_scope"], "scene")
+        self.assertEqual(plan[0]["master_indexes"], [1])
+        self.assertEqual(plan[0]["description"], "single-use equipment yard")
+        self.assertEqual(
+            plan[0]["blocking_anchor"],
+            {"axis": "preserve-180-degree-axis"},
+        )
+
+    async def test_explicit_graph_key_resolves_single_master_scene_anchor(self):
+        storyboard = {
+            "production_settings": {
+                "scene_anchor_generator": "seedream_5_0",
+            },
+            "masters": [{
+                "idx": 1,
+                "scene": "single-use equipment yard",
+                "scene_anchor_key": "yard-a",
+                "scene_anchor_description": "single-use equipment yard",
+            }],
+        }
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base = Path(tmp)
+            database_path = base / "factory.db"
+            image_path = base / "yard-a.png"
+            image_path.write_bytes(b"png")
+            with patch.dict(
+                os.environ, {"FACTORY_DB_PATH": str(database_path)}
+            ):
+                database = db.conn()
+                database.execute(
+                    "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        "J-SINGLE-SCENE", "T", "single scene",
+                        "PRODUCTION_RUNNING", json.dumps(storyboard),
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO scene_visual_anchors("
+                    "job_id,anchor_key,description,master_indexes,state,"
+                    "approval_state,generator,image_url,image_path) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        "J-SINGLE-SCENE", "yard-a",
+                        "single-use equipment yard", "[1]", "READY",
+                        "PENDING_REVIEW", "seedream_5_0",
+                        "https://assets/yard-a.png", str(image_path),
+                    ),
+                )
+                database.commit()
+
+                anchors = await s3_shots._ensure_scene_visual_anchors(
+                    "J-SINGLE-SCENE",
+                    storyboard,
+                    anchor_keys={"yard-a"},
+                    existing_only=True,
+                )
+
+        self.assertEqual(
+            anchors, {"yard-a": "https://assets/yard-a.png"}
+        )
+
     def test_distinct_subspaces_share_one_explicit_project_site_anchor(self):
         storyboard = {
             "masters": [
@@ -7489,6 +7566,51 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(s3_shots.normalize_anchor_review_mode(None), "manual")
         self.assertEqual(s3_shots.normalize_anchor_review_mode(""), "manual")
         self.assertEqual(s3_shots.normalize_anchor_review_mode("auto"), "auto")
+
+    def test_required_character_ids_include_every_dialogue_speaker(self):
+        units = [{
+            "idx": 1,
+            "speaker": "zhou_gong",
+            "speakers": ["zhou_gong", "lin_xia"],
+            "dialogue_blocks": [
+                {"speaker": "zhou_gong", "text": "今晚能交付吗"},
+                {"speaker": "lin_xia", "text": "可以准时交付"},
+            ],
+        }]
+
+        self.assertEqual(
+            s3_shots._required_character_ids(units),
+            {"zhou_gong", "lin_xia"},
+        )
+
+    def test_scene_cast_includes_structured_non_primary_dialogue_speaker(self):
+        characters = {
+            "zhou_gong": {
+                "id": "zhou_gong", "name": "周工",
+                "generation_mode": "ai_generated",
+            },
+            "lin_xia": {
+                "id": "lin_xia", "name": "林夏",
+                "generation_mode": "ai_generated",
+            },
+        }
+        shot = {
+            "idx": 1,
+            "speaker": "zhou_gong",
+            "speakers": ["zhou_gong", "lin_xia"],
+            "dialogue_blocks": [
+                {"speaker": "zhou_gong", "text": "今晚能交付吗"},
+                {"speaker": "lin_xia", "text": "可以准时交付"},
+            ],
+            "scene": "同一设备停放场，人物站位、设备和光线连续",
+            "action": "两人并肩向设备移动",
+        }
+
+        cast = s3_shots._scene_cast_characters(
+            shot, characters, "zhou_gong"
+        )
+
+        self.assertEqual([item["id"] for item in cast], ["lin_xia"])
 
     def test_auto_review_mode_approves_ready_generated_anchors(self):
         database = sqlite3.connect(":memory:")

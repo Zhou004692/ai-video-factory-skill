@@ -266,6 +266,77 @@ def recurring_scene_anchors(storyboard: dict) -> list[dict]:
     return [*exact_scene_anchors, *project_site_anchors]
 
 
+def required_scene_anchors(
+    storyboard: dict,
+    required_keys: set[str] | list[str] | tuple[str, ...],
+) -> list[dict]:
+    """Return the explicitly requested scene/site anchors.
+
+    ``recurring_scene_anchors`` is intentionally conservative for the legacy
+    pipeline: it avoids a paid anchor call for a location that appears only
+    once.  A compiled production graph is different.  Once the frozen graph
+    contains a scene-anchor node, that key is an execution requirement even
+    when only one compiled master uses it.  Re-applying the legacy recurrence
+    filter at execution time would make the graph impossible to complete.
+    """
+    normalized_keys = {
+        str(value or "").strip().casefold()
+        for value in required_keys
+        if str(value or "").strip()
+    }
+    if not normalized_keys:
+        return []
+
+    grouped: dict[str, dict] = {}
+    site_groups: dict[str, dict] = {}
+    for master in storyboard.get("masters") or []:
+        idx = int(master.get("idx") or 0)
+        if not idx:
+            continue
+
+        scene_key = str(
+            master.get("scene_anchor_key") or ""
+        ).strip().casefold()
+        if scene_key and scene_key in normalized_keys:
+            item = grouped.setdefault(scene_key, {
+                "anchor_key": scene_key,
+                "anchor_scope": "scene",
+                "description": str(
+                    master.get("scene_anchor_description")
+                    or master.get("scene") or ""
+                ).strip(),
+                "master_indexes": [],
+                "blocking_anchor": master.get("blocking_anchor") or {},
+            })
+            if idx not in item["master_indexes"]:
+                item["master_indexes"].append(idx)
+            if not item["description"] and master.get("scene"):
+                item["description"] = str(master["scene"]).strip()
+
+        site_key = str(
+            master.get("site_anchor_key") or ""
+        ).strip().casefold()
+        if site_key and site_key in normalized_keys:
+            item = site_groups.setdefault(site_key, {
+                "anchor_key": site_key,
+                "anchor_scope": "site",
+                "description": str(
+                    master.get("site_anchor_description")
+                    or master.get("scene_anchor_description")
+                    or master.get("scene") or ""
+                ).strip(),
+                "master_indexes": [],
+                "child_scene_keys": [],
+                "blocking_anchor": {},
+            })
+            if idx not in item["master_indexes"]:
+                item["master_indexes"].append(idx)
+            if scene_key and scene_key not in item["child_scene_keys"]:
+                item["child_scene_keys"].append(scene_key)
+
+    return [*grouped.values(), *site_groups.values()]
+
+
 def reference_anchor_key(master: dict, available_keys) -> str:
     """Prefer an exact scene anchor, then a broader project-site anchor."""
     normalized = {

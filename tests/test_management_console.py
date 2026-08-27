@@ -114,6 +114,34 @@ class ManagementServiceTests(unittest.TestCase):
             self.assertIn("duplicate_paid_submissions", window)
             self.assertIn("duration_seconds", window)
 
+    def test_overview_exposes_local_canary_first_pass_scorecard(self):
+        acceptance = self.root / "data" / "acceptance" / "run-1"
+        acceptance.mkdir(parents=True)
+        acceptance.joinpath("acceptance.json").write_text(json.dumps({
+            "run_id": "run-1",
+            "classification": "canary",
+            "profile_id": "single-speaker-8s-v1",
+            "completion_status": "complete",
+            "cost": {"actual_cents": 1216},
+            "quality": {
+                "final_review": {"decision": "approved", "first_pass": 1},
+                "manual_scores": {
+                    field: 4.5 for field in (
+                        "character_consistency", "scene_continuity", "staging",
+                        "performance", "lip_sync", "subtitle_sync",
+                        "readable_text", "editing_rhythm",
+                    )
+                },
+            },
+        }, ensure_ascii=False), encoding="utf-8")
+
+        scorecard = self.service.overview()["reliability"]["canary_scorecard"]
+
+        self.assertEqual(scorecard["runs"], 1)
+        self.assertEqual(scorecard["reviewed_runs"], 1)
+        self.assertEqual(scorecard["first_pass_usable_rate"], 1.0)
+        self.assertEqual(scorecard["covered_profiles"], 1)
+
     def test_explicit_canary_entry_creates_isolated_storyboard_without_provider_call(self):
         result = self.service.create_quality_canary({
             "profile_id": "single-speaker-8s-v1",
@@ -2124,6 +2152,7 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual(anchor["master_indexes"], [1, 2])
         self.assertEqual(anchor["cost_cents"], 29)
         self.assertIn("/scenes/", anchor["preview_url"])
+        self.assertRegex(anchor["preview_url"], r"\?v=\d+$")
         self.assertEqual(
             self.service.scene_anchor_preview_file(
                 "J-SCENE-UI", scene_assets.anchor_token("repair-bay-a")
@@ -2229,6 +2258,70 @@ class ManagementServiceTests(unittest.TestCase):
             "SELECT state FROM jobs WHERE job_id='J-ANCHOR-WAIT'"
         ).fetchone()[0]
         self.assertEqual(state, "ANCHOR_REVIEW_REQUIRED")
+
+    def test_approve_continuity_anchors_rejects_missing_required_character_anchor(self):
+        storyboard = {
+            "masters": [{
+                "idx": 1,
+                "speaker": "zhou_gong",
+                "speakers": ["zhou_gong", "lin_xia"],
+                "dialogue_blocks": [
+                    {"speaker": "zhou_gong", "text": "今晚能交付吗"},
+                    {"speaker": "lin_xia", "text": "可以准时交付"},
+                ],
+            }],
+        }
+        characters = [
+            {
+                "id": "zhou_gong", "name": "周工",
+                "identity_type": "custom", "generation_mode": "ai_generated",
+            },
+            {
+                "id": "lin_xia", "name": "林夏",
+                "identity_type": "custom", "generation_mode": "ai_generated",
+            },
+        ]
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,characters_json) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                "J-ANCHOR-MISSING", "T-ANCHOR-MISSING", "双人锚点",
+                "ANCHOR_REVIEW_REQUIRED",
+                json.dumps(storyboard, ensure_ascii=False),
+                json.dumps(characters, ensure_ascii=False),
+            ),
+        )
+        self.database.execute(
+            "INSERT INTO character_identity_anchors("
+            "job_id,identity_key,character_id,display_name,source_type,state,"
+            "approval_state) VALUES(?,?,?,?,?,'READY','PENDING_REVIEW')",
+            (
+                "J-ANCHOR-MISSING", "script:周工", "zhou_gong", "周工",
+                "seedance_identity_master",
+            ),
+        )
+        self.database.commit()
+
+        with mock.patch.object(
+            self.service, "dispatch_production_queue"
+        ) as dispatch:
+            with self.assertRaisesRegex(
+                ValueError, "missing required character anchors"
+            ):
+                self.service.approve_continuity_anchors("J-ANCHOR-MISSING")
+
+        state = self.database.execute(
+            "SELECT state FROM jobs WHERE job_id='J-ANCHOR-MISSING'"
+        ).fetchone()[0]
+        self.assertEqual(state, "ANCHOR_REVIEW_REQUIRED")
+        dispatch.assert_not_called()
+        self.assertEqual(
+            self.database.execute(
+                "SELECT COUNT(*) FROM provider_calls "
+                "WHERE job_id='J-ANCHOR-MISSING'"
+            ).fetchone()[0],
+            0,
+        )
 
     def test_approved_review_requires_every_check_to_pass(self):
         final = self.root / "data" / "checks.mp4"
@@ -2776,6 +2869,95 @@ class ManagementServiceTests(unittest.TestCase):
         )
         self.assertEqual(candidate_path.read_bytes(), b"original review candidate")
 
+    def test_video_list_uses_each_master_own_lip_sync_evidence(self):
+        storyboard = {
+            "masters": [{
+                "idx": 1,
+                "type": "dialogue",
+                "duration": 8,
+                "speaker": "林夏",
+                "voiceover": "第一条母片台词",
+            }, {
+                "idx": 2,
+                "type": "dialogue",
+                "duration": 8,
+                "speaker": "周工",
+                "voiceover": "第二条母片台词",
+            }],
+            "shots": [{
+                "idx": 1,
+                "video_master_idx": 1,
+                "audio_master_idx": 1,
+                "duration": 8,
+            }, {
+                "idx": 2,
+                "video_master_idx": 2,
+                "audio_master_idx": 2,
+                "duration": 8,
+            }],
+            "production_settings": {"budget_cents": 5000},
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-LIP-PER-MASTER','T-1','逐母片口型证据',"
+            "'PRODUCTION_REVIEW_REQUIRED',?,1000)",
+            (json.dumps(storyboard, ensure_ascii=False),),
+        )
+        for idx, start, end, offset in (
+            (1, 1.0, 2.0, 120),
+            (2, 5.0, 6.0, 420),
+        ):
+            candidate = (
+                self.root / "data" / "assets" / "J-LIP-PER-MASTER"
+                / "shots" / "review" / f"{idx:02d}-candidate.mp4"
+            )
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_bytes(f"candidate-{idx}".encode())
+            qa = {
+                "status": "manual_review_required",
+                "reasons": ["lip_sync_mismatch"],
+                "candidate_path": str(candidate),
+                "result": {
+                    "lip_sync_evidence": {
+                        "overall_alignment": 0.5,
+                        "confidence": 0.9,
+                        "segments": [{
+                            "start_sec": start,
+                            "end_sec": end,
+                            "alignment": 0.4,
+                            "confidence": 0.9,
+                            "offset_ms": offset,
+                            "dialogue": f"第{idx}条",
+                            "reason": f"第{idx}条口型偏差",
+                            "severity": "high",
+                        }],
+                    },
+                },
+            }
+            self.database.execute(
+                "INSERT INTO shots(job_id,idx,duration_sec,state,provider,"
+                "cost_cents,video_qa) VALUES('J-LIP-PER-MASTER',?,8,"
+                "'REVIEW_REQUIRED','seedance',500,?)",
+                (idx, json.dumps(qa, ensure_ascii=False)),
+            )
+        self.database.commit()
+
+        visible_job = next(
+            job for job in self.service.videos()["jobs"]
+            if job["job_id"] == "J-LIP-PER-MASTER"
+        )
+        suggestions = {
+            int(shot["idx"]): shot["lip_sync_repair_suggestion"]
+            for shot in visible_job["shots"]
+        }
+
+        self.assertEqual(suggestions[1]["start_sec"], 0.75)
+        self.assertEqual(suggestions[1]["end_sec"], 2.25)
+        self.assertIn("120ms", suggestions[1]["reason"])
+        self.assertEqual(suggestions[2]["start_sec"], 4.75)
+        self.assertEqual(suggestions[2]["end_sec"], 6.25)
+        self.assertIn("420ms", suggestions[2]["reason"])
+
     def test_video_api_exposes_lip_sync_repair_before_after_comparison(self):
         asset_root = (
             self.root / "data" / "assets" / "J-LIP-COMPARE" / "shots"
@@ -3059,7 +3241,7 @@ class ManagementServiceTests(unittest.TestCase):
         ])
         self.assertEqual(paid_master.read_bytes(), b"paid-ok-master")
 
-    def test_legacy_storyboard_can_upgrade_before_any_paid_call(self):
+    def test_legacy_storyboard_upgrade_does_not_add_unrequested_broll(self):
         self._insert_editable_content(approved=True, script_approved=True)
         legacy_storyboard = {
             "production_profile": "standard",
@@ -3088,13 +3270,15 @@ class ManagementServiceTests(unittest.TestCase):
 
         result = self.service.upgrade_director_plan("J-TOPIC-EDIT")
 
-        self.assertEqual(result["director_plan"]["strategy"], "dialogue_plus_broll")
+        self.assertEqual(
+            result["director_plan"]["strategy"], "cinematic_dialogue_only"
+        )
         upgraded = json.loads(self.database.execute(
             "SELECT storyboard FROM jobs WHERE job_id='J-TOPIC-EDIT'"
         ).fetchone()[0])
         self.assertEqual(upgraded["production_settings"]["orientation"], "16:9")
         self.assertEqual(upgraded["production_settings"]["budget_cents"], 3600)
-        self.assertEqual(upgraded["director_plan"]["broll_master_count"], 1)
+        self.assertEqual(upgraded["director_plan"]["broll_master_count"], 0)
         refreshed = self.service.videos()["jobs"][0]
         self.assertFalse(refreshed["director_plan_upgradeable"])
 
@@ -3193,7 +3377,7 @@ class ManagementServiceTests(unittest.TestCase):
             return_value={"dispatched_jobs": []},
         ) as dispatch:
             view = self.service.videos()["jobs"][0]
-            with self.assertRaisesRegex(ValueError, "高风险"):
+            with self.assertRaisesRegex(ValueError, "高复杂度"):
                 self.service.start_video_job("J-RISK", confirmed=True)
             result = self.service.start_video_job(
                 "J-RISK", confirmed=True, high_risk_confirmed=True
@@ -3201,6 +3385,12 @@ class ManagementServiceTests(unittest.TestCase):
 
         self.assertTrue(view["preflight"]["requires_long_master_confirmation"])
         self.assertEqual(view["preflight"]["high_risk_master_indexes"], [1])
+        self.assertTrue(
+            view["preflight"]["requires_master_feasibility_confirmation"]
+        )
+        self.assertEqual(
+            view["preflight"]["high_complexity_master_indexes"], [1]
+        )
         self.assertEqual(result["status"], "queued")
         dispatch.assert_called_once()
 
@@ -3317,6 +3507,179 @@ class ManagementServiceTests(unittest.TestCase):
         self.assertEqual(confirmed["current_cost_cents"], 0)
         self.assertEqual(confirmed["budget_cents"], 900)
         self.assertEqual(confirmed["pricing_version"], "seedance25-area-v1")
+
+    def test_confirm_video_budget_resumes_only_the_unpaid_budget_paused_node(self):
+        storyboard = {
+            "production_settings": {
+                "budget_cents": 6000,
+                "generation_snapshot": {
+                    "model": "doubao-seedance-2-5-260628",
+                    "resolution": "720p",
+                    "output_format": "mp4",
+                    "ratio": "9:16",
+                    "audio_mode": "native",
+                    "reference_video_budget": 1,
+                    "max_concurrent_masters": 1,
+                    "qa_enabled": True,
+                    "job_budget_cents": 6000,
+                    "max_auto_retries": 1,
+                    "auto_retry_budget_cents": 800,
+                },
+            },
+            "masters": [
+                {"idx": 1, "type": "dialogue", "duration": 18},
+                {"idx": 2, "type": "dialogue", "duration": 27},
+            ],
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents,"
+            "execution_engine,error,failure_code) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                "J-BUDGET-PAUSE", "T-1", "budget pause",
+                "BUDGET_CONFIRMATION_REQUIRED", json.dumps(storyboard), 3857,
+                "graph_v2", "budget exceeded", "budget_confirmation_required",
+            ),
+        )
+        self.database.executemany(
+            "INSERT INTO shots(job_id,idx,state,cost_cents) VALUES(?,?,?,?)",
+            [
+                ("J-BUDGET-PAUSE", 1, "OK", 1953),
+                ("J-BUDGET-PAUSE", 2, "PENDING", 0),
+            ],
+        )
+        self.database.executemany(
+            "INSERT INTO production_nodes(job_id,node_id,node_type,paid,state,"
+            "spec_hash,input_json,idempotency_key,estimated_cost_cents,"
+            "actual_cost_cents,error_code,next_action,output_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    "J-BUDGET-PAUSE", "master:1", "master", 1, "SUCCEEDED",
+                    "spec", "{}", "idem-budget-1", 1953, 1953, None, None, "{}",
+                ),
+                (
+                    "J-BUDGET-PAUSE", "master:2", "master", 1,
+                    "BUDGET_REQUIRED", "spec", "{}", "idem-budget-2", 1836,
+                    0, "budget_confirmation_required", "increase_job_budget",
+                    json.dumps({
+                        "current_cost_cents": 3857,
+                        "next_estimate_cents": 3672,
+                        "budget_limit_cents": 6000,
+                    }),
+                ),
+            ],
+        )
+        self.database.commit()
+
+        projected = next(
+            item for item in self.service.videos()["jobs"]
+            if item["job_id"] == "J-BUDGET-PAUSE"
+        )
+        self.assertEqual(
+            projected["budget_confirmation"][
+                "minimum_budget_without_retry_cents"
+            ],
+            7529,
+        )
+        with self.assertRaisesRegex(ValueError, "75.29"):
+            self.service.confirm_video_budget(
+                "J-BUDGET-PAUSE", confirmed=True,
+                approved_budget_cents=6000, max_auto_retries=0,
+            )
+
+        with mock.patch.object(
+            self.service, "dispatch_production_queue",
+            return_value={"dispatched_jobs": []},
+        ) as dispatch:
+            result = self.service.confirm_video_budget(
+                "J-BUDGET-PAUSE", confirmed=True,
+                approved_budget_cents=7529, max_auto_retries=0,
+            )
+
+        self.assertEqual(result["state"], "PRODUCTION_QUEUED")
+        self.assertEqual(result["resumed_master_indexes"], [2])
+        row = self.database.execute(
+            "SELECT state,storyboard,error,failure_code FROM jobs "
+            "WHERE job_id='J-BUDGET-PAUSE'"
+        ).fetchone()
+        settings = json.loads(row["storyboard"])["production_settings"]
+        self.assertEqual(row["state"], "PRODUCTION_QUEUED")
+        self.assertIsNone(row["error"])
+        self.assertIsNone(row["failure_code"])
+        self.assertEqual(settings["budget_cents"], 7529)
+        self.assertEqual(settings["generation_snapshot"]["job_budget_cents"], 7529)
+        self.assertEqual(settings["generation_snapshot"]["max_auto_retries"], 0)
+        self.assertEqual(
+            self.database.execute(
+                "SELECT state FROM production_nodes WHERE job_id=? AND node_id=?",
+                ("J-BUDGET-PAUSE", "master:2"),
+            ).fetchone()[0],
+            "READY",
+        )
+        dispatch.assert_called_once()
+
+    def test_legacy_unpaid_budget_failure_is_repaired_into_budget_pause(self):
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents,"
+            "execution_engine,error) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                "J-LEGACY-BUDGET", "T-1", "legacy budget", "STORYBOARDED",
+                json.dumps({"production_settings": {"budget_cents": 6000}}),
+                3857, "graph_v2", "1 shots failed",
+            ),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,state,error) VALUES(?,?,?,?)",
+            ("J-LEGACY-BUDGET", 2, "PENDING", None),
+        )
+        self.database.execute(
+            "INSERT INTO production_nodes(job_id,node_id,node_type,paid,state,"
+            "spec_hash,input_json,idempotency_key,estimated_cost_cents,"
+            "actual_cost_cents,error_code,output_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "J-LEGACY-BUDGET", "master:2", "master", 1, "FAILED",
+                "spec", "{}", "idem-legacy-budget", 1836, 0,
+                "RuntimeError", "{}",
+            ),
+        )
+        self.database.execute(
+            "INSERT INTO production_node_events(job_id,event_id,node_id,event,"
+            "from_state,to_state,payload_json) VALUES(?,?,?,?,?,?,?)",
+            (
+                "J-LEGACY-BUDGET", "legacy-budget-failed", "master:2",
+                "fail", "RUNNING", "FAILED", json.dumps({
+                    "error": "1 shots failed: #2: Seedance job budget exceeded "
+                    "before paid call: current=3857, pending=0, "
+                    "next_estimate=3672, limit=6000 cents",
+                }),
+            ),
+        )
+        self.database.commit()
+
+        repaired = self.service._repair_legacy_budget_pauses(
+            "J-LEGACY-BUDGET"
+        )
+
+        self.assertEqual(repaired, 1)
+        self.assertEqual(
+            self.database.execute(
+                "SELECT state,failure_code FROM jobs WHERE job_id=?",
+                ("J-LEGACY-BUDGET",),
+            ).fetchone()[:],
+            ("BUDGET_CONFIRMATION_REQUIRED", "budget_confirmation_required"),
+        )
+        node = self.database.execute(
+            "SELECT state,error_code,next_action,output_json "
+            "FROM production_nodes WHERE job_id=? AND node_id='master:2'",
+            ("J-LEGACY-BUDGET",),
+        ).fetchone()
+        self.assertEqual(node["state"], "BUDGET_REQUIRED")
+        self.assertEqual(node["error_code"], "budget_confirmation_required")
+        self.assertEqual(node["next_action"], "increase_job_budget")
+        self.assertEqual(
+            json.loads(node["output_json"])["next_estimate_cents"], 3672
+        )
 
     def test_completed_video_exposes_confirmed_cost_variance_without_reestimating(self):
         storyboard = {
@@ -8833,6 +9196,33 @@ class ManagementServiceTests(unittest.TestCase):
 
 
 class ManagementUiContractTests(unittest.TestCase):
+    def test_execution_contract_pause_has_one_click_safe_repair_route(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        server = (ROOT / "scripts" / "management_server.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("action==='repair_execution_contract'", js)
+        self.assertIn("function repairExecutionContract(job)", js)
+        self.assertIn("/execution-contract/repair", js)
+        self.assertIn('endswith("/execution-contract/repair")', server)
+
+    def test_budget_pause_has_explicit_confirmation_action(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        server = (ROOT / "scripts" / "management_server.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("BUDGET_CONFIRMATION_REQUIRED", js)
+        self.assertIn("increase_job_budget", js)
+        self.assertIn("confirmVideoBudget", js)
+        self.assertIn("/budget-confirmation", js)
+        self.assertIn('endswith("/budget-confirmation")', server)
+
     def test_video_drawer_consumes_backend_next_action_as_its_only_primary_action(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
@@ -8912,15 +9302,25 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("checked", js)
         self.assertIn("pending", js)
 
-    def test_ui_requires_explicit_confirmation_for_high_risk_long_masters(self):
+    def test_ui_requires_explicit_confirmation_for_high_complexity_masters(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("requires_long_master_confirmation", js)
+        self.assertIn("requires_master_feasibility_confirmation", js)
         self.assertIn("high-risk-master-confirm", js)
         self.assertIn("high_risk_confirmed", js)
-        self.assertIn("长母片质量风险", js)
+        self.assertIn("母片可生成性风险", js)
+
+    def test_ui_exposes_canary_first_pass_quality_scorecard(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("canary_scorecard", js)
+        self.assertIn("首遍成片可用率", js)
+        self.assertIn("质量样本覆盖", js)
+        self.assertIn("top_failure_dimensions", js)
 
     def test_optimized_non_concurrency_controls_are_exposed_inline(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -9229,31 +9629,54 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn('id="global-video-review-count"', html)
         self.assertIn("global-video-review-count", js)
         self.assertIn("const reviewJobs=", js)
-        self.assertIn(
-            "'video-review':()=>reviewJobs.length?openVideoDrawer(reviewJobs[0])",
-            js,
-        )
+        self.assertIn("function globalProjectCollections", js)
+        self.assertIn("state.globalProjectFilter", js)
         self.assertIn("button.dataset.state===state.videoFilter", js)
         self.assertIn(
             ".action-items{grid-template-columns:repeat(4,1fr)}",
             (ui_root / "styles.css").read_text(encoding="utf-8"),
         )
 
+    def test_smart_collections_filter_the_project_library_instead_of_opening_arbitrary_projects(self):
+        ui_root = ROOT / "scripts" / "management_ui"
+        html = (ui_root / "index.html").read_text(encoding="utf-8")
+        js = (ui_root / "app.js").read_text(encoding="utf-8")
+        parity_css = (ui_root / "studio-preview-parity.css").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('id="global-filter-reset"', html)
+        self.assertIn('id="global-project-list-title"', html)
+        self.assertIn("需人工处理", html)
+        self.assertIn("function globalProjectCollections", js)
+        self.assertIn("function globalProjectCollectionReason", js)
+        self.assertIn("globalProjectFilter:'all'", js)
+        self.assertIn("button.classList.toggle('active'", js)
+        self.assertIn("state.globalProjectFilter=", js)
+        self.assertNotIn(
+            '[data-global-filter="video-review"]{display:none}', parity_css
+        )
+
     def test_recent_business_events_open_their_related_record(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )
+        recent = js[
+            js.index("async function openRecentEvent") : js.index(
+                "function bindRecentEvents"
+            )
+        ]
 
         self.assertIn("openRecentEvent", js)
         self.assertIn("data-event-id", js)
-        self.assertIn("event.draft_id", js)
-        self.assertIn("event.publication_id", js)
-        self.assertIn("await navigate('scripts')", js)
-        self.assertIn("await navigate('videos')", js)
-        self.assertIn("await navigate('publishing')", js)
+        self.assertIn("event.draft_id", recent)
+        self.assertIn("event.publication_id", recent)
+        self.assertGreaterEqual(recent.count("openEntityInProject("), 3)
+        self.assertNotIn("navigate('scripts')", recent)
+        self.assertNotIn("navigate('videos')", recent)
+        self.assertNotIn("navigate('publishing')", recent)
         self.assertIn("recentEvents:[]", js)
-        self.assertIn("studio-project-events", js)
-        self.assertIn("data-studio-event-id", js)
+        self.assertIn("data-event-id", js)
 
     def test_project_next_action_waits_for_loaded_data_before_opening_record(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -9266,10 +9689,32 @@ class ManagementUiContractTests(unittest.TestCase):
         ]
 
         self.assertIn("async function routeProjectAction", js)
-        self.assertIn("await navigate('scripts')", route)
-        self.assertIn("await navigate('videos')", route)
+        self.assertIn("await openProjectStudio(project,actionStage,focus)", route)
+        self.assertNotIn("navigate('scripts')", route)
+        self.assertNotIn("navigate('videos')", route)
+        self.assertIn("openBriefDrawer", route)
+        self.assertIn("const related=studioRelated(activeProject)", route)
         self.assertIn("openDraftDrawer", route)
         self.assertNotIn("setTimeout", route)
+
+    def test_review_script_action_opens_the_current_version_without_prompt(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        route = js[
+            js.index("async function routeProjectAction") : js.index(
+                "function renderScripts"
+            )
+        ]
+        review_branch = route[
+            route.index("if(project.next_action==='review_script')") : route.index(
+                "if(['configure_video'"
+            )
+        ]
+
+        self.assertIn("drafts[state.studioOutlineIndex]", review_branch)
+        self.assertIn("openDraftDrawer", review_branch)
+        self.assertNotIn("请选择左侧剧本版本", review_branch)
 
     def test_project_without_drafts_routes_to_brief_for_script_generation(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -9281,46 +9726,172 @@ class ManagementUiContractTests(unittest.TestCase):
             )
         ]
 
-        self.assertIn("generate_scripts:'选择角度并生成剧本'", js)
+        self.assertIn("generate_scripts:'确认选题并生成剧本'", js)
         self.assertIn("if(project.next_action==='generate_scripts')", route)
-        self.assertIn("const stayInWorkbench=state.page==='overview'", route)
+        self.assertIn("generate_scripts:'brief'", route)
+        self.assertIn("await openProjectStudio(project,actionStage,focus)", route)
+        self.assertIn("const brief=related.brief", route)
         self.assertIn(
-            "if(!stayInWorkbench&&!await navigate('scripts'))return", route
+            "openBriefDrawer(brief,{angleIndex:state.studioOutlineIndex})", route
         )
-        self.assertIn("state.scripts?.briefs", route)
-        self.assertIn("openBriefDrawer", route)
 
-    def test_global_project_picker_updates_workbench_before_async_refresh(self):
+    def test_global_project_picker_enters_the_selected_project_studio(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )
         renderer = js[
             js.index("function renderGlobalProjects") : js.index(
-                "const renderGlobalProjectsBase"
+                "function studioBackgroundTasks"
             )
         ]
 
         self.assertIn(
-            "state.studioStage=studioStageOrder[studioStageIndex(project.stage)];"
-            "renderStudioProject(project);navigate('overview')",
+            "openProjectStudio(project,studioStageOrder[studioStageIndex(project.stage)])",
             renderer,
         )
 
-    def test_studio_publish_action_uses_the_loaded_project_route(self):
+    def test_studio_publish_action_targets_the_selected_channel(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )
-        render_stage = js[
-            js.index("function renderStudioStage") : js.index(
-                "function renderStudioInspector"
+        publish_stage = js[
+            js.index("function studioPublishStage") : js.index(
+                "function renderStudioStage"
             )
         ]
 
         self.assertIn(
-            "$('#studio-publish-action').onclick=()=>routeProjectAction(project)",
-            render_stage,
+            "openStudioPublishTarget(project,r,selectedPlatform)",
+            publish_stage,
         )
-        self.assertNotIn("setTimeout", render_stage)
+        self.assertNotIn("routeProjectAction(project)", publish_stage)
+
+    def test_project_publish_action_opens_the_current_channel_without_prompt(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        route = js[
+            js.index("async function routeProjectAction") : js.index(
+                "function renderScripts"
+            )
+        ]
+
+        self.assertIn("['continue_publish','record_performance']", route)
+        self.assertIn("openStudioPublishTarget(project,related,platform)", route)
+        self.assertNotIn("请选择左侧发布渠道", route)
+        self.assertNotIn("openPublicationDrawer(publications[0])", route)
+
+    def test_studio_primary_action_names_and_targets_the_current_object(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        label = js[
+            js.index("function studioPrimaryActionLabel") : js.index(
+                "function renderStudioPrimaryAction"
+            )
+        ]
+        renderer = js[
+            js.index("function renderStudioPrimaryAction") : js.index(
+                "function renderStudioProject"
+            )
+        ]
+
+        self.assertIn("审核当前版本", label)
+        self.assertIn("使用当前角度生成剧本", label)
+        self.assertIn("查看当前母片", label)
+        self.assertIn("发布到当前渠道", label)
+        self.assertIn("录入当前渠道绩效", label)
+        self.assertIn("routeProjectAction(project)", renderer)
+
+    def test_studio_primary_action_is_hidden_outside_the_project_current_stage(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        renderer = js[
+            js.index("function renderStudioPrimaryAction") : js.index(
+                "function renderStudioProject"
+            )
+        ]
+
+        self.assertIn(
+            "const currentStage=studioStageOrder[studioStageIndex(project.stage)]",
+            renderer,
+        )
+        self.assertIn("state.studioStage!==currentStage", renderer)
+        self.assertIn("primary.hidden=true", renderer)
+        self.assertIn("primary.onclick=null", renderer)
+        self.assertIn("primary.hidden=false", renderer)
+
+    def test_entering_a_multi_object_stage_uses_semantic_default_selection(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        opener = js[
+            js.index("async function openProjectStudio") : js.index(
+                "async function openEntityInProject"
+            )
+        ]
+        brief_stage = js[
+            js.index("function studioBriefStage") : js.index(
+                "function studioScriptStage"
+            )
+        ]
+        script_stage = js[
+            js.index("function studioScriptStage") : js.index(
+                "function studioReviewStage"
+            )
+        ]
+
+        self.assertIn("focus.outlineIndex==null?-1", opener)
+        self.assertIn("state.studioOutlineIndex<0", brief_stage)
+        self.assertIn("approvedIndex??recommendedIndex", brief_stage)
+        self.assertIn("state.studioOutlineIndex<0", script_stage)
+        self.assertIn("approvedIndex>=0?approvedIndex:recommendedIndex", script_stage)
+
+    def test_entity_navigation_preserves_exact_draft_and_publication_focus(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        focus = js[
+            js.index("function studioFocusForEntity") : js.index(
+                "async function openProjectStudio"
+            )
+        ]
+        entity = js[
+            js.index("async function openEntityInProject") : js.index(
+                "function renderStudio(){"
+            )
+        ]
+
+        self.assertIn("item.draft_id===id", focus)
+        self.assertIn("item.publication_id===id", focus)
+        self.assertIn("outlineIndex", focus)
+        self.assertIn("studioFocusForEntity(project,id,kind,focus)", entity)
+
+    def test_workspace_detail_actions_keep_the_selected_angle_master_and_issue(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "openBriefDrawer(r.brief,{angleIndex:state.studioOutlineIndex})", js
+        )
+        self.assertIn("function openVideoDrawerAt(job,masterIndex)", js)
+        self.assertIn("openVideoDrawerAt(video,selected.idx)", js)
+        self.assertIn("openVideoDrawerAt(video,selectedIssue.masterIndex)", js)
+
+    def test_anchor_review_todo_routes_to_the_video_stage(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        todo = js[
+            js.index("async function openTodoTarget") : js.index(
+                "const studioStageOrder"
+            )
+        ]
+
+        self.assertIn("anchor_review:'video'", todo)
+        self.assertIn("openEntityInProject(todo.id,todo.kind,stage,focus)", todo)
 
     def test_douyin_binding_waits_for_configuration_page_data(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
@@ -9417,14 +9988,14 @@ class ManagementUiContractTests(unittest.TestCase):
             )
         ]
 
-        self.assertIn("const stayInWorkbench=state.page==='overview'", recent)
-        self.assertGreaterEqual(
-            recent.count("if(!stayInWorkbench&&!await navigate("), 3
-        )
-        self.assertIn("const stayInWorkbench=state.page==='overview'", route)
-        self.assertGreaterEqual(
-            route.count("if(!stayInWorkbench&&!await navigate("), 4
-        )
+        self.assertGreaterEqual(recent.count("openEntityInProject("), 3)
+        self.assertNotIn("navigate('scripts')", recent)
+        self.assertNotIn("navigate('videos')", recent)
+        self.assertNotIn("navigate('publishing')", recent)
+        self.assertIn("openProjectStudio(project,actionStage,focus)", route)
+        self.assertNotIn("navigate('scripts')", route)
+        self.assertNotIn("navigate('videos')", route)
+        self.assertNotIn("navigate('publishing')", route)
         self.assertIn("if(!await navigate('config'))return", bind)
         self.assertIn("if(!await navigate('videos'))return", character)
         self.assertIn("trigger.click()", new_project)
@@ -9533,7 +10104,7 @@ class ManagementUiContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("/app.js?v=20260819-audio-mode-v1", html)
+        self.assertIn("/app.js?v=20260825-studio-v3", html)
 
     def test_audio_mode_is_selectable_globally_and_per_video(self):
         html = (ROOT / "scripts" / "management_ui" / "index.html").read_text(
@@ -9615,15 +10186,12 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn('id="action-queue"', todo_page)
         self.assertIn("todos:['UNIFIED TODO / 01','统一待办中心']", js)
         self.assertIn("if(page==='todos')", js)
-        self.assertIn(
-            "state.todos=todos;state.recentEvents=eventData.events||[];"
-            "renderTodoCenter(todos,eventData)",
-            js,
-        )
+        self.assertIn("const todos=await api('/api/todos')", js)
+        self.assertIn("state.todos=todos;renderTodoCenter(todos)", js)
         self.assertIn("todos:state.todos", js)
         self.assertIn('body[data-page="todos"] .global-stage-strip', css)
 
-    def test_unified_todo_center_includes_clickable_business_activity(self):
+    def test_unified_todo_center_omits_latest_activity(self):
         ui_root = ROOT / "scripts" / "management_ui"
         html = (ui_root / "index.html").read_text(encoding="utf-8")
         js = (ui_root / "app.js").read_text(encoding="utf-8")
@@ -9631,16 +10199,14 @@ class ManagementUiContractTests(unittest.TestCase):
         todo_page = html[
             html.index('id="page-todos"') : html.index('id="page-projects"')
         ]
-        self.assertIn('id="todo-recent-events"', todo_page)
-        self.assertIn("最新动态", todo_page)
-        self.assertIn("业务里程碑，不展示模型调用与执行日志", todo_page)
-        self.assertIn(
-            "Promise.all([api('/api/todos'),api('/api/events?limit=12')])",
-            js,
-        )
-        self.assertIn("function renderTodoRecentEvents", js)
-        self.assertIn('data-todo-event-id="${esc(event.id)}"', js)
-        self.assertIn("openRecentEvent(event)", js)
+        self.assertNotIn('id="todo-recent-events"', todo_page)
+        self.assertNotIn("最新动态", todo_page)
+        self.assertNotIn("LATEST ACTIVITY", todo_page)
+        todo_loader = js[
+            js.index("if(page==='todos')") : js.index("if(page==='projects')")
+        ]
+        self.assertNotIn("/api/events", todo_loader)
+        self.assertNotIn("renderTodoRecentEvents", js)
 
     def test_config_ui_prioritizes_required_setup_and_collapses_optional_fields(self):
         html = (ROOT / "scripts" / "management_ui" / "index.html").read_text(
@@ -9743,6 +10309,47 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("function directorPlanLabel", script)
         self.assertIn("导演方案", script)
         self.assertIn("场景 B-roll", script)
+
+    def test_studio_timeline_defaults_to_current_master_and_can_expand_to_full_film(self):
+        script = (
+            ROOT / "scripts" / "management_ui" / "app.js"
+        ).read_text(encoding="utf-8")
+        timeline = script[
+            script.index("function studioTimelineView") :
+            script.index("function studioAnchorView")
+        ]
+        renderer = script[
+            script.index("function renderStudioVideoStage") :
+            script.index("function studioWorkContract")
+        ]
+
+        self.assertIn("studioTimelineScope:'master'", script)
+        self.assertIn("state.studioTimelineScope==='all'", timeline)
+        self.assertIn("filter(item=>item.related)", timeline)
+        self.assertIn("查看全片时间线", timeline)
+        self.assertIn("仅看当前母片", timeline)
+        self.assertIn("跨母片", timeline)
+        self.assertIn("studio-timeline-scope", renderer)
+
+    def test_studio_anchor_cards_are_readable_and_open_image_preview(self):
+        ui_root = ROOT / "scripts" / "management_ui"
+        script = (ui_root / "app.js").read_text(encoding="utf-8")
+        styles = (ui_root / "styles.css").read_text(encoding="utf-8")
+        anchors = script[
+            script.index("function studioAnchorView") :
+            script.index("function studioSessionsView")
+        ]
+        renderer = script[
+            script.index("function renderStudioVideoStage") :
+            script.index("function studioWorkContract")
+        ]
+
+        self.assertIn("function openStudioAnchorPreview", script)
+        self.assertIn("data-studio-anchor-preview", anchors)
+        self.assertIn("查看大图", anchors)
+        self.assertIn("studio-anchor-preview", renderer)
+        self.assertIn(".studio-anchor-media", styles)
+        self.assertIn(".studio-anchor-lightbox", styles)
 
     def test_video_drawer_exposes_director_timeline_and_single_master_regeneration(self):
         ui_root = ROOT / "scripts" / "management_ui"
@@ -9960,10 +10567,11 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn('id="action-queue"', todo_page)
         self.assertNotIn("legacy.before(target)", js)
         self.assertIn(
-            'body[data-page="overview"] #page-overview{display:block;', css
+            'body[data-page="overview"] #page-overview{display:grid;grid-template-rows:auto minmax(0,1fr);',
+            css,
         )
         self.assertIn(
-            'body[data-page="overview"] .studio-workbench{height:100%;', css
+            'body[data-page="overview"] .studio-workbench{height:auto;', css
         )
 
     def test_ui_exposes_content_review_media_actions_and_channel_publishing(self):
@@ -10065,6 +10673,23 @@ class ManagementUiContractTests(unittest.TestCase):
 
         self.assertIn(
             'body[data-page="overview"] .studio-workbench{grid-template-rows:minmax(0,1fr)}',
+            css,
+        )
+
+    def test_reliability_summary_does_not_consume_the_workbench_scroll_viewport(self):
+        ui_root = ROOT / "scripts" / "management_ui"
+        js = (ui_root / "app.js").read_text(encoding="utf-8")
+        css = (ui_root / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("document.createElement('details')", js)
+        self.assertIn("<summary>", js)
+        self.assertIn('class="reliability-details"', js)
+        self.assertIn(
+            'body[data-page="overview"] #page-overview{display:grid;grid-template-rows:auto minmax(0,1fr);',
+            css,
+        )
+        self.assertIn(
+            'body[data-page="overview"] .studio-workbench{height:auto;',
             css,
         )
 
@@ -10807,6 +11432,177 @@ class ManagementMediaServerTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 413)
         self.assertIn("过大", payload["error"])
         service.add_media_source.assert_not_called()
+
+    def test_project_studio_has_one_stage_context_primary_action(self):
+        ui_root = ROOT / "scripts" / "management_ui"
+        html = (ui_root / "index.html").read_text(encoding="utf-8")
+        js = (ui_root / "app.js").read_text(encoding="utf-8")
+        project_head = html[
+            html.index('<header class="studio-project-head">') : html.index(
+                '<nav class="studio-stages"'
+            )
+        ]
+        stage_navigation = html[
+            html.index('<nav class="studio-stages"') : html.index(
+                '<section class="studio-canvas">'
+            )
+        ]
+        inspector = js[
+            js.index("function renderStudioInspector") : js.index(
+                "const previewText"
+            )
+        ]
+
+        self.assertEqual(html.count('id="studio-primary-action"'), 1)
+        self.assertNotIn('id="studio-primary-action"', project_head)
+        self.assertIn('class="studio-stage-action"', stage_navigation)
+        self.assertIn('id="studio-primary-action"', stage_navigation)
+        self.assertNotIn('id="studio-project-menu"', html)
+        self.assertNotIn("$('#studio-project-menu').onclick", js)
+        self.assertNotIn('id="studio-inspector-next"', inspector)
+        self.assertIn("studioStageInspection(project,r,state.studioStage)", inspector)
+        self.assertNotIn("const stageChecks={", inspector)
+
+    def test_project_inspector_omits_recent_events_panel(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        inspector = js[
+            js.index("function renderStudioInspector") : js.index(
+                "const previewText"
+            )
+        ]
+
+        self.assertNotIn("最近动态", inspector)
+        self.assertNotIn("studio-project-events", inspector)
+        self.assertNotIn("data-studio-event-id", inspector)
+        self.assertIn("data-event-id", js)
+
+    def test_project_studio_distinguishes_viewed_stage_from_pipeline_stage(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("function studioStageInspection", js)
+        self.assertIn("viewed_stage", js)
+        self.assertIn("pipeline_stage", js)
+        self.assertIn("inspection.status_label", js)
+        self.assertIn("inspection.checks", js)
+
+    def test_project_studio_columns_have_stable_information_roles(self):
+        ui_root = ROOT / "scripts" / "management_ui"
+        html = (ui_root / "index.html").read_text(encoding="utf-8")
+        js = (ui_root / "app.js").read_text(encoding="utf-8")
+        source_stage = js[
+            js.index("function studioSourceStage") : js.index(
+                "function studioBriefStage"
+            )
+        ]
+        inspector = js[
+            js.index("function renderStudioInspector") : js.index(
+                "const previewText"
+            )
+        ]
+
+        self.assertIn("01 · 选择对象", js)
+        self.assertIn("02 · 内容工作区", js)
+        self.assertIn("03 / STAGE DECISION", html)
+        self.assertIn("function studioStageContract", js)
+        self.assertIn("进入下一阶段前需满足", inspector)
+        self.assertIn("本阶段产物", inspector)
+        self.assertIn("影响下一阶段", inspector)
+        self.assertNotIn("<b>项目上下文</b>", inspector)
+        self.assertNotIn("title:'来源信息'", source_stage)
+        self.assertNotIn("title:'生成输入'", source_stage)
+
+    def test_project_studio_exposes_view_selection_and_editability_state(self):
+        js = (
+            ROOT / "scripts" / "management_ui" / "app.js"
+        ).read_text(encoding="utf-8")
+        brief_stage = js[
+            js.index("function studioBriefStage") : js.index(
+                "function studioScriptStage"
+            )
+        ]
+        script_stage = js[
+            js.index("function studioScriptStage") : js.index(
+                "function studioReviewStage"
+            )
+        ]
+
+        self.assertIn("function studioWorkState", js)
+        self.assertIn("当前对象", js)
+        self.assertIn("业务状态", js)
+        self.assertIn("编辑权限", js)
+        self.assertIn("approved_angle_index", brief_stage)
+        self.assertIn("已选定", brief_stage)
+        self.assertIn("系统推荐", brief_stage)
+        self.assertIn("可编辑", brief_stage)
+        self.assertIn("已锁定", brief_stage)
+        self.assertIn("已选定", script_stage)
+        self.assertIn("候选版本", script_stage)
+
+    def test_operational_records_return_to_the_exact_project_studio_stage(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        todo = js[
+            js.index("async function openTodoTarget") : js.index(
+                "const studioStageOrder"
+            )
+        ]
+
+        self.assertIn("function openProjectStudio", js)
+        self.assertIn("findProjectForEntity", js)
+        self.assertIn("openEntityInProject(todo.id,todo.kind,stage,focus)", todo)
+        self.assertNotIn("navigate('scripts')", todo)
+        self.assertNotIn("navigate('videos')", todo)
+        self.assertNotIn("navigate('publishing')", todo)
+
+    def test_global_stage_navigation_always_keeps_project_context(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        handler = js[
+            js.index("$$('[data-global-stage]').forEach") : js.index(
+                "$('#new-source').onclick"
+            )
+        ]
+
+        self.assertIn("openProjectStudio(project,stage", handler)
+        self.assertNotIn("const page={source:'scripts'", handler)
+
+    def test_project_stage_outlines_do_not_expose_dead_buttons(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("item.interactive===false?'div':'button'", js)
+        self.assertIn("interactive:false", js)
+        self.assertIn("data-studio-review-issue", js)
+        self.assertIn("data-studio-publish-channel", js)
+
+    def test_module_inspectors_do_not_duplicate_page_primary_actions(self):
+        ui_root = ROOT / "scripts" / "management_ui"
+        html = (ui_root / "index.html").read_text(encoding="utf-8")
+        js = (ui_root / "app.js").read_text(encoding="utf-8")
+
+        for duplicate_id in (
+            "script-new-source-secondary",
+            "publish-register-secondary",
+            "character-add-secondary",
+            "save-config-secondary",
+        ):
+            self.assertNotIn(duplicate_id, html)
+            self.assertNotIn(duplicate_id, js)
+
+    def test_background_task_drawer_is_compact_until_opened(self):
+        css = (ROOT / "scripts" / "management_ui" / "styles.css").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(".studio-task-drawer{width:46px;height:46px", css)
+        self.assertIn(".studio-task-drawer.open{width:min(390px", css)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ Usage:
 """
 import asyncio
 import json
+import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -38,16 +40,21 @@ from factory import (  # noqa: E402
     creative_experiments,
     creative_learning,
     production_metrics,
+    production_adapters,
+    error_registry,
+    production_graph_runner,
     performance_feedback,
     production_planner,
     media_sources,
     script_drafts,
     script_sources,
     source_analysis,
+    state_machine,
     topic_briefs,
 )
 from factory.steps import s1_storyboard  # noqa: E402
 from factory.clients import volc_assets  # noqa: E402
+from factory.management_api import ManagementService  # noqa: E402
 
 
 @click.group()
@@ -936,6 +943,118 @@ def produce_approved(job_id, yes, dispatched):
             )
     click.echo("Confirmed: resuming from s3_shots; s1_storyboard will not run.")
     asyncio.run(_process_job(job_id, asyncio.Semaphore(1)))
+
+
+@cli.command(name="produce-graph")
+@click.argument("job_id")
+@click.option(
+    "--dispatched",
+    is_flag=True,
+    hidden=True,
+    help="Internal: the queue supervisor already claimed this graph job.",
+)
+def produce_graph(job_id, dispatched):
+    """Run one explicitly assigned Production Graph v2 job."""
+    database = conn()
+    row = database.execute(
+        "SELECT state,execution_engine FROM jobs WHERE job_id=?", (job_id,)
+    ).fetchone()
+    if not row:
+        raise click.ClickException(f"job not found: {job_id}")
+    if str(row["execution_engine"] or "legacy") != "graph_v2":
+        raise click.ClickException("job is not assigned to graph_v2")
+    allowed = {"PRODUCTION_QUEUED"}
+    if dispatched:
+        allowed.add("PRODUCTION_RUNNING")
+    if str(row["state"]) not in allowed:
+        raise click.ClickException(
+            "graph job must be queued or already claimed by the supervisor"
+        )
+    if str(row["state"]) == "PRODUCTION_QUEUED":
+        claimed = database.execute(
+            "UPDATE jobs SET state='PRODUCTION_RUNNING',"
+            "updated_at=CURRENT_TIMESTAMP WHERE job_id=? "
+            "AND state='PRODUCTION_QUEUED'",
+            (job_id,),
+        )
+        database.commit()
+        if int(claimed.rowcount or 0) != 1:
+            raise click.ClickException("graph job was already claimed")
+    try:
+        configured_limit = max(1, int(
+            os.getenv("SEEDANCE_MAX_CONCURRENT_MASTERS")
+            or os.getenv("MAX_CONCURRENT_SHOTS")
+            or 3
+        ))
+    except (TypeError, ValueError):
+        configured_limit = 3
+    previous_contract_gate = os.environ.get("FACTORY_REQUIRE_V2_CONTRACT")
+    os.environ["FACTORY_REQUIRE_V2_CONTRACT"] = "1"
+    try:
+        try:
+            result = asyncio.run(production_graph_runner.run_graph_job(
+                database,
+                job_id,
+                configured_limit=configured_limit,
+                handlers=production_adapters.build_handlers(database),
+            ))
+        except Exception as exc:
+            outcome = error_registry.describe_failure(
+                exc, stage="production_preflight",
+            )
+            try:
+                state_machine.transition(
+                    database,
+                    job_id,
+                    "failed",
+                    event_id=(
+                        f"{job_id}:graph-worker-failed:{secrets.token_hex(8)}"
+                    ),
+                    updates={
+                        "error": outcome.user_message,
+                        "failure_code": outcome.code,
+                        "production_worker_pid": None,
+                    },
+                    payload={
+                        "stage": outcome.stage,
+                        "failure_code": outcome.code,
+                        "next_action": outcome.next_action.id,
+                    },
+                )
+            except state_machine.InvalidTransitionError:
+                database.execute(
+                    "UPDATE jobs SET production_worker_pid=NULL "
+                    "WHERE job_id=?",
+                    (job_id,),
+                )
+                database.commit()
+            raise click.ClickException(outcome.user_message) from exc
+    finally:
+        if previous_contract_gate is None:
+            os.environ.pop("FACTORY_REQUIRE_V2_CONTRACT", None)
+        else:
+            os.environ["FACTORY_REQUIRE_V2_CONTRACT"] = previous_contract_gate
+    click.echo(
+        f"graph_v2 {job_id}: state={result.job_state}, "
+        f"next={result.next_action}, waves={result.waves}"
+    )
+
+
+@cli.command(name="assign-execution-engine", hidden=True)
+@click.argument("job_id")
+@click.argument("engine", type=click.Choice(("legacy", "graph_v2")))
+def assign_execution_engine(job_id, engine):
+    """Internal: assign one unpaid storyboarded job to a gray engine."""
+    database = conn()
+    try:
+        result = ManagementService(database, SKILL_ROOT).assign_execution_engine(
+            job_id, engine
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        database.close()
+    click.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 
 @cli.command()

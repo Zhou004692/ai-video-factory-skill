@@ -36,8 +36,8 @@ def load_provider_failure(name: str) -> dict:
 
 from factory import (  # noqa: E402
     db, master_dependencies, master_risk, orchestrator, provider_capacity,
-    provider_tasks, quality_canary, reference_attention, script_drafts,
-    script_sources,
+    production_invariants, provider_tasks, quality_canary,
+    reference_attention, script_drafts, script_sources,
 )
 from factory.clients import (  # noqa: E402
     music, provider_downloads, seedance, seedream_45,
@@ -55,6 +55,49 @@ except ImportError:
 
 
 class FailureOutcomeContractTests(unittest.TestCase):
+    def test_execution_contract_failure_has_safe_recovery_action(self):
+        registry = importlib.import_module("factory.error_registry")
+        report = production_invariants.InvariantReport(
+            "J-CONTRACT",
+            (
+                production_invariants.InvariantIssue(
+                    "materialized_master_mismatch", "blocking", "master:99",
+                    "private technical detail C:\\Users\\private",
+                ),
+            ),
+        )
+
+        outcome = registry.describe_failure(
+            production_invariants.ProductionInvariantError(report),
+            stage="preflight",
+        )
+
+        self.assertEqual(outcome.code, "execution_contract_invalid")
+        self.assertEqual(outcome.category, "contract")
+        self.assertEqual(outcome.retry_policy, "manual")
+        self.assertEqual(outcome.cost_effect, "none")
+        self.assertEqual(
+            outcome.next_action.id, "repair_execution_contract",
+        )
+        rendered = (
+            outcome.user_message + " " + outcome.technical_summary
+        ).casefold()
+        self.assertNotIn("master:99", rendered)
+        self.assertNotIn("c:\\users", rendered)
+
+    def test_seedance_budget_error_preserves_structured_confirmation_costs(self):
+        error = s3_shots.SeedanceBudgetError(
+            "paid submit budget exceeded before reservation: current=3857, "
+            "reserved=0, next_estimate=1836, limit=5000 cents"
+        )
+
+        self.assertEqual(error.pause_state, "BUDGET_CONFIRMATION_REQUIRED")
+        self.assertEqual(error.stable_code, "budget_confirmation_required")
+        self.assertEqual(error.current_cost_cents, 3857)
+        self.assertEqual(error.pending_cost_cents, 0)
+        self.assertEqual(error.next_estimate_cents, 1836)
+        self.assertEqual(error.budget_limit_cents, 5000)
+
     def test_every_failure_has_stable_code_and_one_next_action(self):
         module_spec = importlib.util.find_spec("factory.error_registry")
         self.assertIsNotNone(
@@ -87,6 +130,7 @@ class FailureOutcomeContractTests(unittest.TestCase):
             ("output_policy_rejected", "", "revise_output_prompt", "none"),
             ("output_copyright_rejected", "", "replace_copyright_reference", "none"),
             ("account_unavailable", "PROVIDER_ACTION_REQUIRED", "view_provider_account_guide", "none"),
+            ("budget_confirmation_required", "BUDGET_CONFIRMATION_REQUIRED", "increase_job_budget", "none"),
             ("transient_network", "", "retry_automatically", "none"),
             ("transient_network", "PROVIDER_ACTION_REQUIRED", "reconcile_provider_task", "unknown"),
         ]
@@ -167,6 +211,40 @@ class FailureOutcomeContractTests(unittest.TestCase):
         self.assertNotIn("top-secret", rendered)
         self.assertNotIn("token=", rendered)
         self.assertNotIn("evil.example", rendered)
+        database.close()
+
+    def test_legacy_orchestrator_pauses_budget_gate_without_marking_failed(self):
+        database = memory_database()
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,cost_cents) "
+            "VALUES('J-BUDGET-ORCH','T-BUDGET','预算暂停','PRODUCTION_RUNNING',3857)"
+        )
+        database.commit()
+        error = s3_shots.SeedanceBudgetError(
+            "Seedance job budget exceeded before paid call: current=3857, "
+            "pending=0, next_estimate=1836, limit=5000 cents"
+        )
+
+        with (
+            patch.object(orchestrator, "conn", return_value=database),
+            patch.object(
+                orchestrator, "_run_step", new=AsyncMock(side_effect=error)
+            ),
+        ):
+            asyncio.run(
+                orchestrator._process_job(
+                    "J-BUDGET-ORCH", asyncio.Semaphore(1)
+                )
+            )
+
+        row = database.execute(
+            "SELECT state,error,failure_code,cost_cents FROM jobs "
+            "WHERE job_id='J-BUDGET-ORCH'"
+        ).fetchone()
+        self.assertEqual(row["state"], "BUDGET_CONFIRMATION_REQUIRED")
+        self.assertEqual(row["failure_code"], "budget_confirmation_required")
+        self.assertEqual(row["cost_cents"], 3857)
+        self.assertIn("扣费前暂停", row["error"])
         database.close()
 
     def test_management_uses_registered_action_for_failed_jobs(self):
@@ -3686,11 +3764,20 @@ class RealQualityCanaryContractTests(unittest.TestCase):
         profiles = quality_canary.load_frozen_profiles()
 
         self.assertEqual(
-            [(item["duration_sec"], len(item["characters"])) for item in profiles],
-            [(8, 1), (18, 2), (26, 3)],
+            [item["id"] for item in profiles],
+            [
+                "single-speaker-8s-v1",
+                "two-person-continuous-18s-v1",
+                "multi-person-multi-scene-cinematic-30s-v1",
+            ],
         )
         self.assertEqual(
-            [item["budget_cents"] for item in profiles], [1500, 3000, 4500]
+            [(item["duration_sec"], len(item["characters"])) for item in profiles],
+            [(8, 1), (18, 2), (30, 3)],
+        )
+        self.assertEqual(
+            [item["budget_cents"] for item in profiles],
+            [1500, 3000, 6000],
         )
         self.assertTrue(all(item["max_auto_retries"] == 0 for item in profiles))
         self.assertTrue(all(item["requires_explicit_authorization"] for item in profiles))

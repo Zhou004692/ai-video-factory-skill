@@ -42,6 +42,17 @@ class _FailureTemplate:
 
 
 _REGISTRY: dict[str, _FailureTemplate] = {
+    "execution_contract_invalid": _FailureTemplate(
+        category="contract",
+        retry_policy="manual",
+        user_message=(
+            "生产数据未能自动对齐，系统已在新的付费调用前暂停并保留现场"
+        ),
+        technical_summary="frozen production contract invariant failed",
+        cost_effect="none",
+        action_id="repair_execution_contract",
+        action_label="重新同步生产状态",
+    ),
     "internal_error": _FailureTemplate(
         category="local",
         retry_policy="manual",
@@ -122,6 +133,15 @@ _REGISTRY: dict[str, _FailureTemplate] = {
         cost_effect="none",
         action_id="configure_music_provider",
         action_label="检查音乐配置",
+    ),
+    "budget_confirmation_required": _FailureTemplate(
+        category="configuration",
+        retry_policy="manual",
+        user_message="下一次付费调用超过已确认预算，已在扣费前暂停",
+        technical_summary="confirmed production budget is insufficient",
+        cost_effect="none",
+        action_id="increase_job_budget",
+        action_label="确认预算并继续",
     ),
 }
 

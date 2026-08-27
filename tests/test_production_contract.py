@@ -20,6 +20,54 @@ from factory.management_api import ManagementService  # noqa: E402
 
 
 class ProductionContractTests(unittest.TestCase):
+    def test_compile_supports_explicit_v2_without_changing_v1_default(self):
+        from factory.production_contract import compile_production_spec
+
+        storyboard = {
+            "title": "双人连续场景",
+            "characters": [
+                {"id": "lin_xia", "name": "林夏", "identity_type": "ai_generated"},
+                {"id": "worker", "name": "维修员", "identity_type": "ai_generated"},
+            ],
+            "beats": [{
+                "id": "beat-1",
+                "kind": "dialogue",
+                "scene": "暴雨抢修现场",
+                "speakers": ["lin_xia"],
+                "dialogue": "先确认风速，再让设备进场",
+                "action": "林夏查看仪表，维修员固定吊篮",
+                "characters": ["lin_xia", "worker"],
+                "must_preserve": ["完整台词", "双人协作"],
+            }],
+            "masters": [{
+                "idx": 1, "type": "dialogue", "duration": 8,
+                "speaker": "lin_xia", "scene": "暴雨抢修现场",
+                "scene_anchor_key": "storm-site",
+                "cast": ["lin_xia", "worker"],
+                "performance_beats": [{
+                    "speaker": "lin_xia",
+                    "dialogue": "先确认风速，再让设备进场",
+                }],
+            }],
+        }
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) VALUES(?,?,?,?,?)",
+            ("J-V2", "T-V2", "双人连续场景", "STORYBOARDED", json.dumps(storyboard)),
+        )
+        self.database.commit()
+
+        v1 = compile_production_spec(
+            self.database, "J-V2", self.root, persist=False,
+        )
+        v2 = compile_production_spec(
+            self.database, "J-V2", self.root, persist=False, target_version=2,
+        )
+
+        self.assertEqual(v1.spec.version, 1)
+        self.assertEqual(v2.spec.version, 2)
+        self.assertTrue(v2.payable)
+        self.assertEqual(v2.spec.masters[0].creative_beat_ids, ("beat-1",))
+
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)

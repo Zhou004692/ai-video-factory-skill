@@ -35,6 +35,16 @@ _EVENT_RULES: dict[str, tuple[frozenset[str], str | None]] = {
         }),
         "PROVIDER_ACTION_REQUIRED",
     ),
+    "budget_paused": (
+        frozenset({
+            "PENDING", "STORYBOARDED", "PRODUCTION_QUEUED", "PRODUCTION_RUNNING",
+            "SHOTS_OK", "BGM_OK", "FAILED",
+        }),
+        "BUDGET_CONFIRMATION_REQUIRED",
+    ),
+    "budget_confirmed": (
+        frozenset({"BUDGET_CONFIRMATION_REQUIRED"}), "PRODUCTION_QUEUED",
+    ),
     "review_required": (
         frozenset({
             "STORYBOARDED", "PRODUCTION_RUNNING", "FAILED",

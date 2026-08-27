@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import sqlite3
 import unittest
+from unittest import mock
 
 from scripts.factory import provider_executor, provider_tasks
 from scripts.factory.db import DDL
@@ -87,6 +88,121 @@ class ProviderExecutorTests(unittest.TestCase):
         for module in (s3_shots, s5_bgm):
             with self.subTest(module=module.__name__):
                 self.assertIs(module.provider_tasks, provider_executor)
+
+    def test_frozen_owner_gate_accepts_only_matching_ready_node(self):
+        self.database.execute(
+            "INSERT INTO production_nodes("
+            "job_id,node_id,node_type,paid,state,spec_hash,input_json,"
+            "idempotency_key) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                "J-1", "master:1", "master", 1, "READY", "spec-1", "{}",
+                "idem-1",
+            ),
+        )
+        self.database.commit()
+        provider_executor.assert_frozen_owner(
+            self.database, job_id="J-1", owner_id="master:1", spec_hash="spec-1",
+        )
+        with self.assertRaises(provider_executor.ProductionContractRequiredError):
+            provider_executor.assert_frozen_owner(
+                self.database, job_id="J-1", owner_id="master:1",
+                spec_hash="wrong",
+            )
+
+    def test_enforced_gate_rejects_before_reservation_without_owner(self):
+        with mock.patch.dict("os.environ", {"FACTORY_REQUIRE_V2_CONTRACT": "1"}):
+            with self.assertRaises(provider_executor.ProductionContractRequiredError):
+                provider_executor.reserve_paid_submit(
+                    self.database,
+                    job_id="J-1", shot_idx=1, provider="seedance",
+                    intent="generate",
+                )
+        self.assertEqual(
+            self.database.execute(
+                "SELECT COUNT(*) FROM provider_calls WHERE job_id='J-1'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_node_context_owns_nested_paid_reservation(self):
+        self.database.execute(
+            "INSERT INTO production_nodes("
+            "job_id,node_id,node_type,paid,state,spec_hash,input_json,"
+            "idempotency_key) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                "J-1", "master:1", "master", 1, "RUNNING", "spec-1",
+                "{}", "idem-context",
+            ),
+        )
+        self.database.commit()
+
+        with provider_executor.paid_task_owner_context(
+            job_id="J-1", node_id="master:1", spec_hash="spec-1",
+        ):
+            reservation = provider_executor.reserve_paid_submit(
+                self.database,
+                job_id="J-1", shot_idx=1, provider="seedance",
+                intent="generate",
+            )
+            provider_executor.persist_remote_task_id(
+                self.database,
+                reservation,
+                remote_task_id="remote-context-1",
+                provider="seedance",
+                intent="generate",
+            )
+            provider_executor.promote_reservation(
+                self.database,
+                reservation,
+                task_id="remote-context-1",
+                job_id="J-1",
+                shot_idx=1,
+                provider="seedance",
+                intent="generate",
+            )
+            provider_executor.upsert_final_call(
+                self.database,
+                task_id="remote-context-1",
+                job_id="J-1",
+                shot_idx=1,
+                provider="seedance",
+                intent="generate",
+                status="completed",
+                usage={},
+                cost_cents=123,
+            )
+
+        self.assertTrue(reservation)
+        node = self.database.execute(
+            "SELECT provider_task_id,actual_cost_cents FROM production_nodes "
+            "WHERE job_id='J-1' AND node_id='master:1'"
+        ).fetchone()
+        self.assertEqual(node["provider_task_id"], "remote-context-1")
+        self.assertEqual(node["actual_cost_cents"], 123)
+
+    def test_non_paid_node_cannot_own_paid_reservation(self):
+        self.database.execute(
+            "INSERT INTO production_nodes("
+            "job_id,node_id,node_type,paid,state,spec_hash,input_json,"
+            "idempotency_key) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                "J-1", "local_compose", "local_compose", 0, "RUNNING",
+                "spec-1", "{}", "idem-local",
+            ),
+        )
+        self.database.commit()
+
+        with provider_executor.paid_task_owner_context(
+            job_id="J-1", node_id="local_compose", spec_hash="spec-1",
+        ):
+            with self.assertRaises(
+                provider_executor.ProductionContractRequiredError
+            ):
+                provider_executor.reserve_paid_submit(
+                    self.database,
+                    job_id="J-1", shot_idx=0, provider="music",
+                    intent="bgm",
+                )
 
 
 if __name__ == "__main__":

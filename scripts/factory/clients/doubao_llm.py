@@ -14,6 +14,18 @@ from .claude import _extract_json  # JSON 抽取容错,公用
 
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_MODEL = os.getenv("ARK_LLM_MODEL", "doubao-1-5-pro-32k-250115")
+DEFAULT_TIMEOUT_SEC = 300.0
+
+
+def _timeout_seconds() -> float:
+    raw = os.environ.get("ARK_LLM_TIMEOUT_SEC") or DEFAULT_TIMEOUT_SEC
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ARK_LLM_TIMEOUT_SEC must be a positive number") from exc
+    if value <= 0:
+        raise ValueError("ARK_LLM_TIMEOUT_SEC must be a positive number")
+    return value
 
 
 def complete_json(prompt: str, system: str | None = None,
@@ -36,7 +48,7 @@ def complete_json(prompt: str, system: str | None = None,
         "response_format": {"type": "json_object"},
     }
 
-    with httpx.Client(timeout=120) as cli:
+    with httpx.Client(timeout=_timeout_seconds()) as cli:
         r = cli.post(
             f"{ARK_BASE}/chat/completions",
             json=payload,

@@ -1,0 +1,65 @@
+{
+  "fixture_version": 1,
+  "profile_id": "experimental_multi_character_action",
+  "title": "暴雨后的沿海工厂抢修",
+  "target_duration_sec": 26,
+  "characters": [
+    {"id": "linxia", "name": "林夏", "look": "成年女性项目协调人"},
+    {"id": "zhougong", "name": "周工", "look": "成年男性高空设备工程师"},
+    {"id": "malik", "name": "Malik", "look": "成年男性海外客户负责人"}
+  ],
+  "beats": [
+    {
+      "id": "beat-1",
+      "kind": "dialogue",
+      "scene_id": "coastal_repair_site",
+      "scene": "暴雨后的沿海工厂抢修现场，警示灯闪烁",
+      "characters": ["malik"],
+      "speaker": "malik",
+      "dialogue": "主塔停机每一分钟，整条产线都在损失",
+      "action": "Malik穿过积水指向停机主塔",
+      "emotion": "焦急",
+      "must_preserve": ["Malik完整台词", "停机主塔", "暴雨后环境"],
+      "may_adapt": ["积水范围", "警示灯节奏"]
+    },
+    {
+      "id": "beat-2",
+      "kind": "dialogue",
+      "scene_id": "coastal_repair_site",
+      "scene": "延续同一抢修现场和设备方位",
+      "characters": ["linxia", "zhougong", "malik"],
+      "speaker": "linxia",
+      "dialogue": "设备、工程师和备件已经到位，我们按同一套方案同步推进",
+      "action": "林夏展开现场图，三人围拢形成稳定三角站位",
+      "emotion": "镇定、领导力",
+      "must_preserve": ["三人同场", "现场图", "同步推进"],
+      "may_adapt": ["三角站位角度", "图纸特写"]
+    },
+    {
+      "id": "beat-3",
+      "kind": "dialogue",
+      "scene_id": "coastal_repair_site",
+      "scene": "延续同一抢修现场，高空平台位于主塔左侧",
+      "characters": ["zhougong", "linxia", "malik"],
+      "speaker": "zhougong",
+      "dialogue": "高空平台升起后，我先处理主电缆，再恢复控制系统",
+      "action": "周工扣紧安全带登上平台，平台平稳升起",
+      "emotion": "专业、果断",
+      "must_preserve": ["安全带动作", "平台升起", "先电缆后控制系统"],
+      "may_adapt": ["升起高度", "动作拆镜"]
+    },
+    {
+      "id": "beat-4",
+      "kind": "dialogue",
+      "scene_id": "coastal_repair_site",
+      "scene": "延续同一抢修现场，产线恢复照明",
+      "characters": ["malik", "linxia", "zhougong"],
+      "speaker": "malik",
+      "dialogue": "这就是我们要的抢修效率",
+      "action": "设备恢复运转，三人回望亮起的产线",
+      "emotion": "认可、释然",
+      "must_preserve": ["设备恢复", "三人仍在同一现场", "Malik完整台词"],
+      "may_adapt": ["收尾景别", "人物反应顺序"]
+    }
+  ]
+}
