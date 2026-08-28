@@ -50,6 +50,7 @@ PREFERENCES = {
     "suggested_shot_count": 6,
     "suggested_character_count": 3,
 }
+REPLAY_LLM_MODEL = "zero-cost-replay-llm-v1"
 
 
 def _write_combined_manifest(root: Path, operations: list[tuple[dict, dict]]) -> None:
@@ -90,7 +91,9 @@ def _prepare_manifest(planning_db: Path, fixture_root: Path) -> None:
         source_record = full_flow_regression._source_record(database, source_id)
 
         brief_request = doubao_llm.request_payload(
-            topic_briefs._brief_prompt([source_record]), max_tokens=3000
+            topic_briefs._brief_prompt([source_record]),
+            max_tokens=3000,
+            model=REPLAY_LLM_MODEL,
         )
         brief_result = full_flow_regression._brief_result(source_record)
         generated_brief = topic_briefs.generate_brief(
@@ -111,6 +114,7 @@ def _prepare_manifest(planning_db: Path, fixture_root: Path) -> None:
         script_request = doubao_llm.request_payload(
             script_drafts._prompt(context, sources, PREFERENCES),
             max_tokens=6000,
+            model=REPLAY_LLM_MODEL,
         )
         script_result = full_flow_regression._script_result(source_id)
         _write_combined_manifest(
@@ -152,6 +156,25 @@ def _job_id(database) -> str:
     return str(row["job_id"])
 
 
+def _wait_for_ui_action(page, selector: str, *, timeout: int = 30_000) -> None:
+    """Wait for an action or fail with the user-visible/API diagnostic."""
+    page.wait_for_function(
+        """selector => Boolean(document.querySelector(selector))
+            || Boolean(document.querySelector('#toast.error.show'))""",
+        arg=selector,
+        timeout=timeout,
+    )
+    if page.locator(selector).count():
+        return
+    toast = page.locator("#toast")
+    message = toast.inner_text().strip() if toast.count() else ""
+    technical = page.evaluate("() => state.lastTechnicalError || ''")
+    raise AssertionError(
+        f"UI action {selector} was not rendered; "
+        f"toast={message!r}; technical={technical!r}"
+    )
+
+
 def _run_graph(database, job_id: str, media_root: Path) -> str:
     handlers = full_flow_regression.build_zero_cost_handlers(
         database, media_root=media_root
@@ -186,6 +209,7 @@ def main() -> int:
             "FACTORY_PROVIDER_MODE": "replay",
             "FACTORY_REPLAY_FIXTURE_ROOT": str(fixture_root),
             "FACTORY_REPLAY_DISABLE_WORKERS": "1",
+            "ARK_LLM_MODEL": REPLAY_LLM_MODEL,
             "PRODUCTION_EXECUTION_ENGINE": "graph_v2",
             "PROVIDER_RECONCILE_ENABLED": "false",
         })
@@ -244,13 +268,13 @@ def main() -> int:
                     page.wait_for_selector('#drawer[aria-hidden="false"]')
                     page.locator("#drawer-generate-brief").click()
                     page.locator("#confirm-generate-brief").click()
-                    page.wait_for_selector("#drawer-generate-scripts")
+                    _wait_for_ui_action(page, "#drawer-generate-scripts")
 
                     page.locator("#drawer-edit-brief").click()
                     page.wait_for_selector("#save-brief-edit")
                     page.locator("#edit-brief-note").fill("零费用回归：确认人工可编辑")
                     page.locator("#save-brief-edit").click()
-                    page.wait_for_selector("#drawer-generate-scripts")
+                    _wait_for_ui_action(page, "#drawer-generate-scripts")
                     page.locator("#drawer-generate-scripts").click()
                     page.locator("#script-suggest-duration").fill("24")
                     page.locator("#script-suggest-shots").fill("6")

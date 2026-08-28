@@ -16,6 +16,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from factory import provider_runtime  # noqa: E402
 from tests import zero_cost_release_gate  # noqa: E402
+from tests.management_workflow_browser_check import (  # noqa: E402
+    _signature as management_signature,
+)
 
 
 class ZeroCostReleaseGateTests(unittest.TestCase):
@@ -52,6 +55,23 @@ class ZeroCostReleaseGateTests(unittest.TestCase):
             nested.write_bytes(b"second")
             after = zero_cost_release_gate.tree_signature(root)
 
+            self.assertNotEqual(before, after)
+
+    def test_management_production_guard_signs_asset_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "assets"
+            first = root / "job-1" / "final.mp4"
+            second = root / "job-2" / "cover.jpg"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"video")
+            second.write_bytes(b"cover")
+
+            before = management_signature(root)
+            second.write_bytes(b"changed-cover")
+            after = management_signature(root)
+
+            self.assertIsNotNone(before)
             self.assertNotEqual(before, after)
 
     def test_summary_contract_is_machine_readable(self):

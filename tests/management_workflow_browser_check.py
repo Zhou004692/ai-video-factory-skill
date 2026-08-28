@@ -30,11 +30,29 @@ def _signature(path: Path) -> tuple[int, int, str] | None:
     if not path.exists():
         return None
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    stat = path.stat()
-    return stat.st_size, stat.st_mtime_ns, digest.hexdigest()
+    if path.is_file():
+        files = (path,)
+        relative_root = path.parent
+    else:
+        files = tuple(sorted(
+            (item for item in path.rglob("*") if item.is_file()),
+            key=lambda item: item.relative_to(path).as_posix(),
+        ))
+        relative_root = path
+    total_size = 0
+    newest_mtime_ns = path.stat().st_mtime_ns
+    for item in files:
+        relative = item.relative_to(relative_root).as_posix()
+        stat = item.stat()
+        total_size += stat.st_size
+        newest_mtime_ns = max(newest_mtime_ns, stat.st_mtime_ns)
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with item.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return total_size, newest_mtime_ns, digest.hexdigest()
 
 
 def _free_port() -> int:
