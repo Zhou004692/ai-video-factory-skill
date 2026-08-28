@@ -26,6 +26,35 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertEqual(profile.worker_mode, "child_process")
         self.assertEqual(profile.bind_host, "127.0.0.1")
 
+    def test_desktop_replay_can_disable_background_workers_for_browser_regression(self):
+        from factory.runtime_profile import resolve_runtime_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = resolve_runtime_profile(
+                root=Path(tmp),
+                environ={
+                    "FACTORY_PROVIDER_MODE": "replay",
+                    "FACTORY_REPLAY_DISABLE_WORKERS": "1",
+                },
+            )
+
+        self.assertEqual(profile.mode, "desktop")
+        self.assertEqual(profile.worker_mode, "external")
+
+    def test_desktop_live_mode_ignores_replay_worker_override(self):
+        from factory.runtime_profile import resolve_runtime_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = resolve_runtime_profile(
+                root=Path(tmp),
+                environ={
+                    "FACTORY_PROVIDER_MODE": "live",
+                    "FACTORY_REPLAY_DISABLE_WORKERS": "1",
+                },
+            )
+
+        self.assertEqual(profile.worker_mode, "child_process")
+
     def test_desktop_rejects_non_loopback_bind(self):
         from factory.runtime_profile import RuntimeProfileError, resolve_runtime_profile
 

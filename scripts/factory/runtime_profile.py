@@ -73,12 +73,18 @@ def resolve_runtime_profile(
         data_dir = Path(data_value).expanduser() if data_value else root / "data"
         if not data_dir.is_absolute():
             data_dir = root / data_dir
+        replay_without_workers = (
+            str(values.get("FACTORY_PROVIDER_MODE") or "").strip().casefold()
+            == "replay"
+            and str(values.get("FACTORY_REPLAY_DISABLE_WORKERS") or "")
+            .strip().casefold() in {"1", "true", "yes", "on"}
+        )
         return RuntimeProfile(
             mode="desktop",
             data_dir=_writable_directory(data_dir.resolve()),
             public_base_url=None,
             trusted_origins=(),
-            worker_mode="child_process",
+            worker_mode="external" if replay_without_workers else "child_process",
             bind_host=bind_host,
         )
 

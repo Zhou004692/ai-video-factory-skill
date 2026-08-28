@@ -10586,6 +10586,15 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("充值后继续生成剩余母片", script)
         self.assertIn("母片已生成，自动质检未完成，需人工复核", script)
 
+    def test_replay_fixture_miss_is_explained_as_a_safe_local_recovery(self):
+        script = (
+            ROOT / "scripts" / "management_ui" / "app.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ReplayFixtureMissing", script)
+        self.assertIn("零费用回放未找到匹配夹具", script)
+        self.assertIn("未调用外部模型", script)
+
     def test_only_active_video_production_refreshes_without_manual_navigation(self):
         script = (
             ROOT / "scripts" / "management_ui" / "app.js"
