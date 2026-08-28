@@ -6,6 +6,7 @@ import sqlite3
 from typing import Mapping
 
 from . import production_executor, production_invariants, production_projection
+from .testing import fault_injection
 
 
 NodeOutcome = production_executor.NodeOutcome
@@ -58,6 +59,12 @@ async def run_graph_job(
         database, job_id,
     ):
         recovered[node_id] = "READY"
+    if recovered:
+        fault_injection.hit(
+            database,
+            "after_service_restart",
+            job_id=job_id,
+        )
     node_count = int(database.execute(
         "SELECT COUNT(*) FROM production_nodes WHERE job_id=?", (job_id,)
     ).fetchone()[0] or 0)
@@ -82,6 +89,11 @@ async def run_graph_job(
             break
         waves += 1
         started.extend(wave.started)
+        fault_injection.hit(
+            database,
+            "after_node_update_before_job_projection",
+            job_id=job_id,
+        )
 
     report = production_projection.reconcile(database, job_id)
     database.execute(

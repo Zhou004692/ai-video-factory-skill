@@ -10,6 +10,7 @@ import sqlite3
 from typing import Awaitable, Callable, Generic, TypeVar
 
 from . import provider_tasks
+from .testing import fault_injection
 
 
 T = TypeVar("T")
@@ -129,6 +130,16 @@ class ProviderExecutor:
                 task_id=remote_task_id,
                 owner=self.owner,
             )
+            fault_injection.hit(
+                self.database,
+                "after_provider_submission",
+                job_id=self.owner.job_id,
+                node_id=(
+                    self.owner.node_id
+                    or f"{self.owner.provider}:{self.owner.shot_idx}:"
+                    f"{self.owner.intent}"
+                ),
+            )
 
         try:
             value = await submit(on_task_created)
@@ -157,6 +168,24 @@ class ProviderExecutor:
             raise ProviderSubmissionOutcomeUnknown(
                 "provider response has no durable remote task id"
             )
+        try:
+            fault_injection.hit(
+                self.database,
+                "after_provider_completion_before_promotion",
+                job_id=self.owner.job_id,
+                node_id=(
+                    self.owner.node_id
+                    or f"{self.owner.provider}:{self.owner.shot_idx}:"
+                    f"{self.owner.intent}"
+                ),
+            )
+        except BaseException:
+            mark_action_required(
+                self.database,
+                remote_task_id,
+                message="provider completion requires durable promotion",
+            )
+            raise
         return SubmitReceipt(
             owner=self.owner, task_id=remote_task_id, value=value,
         )

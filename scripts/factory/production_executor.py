@@ -10,6 +10,7 @@ from typing import Awaitable, Callable, Mapping
 import uuid
 
 from . import node_state_machine, provider_capacity, provider_executor
+from .testing import fault_injection
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,13 @@ async def run_ready_wave(
                 payload={"error": "missing node handler"},
             )
             return
+        if str(row["node_type"]) == "local_compose":
+            fault_injection.hit(
+                database,
+                "during_local_compose",
+                job_id=job_id,
+                node_id=node_id,
+            )
         try:
             with provider_executor.paid_task_owner_context(
                 job_id=job_id, node_id=node_id,
@@ -198,6 +206,39 @@ async def run_ready_wave(
                 else NodeOutcome.succeed(raw_outcome)
             )
             output = dict(outcome.output)
+            checkpoint = {
+                "event": outcome.event,
+                "event_id": f"{job_id}:{node_id}:{lease}:{outcome.event}",
+            }
+            checkpointed_output = {
+                **output,
+                "_executor_checkpoint": checkpoint,
+            }
+            # Persist the completed handler outcome before moving the durable
+            # node state. If the process dies in this narrow window, restart
+            # recovery can apply the recorded transition without re-running a
+            # provider or local handler.
+            database.execute(
+                "UPDATE production_nodes SET output_json=? "
+                "WHERE job_id=? AND node_id=? AND lease_id=?",
+                (
+                    json.dumps(
+                        checkpointed_output,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    job_id,
+                    node_id,
+                    lease,
+                ),
+            )
+            database.commit()
+            fault_injection.hit(
+                database,
+                "after_handler_completion_before_node_update",
+                job_id=job_id,
+                node_id=node_id,
+            )
             database.execute(
                 "UPDATE production_nodes SET output_json=?,lease_id=NULL,"
                 "heartbeat_at=NULL WHERE job_id=? AND node_id=? AND lease_id=?",
@@ -314,6 +355,51 @@ def recover_expired_nodes(
             output = json.loads(row["output_json"] or "{}")
         except (TypeError, json.JSONDecodeError):
             output = {}
+        checkpoint = (
+            output.get("_executor_checkpoint")
+            if isinstance(output, dict) else None
+        )
+        if isinstance(checkpoint, dict):
+            event = str(checkpoint.get("event") or "")
+            event_id = str(checkpoint.get("event_id") or "")
+            if event in {
+                "succeed", "require_review", "require_action", "require_budget",
+            } and event_id:
+                database.execute(
+                    "UPDATE production_nodes SET lease_id=NULL,heartbeat_at=NULL "
+                    "WHERE job_id=? AND node_id=? AND state='RUNNING'",
+                    (job_id, row["node_id"]),
+                )
+                database.commit()
+                result = node_state_machine.transition_node(
+                    database,
+                    job_id,
+                    str(row["node_id"]),
+                    event,
+                    event_id=event_id,
+                )
+                clean_output = dict(output)
+                clean_output.pop("_executor_checkpoint", None)
+                next_action = {
+                    "require_review": "review_candidate",
+                    "require_action": "reconcile_provider_task",
+                    "require_budget": "increase_job_budget",
+                }.get(event)
+                database.execute(
+                    "UPDATE production_nodes SET output_json=?,next_action=? "
+                    "WHERE job_id=? AND node_id=?",
+                    (
+                        json.dumps(
+                            clean_output, ensure_ascii=False, sort_keys=True,
+                        ),
+                        next_action,
+                        job_id,
+                        row["node_id"],
+                    ),
+                )
+                database.commit()
+                recovered[str(row["node_id"])] = result.state
+                continue
         if str(row["provider_task_id"] or "").strip():
             state, action = "ACTION_REQUIRED", "reconcile_provider_task"
         elif isinstance(output, dict) and (
