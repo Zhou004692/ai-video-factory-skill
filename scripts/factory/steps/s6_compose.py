@@ -510,3 +510,8 @@ async def run(job_id: str, *, storyboard_override: dict | None = None) -> None:
                (str(final), job_id))
     db.commit()
     finalize_accepted_candidates(db, ASSETS_DIR, job_id)
+    # The desktop service normally keeps its primary connection for the
+    # process lifetime, but compose owns this auxiliary connection. Releasing
+    # it here prevents locked SQLite files after an isolated regression run or
+    # a portable-runtime shutdown.
+    db.close()

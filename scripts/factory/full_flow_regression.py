@@ -7,12 +7,25 @@ remain the real application code.
 """
 from __future__ import annotations
 
+import asyncio
+from copy import deepcopy
+import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
+import subprocess
 from typing import Mapping
 
-from . import provider_replay, script_drafts, topic_briefs
+from . import (
+    character_assets,
+    production_adapters,
+    production_executor,
+    production_graph_runner,
+    provider_replay,
+    script_drafts,
+    topic_briefs,
+)
 from .clients import doubao_llm
 
 
@@ -192,7 +205,13 @@ def _script_result(source_id: str) -> dict:
     }
 
 
-def run_source_to_compiled(service, scenario: dict, *, fixture_root: Path) -> dict:
+def run_source_to_compiled(
+    service,
+    scenario: dict,
+    *,
+    fixture_root: Path,
+    asr_enabled: bool = True,
+) -> dict:
     """Run source → brief → scripts → approval → graph compilation.
 
     The caller supplies a real ``ManagementService``.  The function creates
@@ -271,7 +290,7 @@ def run_source_to_compiled(service, scenario: dict, *, fixture_root: Path) -> di
         "orientation": "9:16",
         "production_profile": "standard",
         "subtitle_style": "clean",
-        "asr_enabled": True,
+        "asr_enabled": bool(asr_enabled),
         "audio_mode": "seedance_native",
         "anchor_review_mode": "manual",
         "budget_cents": 10_000,
@@ -302,5 +321,300 @@ def run_source_to_compiled(service, scenario: dict, *, fixture_root: Path) -> di
         "external_cost_cents": int(job["cost_cents"] or 0),
         "completed_stages": [
             "source", "brief", "scripts", "approved", "compiled",
+        ],
+    }
+
+
+def _run_ffmpeg(command: list[str]) -> None:
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *command],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _fixture_image(path: Path, *, color: str = "0xD9E7E0") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _run_ffmpeg([
+        "-f", "lavfi", "-i", f"color=c={color}:s=320x568",
+        "-frames:v", "1", str(path),
+    ])
+    return path
+
+
+def _fixture_video(path: Path, *, duration_sec: float, index: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    colors = ("0x426B5B", "0x55718A", "0x8A6C55", "0x6C668A")
+    frequency = 440 + (max(1, int(index)) * 80)
+    duration = max(0.5, float(duration_sec))
+    _run_ffmpeg([
+        "-f", "lavfi", "-i",
+        f"color=c={colors[(index - 1) % len(colors)]}:s=320x568:r=25:d={duration}",
+        "-f", "lavfi", "-i", f"sine=frequency={frequency}:duration={duration}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-shortest", str(path),
+    ])
+    return path
+
+
+def _fixture_bgm(path: Path, *, duration_sec: float) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _run_ffmpeg([
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-t", str(max(1.0, float(duration_sec))),
+        "-codec:a", "libmp3lame", "-q:a", "9", str(path),
+    ])
+    return path
+
+
+def build_zero_cost_handlers(
+    database: sqlite3.Connection,
+    *,
+    media_root: Path,
+):
+    """Build graph handlers that replace only paid provider boundaries.
+
+    Graph scheduling, state transitions, human gates and local composition are
+    untouched.  Fixture handlers materialize the artifacts a paid provider
+    would return and always record zero cost.
+    """
+    media_root = Path(media_root).resolve()
+
+    async def character_anchor(node: sqlite3.Row):
+        spec, node_input = production_adapters._frozen_spec(database, node)
+        character_id = str(node_input.get("character_id") or "").strip()
+        character = next((
+            deepcopy(item) for item in (spec.get("characters") or [])
+            if isinstance(item, dict)
+            and str(item.get("id") or "") == character_id
+        ), None)
+        if character is None:
+            raise RuntimeError(f"fixture character missing: {character_id}")
+        plan = character_assets.character_makeup_plan([character])
+        if not plan:
+            raise RuntimeError(f"fixture identity plan missing: {character_id}")
+        entry = plan[0]
+        token = character_assets.identity_token(str(entry["identity_key"]))
+        image = _fixture_image(
+            media_root / str(node["job_id"]) / "anchors" / f"character-{token}.png"
+        )
+        database.execute(
+            "INSERT INTO character_identity_anchors("
+            "job_id,identity_key,character_id,display_name,source_type,state,"
+            "anchor_mode,image_path,preview_path,duration_sec,cost_cents,"
+            "approval_state,generator,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(job_id,identity_key) DO UPDATE SET state='READY',"
+            "image_path=excluded.image_path,preview_path=excluded.preview_path,"
+            "cost_cents=0,approval_state='PENDING_REVIEW'",
+            (
+                node["job_id"], entry["identity_key"], character_id,
+                entry["display_name"], "fixture_identity_anchor", "READY",
+                "static_image", str(image), str(image), 0, 0,
+                "PENDING_REVIEW", "fixture", "zero-cost-v1",
+            ),
+        )
+        database.commit()
+        return production_executor.NodeOutcome.require_review({
+            "character_id": character_id,
+            "identity_key": str(entry["identity_key"]),
+            "image_path": str(image),
+            "fixture": True,
+        })
+
+    async def scene_anchor(node: sqlite3.Row):
+        _spec, node_input = production_adapters._frozen_spec(database, node)
+        scene_key = str(node_input.get("scene_key") or "").strip().casefold()
+        if not scene_key:
+            raise RuntimeError("fixture scene key missing")
+        token = hashlib.sha256(scene_key.encode("utf-8")).hexdigest()[:20]
+        image = _fixture_image(
+            media_root / str(node["job_id"]) / "anchors" / f"scene-{token}.png",
+            color="0xC9D6DF",
+        )
+        database.execute(
+            "INSERT INTO scene_visual_anchors("
+            "job_id,anchor_key,description,master_indexes,state,image_path,"
+            "preview_path,cost_cents,generator,model,approval_state) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(job_id,anchor_key) DO UPDATE SET state='READY',"
+            "image_path=excluded.image_path,preview_path=excluded.preview_path,"
+            "cost_cents=0,approval_state='PENDING_REVIEW'",
+            (
+                node["job_id"], scene_key,
+                str(node_input.get("description") or scene_key), "[]", "READY",
+                str(image), str(image), 0, "fixture", "zero-cost-v1",
+                "PENDING_REVIEW",
+            ),
+        )
+        database.commit()
+        return production_executor.NodeOutcome.require_review({
+            "scene_key": scene_key,
+            "image_path": str(image),
+            "fixture": True,
+        })
+
+    async def master(node: sqlite3.Row):
+        _spec, node_input = production_adapters._frozen_spec(database, node)
+        master_idx = int(node_input.get("master_idx") or 0)
+        row = database.execute(
+            "SELECT duration_sec FROM shots WHERE job_id=? AND idx=?",
+            (node["job_id"], master_idx),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"fixture master row missing: {master_idx}")
+        video = _fixture_video(
+            media_root / str(node["job_id"]) / "masters" / f"{master_idx:02d}.mp4",
+            duration_sec=float(row["duration_sec"] or 1),
+            index=master_idx,
+        )
+        database.execute(
+            "UPDATE shots SET state='OK',video_path=?,provider='fixture',"
+            "video_model='zero-cost-v1',native_audio=1,cost_cents=0,error=NULL "
+            "WHERE job_id=? AND idx=?",
+            (str(video), node["job_id"], master_idx),
+        )
+        database.commit()
+        return {
+            "master_idx": master_idx,
+            "video_path": str(video),
+            "fixture": True,
+        }
+
+    async def bgm(node: sqlite3.Row):
+        job = database.execute(
+            "SELECT storyboard FROM jobs WHERE job_id=?", (node["job_id"],)
+        ).fetchone()
+        storyboard = json.loads(job["storyboard"] or "{}") if job else {}
+        duration = sum(
+            float(master.get("duration") or 0)
+            for master in (storyboard.get("masters") or [])
+        )
+        path = _fixture_bgm(
+            media_root / str(node["job_id"]) / "bgm.mp3",
+            duration_sec=duration,
+        )
+        database.execute(
+            "UPDATE jobs SET bgm_path=? WHERE job_id=?",
+            (str(path), node["job_id"]),
+        )
+        database.commit()
+        return {"bgm_path": str(path), "fixture": True}
+
+    return {
+        "character_anchor": character_anchor,
+        "scene_anchor": scene_anchor,
+        "master": master,
+        "bgm": bgm,
+        "local_compose": (
+            lambda node: production_adapters.run_local_compose_node(database, node)
+        ),
+        "final_review": (
+            lambda node: production_adapters.run_final_review_node(database, node)
+        ),
+    }
+
+
+def run_source_to_ready_to_publish(
+    service,
+    scenario: dict,
+    *,
+    fixture_root: Path,
+    media_root: Path,
+) -> dict:
+    """Exercise the complete console workflow and stop before external publish."""
+    compiled = run_source_to_compiled(
+        service,
+        scenario,
+        fixture_root=fixture_root,
+        asr_enabled=False,
+    )
+    job_id = str(compiled["job_id"])
+    service.start_video_job(
+        job_id,
+        confirmed=True,
+        approved_budget_cents=10_000,
+        high_risk_confirmed=True,
+    )
+    handlers = build_zero_cost_handlers(
+        service.database, media_root=media_root
+    )
+    observed_states = ["PRODUCTION_QUEUED"]
+    first = asyncio.run(production_graph_runner.run_graph_job(
+        service.database,
+        job_id,
+        configured_limit=4,
+        handlers=handlers,
+    ))
+    observed_states.append(first.job_state)
+    if first.job_state != "ANCHOR_REVIEW_REQUIRED":
+        raise RuntimeError(
+            "zero-cost graph did not stop at the continuity-anchor review gate: "
+            f"{first.job_state}"
+        )
+    service.approve_continuity_anchors(
+        job_id, note="zero-cost regression fixture approved"
+    )
+    observed_states.append("PRODUCTION_QUEUED")
+
+    from .steps import s6_compose
+
+    previous_assets_dir = s6_compose.ASSETS_DIR
+    s6_compose.ASSETS_DIR = Path(media_root).resolve()
+    try:
+        second = asyncio.run(production_graph_runner.run_graph_job(
+            service.database,
+            job_id,
+            configured_limit=4,
+            handlers=handlers,
+        ))
+    finally:
+        s6_compose.ASSETS_DIR = previous_assets_dir
+    observed_states.append(second.job_state)
+    if second.job_state != "COMPOSED":
+        raise RuntimeError(
+            f"zero-cost graph did not produce a reviewable final: {second.job_state}"
+        )
+    service.review_video(
+        job_id,
+        decision="approved",
+        first_pass=True,
+        checks={
+            "identity": True,
+            "lip_sync": True,
+            "subtitle_sync": True,
+            "visual_integrity": True,
+            "clean_frame": True,
+            "editing_rhythm": True,
+        },
+    )
+    published = service.submit_for_publish(job_id)
+    observed_states.append(str(published["state"]))
+    job = service.database.execute(
+        "SELECT state,final_path,cost_cents FROM jobs WHERE job_id=?",
+        (job_id,),
+    ).fetchone()
+    nodes = service.database.execute(
+        "SELECT node_id,state FROM production_nodes WHERE job_id=? "
+        "ORDER BY node_id",
+        (job_id,),
+    ).fetchall()
+    failed_nodes = [
+        str(node["node_id"]) for node in nodes
+        if str(node["state"]) == "FAILED"
+    ]
+    return {
+        **compiled,
+        "job_state": str(job["state"]),
+        "final_path": str(job["final_path"] or ""),
+        "external_cost_cents": int(job["cost_cents"] or 0),
+        "observed_states": observed_states,
+        "failed_nodes": failed_nodes,
+        "all_nodes_succeeded": bool(nodes) and all(
+            str(node["state"]) == "SUCCEEDED" for node in nodes
+        ),
+        "completed_stages": [
+            "source", "brief", "scripts", "approved", "compiled",
+            "anchors", "anchor_review", "masters", "local_compose",
+            "final_review", "ready_to_publish",
         ],
     }

@@ -76,6 +76,71 @@ class FullFlowRegressionTests(unittest.TestCase):
             )
             database.close()
 
+    def test_real_graph_reaches_ready_to_publish_with_manual_anchor_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "data").mkdir()
+            (root / "templates").mkdir()
+            (root / "templates" / "env.example").write_text(
+                "FACTORY_PROVIDER_MODE=live\n",
+                encoding="utf-8",
+            )
+            (root / ".env").write_text(
+                "FACTORY_PROVIDER_MODE=replay\n"
+                "PRODUCTION_EXECUTION_ENGINE=graph_v2\n"
+                "DIALOGUE_AUDIO_MODE=seedance_native\n"
+                "APPEND_CTA=false\n"
+                "GEN_THUMBNAIL=false\n"
+                "GEN_MARKETING_THUMBNAIL=false\n",
+                encoding="utf-8",
+            )
+            database_path = root / "data" / "factory.db"
+            database = sqlite3.connect(str(database_path))
+            database.row_factory = sqlite3.Row
+            database.executescript(db.DDL)
+            service = ManagementService(database, root, worker_mode="external")
+            scenario = {
+                "scenario_id": "ready_to_publish",
+                "source": {
+                    "type": "manual",
+                    "title": "三人跨场景零费用验收",
+                    "content": (
+                        "林夏在调度中心收到告警，高远在设备场复检备用高空车，"
+                        "周工在白天施工现场隔离故障。三人分别发言并完成复工闭环。"
+                    ),
+                },
+            }
+            with mock.patch.dict(os.environ, {
+                "FACTORY_DB_PATH": str(database_path),
+                "APPEND_CTA": "false",
+                "GEN_THUMBNAIL": "false",
+                "GEN_MARKETING_THUMBNAIL": "false",
+            }, clear=False):
+                try:
+                    report = full_flow_regression.run_source_to_ready_to_publish(
+                        service,
+                        scenario,
+                        fixture_root=root / "data" / "replay",
+                        media_root=root / "data" / "assets",
+                    )
+
+                    self.assertEqual(report["job_state"], "READY_TO_PUBLISH")
+                    self.assertEqual(report["external_cost_cents"], 0)
+                    self.assertTrue(Path(report["final_path"]).is_file())
+                    self.assertIn(
+                        "ANCHOR_REVIEW_REQUIRED", report["observed_states"]
+                    )
+                    self.assertEqual(report["failed_nodes"], [])
+                    self.assertTrue(report["all_nodes_succeeded"])
+                    self.assertEqual(
+                        database.execute(
+                            "SELECT COUNT(*) FROM provider_calls"
+                        ).fetchone()[0],
+                        0,
+                    )
+                finally:
+                    database.close()
+
 
 if __name__ == "__main__":
     unittest.main()
