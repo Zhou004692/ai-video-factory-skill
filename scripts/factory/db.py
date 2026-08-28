@@ -71,6 +71,21 @@ CREATE TABLE IF NOT EXISTS events (
     ts      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS task_doctor_runs (
+    run_id                 TEXT PRIMARY KEY,
+    entity_type            TEXT NOT NULL,
+    entity_id              TEXT NOT NULL,
+    requested_actions_json TEXT NOT NULL DEFAULT '[]',
+    applied_actions_json   TEXT NOT NULL DEFAULT '[]',
+    before_json            TEXT NOT NULL DEFAULT '{}',
+    after_json             TEXT NOT NULL DEFAULT '{}',
+    status                 TEXT NOT NULL,
+    created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_doctor_runs_entity
+    ON task_doctor_runs(entity_type, entity_id, created_at);
+
 CREATE TABLE IF NOT EXISTS provider_calls (
     task_id      TEXT PRIMARY KEY,
     job_id       TEXT NOT NULL,

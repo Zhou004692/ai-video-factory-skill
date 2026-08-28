@@ -675,6 +675,13 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 return self._json(self.service.production_graph_detail(job_id))
             except ValueError as exc:
                 return self._json({"error": str(exc)}, 404)
+        if (parsed.path.startswith("/api/videos/")
+                and parsed.path.endswith("/doctor")):
+            job_id = parsed.path.split("/")[3]
+            try:
+                return self._json(self.service.diagnose_video_task(job_id))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 404)
         if parsed.path in endpoints:
             try:
                 return self._json(endpoints[parsed.path]())
@@ -920,6 +927,17 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                   and request_path.startswith("/api/videos/")):
                 job_id = request_path.split("/")[3]
                 result = self.service.repair_execution_contract(job_id)
+            elif (request_path.startswith("/api/videos/")
+                  and request_path.endswith("/doctor/repair")):
+                job_id = request_path.split("/")[3]
+                requested_actions = payload.get("action_ids")
+                result = self.service.repair_video_task(
+                    job_id,
+                    action_ids=(
+                        [str(item) for item in requested_actions]
+                        if isinstance(requested_actions, list) else None
+                    ),
+                )
             elif self.path.endswith("/resume") and self.path.startswith("/api/videos/"):
                 job_id = self.path.split("/")[3]
                 result = self.service.resume_failed_video(job_id)

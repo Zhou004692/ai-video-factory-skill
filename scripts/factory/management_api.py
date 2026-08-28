@@ -25,7 +25,7 @@ from . import (
     production_invariants, production_projection, provider_capacity,
     provider_health, provider_tasks, recovery_controller, scene_assets,
     script_drafts, script_sources, source_analysis, source_scheduler,
-    state_machine, topic_briefs,
+    state_machine, task_doctor, topic_briefs,
 )
 from .clients import douyin, music, seedance, video_qa, volc_assets, volc_tts
 from .video_routing import AUDIO_MODE_FIXED_TTS, normalize_audio_mode
@@ -801,6 +801,20 @@ class ManagementService:
         self._reconcile_orphaned_production_workers()
         production_invariants.repair_all_safe(self.database)
         self._clear_stale_success_errors()
+
+    def diagnose_video_task(self, job_id: str) -> dict:
+        """Return a read-only, business-facing diagnosis for one video task."""
+        return task_doctor.TaskDoctor(
+            self.database, self.root
+        ).diagnose_video(job_id)
+
+    def repair_video_task(
+        self, job_id: str, action_ids: list[str] | None = None,
+    ) -> dict:
+        """Apply only Task Doctor's current zero-cost repair allowlist."""
+        return task_doctor.TaskDoctor(
+            self.database, self.root
+        ).repair_video(job_id, action_ids=action_ids)
 
     @staticmethod
     def _budget_pause_details(message: str) -> dict[str, int] | None:

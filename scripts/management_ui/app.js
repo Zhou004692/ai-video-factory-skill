@@ -1052,6 +1052,40 @@ const openVideoDrawerWithReconciliationDeleteGuard=openVideoDrawer;
 openVideoDrawer=function(job){openVideoDrawerWithReconciliationDeleteGuard(job);if(['PROVIDER_ACTION_REQUIRED','REJECTED_PENDING_RECONCILIATION'].includes(job?.state))$('#drawer-delete-video')?.remove()}
 const openVideoDrawerWithProductionStages=openVideoDrawer;
 openVideoDrawer=function(job){openVideoDrawerWithProductionStages(job);const markup=productionStageCards(job);if(!markup)return;const progress=$('#drawer .job-progress');if(progress)progress.insertAdjacentHTML('afterend',markup)}
+const doctorStatusLabel=status=>({healthy:'运行正常',repairable:'可安全修复',action_required:'需要人工确认',external_blocked:'外部条件阻塞'})[status]||status;
+const doctorSeverityLabel=severity=>({error:'阻塞',warning:'需处理',info:'提示'})[severity]||severity;
+const doctorCategoryLabel=category=>({production_graph:'生产图',worker:'执行器',execution_contract:'执行契约',state:'任务状态',provider:'模型服务',media:'本地文件',unknown:'未分类'})[category]||category;
+function taskDoctorFindingMarkup(report){
+  if(!report.findings?.length)return'<div class="task-doctor-empty"><i>✓</i><div><strong>未发现阻塞问题</strong><span>任务状态、执行节点和本地产物未发现可自动修复异常</span></div></div>';
+  return `<div class="task-doctor-findings">${report.findings.map(item=>`<article class="${esc(item.severity)}"><header><span>${esc(doctorCategoryLabel(item.category))}</span><em>${esc(doctorSeverityLabel(item.severity))}</em></header><strong>${esc(item.title)}</strong><p>${esc(item.detail)}</p><small>${item.repair_kind==='automatic'?'可执行零费用自动修复':item.repair_kind==='external'?'需处理外部账号或核对原任务':'需人工确认，不会自动执行'}</small></article>`).join('')}</div>`;
+}
+function taskDoctorActionMarkup(title,items,tone='neutral'){
+  if(!items?.length)return'';
+  return `<section class="task-doctor-actions ${tone}"><h3>${esc(title)}</h3>${items.map(item=>`<article><div><strong>${esc(item.label)}</strong><span>${esc(item.detail)}</span></div><em>${item.paid?'可能付费':'不新增模型费用'}</em></article>`).join('')}</section>`;
+}
+function renderTaskDoctor(job,report,repairResult=null){
+  const safeIds=(report.safe_actions||[]).map(item=>item.id);
+  const actionLabels=Object.fromEntries([...(repairResult?.before?.safe_actions||[]),...(report.safe_actions||[])].map(item=>[item.id,item.label]));
+  const history=report.audit_history||[];
+  openModal('TASK DOCTOR','任务诊断与修复',`<div class="task-doctor-summary ${esc(report.status)}"><span>${esc(doctorStatusLabel(report.status))}</span><div><strong>${esc(report.headline)}</strong><small>${esc(job.title||report.title)} · ${esc(job.job_id||report.entity_id)}</small></div></div>${repairResult?`<div class="task-doctor-result"><strong>${repairResult.applied_actions?.length?'安全修复已完成并复检':'本次没有可执行的安全修复'}</strong><span>${repairResult.applied_actions?.length?`已执行 ${repairResult.applied_actions.map(item=>actionLabels[item.id]||item.id).join('、')}`:'任务现场未被修改'}</span></div>`:''}${taskDoctorFindingMarkup(report)}${taskDoctorActionMarkup('可自动执行',report.safe_actions,'safe')}${taskDoctorActionMarkup('需要人工确认',report.confirmation_actions,'confirm')}${taskDoctorActionMarkup('需要外部处理',report.external_actions,'external')}${history.length?`<details class="task-doctor-history"><summary>最近诊断记录（${history.length}）</summary>${history.map(item=>`<div><span>${esc(item.created_at)}</span><b>${item.status==='repaired'?'已修复':'仅诊断'}</b></div>`).join('')}</details>`:''}<div class="impact-callout"><strong>安全边界</strong><span>自动修复不会启动生产 worker、不会创建模型任务、不会提高预算、不会接受候选或删除产物。涉及这些动作时只给出建议，由你确认后再执行。</span></div><div class="modal-actions"><button class="mini-action" id="task-doctor-rediagnose">重新诊断</button>${safeIds.length?'<button class="primary-action" id="task-doctor-repair">执行安全修复</button>':'<button class="primary-action" onclick="document.querySelector(\'#modal-close\').click()">完成</button>'}</div>`);
+  $('#task-doctor-rediagnose').onclick=()=>openTaskDoctor(job);
+  const repair=$('#task-doctor-repair');if(repair)repair.onclick=()=>repairTaskDoctor(job);
+}
+async function openTaskDoctor(job){
+  openModal('TASK DOCTOR','任务诊断与修复','<div class="task-doctor-loading"><i></i><strong>正在检查任务现场</strong><span>核对状态、执行节点、远端任务、本地文件和恢复条件</span></div>');
+  try{const report=await api(`/api/videos/${encodeURIComponent(job.job_id)}/doctor`);renderTaskDoctor(job,report)}catch(error){toast(error.message,true);closeModal()}
+}
+async function repairTaskDoctor(job){
+  const button=$('#task-doctor-repair');if(button){button.disabled=true;button.textContent='正在安全修复并复检…'}
+  try{
+    const result=await api(`/api/videos/${encodeURIComponent(job.job_id)}/doctor/repair`,{method:'POST',body:'{}'});
+    await loadPage('videos');
+    const fresh=state.videos?.jobs?.find(item=>item.job_id===job.job_id)||job;
+    renderTaskDoctor(fresh,result.after,result);
+  }catch(error){if(button){button.disabled=false;button.textContent='执行安全修复'}toast(error.message,true)}
+}
+const openVideoDrawerWithTaskDoctor=openVideoDrawer;
+openVideoDrawer=function(job){openVideoDrawerWithTaskDoctor(job);if(!job)return;const footer=$('#drawer .drawer-footer');if(!footer||$('#drawer-task-doctor'))return;footer.insertAdjacentHTML('afterbegin',`<button class="mini-action task-doctor-trigger" id="drawer-task-doctor">诊断修复</button>`);$('#drawer-task-doctor').onclick=()=>openTaskDoctor(job)}
 function openVideoDrawerAt(job,masterIndex){openVideoDrawer(job);const row=$(`[data-video-master="${CSS.escape(String(masterIndex))}"]`,$('#drawer'));if(!row)return;row.classList.add('focused');row.setAttribute('aria-current','true');row.scrollIntoView({block:'center'})}
 function openPublishReadyDrawer(item){openPublishFlow(item)}
 function openPublishFlow(item,selectedPlatform=''){
