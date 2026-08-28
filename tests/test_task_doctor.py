@@ -250,11 +250,16 @@ class TaskDoctorTests(unittest.TestCase):
         source = (
             PROJECT_ROOT / "scripts" / "management_ui" / "app.js"
         ).read_text(encoding="utf-8")
+        markup = (
+            PROJECT_ROOT / "scripts" / "management_ui" / "index.html"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("诊断修复", source)
         self.assertIn("openTaskDoctor", source)
         self.assertIn("/doctor/repair", source)
         self.assertIn("执行安全修复", source)
+        self.assertIn('id="studio-doctor-action"', markup)
+        self.assertIn("renderStudioDoctorAction", source)
 
 
 if __name__ == "__main__":

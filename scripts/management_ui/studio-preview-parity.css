@@ -135,8 +135,9 @@ body[data-page="overview"] .studio-stages>button.done:not(.active)>b{background:
 body[data-page="overview"] .studio-stages>button span{font-size:13px}
 body[data-page="overview"] .studio-stages>button small,body[data-page="overview"] .studio-stages>i{display:none}
 body[data-page="overview"] .studio-stage-action{
-  min-width:0;margin-left:auto;padding-left:18px;align-self:stretch;display:flex;align-items:center;background:#fff
+  min-width:0;margin-left:auto;padding-left:18px;align-self:stretch;display:flex;align-items:center;gap:8px;background:#fff
 }
+body[data-page="overview"] .studio-stage-action .task-doctor-trigger{min-height:36px;padding:0 12px;white-space:nowrap}
 body[data-page="overview"] .studio-stage-action .primary-action{
   min-height:36px;max-width:190px;padding:0 14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap
 }
