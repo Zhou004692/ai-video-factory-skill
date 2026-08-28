@@ -17,6 +17,9 @@ from .claude import _extract_json  # JSON 抽取容错,公用
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_MODEL = os.getenv("ARK_LLM_MODEL", "doubao-1-5-pro-32k-250115")
 DEFAULT_TIMEOUT_SEC = 300.0
+DEFAULT_SYSTEM_PROMPT = (
+    "你必须输出严格的 JSON,不要任何额外解释文字、不要 markdown 代码块。"
+)
 
 
 def _timeout_seconds() -> float:
@@ -30,21 +33,28 @@ def _timeout_seconds() -> float:
     return value
 
 
-def complete_json(prompt: str, system: str | None = None,
-                  max_tokens: int = 4000,
-                  model: str | None = None) -> tuple[dict, dict]:
-    """同步调用,返回 (JSON, usage_dict)。签名与 claude.complete_json 完全一致。"""
-    payload = {
+def request_payload(prompt: str, system: str | None = None,
+                    max_tokens: int = 4000,
+                    model: str | None = None) -> dict:
+    return {
         "model": model or DEFAULT_MODEL,
         "max_tokens": max_tokens,
         "temperature": 0.7,
         "messages": [
-            {"role": "system", "content": system or
-             "你必须输出严格的 JSON,不要任何额外解释文字、不要 markdown 代码块。"},
+            {"role": "system", "content": system or DEFAULT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
         "response_format": {"type": "json_object"},
     }
+
+
+def complete_json(prompt: str, system: str | None = None,
+                  max_tokens: int = 4000,
+                  model: str | None = None) -> tuple[dict, dict]:
+    """同步调用,返回 (JSON, usage_dict)。签名与 claude.complete_json 完全一致。"""
+    payload = request_payload(
+        prompt, system=system, max_tokens=max_tokens, model=model
+    )
 
     runtime = provider_runtime.from_environment()
     if runtime.mode == "replay":
