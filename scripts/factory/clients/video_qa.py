@@ -224,6 +224,7 @@ def evaluate_continuity(
     min_identity_alignment: float = 0.82,
     min_scene_alignment: float = 0.78,
     min_blocking_alignment: float = 0.80,
+    blocking_mode: str = "continuity",
 ) -> QADecision:
     """Fail closed only for continuity dimensions backed by references."""
     reasons: list[str] = []
@@ -235,7 +236,8 @@ def evaluate_continuity(
         result.get("scene_alignment") or 0
     ) < min_scene_alignment:
         reasons.append("scene_drift")
-    if bool(result.get("blocking_checked")) and float(
+    if str(blocking_mode or "continuity").casefold() != "free" \
+            and bool(result.get("blocking_checked")) and float(
         result.get("blocking_alignment") or 0
     ) < min_blocking_alignment:
         reasons.append("blocking_drift")
@@ -270,12 +272,41 @@ def analyze_continuity(
         "ARK_VIDEO_QA_MODEL",
         os.getenv("ARK_LLM_MODEL", "doubao-seed-2-0-pro-260215"),
     )
+    spatial = contract.get("spatial") if isinstance(contract, dict) else {}
+    spatial = spatial if isinstance(spatial, dict) else {}
+    legacy_mode = (
+        "locked"
+        if isinstance(contract, dict) and int(contract.get("version") or 1) < 2
+        else "continuity"
+    )
+    blocking_mode = str(
+        spatial.get("mode")
+        or (contract.get("blocking_mode") if isinstance(contract, dict) else "")
+        or legacy_mode
+    ).strip().casefold()
+    if blocking_mode not in {"free", "continuity", "locked"}:
+        blocking_mode = "continuity"
+    blocking_instruction = {
+        "free": (
+            "本镜为空间自由调度：不得用左右槽位或绝对站位判失败，"
+            "blocking_checked 必须为 false；仍需检查人物身份和场景。"
+        ),
+        "continuity": (
+            "本镜为空间连续调度：检查上一镜结束状态到本镜开始状态、视线、"
+            "出入方向和180度轴线是否连贯；允许剧情驱动的走位，不得按绝对"
+            "左右位置或静态构图判失败。"
+        ),
+        "locked": (
+            "本镜为精确站位锁定：按契约检查人物左右顺序、相对距离、朝向和"
+            "指定位置。"
+        ),
+    }[blocking_mode]
     prompt = (
         "你是跨镜头连续性质检器。第一个视频是当前候选母片；随后图片依次是"
         "人物标准定妆照和场景标准锚点；最后一个视频（如有）是上一条已验收"
         "的同场景母片。标准锚点是真值，上一母片只用于动作、站位和空间状态。"
         "逐项判断人物身份、视觉年龄、发型、服装、场景结构、设备位置、人物"
-        "左右顺序、相对距离、朝向、道具状态和180度轴线。没有对应参考证据的"
+        "空间关系、道具状态和180度轴线。" + blocking_instruction + "没有对应参考证据的"
         "维度必须把 checked 设为 false，不得猜测。只输出 JSON："
         '{"identity_checked":false,"identity_alignment":0.0,'
         '"scene_checked":false,"scene_alignment":0.0,'
@@ -320,7 +351,7 @@ def analyze_continuity(
             )
         body = response.json()
     raw = _extract_json(body["choices"][0]["message"]["content"])
-    return raw, evaluate_continuity(raw)
+    return raw, evaluate_continuity(raw, blocking_mode=blocking_mode)
 
 
 def analyze(video_url: str, *, expect_speech: bool,

@@ -3794,16 +3794,77 @@ def _blocking_anchor_text(blocking_anchor: dict | None) -> str:
     return f"axis={axis}; positions=" + ", ".join(positions)
 
 
+def _blocking_mode(shot: dict) -> str:
+    blocking = shot.get("blocking_anchor") or {}
+    contract = shot.get("continuity_contract") or {}
+    spatial = contract.get("spatial") or {}
+    mode = str(
+        blocking.get("mode") or spatial.get("mode") or "locked"
+    ).strip().casefold()
+    return mode if mode in {"free", "continuity", "locked"} else "locked"
+
+
+def _blocking_state_text(value: dict | None) -> str:
+    state = value or {}
+    source_names = {
+        "scene_baseline": "场景基准构图",
+        "previous_master_out": "承接上一母片结束状态",
+        "performance_end": "由本镜表演结束状态决定",
+        "locked_layout": "保持锁定构图",
+        "explicit": "剧本明确指定",
+    }
+    source = str(state.get("source") or "").strip()
+    positions = []
+    for item in state.get("positions") or []:
+        positions.append(
+            f"{item.get('display_name') or item.get('identity_key') or '角色'}="
+            f"{item.get('screen_position') or 'screen-center'}"
+        )
+    detail = "、".join(positions) if positions else "按参考画面实际状态"
+    return f"{source_names.get(source, source or '未指定')}（{detail}）"
+
+
+def _spatial_constraint_lines(shot: dict) -> list[str]:
+    blocking = shot.get("blocking_anchor") or {}
+    mode = _blocking_mode(shot)
+    axis = str(blocking.get("axis") or "preserve-180-degree-axis")
+    if mode == "free":
+        return [
+            "人物调度模式：自由调度。场景身份与人物身份保持稳定，但不锁定人物左右槽位、相对距离或固定构图。",
+            "人物可根据剧情动作自由进入、离开、靠近、后退、交接和改变视觉中心；不得无故复制、消失或更换身份。",
+        ]
+    if mode == "continuity":
+        movement = str(
+            blocking.get("movement") or shot.get("action") or "按剧情自然调度"
+        ).strip()
+        return [
+            "空间连续性契约：站位是镜头间的状态传递，不是全程固定构图。",
+            f"入镜状态：{_blocking_state_text(blocking.get('blocking_in'))}",
+            f"剧情走位：{movement}",
+            f"出镜状态：{_blocking_state_text(blocking.get('blocking_out'))}",
+            "允许人物按剧情动作改变位置、相对距离和视觉中心；保持视线、出入方向与动作惯性连续，禁止无动机瞬移、身份交换或跳轴。",
+            f"镜头轴线：{axis}；有明确镜头动机时可通过可见运镜建立新的轴线。",
+        ]
+    return [
+        "人物调度模式：精确锁定。场景连续性与人物站位均为硬约束。",
+        f"固定场景键：{shot.get('scene_anchor_key') or ''}",
+        f"固定站位图：{_blocking_anchor_text(blocking)}",
+        "同一人物必须保持同一屏幕侧、相对距离、朝向和身高关系；除非剧本明确指定换位，否则禁止交换左右位置。",
+        "锁定建筑、设备位置、地面材质、天气、时段、主光方向与180度镜头轴线。",
+    ]
+
+
 def _continuity_contract_text(contract: dict | None) -> str:
     value = contract or {}
     scene = value.get("scene") or {}
     camera = value.get("camera") or {}
+    spatial = value.get("spatial") or {}
     character_lines = []
     for character in value.get("characters") or []:
         character_lines.append(
             f"{character.get('display_name') or character.get('identity_key') or '角色'}:"
             f"服装={character.get('wardrobe') or '保持身份锚点造型'},"
-            f"站位={character.get('screen_position') or 'screen-center'}"
+            f"场景基准位置={character.get('screen_position') or 'screen-center'}"
         )
     props = "、".join(str(item) for item in value.get("props") or []) or "无固定道具"
     return "；".join([
@@ -3813,6 +3874,10 @@ def _continuity_contract_text(contract: dict | None) -> str:
         f"人物=[{'；'.join(character_lines)}]",
         f"道具={props}",
         f"轴线={camera.get('axis') or 'preserve-180-degree-axis'}",
+        f"调度模式={spatial.get('mode') or 'locked'}",
+        f"入镜={_blocking_state_text(spatial.get('blocking_in'))}",
+        f"剧情走位={spatial.get('movement') or '按本镜动作自然调度'}",
+        f"出镜={_blocking_state_text(spatial.get('blocking_out'))}",
     ])
 
 
@@ -3938,22 +4003,38 @@ def _build_native_dialogue_prompt(
             ]
         else:
             parts[1:1] = [
-                "场景连续性为硬约束，不是风格参考。",
+                "场景身份与可重复识别的空间结构为硬约束，不是风格参考。",
                 f"固定场景键：{shot.get('scene_anchor_key') or ''}",
-                f"固定站位图：{_blocking_anchor_text(shot.get('blocking_anchor'))}",
-                "同一人物必须保持同一屏幕侧、相对距离、朝向和身高关系；"
-                "除非动作明确要求换位，否则禁止交换左右位置。",
-                "锁定建筑、设备位置、地面材质、天气、时段、主光方向与180度镜头轴线。",
+                *_spatial_constraint_lines(shot),
             ]
     if shot.get("continuity_contract"):
+        mode = _blocking_mode(shot)
+        scope = {
+            "free": "场景和人物身份为硬约束；人物空间为自由调度",
+            "continuity": "场景和人物身份为硬约束；人物空间按入镜、走位、出镜状态传递",
+            "locked": "场景、人物身份和明确站位均为硬约束",
+        }[mode]
         parts[1:1] = [
-            "结构化连续性契约（以下字段均为硬约束）：",
+            f"结构化连续性契约（{scope}）：",
             _continuity_contract_text(shot.get("continuity_contract")),
         ]
     if previous_scene_anchored:
+        if _blocking_mode(shot) == "free":
+            previous_duty = (
+                "前序同场景视频只负责延续空间身份、材质和光线，不锁定本镜人物站位或构图；"
+            )
+        elif _blocking_mode(shot) == "continuity":
+            previous_duty = (
+                "前序同场景视频负责提供上一母片的出镜状态、视线、动作惯性和镜头轴线；"
+                "从该状态自然继续，但允许本镜按剧情走位；"
+            )
+        else:
+            previous_duty = (
+                "前序同场景视频只负责延续空间布局、人物站位、视线方向和镜头轴线；"
+            )
         parts[1:1] = [
-            "前序同场景视频只负责延续空间布局、人物站位、视线方向和镜头轴线；"
-            "人物身份仍以定妆照或授权角色资产为准，不得沿用前序视频中的脸部漂移。",
+            previous_duty
+            + "人物身份仍以定妆照或授权角色资产为准，不得沿用前序视频中的脸部漂移。",
         ]
     if cinematic:
         cast_lines = []

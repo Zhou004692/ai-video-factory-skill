@@ -1905,6 +1905,7 @@ class VideoQATests(unittest.TestCase):
             ["text", "video_url", "image_url", "image_url", "video_url"],
         )
         self.assertIn("continuity_contract", content[0]["text"])
+        self.assertIn("精确站位锁定", content[0]["text"])
 
     def test_continuity_gate_rejects_identity_scene_and_blocking_drift(self):
         decision = video_qa.evaluate_continuity({
@@ -1931,6 +1932,36 @@ class VideoQATests(unittest.TestCase):
 
         self.assertTrue(decision.passed)
         self.assertEqual(decision.reasons, ())
+
+    def test_continuity_gate_ignores_blocking_drift_in_free_mode(self):
+        decision = video_qa.evaluate_continuity(
+            {
+                "identity_checked": True, "identity_alignment": 0.95,
+                "scene_checked": True, "scene_alignment": 0.91,
+                "blocking_checked": True, "blocking_alignment": 0.25,
+                "wardrobe_checked": True, "wardrobe_match": True,
+                "prop_state_checked": True, "prop_state_match": True,
+            },
+            blocking_mode="free",
+        )
+
+        self.assertTrue(decision.passed)
+        self.assertNotIn("blocking_drift", decision.reasons)
+
+    def test_continuity_gate_keeps_blocking_check_in_continuity_mode(self):
+        decision = video_qa.evaluate_continuity(
+            {
+                "identity_checked": True, "identity_alignment": 0.95,
+                "scene_checked": True, "scene_alignment": 0.91,
+                "blocking_checked": True, "blocking_alignment": 0.25,
+                "wardrobe_checked": True, "wardrobe_match": True,
+                "prop_state_checked": True, "prop_state_match": True,
+            },
+            blocking_mode="continuity",
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertIn("blocking_drift", decision.reasons)
 
     def test_broll_semantic_gate_requires_industry_subject_and_environment(self):
         decision = video_qa.evaluate(
@@ -7947,12 +7978,21 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(changed)
         first = storyboard["masters"][0]
         contract = first["continuity_contract"]
-        self.assertEqual(contract["version"], 1)
+        self.assertEqual(contract["version"], 2)
         self.assertEqual(contract["scene"]["key"], "yard-a")
         self.assertEqual(contract["scene"]["time_of_day"], "白天")
         self.assertEqual(contract["scene"]["lighting"], "左前方自然光")
         self.assertEqual(contract["props"], ["手机"])
         self.assertEqual(contract["camera"]["axis"], "preserve-180-degree-axis")
+        self.assertEqual(contract["spatial"]["mode"], "continuity")
+        self.assertEqual(
+            first["blocking_anchor"]["blocking_in"]["source"],
+            "scene_baseline",
+        )
+        self.assertEqual(
+            first["blocking_anchor"]["blocking_out"]["source"],
+            "performance_end",
+        )
         by_name = {item["display_name"]: item for item in contract["characters"]}
         self.assertEqual(by_name["老大"]["wardrobe"], "白色安全帽、荧光绿反光背心")
         self.assertEqual(by_name["老大"]["screen_position"], "screen-left")
@@ -7960,6 +8000,82 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             storyboard["masters"][1]["continuity_contract"]["scene"]["key"],
             "yard-a",
+        )
+        self.assertEqual(
+            storyboard["masters"][1]["blocking_anchor"]["blocking_in"]["source"],
+            "previous_master_out",
+        )
+
+    def test_single_scene_defaults_to_free_blocking(self):
+        storyboard = {
+            "characters": [{
+                "id": "lead", "name": "林夏", "generation_mode": "ai_generated",
+            }],
+            "masters": [{
+                "idx": 1,
+                "speaker": "lead",
+                "scene": "场景：设备展厅；出镜人物：林夏；人物动作：林夏穿过展厅走向设备",
+                "action": "林夏从画面右侧进入，绕过设备后走向镜头",
+            }],
+        }
+
+        scene_assets.apply_continuity_metadata(
+            storyboard, storyboard["characters"]
+        )
+
+        master = storyboard["masters"][0]
+        self.assertEqual(master["blocking_anchor"]["mode"], "free")
+        self.assertEqual(master["continuity_contract"]["spatial"]["mode"], "free")
+
+    def test_explicit_locked_blocking_remains_available(self):
+        storyboard = {
+            "characters": [
+                {"id": "a", "name": "甲", "generation_mode": "ai_generated"},
+                {"id": "b", "name": "乙", "generation_mode": "ai_generated"},
+            ],
+            "masters": [{
+                "idx": 1,
+                "speaker": "a",
+                "blocking_mode": "locked",
+                "scene": "场景：会议室；出镜人物：甲、乙；人物动作：正反打对话",
+                "action": "甲乙保持座位完成正反打",
+            }],
+        }
+
+        scene_assets.apply_continuity_metadata(
+            storyboard, storyboard["characters"]
+        )
+
+        blocking = storyboard["masters"][0]["blocking_anchor"]
+        self.assertEqual(blocking["mode"], "locked")
+        self.assertEqual(len(blocking["positions"]), 2)
+
+    def test_repeated_broll_scene_keeps_free_blocking(self):
+        storyboard = {
+            "characters": [],
+            "masters": [
+                {
+                    "idx": 1,
+                    "role": "broll",
+                    "scene_anchor_key": "yard",
+                    "scene": "场景：设备停车场；人物动作：车辆驶过",
+                    "action": "航拍车辆驶入停车场",
+                },
+                {
+                    "idx": 2,
+                    "role": "broll",
+                    "scene_anchor_key": "yard",
+                    "scene": "场景：设备停车场；人物动作：吊臂升起",
+                    "action": "低机位跟随吊臂升起",
+                },
+            ],
+        }
+
+        scene_assets.apply_continuity_metadata(storyboard, [])
+
+        self.assertEqual(
+            [item["blocking_anchor"]["mode"] for item in storyboard["masters"]],
+            ["free", "free"],
         )
 
     def test_fixed_asset_background_is_not_treated_as_wardrobe_contract(self):
@@ -8109,6 +8225,7 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
                 "action": "两人继续对话",
                 "scene_anchor_key": "scene-yard",
                 "blocking_anchor": {
+                    "mode": "locked",
                     "axis": "preserve-180-degree-axis",
                     "positions": [
                         {"display_name": "老大", "screen_position": "screen-left"},
@@ -8127,6 +8244,69 @@ class SceneVisualAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("screen-right", prompt)
         self.assertIn("180", prompt)
         self.assertIn("人物身份仍以定妆照或授权角色资产为准", prompt)
+
+    def test_continuity_prompt_allows_motivated_blocking_changes(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 2,
+                "duration_sec": 8,
+                "voiceover": "现在由我接管现场。",
+                "scene": "设备调度室",
+                "action": "林夏从左侧走到中央，赵总后退半步",
+                "scene_anchor_key": "dispatch-room",
+                "blocking_anchor": {
+                    "mode": "continuity",
+                    "axis": "preserve-180-degree-axis",
+                    "positions": [
+                        {"display_name": "林夏", "screen_position": "screen-left"},
+                        {"display_name": "赵总", "screen_position": "screen-center"},
+                    ],
+                    "blocking_in": {
+                        "source": "previous_master_out", "positions": [],
+                    },
+                    "movement": "林夏从左侧走到中央，赵总后退半步",
+                    "blocking_out": {
+                        "source": "performance_end", "positions": [],
+                    },
+                },
+            },
+            {"id": "linxia", "name": "林夏", "generation_mode": "ai_generated"},
+            anchored=True,
+            scene_anchored=True,
+            previous_scene_anchored=True,
+        )
+
+        self.assertIn("空间连续性契约", prompt)
+        self.assertIn("允许人物按剧情动作改变位置", prompt)
+        self.assertIn("林夏从左侧走到中央", prompt)
+        self.assertIn("禁止无动机瞬移", prompt)
+        self.assertNotIn("固定站位图", prompt)
+
+    def test_free_blocking_prompt_does_not_lock_screen_side(self):
+        prompt = s3_shots._build_native_dialogue_prompt(
+            {
+                "idx": 1,
+                "duration_sec": 6,
+                "voiceover": "我们开始检查。",
+                "scene": "高空车停车场",
+                "action": "工程师绕过车辆走向镜头",
+                "scene_anchor_key": "yard",
+                "blocking_anchor": {
+                    "mode": "free",
+                    "axis": "preserve-180-degree-axis",
+                    "positions": [{
+                        "display_name": "工程师",
+                        "screen_position": "screen-center",
+                    }],
+                },
+            },
+            {"id": "engineer", "name": "工程师", "generation_mode": "ai_generated"},
+            scene_anchored=True,
+        )
+
+        self.assertIn("自由调度", prompt)
+        self.assertIn("不锁定人物左右槽位", prompt)
+        self.assertNotIn("固定站位图", prompt)
 
     def test_reference_video_budget_is_a_product_attention_guard(self):
         self.assertEqual(

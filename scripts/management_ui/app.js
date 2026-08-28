@@ -457,7 +457,7 @@ function openStudioAnchorPreview(video,kind,index){
   const relation=character
     ?`${makeupStatusLabel(item.status)} · ${anchorApprovalLabel(item)}`
     :`关联母片 ${(item.master_indexes||[]).map(master=>`#${master}`).join('、')||'待识别'} · ${anchorApprovalLabel(item)}`;
-  openModal(character?'IDENTITY ANCHOR':'SCENE ANCHOR',`${title} · ${character?'人物锚点':'场景锚点'}`,`<div class="studio-anchor-lightbox ${character?'character':'scene'}"><figure><img src="${esc(item.preview_url)}" alt="${esc(title)} ${character?'人物定妆照':'场景锚点图'}"></figure><aside><p class="section-no">ANCHOR DETAILS</p><h3>${esc(title)}</h3><dl><div><dt>锚点类型</dt><dd>${character?'人物身份与服装':'空间、光线与站位'}</dd></div><div><dt>生成方式</dt><dd>${esc(anchorGeneratorLabel(item.generator||item.source))}</dd></div><div><dt>当前状态</dt><dd>${esc(relation)}</dd></div></dl><a class="mini-action" href="${esc(item.preview_url)}" target="_blank" rel="noopener">在新窗口打开原图</a></aside></div>`);
+  openModal(character?'IDENTITY ANCHOR':'SCENE ANCHOR',`${title} · ${character?'人物锚点':'场景锚点'}`,`<div class="studio-anchor-lightbox ${character?'character':'scene'}"><figure><img src="${esc(item.preview_url)}" alt="${esc(title)} ${character?'人物定妆照':'场景锚点图'}"></figure><aside><p class="section-no">ANCHOR DETAILS</p><h3>${esc(title)}</h3><dl><div><dt>锚点类型</dt><dd>${character?'人物身份与服装':'空间、光线与人物调度'}</dd></div><div><dt>生成方式</dt><dd>${esc(anchorGeneratorLabel(item.generator||item.source))}</dd></div><div><dt>当前状态</dt><dd>${esc(relation)}</dd></div></dl><a class="mini-action" href="${esc(item.preview_url)}" target="_blank" rel="noopener">在新窗口打开原图</a></aside></div>`);
 }
 function studioAnchorView(video,selected){
   const cast=new Set([...(selected?.cast||[]),...(selected?.speakers||[]),selected?.speaker].filter(Boolean).map(String));
@@ -476,7 +476,8 @@ function studioAnchorView(video,selected){
     const media=item.preview_url?`<button type="button" class="studio-anchor-media scene" data-studio-anchor-preview="scene" data-anchor-index="${index}" aria-label="预览 ${esc(name)} 场景锚点"><img src="${esc(item.preview_url)}" alt="${esc(name)} 场景锚点" loading="lazy"><span>查看大图</span></button>`:'<span class="studio-anchor-placeholder scene">景</span>';
     return `<article class="studio-anchor-card scene ${related?'related':'muted'}">${media}<div><b>${esc(name)}</b><small>关联母片 ${(item.master_indexes||[]).map(master=>`#${master}`).join('、')||'待识别'}</small><em>${esc(anchorGeneratorLabel(item.generator))} · ${esc(anchorApprovalLabel(item))}</em>${item.preview_url?'<span class="studio-anchor-hint">点击图片检查空间、光线和构图基线</span>':''}</div>${sceneBlockingStage(item)}</article>`;
   }).join('')||'<p class="empty-inline">当前任务没有跨母片场景锚点</p>';
-  return `<section class="studio-anchor-section"><header><div><p class="section-no">IDENTITY ANCHORS</p><h3>角色定妆</h3></div><small>锁定人物身份与服装基线 · 点击图片可预览原图</small></header><div class="studio-anchor-grid">${peopleMarkup}</div></section><section class="studio-anchor-section"><header><div><p class="section-no">SCENE & BLOCKING</p><h3>场景与站位</h3></div><small>仅跨母片复用的空间需要锚点 · 点击图片可预览原图</small></header><div class="studio-anchor-grid scenes">${sceneMarkup}</div></section>`;
+  const spatialModes=`<div class="studio-spatial-mode-legend" aria-label="空间连续性策略说明"><article class="free"><i></i><div><b>自由调度</b><small>允许进出画与自由走位</small></div></article><article class="continuity"><i></i><div><b>连续调度</b><small>承接上一母片结束状态</small></div></article><article class="locked"><i></i><div><b>精确锁定</b><small>仅明确构图时锁定</small></div></article></div>`;
+  return `<section class="studio-anchor-section"><header><div><p class="section-no">IDENTITY ANCHORS</p><h3>角色定妆</h3></div><small>锁定人物身份与服装基线 · 点击图片可预览原图</small></header><div class="studio-anchor-grid">${peopleMarkup}</div></section><section class="studio-anchor-section"><header><div><p class="section-no">SCENE & BLOCKING</p><h3>场景与人物调度</h3></div><small>场景图锁定空间基线；人物按自由、连续或精确锁定策略运动</small></header>${spatialModes}<div class="studio-anchor-grid scenes">${sceneMarkup}</div></section>`;
 }
 function studioSessionsView(video,selected){const masters=studioVideoMasters(video);return `<div class="studio-session-list">${masters.map(master=>{const active=selected&&Number(master.idx)===Number(selected.idx);const scenes=studioMasterScenes(video,master);return `<article class="studio-session-card ${active?'active':''} ${master.error?'failed':''}" data-studio-master="${master.idx}"><span class="studio-session-index">M${String(master.idx).padStart(2,'0')}</span><div><header><b>${esc(studioMasterTitle(master))}</b><i>${esc(studioMasterStatus(master))}</i></header><p>${esc(studioMasterSubtitle(master))} · ${Number(master.duration_sec||master.duration||0)} 秒 · ${scenes.length} 个场次</p><footer><span>${esc(master.provider||'等待模型调度')}</span><span>${money(master.cost_cents)}</span>${master.error?`<em>${esc(summarizeError(master.error))}</em>`:''}</footer></div></article>`}).join('')||'<div class="studio-empty"><b>尚未创建生成会话</b></div>'}</div>${selected?.video_url?`<div class="studio-session-preview"><video controls preload="metadata" src="${esc(selected.video_url)}"></video><small>当前母片 M${String(selected.idx).padStart(2,'0')} 预览</small></div>`:''}`}
 function studioVideoView(video,selected){if(state.studioVideoView==='anchors')return studioAnchorView(video,selected);if(state.studioVideoView==='sessions')return studioSessionsView(video,selected);return studioTimelineView(video,selected)}
@@ -1007,7 +1008,7 @@ function fixedVoiceCards(job){const plan=job?.preflight?.voice_plan||{};const ro
 function anchorApprovalLabel(item){return String(item?.approval_state||'').toLowerCase()==='approved'?'已确认':'待确认'}
 const characterMakeupCardsWithApproval=characterMakeupCards;
 characterMakeupCards=function(job){const html=characterMakeupCardsWithApproval(job);const pending=(job?.character_makeup_plan||[]).filter(item=>item.source!=='volc_asset'&&String(item.approval_state||'').toLowerCase()!=='approved');if(!pending.length)return html;return html.replace('</section>',`<div class="anchor-approval-summary"><strong>人物锚点待确认</strong><span>${esc(pending.map(item=>`${item.display_name}·${anchorApprovalLabel(item)}`).join(' / '))}</span></div></section>`)}
-function sceneAnchorCards(job){const plan=job?.scene_anchor_plan||job?.preflight?.paid_scene_anchors||[];if(!plan.length)return'';const statusLabel=status=>({ready:'锚点就绪',pending:'待生成',generating:'正在生成',failed:'生成失败'})[String(status||'pending').toLowerCase()]||'待生成';const siteCount=plan.filter(item=>item.anchor_scope==='site').length;const sceneCount=plan.length-siteCount;const scopeSummary=[sceneCount?`${sceneCount} 个同一物理场景`:'',siteCount?`${siteCount} 个项目现场`:''].filter(Boolean).join(' · ');return `<section class="detail-section scene-anchor-section"><div class="section-line"><h3>场景连续性锚点</h3><small>${scopeSummary}</small></div><div class="scene-anchor-grid">${plan.map(item=>{const isSite=item.anchor_scope==='site';const scopeLabel=isSite?'项目现场连续性锚点':'同一物理场景锚点';return `<article class="scene-anchor-card ${esc(item.status||'pending')}">${item.preview_url?`<a href="${esc(item.preview_url)}" target="_blank" rel="noreferrer"><img src="${esc(item.preview_url)}" alt="${esc(item.anchor_key)} ${scopeLabel}"></a>`:`<div class="scene-anchor-placeholder">景</div>`}<div><b>${scopeLabel}</b><strong>${esc(item.description||item.anchor_key)}</strong><span>${esc(item.anchor_key)} · ${esc(anchorGeneratorLabel(item.generator))}</span><small>关联母片 ${(item.master_indexes||[]).map(index=>`#${index}`).join('、')||'待识别'} · ${statusLabel(item.status)}${Number(item.cost_cents||item.estimated_cost_cents)?` · ${money(item.cost_cents||item.estimated_cost_cents)}`:''}</small>${item.model?`<small>${esc(item.model)}</small>`:''}${item.error?`<em>${esc(item.error)}</em>`:''}</div></article>`}).join('')}</div><p class="section-note">同一物理场景锚点锁定空间与站位；项目现场连续性锚点只统一建筑、材质、设备和安全体系，不锁定不同子空间的构图。一次性场景不预生成</p></section>`}
+function sceneAnchorCards(job){const plan=job?.scene_anchor_plan||job?.preflight?.paid_scene_anchors||[];if(!plan.length)return'';const statusLabel=status=>({ready:'锚点就绪',pending:'待生成',generating:'正在生成',failed:'生成失败'})[String(status||'pending').toLowerCase()]||'待生成';const siteCount=plan.filter(item=>item.anchor_scope==='site').length;const sceneCount=plan.length-siteCount;const scopeSummary=[sceneCount?`${sceneCount} 个同一物理场景`:'',siteCount?`${siteCount} 个项目现场`:''].filter(Boolean).join(' · ');return `<section class="detail-section scene-anchor-section"><div class="section-line"><h3>场景连续性锚点</h3><small>${scopeSummary}</small></div><div class="scene-anchor-grid">${plan.map(item=>{const isSite=item.anchor_scope==='site';const scopeLabel=isSite?'项目现场连续性锚点':'同一物理场景锚点';return `<article class="scene-anchor-card ${esc(item.status||'pending')}">${item.preview_url?`<a href="${esc(item.preview_url)}" target="_blank" rel="noreferrer"><img src="${esc(item.preview_url)}" alt="${esc(item.anchor_key)} ${scopeLabel}"></a>`:`<div class="scene-anchor-placeholder">景</div>`}<div><b>${scopeLabel}</b><strong>${esc(item.description||item.anchor_key)}</strong><span>${esc(item.anchor_key)} · ${esc(anchorGeneratorLabel(item.generator))}</span><small>关联母片 ${(item.master_indexes||[]).map(index=>`#${index}`).join('、')||'待识别'} · ${statusLabel(item.status)}${Number(item.cost_cents||item.estimated_cost_cents)?` · ${money(item.cost_cents||item.estimated_cost_cents)}`:''}</small>${item.model?`<small>${esc(item.model)}</small>`:''}${item.error?`<em>${esc(item.error)}</em>`:''}</div></article>`}).join('')}</div><p class="section-note">同一物理场景锚点锁定空间身份和轴线，人物按自由调度、连续调度或精确锁定执行；项目现场锚点不锁定不同子空间构图。一次性场景不预生成</p></section>`}
 const sceneAnchorCardsWithPlan=sceneAnchorCards;
 const scenePositionLabels={'screen-left':'左侧','screen-center':'中间','screen-right':'右侧'};
 function normalizedScenePositions(item){
@@ -1021,19 +1022,53 @@ function normalizedScenePositions(item){
     screen_position:typeof position==='string'?position:(position?.screen_position||'screen-center')
   }));
 }
+function normalizedSceneState(item,key,fallback=[]){
+  const stateValue=item?.blocking_anchor?.[key];
+  if(!stateValue)return fallback;
+  const positions=stateValue?.positions??stateValue;
+  if(Array.isArray(positions))return positions.map(position=>({
+    display_name:position.display_name||position.identity_key||'人物',
+    screen_position:position.screen_position||'screen-center'
+  }));
+  if(positions&&typeof positions==='object')return Object.entries(positions).map(([name,position])=>({
+    display_name:name,
+    screen_position:typeof position==='string'?position:(position?.screen_position||'screen-center')
+  }));
+  return fallback;
+}
+function sceneStateChips(positions){
+  return positions.map(position=>`<span title="${esc(position.display_name)} · ${esc(scenePositionLabels[position.screen_position]||'画面内')}"><i>${esc(position.display_name.slice(0,1))}</i><b>${esc(position.display_name)}</b><small>${esc(scenePositionLabels[position.screen_position]||'画面内')}</small></span>`).join('')||'<em>按剧情入画</em>';
+}
 function sceneBlockingStage(item){
   const positions=normalizedScenePositions(item);
   if(!positions.length)return'';
-  const slots=['screen-left','screen-center','screen-right'];
-  const slotMarkup=slots.map(slot=>{
-    const people=positions.filter(position=>position.screen_position===slot);
-    const peopleMarkup=people.length
-      ?people.map(person=>`<span title="${esc(person.display_name)}"><i>${esc(person.display_name.slice(0,1))}</i><b>${esc(person.display_name)}</b></span>`).join('')
-      :'<em>留空</em>';
-    return `<div class="scene-position ${slot.replace('screen-','')}"><small>${scenePositionLabels[slot]}</small>${peopleMarkup}</div>`;
-  }).join('');
-  const summary=positions.map(position=>`${position.display_name}在${scenePositionLabels[position.screen_position]||'中间'}`).join('，');
-  return `<article class="scene-blocking-card"><header><strong>固定站位</strong><span>${esc(item.description||item.anchor_key||'当前场景')}</span></header><div class="scene-blocking-stage">${slotMarkup}<div class="scene-axis"><i></i><small>保持 180° 轴线</small></div></div><p>${esc(summary)}</p></article>`;
+  const mode=String(item?.blocking_anchor?.mode||'locked').toLowerCase();
+  const modeLabel={free:'自由调度',continuity:'连续调度',locked:'精确锁定'}[mode]||'精确锁定';
+  const baseline=positions.map(position=>`${position.display_name}在${scenePositionLabels[position.screen_position]||'中间'}`).join('，');
+  let stage='';
+  let summary='';
+  if(mode==='free'){
+    stage=`<div class="scene-free-zone"><header><small>人物活动区</small><b>不锁定左 / 中 / 右</b></header><div class="scene-free-cast">${sceneStateChips(positions)}</div><div class="scene-free-path"><span>进入画面</span><i>→</i><span>按剧情走位与表演</span><i>→</i><span>换位或离画</span></div><div class="scene-axis"><i></i><small>场景与 180° 轴线保持稳定</small></div></div>`;
+    summary=`构图起点仅作参考：${baseline}；人物可按剧情进入、移动、换位或离开画面`;
+  }else if(mode==='continuity'){
+    const incoming=normalizedSceneState(item,'blocking_in',positions);
+    const outgoing=normalizedSceneState(item,'blocking_out',incoming);
+    const movement=item?.blocking_anchor?.movement||'承接动作惯性并按剧情推进';
+    stage=`<div class="scene-motion-flow"><div class="scene-state-frame incoming"><small>起始状态</small><div>${sceneStateChips(incoming)}</div></div><div class="scene-motion-arrow"><small>镜头运动</small><i>→</i><b>${esc(movement)}</b></div><div class="scene-state-frame outgoing"><small>结束状态</small><div>${sceneStateChips(outgoing)}</div></div><div class="scene-axis"><i></i><small>结束状态交给下一母片继续</small></div></div>`;
+    summary='连续调度锁定的是状态交接，而不是全程固定构图；下一母片继承本镜结束时的位置、动作趋势和轴线';
+  }else{
+    const slots=['screen-left','screen-center','screen-right'];
+    const slotMarkup=slots.map(slot=>{
+      const people=positions.filter(position=>position.screen_position===slot);
+      const peopleMarkup=people.length
+        ?people.map(person=>`<span title="${esc(person.display_name)}"><i>${esc(person.display_name.slice(0,1))}</i><b>${esc(person.display_name)}</b></span>`).join('')
+        :'<em>留空</em>';
+      return `<div class="scene-position ${slot.replace('screen-','')}"><small>${scenePositionLabels[slot]}</small>${peopleMarkup}</div>`;
+    }).join('');
+    stage=`<div class="scene-locked-stage"><header><small>固定构图</small><b>人物位置保持不变</b></header><div class="scene-blocking-stage">${slotMarkup}<div class="scene-axis"><i></i><small>保持 180° 轴线</small></div></div></div>`;
+    summary=`精确锁定：${baseline}；仅用于固定机位、证据镜头或明确指定的构图`;
+  }
+  return `<article class="scene-blocking-card ${esc(mode)}"><header><strong>空间连续性 · ${modeLabel}</strong><span>${esc(item.description||item.anchor_key||'当前场景')}</span></header>${stage}<p>${esc(summary)}</p></article>`;
 }
 sceneAnchorCards=function(job){
   const plan=job?.scene_anchor_plan||job?.preflight?.paid_scene_anchors||[];
@@ -1052,7 +1087,7 @@ openVideoDrawer=function(job){openVideoDrawerWithSceneAnchors(job);mountSceneAnc
 async function approveContinuityAnchors(job){const note=$('#anchor-review-note')?.value||'';const button=$('#approve-continuity-anchors');if(button)button.disabled=true;try{const result=await api(`/api/videos/${encodeURIComponent(job.job_id)}/anchors/approve`,{method:'POST',body:JSON.stringify({note})});closeDrawer();toast(result.dispatched_jobs?.includes(job.job_id)?'锚点已确认，母片生成已继续':'锚点已确认，任务已重新排队');loadPage('videos')}catch(e){if(button)button.disabled=false;toast(e.message,true)}}
 function continuityAnchorProgress(job){const characters=job?.character_makeup_plan||job?.preflight?.character_makeup_plan||[];const scenes=job?.scene_anchor_plan||job?.preflight?.paid_scene_anchors||[];const ready=item=>String(item?.status||'').toLowerCase()==='ready';const characterReady=characters.filter(ready).length;const sceneReady=scenes.filter(ready).length;const waiting=[];if(characterReady<characters.length)waiting.push('人物');if(sceneReady<scenes.length)waiting.push('场景');return {characters,scenes,characterReady,sceneReady,complete:characters.length+scenes.length>0&&!waiting.length,waiting}}
 const openVideoDrawerWithAnchorReview=openVideoDrawer;
-openVideoDrawer=function(job){openVideoDrawerWithAnchorReview(job);const footer=$('#drawer .drawer-footer');if(!footer)return;const progress=continuityAnchorProgress(job);if(job?.state==='ANCHOR_REVIEW_REQUIRED'){footer.insertAdjacentHTML('beforebegin',`<section class="detail-section anchor-review-panel" id="anchor-generation-status"><h3>人物与场景锚点确认</h3><p>人物 ${progress.characterReady}/${progress.characters.length} · 场景 ${progress.sceneReady}/${progress.scenes.length}</p><p>请逐项预览定妆照、场景图和固定站位。确认后系统才会继续产生剧情母片费用。</p><label>审核备注<textarea id="anchor-review-note" rows="3" placeholder="可选：记录造型、场景或站位确认意见"></textarea></label></section>`);return}if(['PENDING','PRODUCTION_QUEUED','PRODUCTION_RUNNING'].includes(job?.state)&&progress.characters.length+progress.scenes.length>0&&!progress.complete){footer.insertAdjacentHTML('beforebegin',`<section class="detail-section anchor-review-panel anchor-generation-waiting" id="anchor-generation-status"><h3>锚点正在生成</h3><p>人物 ${progress.characterReady}/${progress.characters.length} · 场景 ${progress.sceneReady}/${progress.scenes.length}</p><small>系统完成全部锚点后会切换为人工确认，不会提前产生剧情母片费用</small></section>`)}}
+openVideoDrawer=function(job){openVideoDrawerWithAnchorReview(job);const footer=$('#drawer .drawer-footer');if(!footer)return;const progress=continuityAnchorProgress(job);if(job?.state==='ANCHOR_REVIEW_REQUIRED'){footer.insertAdjacentHTML('beforebegin',`<section class="detail-section anchor-review-panel" id="anchor-generation-status"><h3>人物与场景锚点确认</h3><p>人物 ${progress.characterReady}/${progress.characters.length} · 场景 ${progress.sceneReady}/${progress.scenes.length}</p><p>请逐项预览定妆照、场景图和空间连续性模式。确认后系统才会继续产生剧情母片费用。</p><label>审核备注<textarea id="anchor-review-note" rows="3" placeholder="可选：记录造型、场景或人物调度确认意见"></textarea></label></section>`);return}if(['PENDING','PRODUCTION_QUEUED','PRODUCTION_RUNNING'].includes(job?.state)&&progress.characters.length+progress.scenes.length>0&&!progress.complete){footer.insertAdjacentHTML('beforebegin',`<section class="detail-section anchor-review-panel anchor-generation-waiting" id="anchor-generation-status"><h3>锚点正在生成</h3><p>人物 ${progress.characterReady}/${progress.characters.length} · 场景 ${progress.sceneReady}/${progress.scenes.length}</p><small>系统完成全部锚点后会切换为人工确认，不会提前产生剧情母片费用</small></section>`)}}
 async function reconcileProviderTask(job,taskId){const button=$(`[data-provider-task="${CSS.escape(taskId)}"]`);if(button)button.disabled=true;try{const result=await api(`/api/videos/${encodeURIComponent(job.job_id)}/provider-task/reconcile`,{method:'POST',body:JSON.stringify({task_id:taskId})});closeModal();if(!await loadPage('videos'))return;const fresh=state.videos.jobs.find(item=>item.job_id===job.job_id);toast(result.state==='REJECTED'?'已终止任务的成本已核对':result.state==='REJECTED_PENDING_RECONCILIATION'?'已核对该远端任务；业务仍保持终止，继续核对剩余成本':result.state==='PROVIDER_ACTION_REQUIRED'?'远端任务仍未结束，任务继续保持暂停':`远端任务已核对，已恢复到 ${videoStateLabel(result.state)}`);if(fresh)openVideoDrawer(fresh)}catch(e){if(button)button.disabled=false;toast(e.message,true)}}
 function openProviderAccountGuide(job){const tasks=job?.unresolved_provider_tasks||[];const taskRows=tasks.map(task=>task.reconcilable===false?`<div class="record-row provider-task-manual"><span><strong>${esc(task.provider)} · ${esc(task.intent||'远端任务')}</strong><small>${esc(task.task_id)}</small><small>${esc(task.action_message||'缺少远端任务 ID，请人工处置')}</small></span><i>人工处置</i></div>`:`<button class="record-row interactive" data-provider-task="${esc(task.task_id)}"><span><strong>${esc(task.provider)} · ${esc(task.intent||'远端任务')}</strong><small>${esc(task.task_id)}</small></span><i>核对 ›</i></button>`).join('')||'<p class="candidate-context-empty">未提供可核对的远端 task_id，请查看技术详情</p>';openModal('PROVIDER ACTION','模型账号与远端任务待处理',`<div class="impact-callout"><strong>系统已暂停所有新的付费提交</strong><span>先处理模型账号问题，再逐个核对原 task_id。系统只查询原任务，不会重新 POST。</span></div><section class="detail-section"><h3>待核对远端任务</h3>${taskRows}</section><div class="modal-actions"><button class="mini-action" onclick="document.querySelector('#modal-close').click()">稍后处理</button></div>`);$$('[data-provider-task]',$('#modal')).forEach(button=>button.onclick=()=>reconcileProviderTask(job,button.dataset.providerTask))}
 const openVideoDrawerWithBusinessPauseAction=openVideoDrawer;
@@ -1235,7 +1270,7 @@ confirmProduction=function(job){confirmProductionWithRisk(job);const modal=$('#m
 const confirmProductionWithAdaptiveCompiler=confirmProduction;
 const productionModeLabel=mode=>({stable:'稳定制作',enhanced:'增强制作',experimental:'实验制作'})[mode]||'自适应制作';
 const productionReliabilityLabel=value=>({standard:'标准交付',assisted:'重点复核',best_effort:'实验性质量承诺'})[value]||value;
-const adaptationActionLabel=value=>({dialogue_time_allocated:'按完整语义分配对白时长',provider_duration_split:'超过单次能力时透明拆分',continuous_scene_grouping:'同一连续场景合并为原生母片',scene_split:'跨空间使用明确转场',multi_character_staging:'多人同镜锁定站位与调度'})[value]||value;
+const adaptationActionLabel=value=>({dialogue_time_allocated:'按完整语义分配对白时长',provider_duration_split:'超过单次能力时透明拆分',continuous_scene_grouping:'同一连续场景合并为原生母片',scene_split:'跨空间使用明确转场',multi_character_staging:'多人同镜采用空间连续性调度'})[value]||value;
 confirmProduction=async function(job){
   let compiled=null;
   try{compiled=await api(`/api/videos/${encodeURIComponent(job.job_id)}/compile`,{method:'POST',body:'{}'})}catch(error){toast(`自适应生产方案暂不可用，已保留原预检：${error.message}`,true)}

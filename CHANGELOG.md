@@ -2,6 +2,23 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.1.2.0] - 2026-08-28
+
+### Added
+
+- Added safe task diagnosis and repair in the management console, including a task-level entry that helps users recover blocked production jobs without editing runtime data manually.
+- Added adaptive spatial continuity contracts with `free`, `continuity` and `locked` modes for cinematic character movement across Seedance masters.
+
+### Changed
+
+- Changed recurring-scene blocking from a fixed left/center/right layout to explicit incoming state, motivated movement and outgoing state handoff; exact position locking is now reserved for shots that require it.
+- Updated Seedance prompts, continuity QA, management-console anchor visualization and product documentation to use the same spatial-continuity semantics.
+
+### Fixed
+
+- Fixed reasonable character movement being rejected as blocking drift in free-dispatch shots while preserving identity, scene and axis checks.
+- Fixed the task doctor entry being hidden from the project-studio workflow.
+
 ## [3.1.1.0] - 2026-08-27
 
 ### Added

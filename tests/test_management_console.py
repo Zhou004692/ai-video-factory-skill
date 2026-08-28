@@ -9720,9 +9720,10 @@ class ManagementUiContractTests(unittest.TestCase):
             "本任务没有跨母片重复的同一物理场景",
             "人物一致性仍由角色定妆锚点保障",
             "项目现场连续性锚点",
-            "固定站位",
+            "空间连续性", "自由调度", "连续调度", "精确锁定",
         ):
             self.assertIn(capability, js)
+        self.assertNotIn("<strong>固定站位</strong>", js)
         self.assertNotIn("本任务没有跨母片重复的核心空间", js)
         self.assertGreaterEqual(js.count("sceneAnchorCards(job)"), 2)
         self.assertIn("scene-anchor-card", css)
@@ -9731,6 +9732,26 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("scene-blocking-stage", css)
         self.assertNotIn("grid-row:1/span 99", css)
         self.assertIn('and "/scenes/" in parsed.path', server)
+
+    def test_studio_anchor_view_visualizes_each_spatial_continuity_mode(self):
+        js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        css = (ROOT / "scripts" / "management_ui" / "styles.css").read_text(
+            encoding="utf-8"
+        )
+
+        for capability in (
+            "场景与人物调度", "人物活动区", "起始状态", "镜头运动",
+            "结束状态", "固定构图", "scene-free-zone",
+            "scene-motion-flow", "scene-state-frame", "scene-locked-stage",
+            "studio-spatial-mode-legend", "允许进出画与自由走位",
+            "承接上一母片结束状态", "仅明确构图时锁定",
+        ):
+            self.assertIn(capability, js + css)
+        self.assertIn("blocking_in", js)
+        self.assertIn("blocking_out", js)
+        self.assertNotIn("<h3>场景与站位</h3>", js)
 
     def test_anchor_generators_are_selectable_globally_and_per_video(self):
         js = (ROOT / "scripts" / "management_ui" / "app.js").read_text(

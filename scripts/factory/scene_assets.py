@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 
 from . import character_assets
 
@@ -36,6 +37,50 @@ def _screen_positions(count: int) -> list[str]:
     if count in presets:
         return presets[count]
     return [f"screen-slot-{index + 1}-of-{count}" for index in range(count)]
+
+
+_BLOCKING_MODES = frozenset({"free", "continuity", "locked"})
+
+
+def _blocking_mode(master: Mapping[str, object], *, repeated_scene: bool) -> str:
+    """Choose the weakest spatial constraint that still preserves continuity."""
+    explicit = str(
+        master.get("blocking_mode")
+        or master.get("continuity_mode")
+        or ""
+    ).strip().casefold()
+    if explicit in _BLOCKING_MODES:
+        return explicit
+    if bool(master.get("lock_blocking")):
+        return "locked"
+    role = " ".join(
+        str(master.get(field) or "")
+        for field in ("role", "type", "master_type", "shot_type")
+    ).casefold()
+    if "b-roll" in role or "broll" in role:
+        return "free"
+    return "continuity" if repeated_scene else "free"
+
+
+def _blocking_state(
+    value: object,
+    *,
+    default_source: str,
+    default_positions: list[dict] | None = None,
+) -> dict:
+    """Normalize an optional blocking state without inventing exact positions."""
+    if isinstance(value, Mapping):
+        source = str(value.get("source") or default_source).strip()
+        positions = value.get("positions")
+        if not isinstance(positions, list):
+            positions = list(default_positions or [])
+        return {"source": source, "positions": positions}
+    if isinstance(value, list):
+        return {"source": "explicit", "positions": value}
+    return {
+        "source": default_source,
+        "positions": list(default_positions or []),
+    }
 
 
 def _normalized_list(value: object) -> list[str]:
@@ -146,11 +191,8 @@ def apply_continuity_metadata(
                 "character_ids": list(group["character_ids"]),
                 "screen_position": screen_position,
             })
-        blocking = {
-            "axis": "preserve-180-degree-axis",
-            "positions": positions,
-        }
-        for master, _ in entries:
+        repeated_scene = len(entries) >= 2
+        for entry_index, (master, _) in enumerate(entries):
             text = " ".join(
                 str(master.get(field) or "")
                 for field in ("speaker", "scene", "action")
@@ -162,8 +204,39 @@ def apply_continuity_metadata(
                     for alias in item.get("character_ids") or []
                 )
             ] or positions
+            mode = _blocking_mode(master, repeated_scene=repeated_scene)
+            blocking_in = _blocking_state(
+                master.get("blocking_in"),
+                default_source=(
+                    "scene_baseline"
+                    if entry_index == 0 or mode in {"free", "locked"}
+                    else "previous_master_out"
+                ),
+                default_positions=(present if entry_index == 0 or mode == "locked" else []),
+            )
+            blocking_out = _blocking_state(
+                master.get("blocking_out"),
+                default_source=(
+                    "locked_layout" if mode == "locked" else "performance_end"
+                ),
+                default_positions=(present if mode == "locked" else []),
+            )
+            blocking = {
+                "mode": mode,
+                "axis": "preserve-180-degree-axis",
+                # Compatibility summary for existing UI and stored jobs. It is
+                # a scene baseline, not an instruction to freeze every frame.
+                "positions": positions,
+                "blocking_in": blocking_in,
+                "movement": str(
+                    master.get("blocking_movement")
+                    or master.get("action")
+                    or ""
+                ).strip(),
+                "blocking_out": blocking_out,
+            }
             contract = {
-                "version": 1,
+                "version": 2,
                 "scene": {
                     "key": key,
                     "description": description,
@@ -187,6 +260,12 @@ def apply_continuity_metadata(
                     "axis": blocking["axis"],
                     "shot_type": str(master.get("shot_type") or "").strip(),
                     "movement": str(master.get("camera") or "").strip(),
+                },
+                "spatial": {
+                    "mode": mode,
+                    "blocking_in": blocking_in,
+                    "movement": blocking["movement"],
+                    "blocking_out": blocking_out,
                 },
             }
             for field, value in (
