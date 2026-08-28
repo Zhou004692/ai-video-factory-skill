@@ -197,6 +197,31 @@ powershell -ExecutionPolicy Bypass -File scripts\open_management.ps1
 
 详细部署说明见 [SETUP_NEW_MACHINE.md](SETUP_NEW_MACHINE.md)。
 
+## 零费用全链路回归
+
+开发和发布前可在**不配置任何 Provider 凭证、不产生模型费用**的前提下，验证“来源 → 简报 → 剧本 → 生产编译 → 人物/场景锚点 → 母片 → 本地导演剪辑 → 成片验收 → 待发布”主链路：
+
+```powershell
+.\.venv\Scripts\python.exe tests\zero_cost_release_gate.py
+```
+
+通过时最后一行固定为：
+
+```text
+ZERO_COST_RELEASE_GATE_OK paid_provider_calls=0 external_requests=0
+```
+
+门禁分为四层并默认全部执行：
+
+| 层级 | 覆盖范围 | 发布用途 |
+|---|---|---|
+| R0 | Schema、规范化、Replay fail-closed、夹具完整性 | 每次提交 |
+| R1 | 生产编译器、Graph V2、导演时间线、历史事故回放 | 每次提交 |
+| R2 | 管理台真实写操作全流程、人工编辑与锚点确认、成片和待发布 | 合并前 |
+| R3 | 服务重启、租约恢复、Provider 回调边界和本地合成故障恢复 | 发布前 |
+
+可在开发期间只执行到某一层，例如 `python tests/zero_cost_release_gate.py --level r1`。门禁会强制使用 Replay 模式、移除子进程中的 Provider 凭证、阻止非本机网络连接，并对生产数据库与资产目录做前后内容签名；未知请求不会回退到在线模型。
+
 ## 数据与安全边界
 
 - 管理台默认只绑定本机回环地址，不对公网开放。

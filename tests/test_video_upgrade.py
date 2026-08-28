@@ -8612,7 +8612,8 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
             master.write_bytes(b"accepted")
             candidate.write_bytes(b"stale-candidate")
             backup.write_bytes(b"prior-master")
-            database = sqlite3.connect(":memory:")
+            database_path = Path(tmp) / "factory.db"
+            database = sqlite3.connect(database_path)
             database.row_factory = sqlite3.Row
             database.executescript(db.DDL)
             database.execute(
@@ -8631,12 +8632,20 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
                 })),
             )
             database.commit()
+            database.close()
+
+            def open_database():
+                opened = sqlite3.connect(database_path)
+                opened.row_factory = sqlite3.Row
+                return opened
 
             async def write_final(_concat, _bgm, final, **_kwargs):
                 final.write_bytes(b"composed")
 
             with patch.object(s6_compose, "ASSETS_DIR", assets), \
-                    patch.object(s6_compose, "conn", return_value=database), \
+                    patch.object(
+                        s6_compose, "conn", side_effect=open_database,
+                    ), \
                     patch.object(
                         s6_compose, "_prep_shot",
                         new=AsyncMock(return_value=master),
@@ -8653,6 +8662,7 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
                 await s6_compose.run("J-FINALIZE-CANDIDATE")
                 await s6_compose.run("J-FINALIZE-CANDIDATE")
 
+            database = open_database()
             qa = json.loads(database.execute(
                 "SELECT video_qa FROM shots "
                 "WHERE job_id='J-FINALIZE-CANDIDATE'"
@@ -8672,7 +8682,8 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
             master = base / "shots" / "01.mp4"
             master.parent.mkdir(parents=True)
             master.write_bytes(b"master")
-            database = sqlite3.connect(":memory:")
+            database_path = Path(tmp) / "factory.db"
+            database = sqlite3.connect(database_path)
             database.row_factory = sqlite3.Row
             database.executescript(db.DDL)
             database.execute(
@@ -8685,6 +8696,12 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
                 (str(master),),
             )
             database.commit()
+            database.close()
+
+            def open_database():
+                opened = sqlite3.connect(database_path)
+                opened.row_factory = sqlite3.Row
+                return opened
 
             async def write_final(_concat, _bgm, final, **_kwargs):
                 final.write_bytes(b"composed")
@@ -8693,7 +8710,9 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
                 thumbnail.write_bytes(b"cover")
 
             with patch.object(s6_compose, "ASSETS_DIR", assets), \
-                    patch.object(s6_compose, "conn", return_value=database), \
+                    patch.object(
+                        s6_compose, "conn", side_effect=open_database,
+                    ), \
                     patch.object(
                         s6_compose, "_prep_shot",
                         new=AsyncMock(return_value=master),
@@ -8713,6 +8732,7 @@ class ComposeNativeAudioTests(unittest.IsolatedAsyncioTestCase):
                     }, clear=False):
                 await s6_compose.run("J-CLOSED-STDOUT")
 
+            database = open_database()
             final_path = database.execute(
                 "SELECT final_path FROM jobs WHERE job_id='J-CLOSED-STDOUT'"
             ).fetchone()["final_path"]
