@@ -2,6 +2,21 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.1.3.0] - 2026-08-31
+
+### Added
+
+- Added a removable Windows desktop `AI Video Factory.cmd` launcher and a portable root launcher so users can open the local management console without starting a conversation.
+
+### Changed
+
+- Changed Windows startup to check `/readyz`, coordinate concurrent launches with a local lock, start the management service in a hidden process and open the browser only after the service is ready.
+- Changed the Windows installation and distribution package to provide ordinary script files without registering a scheduled task, Windows service or registry entry.
+
+### Fixed
+
+- Fixed repeated launcher clicks starting competing management-service processes, while preserving actionable startup logs and error prompts.
+
 ## [3.1.2.0] - 2026-08-28
 
 ### Added
