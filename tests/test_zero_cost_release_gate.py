@@ -91,6 +91,16 @@ class ZeroCostReleaseGateTests(unittest.TestCase):
             "invariant_issues": 0,
         })
 
+    def test_r4_runs_the_continuous_flow_guard_contract(self):
+        commands = zero_cost_release_gate.LEVEL_COMMANDS["r4"]
+
+        flattened = " ".join(part for command in commands for part in command)
+        self.assertIn("tests.test_flow_guard_scenarios", flattened)
+        self.assertIn("tests.test_flow_guard_diagnostics", flattened)
+        self.assertIn("tests.test_flow_guard_management_actions", flattened)
+        self.assertIn("scripts/flow_guard.py", flattened)
+        self.assertIn("--max-scenarios 6", flattened)
+
 
 if __name__ == "__main__":
     unittest.main()

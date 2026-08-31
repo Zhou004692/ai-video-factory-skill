@@ -57,6 +57,18 @@ def _projected_state(
     ).fetchone()
     if final_review and final_review["state"] == "SUCCEEDED":
         return "READY_TO_PUBLISH", "publish_video"
+    if final_review and final_review["state"] in {
+        "ACTION_REQUIRED", "BUDGET_REQUIRED", "FAILED",
+    }:
+        return {
+            "ACTION_REQUIRED": (
+                "PROVIDER_ACTION_REQUIRED", "reconcile_provider_task",
+            ),
+            "BUDGET_REQUIRED": (
+                "BUDGET_CONFIRMATION_REQUIRED", "increase_job_budget",
+            ),
+            "FAILED": ("FAILED", "preserve_and_diagnose"),
+        }[str(final_review["state"])]
     if local_compose and local_compose["state"] == "SUCCEEDED":
         return "COMPOSED", "review_final_video"
     anchor_rows = database.execute(

@@ -2,7 +2,7 @@
 
 面向短视频团队的一站式 AI 内容生产工作台：从人工选题或自动抓取开始，完成来源归档、选题简报、剧本审核、角色与场景一致性控制、Seedance 2.5 原生母片生成、本地导演剪辑、成片验收、渠道发布与效果回流。
 
-当前版本：`3.1.2.0`
+当前版本：`3.2.0.0`
 
 当前正式支持：Windows 个人 PC 单机版
 
@@ -220,7 +220,7 @@ powershell -ExecutionPolicy Bypass -File scripts\open_management.ps1
 ZERO_COST_RELEASE_GATE_OK paid_provider_calls=0 external_requests=0
 ```
 
-门禁分为四层并默认全部执行：
+门禁分为五层并默认全部执行：
 
 | 层级 | 覆盖范围 | 发布用途 |
 |---|---|---|
@@ -228,8 +228,27 @@ ZERO_COST_RELEASE_GATE_OK paid_provider_calls=0 external_requests=0
 | R1 | 生产编译器、Graph V2、导演时间线、历史事故回放 | 每次提交 |
 | R2 | 管理台真实写操作全流程、人工编辑与锚点确认、成片和待发布 | 合并前 |
 | R3 | 服务重启、租约恢复、Provider 回调边界和本地合成故障恢复 | 发布前 |
+| R4 | 功能分支组合遍历、业务暂停恢复、管理台动作可达性、阻塞诊断与零费用自修复 | 发布前 |
 
 可在开发期间只执行到某一层，例如 `python tests/zero_cost_release_gate.py --level r1`。门禁会强制使用 Replay 模式、移除子进程中的 Provider 凭证、阻止非本机网络连接，并对生产数据库与资产目录做前后内容签名；未知请求不会回退到在线模型。
+
+### 常态化流程巡检
+
+R4 Flow Guard 不读取用户任务，也不等待用户在管理台触发。它在临时 SQLite 和临时媒体目录中编译真实 Production Spec v2、遍历真实 Graph V2，并只用 Seedance 2.5 Mock 生成本地测试母片。默认 pairwise 矩阵覆盖生产档位、人工审核、预算暂停、Provider 待处理、可恢复故障和服务重启组合。
+
+完整遍历全部功能分支：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\flow_guard.py run
+```
+
+开发期间持续监听相关代码，发生变更后自动重跑：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\flow_guard.py watch --max-scenarios 8
+```
+
+最新机器可读报告默认写入 `data/flow_guard/latest.json`。失败报告会保留可复现的场景参数、状态序列、下一步动作、节点错误和已执行修复。自动修复仅允许重建可再生投影、恢复过期本地租约、重试已修复且未付费的契约节点；不会提高预算、创建 Provider 任务、接受候选、改写冻结规格或删除媒体。
 
 ## 数据与安全边界
 
@@ -249,6 +268,8 @@ ai-video-factory/
 │  ├─ management_server.py    # 本地管理台服务
 │  ├─ management_ui/          # 管理台前端
 │  ├─ factory/                # 来源、剧本、生产、质检、发布核心逻辑
+│  │  └─ flow_guard/          # R4 分支遍历、诊断和零费用修复
+│  ├─ flow_guard.py           # 单次/持续流程巡检入口
 │  ├─ install.ps1             # Windows 安装器
 │  └─ cli.py                  # 管理员与自动化接口
 ├─ references/                # Provider、流程、提示词与排障说明

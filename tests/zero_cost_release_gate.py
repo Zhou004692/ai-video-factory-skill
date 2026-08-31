@@ -43,6 +43,19 @@ LEVEL_COMMANDS: dict[str, tuple[tuple[str, ...], ...]] = {
         ("tests/management_full_flow_browser_check.py",),
     ),
     "r3": (("-m", "unittest", "tests.test_full_flow_recovery"),),
+    "r4": (
+        (
+            "-m", "unittest",
+            "tests.test_flow_guard_scenarios",
+            "tests.test_flow_guard_diagnostics",
+            "tests.test_flow_guard_management_actions",
+            "tests.test_flow_guard_runner",
+        ),
+        (
+            "scripts/flow_guard.py", "run", "--max-scenarios", "6",
+            "--no-write-report",
+        ),
+    ),
 }
 
 _SECRET_MARKERS = (
@@ -244,8 +257,8 @@ def run_gate(level: str = "all") -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--level", choices=("r0", "r1", "r2", "r3", "all"), default="all",
-        help="Run through this regression level (default: all/R3).",
+        "--level", choices=("r0", "r1", "r2", "r3", "r4", "all"), default="all",
+        help="Run through this regression level (default: all/R4).",
     )
     arguments = parser.parse_args()
     try:

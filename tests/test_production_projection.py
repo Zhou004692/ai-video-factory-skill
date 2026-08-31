@@ -73,6 +73,23 @@ class ProductionProjectionTests(unittest.TestCase):
         after = production_projection.reconcile(self.database, "J-E2E")
         self.assertEqual(after.projected_job_state, "COMPOSED")
 
+    def test_final_review_pause_is_not_hidden_by_composed_projection(self):
+        self.database.execute(
+            "UPDATE production_nodes SET state='SUCCEEDED' "
+            "WHERE job_id='J-E2E' AND node_id='local_compose'"
+        )
+        self.database.execute(
+            "UPDATE production_nodes SET state='ACTION_REQUIRED',"
+            "next_action='reconcile_provider_task' "
+            "WHERE job_id='J-E2E' AND node_id='final_review'"
+        )
+        self.database.commit()
+
+        report = production_projection.reconcile(self.database, "J-E2E")
+
+        self.assertEqual(report.projected_job_state, "PROVIDER_ACTION_REQUIRED")
+        self.assertEqual(report.next_action, "reconcile_provider_task")
+
     def test_anchor_review_projects_distinct_business_pause(self):
         self.database.execute(
             "UPDATE production_nodes SET state='REVIEW_REQUIRED' "

@@ -2,6 +2,24 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.2.0.0] - 2026-08-31
+
+### Added
+
+- Added R4 Flow Guard for continuous pairwise traversal of Production Graph v2 branches using Seedance 2.5 mocks, isolated SQLite databases and temporary local media only.
+- Added machine-readable flow reports covering human reviews, budget pauses, provider reconciliation, recoverable contract failures and service restarts.
+- Added a strict zero-cost repair allowlist for rebuilding reproducible projections, recovering expired leases and retrying repaired unpaid contract nodes.
+
+### Changed
+
+- Extended the zero-cost release gate with R4 branch exploration and management-console action reachability checks.
+- Changed failed-video diagnosis actions to open the task doctor directly instead of only expanding technical error details.
+
+### Fixed
+
+- Fixed backend pause actions for provider reconciliation, quality review and automatic retry having no executable management-console route.
+- Fixed isolated graph tests composing against the production database instead of the scenario database.
+
 ## [3.1.3.0] - 2026-08-31
 
 ### Added
