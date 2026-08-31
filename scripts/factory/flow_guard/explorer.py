@@ -16,8 +16,10 @@ from .. import (
 )
 from ..services import ProductionService
 from ..steps import s6_compose
+from .invariants import evaluate_report
 from .mock_seedance import ScriptedSeedance
-from .model import ExplorationReport, Finding, FlowScenario
+from .model import ExplorationReport, Finding, FlowScenario, RepairResult
+from .repairs import apply_repair
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -115,6 +117,7 @@ def _apply_action(
     action: str,
     *,
     step: int,
+    repairs: list[RepairResult],
 ) -> int:
     if action == "approve_continuity_anchors":
         applied = sum(
@@ -175,9 +178,11 @@ def _apply_action(
             step=step,
         )
     if action == "preserve_and_diagnose":
-        return len(production_executor.retry_repaired_contract_nodes(
-            database, job_id
-        ))
+        result = apply_repair(
+            database, job_id, "retry_repaired_contract_nodes"
+        )
+        repairs.append(result)
+        return int(result.applied)
     return 0
 
 
@@ -208,6 +213,7 @@ async def explore_scenario(
     actions: list[str] = []
     started_nodes: list[str] = []
     findings: list[Finding] = []
+    repairs: list[RepairResult] = []
     restarted = False
     final_state = ""
 
@@ -226,8 +232,7 @@ async def explore_scenario(
             final_state = result.job_state
             states.append(result.job_state)
             started_nodes.extend(result.started_nodes)
-            if result.next_action:
-                actions.append(result.next_action)
+            actions.append(result.next_action)
             if result.job_state in TERMINAL_STATES:
                 break
 
@@ -244,6 +249,7 @@ async def explore_scenario(
                 job_id,
                 result.next_action,
                 step=step,
+                repairs=repairs,
             )
             if not applied and result.next_action != "view_progress":
                 failed_rows = database.execute(
@@ -283,21 +289,27 @@ async def explore_scenario(
             "SELECT COUNT(*) FROM provider_calls WHERE job_id=? AND cost_cents>0",
             (job_id,),
         ).fetchone()[0] or 0)
-        return ExplorationReport(
+        preliminary = ExplorationReport(
             scenario_id=scenario.scenario_id,
-            status=(
-                "passed"
-                if final_state in TERMINAL_STATES and not findings and not paid_calls
-                else "failed"
-            ),
+            status="pending",
             final_state=final_state,
-            observed_states=tuple(dict.fromkeys(states)),
-            observed_actions=tuple(dict.fromkeys(actions)),
+            observed_states=tuple(states),
+            observed_actions=tuple(actions),
             started_nodes=tuple(dict.fromkeys(started_nodes)),
             findings=tuple(findings),
+            repairs=tuple(repairs),
             provider_calls=len(provider.calls),
             paid_provider_calls=paid_calls,
             steps=len(states),
+        )
+        evaluated = evaluate_report(preliminary, max_steps=max_steps)
+        return ExplorationReport(
+            **{
+                **preliminary.as_dict(),
+                "status": "passed" if not evaluated else "failed",
+                "findings": evaluated,
+                "repairs": tuple(repairs),
+            }
         )
     finally:
         s6_compose.ASSETS_DIR = previous_assets_dir
