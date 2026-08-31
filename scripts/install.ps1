@@ -51,20 +51,11 @@ if (-not $ffmpegCmd -or -not $ffprobeCmd) {
     }
 }
 
-& $pythonCmd.Source (Join-Path $PSScriptRoot "install.py") --root $skillDir
+& $pythonCmd.Source (Join-Path $PSScriptRoot "install.py") --root $skillDir --no-desktop-launcher
 if ($LASTEXITCODE -ne 0) {
     throw "AI Video Factory automatic initialization failed."
 }
 
-$launcher = Join-Path $skillDir "打开 AI 视频工厂.cmd"
-$desktop = [Environment]::GetFolderPath("Desktop")
-if ($desktop -and (Test-Path $launcher)) {
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut((Join-Path $desktop "AI Video Factory.lnk"))
-    $shortcut.TargetPath = $launcher
-    $shortcut.WorkingDirectory = $skillDir
-    $shortcut.Description = "Open AI Video Factory"
-    $shortcut.Save()
-}
+& (Join-Path $PSScriptRoot "install_desktop_launcher.ps1") -SkillRoot $skillDir | Out-Null
 
 & (Join-Path $PSScriptRoot "open_management.ps1")

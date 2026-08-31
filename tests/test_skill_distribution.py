@@ -42,11 +42,13 @@ class SkillDistributionTests(unittest.TestCase):
                 "CHANGELOG.md",
                 "SKILL.md",
                 "安装 AI 视频工厂.cmd",
+                "打开 AI 视频工厂.cmd",
                 "agents/openai.yaml",
                 "scripts/cli.py",
                 "scripts/bootstrap.py",
                 "scripts/management_server.py",
                 "scripts/open_management.ps1",
+                "scripts/install_desktop_launcher.ps1",
                 "scripts/management_ui/index.html",
                 "scripts/management_ui/styles.css",
                 "scripts/management_ui/app.js",
@@ -64,6 +66,13 @@ class SkillDistributionTests(unittest.TestCase):
             )
             self.assertIn("scripts\\install.ps1", bootstrap_launcher)
             self.assertNotIn("C:\\Users\\", bootstrap_launcher)
+
+            runtime_launcher = (package / "打开 AI 视频工厂.cmd").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("scripts\\open_management.ps1", runtime_launcher)
+            self.assertIn("-WindowStyle Hidden", runtime_launcher)
+            self.assertNotIn("C:\\Users\\", runtime_launcher)
 
             for relative in (
                 ".env",

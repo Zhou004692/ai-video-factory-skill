@@ -16,6 +16,30 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 class FreshInstallTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows shortcut integration")
+    def test_skill_root_install_creates_desktop_script_automatically(self):
+        from distribute_skill import build_distribution
+        import install as installer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = build_distribution(ROOT, Path(tmp) / "dist")
+            with (
+                patch.object(installer, "ROOT", package),
+                patch.object(
+                    installer,
+                    "install_windows_desktop_launcher",
+                    return_value="C:\\Desktop\\AI Video Factory.cmd",
+                ) as create_launcher,
+            ):
+                report = installer.install(
+                    package, create_venv=False, install_dependencies=False
+                )
+
+            create_launcher.assert_called_once_with(package)
+            self.assertEqual(
+                report["desktop_launcher"], "C:\\Desktop\\AI Video Factory.cmd"
+            )
+
     def test_upgrade_failure_restores_env_database_and_character_assets(self):
         from distribute_skill import build_distribution
         from install import install
@@ -182,20 +206,69 @@ class FreshInstallTests(unittest.TestCase):
         self.assertIn("--start-page", script)
         self.assertIn("config", script)
         self.assertIn("--no-deps", script)
+        self.assertIn("/readyz", script)
+        self.assertIn('WindowStyle = "Hidden"', script)
+        self.assertIn("--no-browser", script)
+        self.assertIn("NoBrowser", script)
         self.assertNotIn("Write-Host", script)
 
         installer = (ROOT / "scripts" / "install.ps1").read_text(
             encoding="utf-8"
         )
         self.assertIn("Gyan.FFmpeg", installer)
-        self.assertIn("CreateShortcut", installer)
-        self.assertIn("打开 AI 视频工厂.cmd", installer)
+        self.assertIn("install_desktop_launcher.ps1", installer)
+
+        desktop_installer = (
+            ROOT / "scripts" / "install_desktop_launcher.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("WriteAllText", desktop_installer)
+        self.assertIn("open_management.ps1", desktop_installer)
+        self.assertIn("-WindowStyle Hidden", desktop_installer)
+        self.assertIn("AI Video Factory.cmd", desktop_installer)
+        self.assertNotIn("CreateShortcut", desktop_installer)
+        self.assertNotIn("Register-ScheduledTask", desktop_installer)
 
         app = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )
         self.assertIn("location.hash", app)
         self.assertIn("navigate(initialPage)", app)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows shortcut integration")
+    def test_desktop_script_targets_hidden_idempotent_launcher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            desktop = Path(tmp) / "Desktop"
+            desktop.mkdir()
+            script = ROOT / "scripts" / "install_desktop_launcher.ps1"
+            command = [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+                "-SkillRoot",
+                str(ROOT),
+                "-DesktopDirectory",
+                str(desktop),
+            ]
+            first = subprocess.run(
+                command, check=True, capture_output=True, text=True, encoding="utf-8"
+            )
+            second = subprocess.run(
+                command, check=True, capture_output=True, text=True, encoding="utf-8"
+            )
+
+            launcher = desktop / "AI Video Factory.cmd"
+            self.assertTrue(launcher.is_file())
+            self.assertIn("AI Video Factory.cmd", first.stdout)
+            self.assertIn("AI Video Factory.cmd", second.stdout)
+            launcher_text = launcher.read_text(encoding="utf-8")
+            self.assertIn("start \"\" /min powershell.exe", launcher_text)
+            self.assertIn("-WindowStyle Hidden", launcher_text)
+            self.assertIn("open_management.ps1", launcher_text)
+            self.assertNotIn("schtasks", launcher_text.casefold())
+            self.assertFalse((desktop / "AI Video Factory.lnk").exists())
 
 
 if __name__ == "__main__":

@@ -9,16 +9,16 @@ description: 用自然语言完成可追溯短视频剧本与标准成片。自�
 
 当用户说“打开 AI 视频工厂”或首次使用管理后台时，Agent 必须在后台完成初始化，普通用户不执行任何命令：
 
-1. 优先运行 Skill 内的 `scripts/bootstrap.py --profile script --json`；该动作只创建本地运行环境、占位配置和数据库，`paid_provider_calls` 必须为 `0`。
-2. Windows 后台调用 `scripts/open_management.ps1`；macOS/Linux 后台调用安装后生成的 `open-ai-video-factory.sh`。
+1. 优先运行 Skill 内的 `scripts/bootstrap.py --profile script --json`；该动作只创建本地运行环境、占位配置和数据库，Windows 首次安装同时生成普通 `.cmd` 桌面启动脚本，不注册计划任务或系统服务，`paid_provider_calls` 必须为 `0`。
+2. Windows 后台调用 `scripts/open_management.ps1`；macOS/Linux 后台调用安装后生成的 `open-ai-video-factory.sh`。Windows 启动器负责健康检查、单实例后台启动和就绪后打开浏览器，不要直接另起 `management_server.py`。
 3. 配置不完整时，管理台直接打开“配置中心”；配置已完成时打开工作台。
 4. 只在页面中引导用户填写缺少的凭证，不让用户复制命令、数据库路径或内部任务 ID。
 5. 初始化必须保留已有 `.env`、数据库、角色和业务数据，不覆盖已有配置。
 
 ## 本地管理台
 
-当用户要求打开、搭建或使用本地管理页面时，Agent 在后台启动
-`scripts/management_server.py`，然后打开 `http://127.0.0.1:8765`。普通用户不需要
+当用户要求打开、搭建或使用本地管理页面时，Windows 调用
+`scripts/open_management.ps1`，其他系统使用对应平台启动器，然后打开 `http://127.0.0.1:8765`。普通用户不需要
 执行命令。管理台集中承载剧本流水线、视频流水线、发布流水线、模型配置与真人
 资产绑定；密钥仅展示配置状态，永不回显明文。任何视频付费动作仍须用户在页面
 明确确认预算。抖音可由用户完成 OAuth 绑号后在管理台确认直连投稿；未接直连的

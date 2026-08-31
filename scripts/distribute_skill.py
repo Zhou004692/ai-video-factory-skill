@@ -18,6 +18,7 @@ ROOT_FILES = (
     "SKILL.md",
     "VERSION",
     "安装 AI 视频工厂.cmd",
+    "打开 AI 视频工厂.cmd",
 )
 
 DIRECTORY_RULES = {
@@ -31,6 +32,7 @@ SCRIPT_ROOT_FILES = {
     "scripts/doctor.py",
     "scripts/install.py",
     "scripts/install.ps1",
+    "scripts/install_desktop_launcher.ps1",
     "scripts/management_server.py",
     "scripts/open_management.ps1",
     "scripts/requirements.txt",
