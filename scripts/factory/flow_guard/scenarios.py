@@ -28,6 +28,31 @@ BRANCH_DIMENSIONS: dict[str, tuple[object, ...]] = {
     "restart": (False, True),
 }
 
+FAULT_NODE_TYPES = (
+    "character_anchor",
+    "scene_anchor",
+    "master",
+    "bgm",
+    "local_compose",
+    "final_review",
+)
+RESOLUTION_BY_PAUSE = {
+    "none": "auto",
+    "anchor_review": "approve",
+    "master_review": "approve",
+    "budget": "resume",
+    "provider_action": "reconcile",
+    "recoverable_failure": "repair",
+}
+PAUSE_NODE_TYPES = {
+    "none": ("master",),
+    "anchor_review": ("character_anchor", "scene_anchor"),
+    "master_review": ("master",),
+    "budget": FAULT_NODE_TYPES,
+    "provider_action": FAULT_NODE_TYPES,
+    "recoverable_failure": FAULT_NODE_TYPES,
+}
+
 
 def _pairs(values: Mapping[str, object]) -> set[tuple[object, ...]]:
     keys = tuple(values)
@@ -76,7 +101,7 @@ def _scenario_values(
     return tuple(selected)
 
 
-def build_scenarios(
+def build_smoke_scenarios(
     dimensions: Mapping[str, Sequence[object]] = BRANCH_DIMENSIONS,
 ) -> tuple[FlowScenario, ...]:
     result: list[FlowScenario] = []
@@ -90,6 +115,38 @@ def build_scenarios(
             restart=bool(values["restart"]),
         ))
     return tuple(result)
+
+
+def build_scenarios() -> tuple[FlowScenario, ...]:
+    """Build constraint-valid branch paths with one restart per path."""
+    profiles = tuple(str(item) for item in BRANCH_DIMENSIONS["profile"])
+    paths = tuple(
+        (pause, node_type)
+        for pause, node_types in PAUSE_NODE_TYPES.items()
+        for node_type in node_types
+    )
+    values: list[tuple[str, str, str, bool]] = []
+    for profile in profiles:
+        values.extend(
+            (profile, pause, node_type, False)
+            for pause, node_type in paths
+        )
+    values.extend(
+        (profiles[index % len(profiles)], pause, node_type, True)
+        for index, (pause, node_type) in enumerate(paths)
+    )
+    return tuple(
+        FlowScenario(
+            scenario_id=f"r4-{index:03d}",
+            profile=profile,
+            pause=pause,
+            pause_node=node_type,
+            resolution=RESOLUTION_BY_PAUSE[pause],
+            restart=restart,
+        )
+        for index, (profile, pause, node_type, restart)
+        in enumerate(values, 1)
+    )
 
 
 def all_pairs_covered(

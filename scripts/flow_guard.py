@@ -10,7 +10,7 @@ import tempfile
 import time
 
 from factory.flow_guard.runner import run_matrix, source_fingerprint
-from factory.flow_guard.scenarios import build_scenarios
+from factory.flow_guard.scenarios import build_scenarios, build_smoke_scenarios
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,8 +21,10 @@ WATCH_PATHS = (
 )
 
 
-def _select_scenarios(max_scenarios: int | None):
-    scenarios = build_scenarios()
+def _select_scenarios(max_scenarios: int | None, suite: str = "full"):
+    scenarios = (
+        build_smoke_scenarios() if suite == "smoke" else build_scenarios()
+    )
     return scenarios[:max_scenarios] if max_scenarios else scenarios
 
 
@@ -41,12 +43,13 @@ def _write_report(path: Path, summary: dict[str, object]) -> None:
 
 
 def run_once(arguments: argparse.Namespace) -> int:
-    scenarios = _select_scenarios(arguments.max_scenarios)
+    scenarios = _select_scenarios(arguments.max_scenarios, arguments.suite)
     with tempfile.TemporaryDirectory(prefix="ai-video-flow-guard-") as directory:
         summary = asyncio.run(run_matrix(
             scenarios,
             work_root=Path(directory),
             max_steps=arguments.max_steps,
+            include_journeys=arguments.suite == "full",
         ))
     if not arguments.no_write_report:
         _write_report(arguments.report, summary)
@@ -54,7 +57,10 @@ def run_once(arguments: argparse.Namespace) -> int:
     if summary["status"] == "passed":
         print(
             "FLOW_GUARD_OK provider=seedance_2_5_mock "
-            f"scenarios={summary['scenario_count']} paid_provider_calls=0"
+            f"scenarios={summary['scenario_count']} "
+            f"journeys={summary['journey_count']} "
+            f"mutation_score={summary['historical_mutation_score_pct']} "
+            "paid_provider_calls=0"
         )
         return 0
     print("FLOW_GUARD_FAILED reproducible blockers were recorded")
@@ -81,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("run", "watch"):
         subparser = subparsers.add_parser(command)
+        subparser.add_argument(
+            "--suite", choices=("smoke", "full"), default="full"
+        )
         subparser.add_argument("--max-scenarios", type=int, default=None)
         subparser.add_argument("--max-steps", type=int, default=32)
         subparser.add_argument(

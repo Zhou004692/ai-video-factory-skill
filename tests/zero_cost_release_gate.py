@@ -52,7 +52,8 @@ LEVEL_COMMANDS: dict[str, tuple[tuple[str, ...], ...]] = {
             "tests.test_flow_guard_runner",
         ),
         (
-            "scripts/flow_guard.py", "run", "--max-scenarios", "6",
+            "scripts/flow_guard.py", "run", "--suite", "smoke",
+            "--max-scenarios", "6",
             "--no-write-report",
         ),
     ),

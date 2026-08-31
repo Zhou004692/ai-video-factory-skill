@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import inspect
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,52 @@ def scenario(name: str) -> FlowScenario:
 
 
 class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_matrix_accepts_full_journey_runner(self):
+        parameters = inspect.signature(run_matrix).parameters
+
+        self.assertIn("journey_runner", parameters)
+        self.assertIn("include_journeys", parameters)
+
+    async def test_failed_full_journey_fails_the_matrix(self):
+        async def fake_explorer(item, *, work_root, max_steps=32):
+            return ExplorationReport(
+                scenario_id=item.scenario_id,
+                status="passed",
+                final_state="READY_TO_PUBLISH",
+            )
+
+        def fake_journey_runner(work_root):
+            return {
+                "status": "failed",
+                "journey_count": 1,
+                "passed": 0,
+                "failed": 1,
+                "paid_provider_calls": 0,
+                "executed_console_actions": ["resume_failed_video"],
+                "journeys": [{
+                    "scenario_id": "blocked",
+                    "status": "failed",
+                    "final_state": "ERROR",
+                }],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = await run_matrix(
+                (scenario("journey-blocked"),),
+                work_root=Path(directory),
+                explorer=fake_explorer,
+                include_journeys=True,
+                journey_runner=fake_journey_runner,
+            )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["journey_count"], 1)
+        self.assertEqual(summary["journeys_failed"], 1)
+        self.assertIn(
+            "resume_failed_video",
+            summary["coverage"]["executed_console_actions"],
+        )
+
     async def test_matrix_summary_is_machine_readable_and_zero_cost(self):
         async def fake_explorer(item, *, work_root, max_steps=32):
             self.assertTrue(work_root.name.startswith(item.scenario_id))
@@ -29,6 +76,12 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
                 provider_calls=4,
                 paid_provider_calls=0,
                 steps=3,
+                observed_states=("COMPOSED", "READY_TO_PUBLISH"),
+                observed_actions=("review_final_video", "publish_video"),
+                started_nodes=("master:1", "local_compose"),
+                semantic_checks=(
+                    "master_projection_consistent", "shot_within_master",
+                ),
             )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -44,6 +97,18 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["paid_provider_calls"], 0)
         self.assertEqual(len(summary["reports"]), 2)
         self.assertEqual(summary["reports"][0]["scenario"]["provider_mode"], "mock")
+        self.assertGreaterEqual(summary.get("historical_mutation_count", 0), 8)
+        self.assertEqual(summary.get("historical_mutations_survived"), 0)
+        self.assertEqual(summary.get("historical_mutation_score_pct"), 100.0)
+        self.assertEqual(summary.get("unique_trace_count"), 1)
+        self.assertEqual(summary.get("duplicate_trace_scenarios"), 1)
+        self.assertGreaterEqual(summary.get("duration_sec", -1), 0)
+        coverage = summary.get("coverage") or {}
+        self.assertEqual(coverage.get("semantic_check_count"), 2)
+        self.assertEqual(coverage.get("executed_console_action_count"), 2)
+        self.assertEqual(coverage.get("dispatch_contract_coverage_pct"), 100.0)
+        self.assertEqual(coverage.get("missing_dispatch_actions"), [])
+        self.assertIn("confirm_budget", coverage.get("missing_console_actions", []))
 
     async def test_any_failed_scenario_fails_the_matrix(self):
         async def fake_explorer(item, *, work_root, max_steps=32):

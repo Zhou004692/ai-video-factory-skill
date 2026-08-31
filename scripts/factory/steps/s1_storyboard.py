@@ -102,16 +102,31 @@ def _validate_director_storyboard(sb: dict) -> None:
         if float(master.get("duration") or 0) <= 0:
             raise ValueError(f"master {master.get('idx')} duration must be > 0")
         if master["type"] == "dialogue":
-            if master.get("speaker") not in char_ids:
+            performance_beats = [
+                beat for beat in (master.get("performance_beats") or [])
+                if isinstance(beat, dict) and str(beat.get("dialogue") or "").strip()
+            ]
+            audio_only_dialogue = bool(performance_beats) and all(
+                str(beat.get("speech_mode") or "on_screen")
+                in {"off_screen", "narration"}
+                for beat in performance_beats
+            )
+            if not audio_only_dialogue and master.get("speaker") not in char_ids:
                 raise ValueError(
                     f"dialogue master speaker must be one of {char_ids}: {master}"
                 )
             master_speakers = master.get("speakers") or [master.get("speaker")]
-            if not isinstance(master_speakers, list) or not master_speakers:
+            if (
+                not audio_only_dialogue
+                and (not isinstance(master_speakers, list) or not master_speakers)
+            ):
                 raise ValueError(
                     f"dialogue master {master['idx']} speakers must be a non-empty list"
                 )
-            unknown_speakers = set(master_speakers) - char_ids
+            unknown_speakers = (
+                set() if audio_only_dialogue
+                else set(master_speakers) - char_ids
+            )
             if unknown_speakers:
                 raise ValueError(
                     f"dialogue master {master['idx']} has unknown speakers: "

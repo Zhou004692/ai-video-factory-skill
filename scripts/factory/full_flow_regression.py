@@ -134,7 +134,7 @@ def _brief_result(source: dict) -> dict:
     }
 
 
-def _script_result(source_id: str) -> dict:
+def _script_result(source_id: str, *, scenario_id: str = "") -> dict:
     characters = [
         {
             "id": "lin_xia",
@@ -184,6 +184,15 @@ def _script_result(source_id: str) -> dict:
             "gesture": "配合任务做简洁手势",
             "body_action": "完成当前工作动作并保持自然视线",
             "camera": "中景缓慢推进",
+        })
+    if scenario_id == "manual_background_voiceover":
+        beats[0].update({
+            "speaker": "narrator",
+            "speakers": ["narrator"],
+            "characters": [],
+            "speech_mode": "narration",
+            "scene": "画外解说",
+            "scene_id": "narration_booth",
         })
     variants = []
     for index, title in enumerate((
@@ -268,7 +277,10 @@ def run_source_to_compiled(
         fixture_id=f"{scenario.get('scenario_id', 'scenario')}:scripts",
         operation="doubao.llm.complete_json",
         request=script_request,
-        result=_script_result(source_id),
+        result=_script_result(
+            source_id,
+            scenario_id=str(scenario.get("scenario_id") or ""),
+        ),
     )
     os.environ["FACTORY_REPLAY_FIXTURE_ROOT"] = str(scripts_root)
     generated = service.confirm_brief_and_generate_scripts(

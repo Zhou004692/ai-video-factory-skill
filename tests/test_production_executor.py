@@ -300,6 +300,50 @@ class ProductionExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["state"], "READY")
         self.assertIsNone(state["error_code"])
 
+    def test_unpaid_frozen_contract_failure_is_retriable_for_local_nodes(self):
+        node_types = ("bgm", "local_compose", "final_review")
+        selected = []
+        for node_type in node_types:
+            row = self.database.execute(
+                "SELECT node_id FROM production_nodes WHERE job_id='J-EXEC' "
+                "AND node_type=? ORDER BY node_id LIMIT 1",
+                (node_type,),
+            ).fetchone()
+            self.assertIsNotNone(row, node_type)
+            node_id = str(row["node_id"])
+            selected.append(node_id)
+            self.database.execute(
+                "UPDATE production_nodes SET state='FAILED',"
+                "error_code='FrozenSpecMismatchError',actual_cost_cents=0,"
+                "provider_task_id=NULL,output_json='{}' "
+                "WHERE job_id='J-EXEC' AND node_id=?",
+                (node_id,),
+            )
+            self.database.execute(
+                "INSERT INTO production_node_events("
+                "job_id,event_id,node_id,event,from_state,to_state,payload_json) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    "J-EXEC", f"failed-{node_type}", node_id, "fail",
+                    "RUNNING", "FAILED",
+                    '{"error":"unpaid frozen contract mismatch"}',
+                ),
+            )
+        self.database.commit()
+
+        recovered = production_executor.retry_repaired_contract_nodes(
+            self.database, "J-EXEC"
+        )
+
+        self.assertEqual(set(recovered), set(selected))
+        states = self.database.execute(
+            "SELECT state,error_code FROM production_nodes "
+            "WHERE job_id='J-EXEC' AND node_id IN (?,?,?)",
+            tuple(selected),
+        ).fetchall()
+        self.assertTrue(all(row["state"] == "READY" for row in states))
+        self.assertTrue(all(row["error_code"] is None for row in states))
+
     def test_anchor_contract_retry_refuses_any_provider_cost_evidence(self):
         row = self.database.execute(
             "SELECT node_id FROM production_nodes WHERE job_id='J-EXEC' "

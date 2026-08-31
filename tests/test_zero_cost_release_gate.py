@@ -99,6 +99,7 @@ class ZeroCostReleaseGateTests(unittest.TestCase):
         self.assertIn("tests.test_flow_guard_diagnostics", flattened)
         self.assertIn("tests.test_flow_guard_management_actions", flattened)
         self.assertIn("scripts/flow_guard.py", flattened)
+        self.assertIn("--suite smoke", flattened)
         self.assertIn("--max-scenarios 6", flattened)
 
 

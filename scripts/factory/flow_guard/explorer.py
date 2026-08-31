@@ -16,7 +16,12 @@ from .. import (
 )
 from ..services import ProductionService
 from ..steps import s6_compose
-from .invariants import evaluate_report
+from .invariants import (
+    SEMANTIC_CHECK_IDS,
+    evaluate_media_artifact,
+    evaluate_production_spec,
+    evaluate_report,
+)
 from .mock_seedance import ScriptedSeedance
 from .model import ExplorationReport, Finding, FlowScenario, RepairResult
 from .repairs import apply_repair
@@ -285,6 +290,22 @@ async def explore_scenario(
                 state=final_state,
             ))
 
+        spec_row = database.execute(
+            "SELECT production_spec_json,final_path FROM jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        try:
+            production_spec = json.loads(
+                str(spec_row["production_spec_json"] or "{}")
+            ) if spec_row else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            production_spec = {}
+        findings.extend(evaluate_production_spec(production_spec))
+        media = evaluate_media_artifact(
+            str(spec_row["final_path"] or "") if spec_row else ""
+        )
+        findings.extend(media["findings"])
+
         paid_calls = int(database.execute(
             "SELECT COUNT(*) FROM provider_calls WHERE job_id=? AND cost_cents>0",
             (job_id,),
@@ -301,6 +322,8 @@ async def explore_scenario(
             provider_calls=len(provider.calls),
             paid_provider_calls=paid_calls,
             steps=len(states),
+            semantic_checks=SEMANTIC_CHECK_IDS,
+            media_metrics=media["metrics"],
         )
         evaluated = evaluate_report(preliminary, max_steps=max_steps)
         return ExplorationReport(
