@@ -242,11 +242,13 @@ R4 Flow Guard 不读取用户任务，也不等待用户在管理台触发。它
 .\.venv\Scripts\python.exe scripts\flow_guard.py run
 ```
 
-开发期间持续监听相关代码，发生变更后自动重跑：
+常态运行默认监听相关代码，发生变更后自动执行全部 32 个场景：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\flow_guard.py watch --max-scenarios 8
+.\.venv\Scripts\python.exe scripts\flow_guard.py watch
 ```
+
+仅在开发调试、需要快速反馈时才显式追加 `--max-scenarios 8`；该参数不作为正式巡检配置。当前完整矩阵通常约 18 分钟生成一轮报告，代码变化检测周期默认为 30 秒。
 
 最新机器可读报告默认写入 `data/flow_guard/latest.json`。失败报告会保留可复现的场景参数、状态序列、下一步动作、节点错误和已执行修复。自动修复仅允许重建可再生投影、恢复过期本地租约、重试已修复且未付费的契约节点；不会提高预算、创建 Provider 任务、接受候选、改写冻结规格或删除媒体。
 
