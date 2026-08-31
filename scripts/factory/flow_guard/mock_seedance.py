@@ -28,13 +28,6 @@ class ScriptedSeedance:
             database, media_root=self._media_root
         )
         target = scenario.pause_node
-        if scenario.pause == "anchor_review":
-            target = next((
-                item for item in ("character_anchor", "scene_anchor")
-                if item in available_node_types
-            ), target)
-        elif scenario.pause in {"master_review", "recoverable_failure"}:
-            target = "master"
         if target not in available_node_types:
             target = next(iter(sorted(available_node_types)))
         self.target_node_type = target

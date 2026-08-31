@@ -57,6 +57,8 @@ class ExplorationReport:
     provider_calls: int = 0
     paid_provider_calls: int = 0
     steps: int = 0
+    semantic_checks: tuple[str, ...] = ()
+    media_metrics: Mapping[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {

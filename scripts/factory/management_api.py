@@ -7856,12 +7856,23 @@ class ManagementService:
             storyboard = json.loads(storyboard_row["storyboard"] or "{}")
         except json.JSONDecodeError:
             storyboard = {}
-        dialogue_speakers = list(dict.fromkeys(
-            str(master.get("speaker") or "").strip()
-            for master in (storyboard.get("masters") or [])
-            if master.get("type") == "dialogue"
-            and str(master.get("speaker") or "").strip()
-        ))
+        dialogue_speakers = []
+        for master in (storyboard.get("masters") or []):
+            if master.get("type") != "dialogue":
+                continue
+            performance_beats = [
+                beat for beat in (master.get("performance_beats") or [])
+                if isinstance(beat, dict) and str(beat.get("dialogue") or "").strip()
+            ]
+            audio_only_dialogue = bool(performance_beats) and all(
+                str(beat.get("speech_mode") or "on_screen")
+                in {"off_screen", "narration"}
+                for beat in performance_beats
+            )
+            speaker = str(master.get("speaker") or "").strip()
+            if speaker and not audio_only_dialogue:
+                dialogue_speakers.append(speaker)
+        dialogue_speakers = list(dict.fromkeys(dialogue_speakers))
         configured_speakers = {
             str(character.get("id") or "").strip()
             for character in (storyboard.get("characters") or [])

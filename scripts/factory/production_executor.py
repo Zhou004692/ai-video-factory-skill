@@ -424,8 +424,8 @@ def retry_repaired_contract_nodes(
 ) -> tuple[str, ...]:
     """Retry known local contract failures after the implementation is fixed.
 
-    This is deliberately narrower than a generic retry.  It only requeues an
-    anchor or master node when there is no provider task, no booked cost and no
+    This is deliberately narrower than a generic retry. It only requeues a
+    known production node when there is no provider task, no booked cost and no
     output artifact. Runtime anchor lookup failures and frozen-contract
     mismatches happen before a usable paid result exists. Every node receives
     at most one versioned repair retry, so a persistent defect cannot loop.
@@ -434,8 +434,9 @@ def retry_repaired_contract_nodes(
     rows = database.execute(
         "SELECT node_id,node_type,error_code,provider_task_id,"
         "actual_cost_cents,output_json FROM production_nodes "
-        "WHERE job_id=? AND state='FAILED' "
-        "AND node_type IN ('character_anchor','scene_anchor','master')",
+        "WHERE job_id=? AND state='FAILED' AND node_type IN ("
+        "'character_anchor','scene_anchor','master','bgm','local_compose',"
+        "'final_review')",
         (job_id,),
     ).fetchall()
     for row in rows:
