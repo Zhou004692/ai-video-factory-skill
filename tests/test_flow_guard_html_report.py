@@ -44,6 +44,12 @@ def sample_payload(*, status: str = "passed") -> dict[str, object]:
             "console_action_count": 24,
             "console_action_coverage_pct": 45.83,
             "missing_console_actions": ["retry_failed_job"],
+            "graph_actions": ["review_final_video"],
+            "ui_dispatch_actions": ["submit_publish"],
+            "integrated_backend_actions": ["review_continuity_anchors"],
+            "worker_node_types": ["master"],
+            "source_types": ["manual"],
+            "provider_response_types": ["replay_success"],
         },
         "mutation_calibration": {
             "status": "passed",
@@ -102,6 +108,11 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("9 / 9", html)
         self.assertIn("24 分 45 秒", html)
         self.assertIn("覆盖与缺口", html)
+        self.assertIn("Graph 模拟动作", html)
+        self.assertIn("UI 实际派发", html)
+        self.assertIn("后端真实处理", html)
+        self.assertIn("Worker 实际节点", html)
+        self.assertNotIn("浏览器动态动作", html)
         self.assertIn("retry_failed_job", html)
         self.assertIn("manual_three_person_multiscene", html)
         self.assertIn("management_fault_decisions", html)

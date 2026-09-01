@@ -161,6 +161,12 @@ def render_html_report(
         )
 
     missing_actions = _items(coverage.get("missing_console_actions"))
+    graph_actions = _items(coverage.get("graph_actions"))
+    ui_actions = _items(coverage.get("ui_dispatch_actions"))
+    backend_actions = _items(coverage.get("integrated_backend_actions"))
+    worker_nodes = _items(coverage.get("worker_node_types"))
+    source_types = _items(coverage.get("source_types"))
+    provider_responses = _items(coverage.get("provider_response_types"))
     generated_at = _text(payload.get("generated_at"))
     provider_mode = _text(payload.get("provider_mode"))
     json_href = escape(json_filename, quote=True)
@@ -235,18 +241,23 @@ def render_html_report(
     {_summary_card("业务与管理台旅程", f"{journey_passed} / {journey_count}")}
     {_summary_card("历史故障检出", f"{mutation_killed} / {mutation_count}", f"杀伤率 {_percent(payload.get('historical_mutation_score_pct'))}")}
     {_summary_card("付费调用", str(paid_calls), "必须保持为 0")}
-    {_summary_card("浏览器动态动作", f"{_number(coverage.get('executed_console_action_count'))} / {_number(coverage.get('console_action_count'))}", _percent(coverage.get('console_action_coverage_pct')))}
+    {_summary_card("真实证据动作", f"{len(ui_actions)} UI / {len(backend_actions)} 后端", f"Worker {len(worker_nodes)} 类")}
     {_summary_card("完整耗时", _duration(payload.get('duration_sec')))}
   </div>
 
   <section>
     <h2>覆盖与缺口</h2>
     <div class="coverage-grid">
+      <div class="coverage-item"><span class="muted">Graph 模拟动作</span><strong>{len(graph_actions)} 项</strong>{_chips(graph_actions)}</div>
+      <div class="coverage-item"><span class="muted">UI 实际派发</span><strong>{len(ui_actions)} 项</strong>{_chips(ui_actions)}</div>
+      <div class="coverage-item"><span class="muted">后端真实处理</span><strong>{len(backend_actions)} 项</strong>{_chips(backend_actions)}</div>
+      <div class="coverage-item"><span class="muted">Worker 实际节点</span><strong>{len(worker_nodes)} 类</strong>{_chips(worker_nodes)}</div>
+      <div class="coverage-item"><span class="muted">来源类型</span><strong>{len(source_types)} 类</strong>{_chips(source_types)}</div>
+      <div class="coverage-item"><span class="muted">Provider 响应类型</span><strong>{len(provider_responses)} 类</strong>{_chips(provider_responses)}</div>
       <div class="coverage-item"><span class="muted">语义与媒体校验</span><strong>{_number(coverage.get('semantic_check_count'))} 项</strong>{_chips(_items(coverage.get('semantic_checks')))}</div>
       <div class="coverage-item"><span class="muted">执行节点类型</span><strong>{_number(coverage.get('executed_node_type_count'))} 类</strong>{_chips(_items(coverage.get('executed_node_types')))}</div>
       <div class="coverage-item"><span class="muted">管理台动作分发契约</span><strong>{_percent(coverage.get('dispatch_contract_coverage_pct'))}</strong><span class="muted">{_number(coverage.get('dispatch_contract_action_count'))} 个动作均存在入口</span></div>
-      <div class="coverage-item"><span class="muted">浏览器动态覆盖</span><strong>{_percent(coverage.get('console_action_coverage_pct'))}</strong><span class="muted">本轮实际执行 {_number(coverage.get('executed_console_action_count'))} 个动作</span></div>
-      <div class="coverage-item wide"><span class="muted">尚未由浏览器动态执行的动作</span><div>{_chips(missing_actions, empty="全部覆盖")}</div></div>
+      <div class="coverage-item wide"><span class="muted">尚未获得任何运行证据的动作</span><div>{_chips(missing_actions, empty="全部覆盖")}</div></div>
     </div>
   </section>
 

@@ -26,6 +26,53 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("journey_runner", parameters)
         self.assertIn("include_journeys", parameters)
 
+    async def test_matrix_keeps_graph_ui_backend_and_worker_evidence_separate(self):
+        async def fake_explorer(item, *, work_root, max_steps=32):
+            return ExplorationReport(
+                scenario_id=item.scenario_id,
+                status="passed",
+                final_state="READY_TO_PUBLISH",
+                observed_actions=("review_final_video",),
+                started_nodes=("master:1",),
+            )
+
+        def fake_journey_runner(work_root):
+            return {
+                "status": "passed", "journey_count": 1,
+                "passed": 1, "failed": 0, "paid_provider_calls": 0,
+                "journeys": [],
+                "coverage_evidence": {
+                    "graph_actions": [],
+                    "ui_dispatch_actions": ["submit_publish"],
+                    "integrated_backend_actions": ["review_continuity_anchors"],
+                    "worker_node_types": ["master"],
+                    "source_types": ["manual"],
+                    "provider_response_types": ["replay_success"],
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = await run_matrix(
+                (scenario("evidence"),),
+                work_root=Path(directory),
+                explorer=fake_explorer,
+                include_journeys=True,
+                journey_runner=fake_journey_runner,
+            )
+
+        coverage = summary["coverage"]
+        self.assertEqual(coverage["graph_actions"], ["review_final_video"])
+        self.assertEqual(coverage["ui_dispatch_actions"], ["submit_publish"])
+        self.assertEqual(
+            coverage["integrated_backend_actions"],
+            ["review_continuity_anchors"],
+        )
+        self.assertEqual(coverage["worker_node_types"], ["master"])
+        self.assertEqual(coverage["source_types"], ["manual"])
+        self.assertEqual(
+            coverage["provider_response_types"], ["replay_success"]
+        )
+
     async def test_failed_full_journey_fails_the_matrix(self):
         async def fake_explorer(item, *, work_root, max_steps=32):
             return ExplorationReport(

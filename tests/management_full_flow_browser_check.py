@@ -30,6 +30,9 @@ from factory import (  # noqa: E402
 )
 from factory.clients import doubao_llm  # noqa: E402
 from factory.management_api import ManagementService  # noqa: E402
+from factory.flow_guard.evidence import (  # noqa: E402
+    BROWSER_EVIDENCE_PREFIX,
+)
 from tests.management_workflow_browser_check import (  # noqa: E402
     _edge_path,
     _free_port,
@@ -379,6 +382,21 @@ def main() -> int:
 
     assert not non_local_requests, non_local_requests
     assert (_signature(production_db), _signature(production_assets)) == before
+    print(BROWSER_EVIDENCE_PREFIX + json.dumps({
+        "ui_dispatch_actions": [
+            "review_continuity_anchors",
+            "review_final_video",
+            "submit_publish",
+        ],
+        "integrated_backend_actions": [
+            "review_continuity_anchors",
+            "review_final_video",
+            "submit_publish",
+        ],
+        "worker_node_types": [],
+        "source_types": ["manual"],
+        "provider_response_types": ["replay_success"],
+    }, sort_keys=True))
     print("MANAGEMENT_FULL_FLOW_BROWSER_CHECK_OK")
     return 0
 

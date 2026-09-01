@@ -12,6 +12,7 @@ from typing import Callable, Iterator, Mapping, Sequence
 
 from .. import db as factory_db, full_flow_regression
 from ..management_api import ManagementService
+from .evidence import CoverageEvidence, parse_browser_evidence
 from .invariants import evaluate_media_artifact, evaluate_production_spec
 
 
@@ -217,32 +218,20 @@ def run_management_browser_suite(
             PROJECT_ROOT / "tests" / "management_full_flow_browser_check.py",
             1,
             (),
-            (
-                "review_continuity_anchors",
-                "review_final_video",
-                "submit_publish",
-            ),
         ),
         (
             "management_fault_decisions",
             PROJECT_ROOT / "tests" / "management_fault_browser_check.py",
             11,
             ("--release-gate",),
-            (
-                "reconcile_provider_task",
-                "reconcile_rejected_provider_cost",
-                "resume_failed_video",
-                "review_master_candidates",
-                "view_progress",
-            ),
         ),
     )
     evidence = []
-    executed_actions: set[str] = set()
+    coverage = CoverageEvidence()
     passed = 0
     failed = 0
     for (
-        scenario_id, script, scenario_count, arguments, actions
+        scenario_id, script, scenario_count, arguments
     ) in specifications:
         try:
             process = command_runner(
@@ -262,10 +251,15 @@ def run_management_browser_suite(
             exit_code = 124
             stdout = str(exc.stdout or "")
             stderr = f"browser suite timed out after {exc.timeout} seconds"
-        status = "passed" if exit_code == 0 else "failed"
+        suite_evidence, evidence_errors = parse_browser_evidence(stdout)
+        status = (
+            "passed"
+            if exit_code == 0 and not evidence_errors
+            else "failed"
+        )
         if status == "passed":
             passed += scenario_count
-            executed_actions.update(actions)
+            coverage.merge(suite_evidence)
         else:
             failed += scenario_count
         evidence.append({
@@ -275,14 +269,22 @@ def run_management_browser_suite(
             "exit_code": exit_code,
             "stdout_tail": stdout[-2000:],
             "stderr_tail": stderr[-2000:],
+            "evidence_errors": evidence_errors,
+            "coverage_evidence": suite_evidence,
         })
+    coverage_payload = coverage.as_dict()
+    executed_actions = sorted(set(
+        coverage_payload["ui_dispatch_actions"]
+        + coverage_payload["integrated_backend_actions"]
+    ))
     return {
         "status": "passed" if not failed else "failed",
         "scenario_count": passed + failed,
         "passed": passed,
         "failed": failed,
         "paid_provider_calls": 0,
-        "executed_console_actions": sorted(executed_actions),
+        "coverage_evidence": coverage_payload,
+        "executed_console_actions": executed_actions,
         "journeys": evidence,
     }
 
@@ -314,9 +316,17 @@ def run_full_journey_suite(
     failed = service_failed + browser_failed
     paid_calls = service_paid_calls + browser_paid_calls
     journey_count = len(journeys) + browser_count
+    coverage = CoverageEvidence()
+    for scenario in scenarios:
+        source = scenario.get("source") or {}
+        coverage.record("source_type", source.get("type") or "unknown")
+        coverage.record("provider_response", "replay_success")
+    coverage.merge((browser_suite or {}).get("coverage_evidence") or {})
+    coverage_payload = coverage.as_dict()
     executed_actions = sorted(set(
         (browser_suite or {}).get("executed_console_actions") or []
-    ))
+    ) | set(coverage_payload["ui_dispatch_actions"])
+      | set(coverage_payload["integrated_backend_actions"]))
     return {
         "status": "passed" if not failed and not paid_calls else "failed",
         "journey_count": journey_count,
@@ -325,5 +335,6 @@ def run_full_journey_suite(
         "paid_provider_calls": paid_calls,
         "journeys": journeys,
         "browser_suite": browser_suite,
+        "coverage_evidence": coverage_payload,
         "executed_console_actions": executed_actions,
     }

@@ -72,7 +72,17 @@ class FlowGuardJourneyTests(unittest.TestCase):
 
     def test_browser_action_coverage_only_counts_passing_suites(self):
         responses = iter((
-            SimpleNamespace(returncode=0, stdout="full passed", stderr=""),
+            SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    'full passed\nFLOW_GUARD_EVIDENCE={'
+                    '"ui_dispatch_actions":["review_continuity_anchors"],'
+                    '"integrated_backend_actions":["review_continuity_anchors"],'
+                    '"worker_node_types":[],"source_types":["manual"],'
+                    '"provider_response_types":["replay_success"]}'
+                ),
+                stderr="",
+            ),
             SimpleNamespace(returncode=1, stdout="", stderr="fault failed"),
         ))
 
@@ -91,6 +101,23 @@ class FlowGuardJourneyTests(unittest.TestCase):
         self.assertNotIn(
             "reconcile_provider_task",
             report["executed_console_actions"],
+        )
+
+    def test_passing_browser_process_without_evidence_fails_closed(self):
+        responses = iter((
+            SimpleNamespace(returncode=0, stdout="full passed", stderr=""),
+            SimpleNamespace(returncode=1, stdout="", stderr="fault failed"),
+        ))
+
+        report = journeys.run_management_browser_suite(
+            command_runner=lambda *args, **kwargs: next(responses)
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["coverage_evidence"]["ui_dispatch_actions"], [])
+        self.assertIn(
+            "browser_evidence_missing",
+            report["journeys"][0]["evidence_errors"],
         )
 
     def test_manual_source_reaches_publishable_video_without_cost(self):

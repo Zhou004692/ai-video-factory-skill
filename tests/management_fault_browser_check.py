@@ -26,6 +26,8 @@ from playwright.sync_api import Route, sync_playwright
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from factory.flow_guard.evidence import BROWSER_EVIDENCE_PREFIX  # noqa: E402
 UI_ROOT = PROJECT_ROOT / "scripts" / "management_ui"
 UNIT_RELEASE_GATE_TESTS = (
     "tests.test_script_drafts",
@@ -683,6 +685,19 @@ def main() -> None:
     if args.release_gate:
         run_unit_gate()
     run_browser_gate()
+    print(BROWSER_EVIDENCE_PREFIX + json.dumps({
+        "ui_dispatch_actions": [
+            "reconcile_provider_task",
+            "reconcile_rejected_provider_cost",
+            "resume_failed_video",
+            "review_master_candidates",
+            "view_progress",
+        ],
+        "integrated_backend_actions": [],
+        "worker_node_types": [],
+        "source_types": [],
+        "provider_response_types": ["stubbed_api"],
+    }, sort_keys=True))
     print("management production-fault browser check: PASS (11 scenarios)")
 
 

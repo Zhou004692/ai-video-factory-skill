@@ -8,6 +8,7 @@ import time
 from typing import Awaitable, Callable, Sequence
 
 from .explorer import explore_scenario
+from .evidence import CoverageEvidence
 from .journeys import run_full_journey_suite
 from .management_actions import (
     BACKEND_VIDEO_ACTION_IDS,
@@ -106,17 +107,26 @@ async def run_matrix(
     semantic_checks = {
         check for report in reports for check in report.semantic_checks
     }
-    executed_actions = {
+    coverage_evidence = CoverageEvidence()
+    graph_actions = {
         normalize_flow_action(action)
         for report in reports
         for action in report.observed_actions
         if normalize_flow_action(action) in BACKEND_VIDEO_ACTION_IDS
     }
-    executed_actions.update(
-        action
-        for action in journey.get("executed_console_actions", [])
-        if action in BACKEND_VIDEO_ACTION_IDS
-    )
+    for action in graph_actions:
+        coverage_evidence.record("graph_action", action)
+    coverage_evidence.merge(journey.get("coverage_evidence") or {})
+    evidence_payload = coverage_evidence.as_dict()
+    executed_actions = set(graph_actions)
+    executed_actions.update(evidence_payload["ui_dispatch_actions"])
+    executed_actions.update(evidence_payload["integrated_backend_actions"])
+    if not journey.get("coverage_evidence"):
+        executed_actions.update(
+            action
+            for action in journey.get("executed_console_actions", [])
+            if action in BACKEND_VIDEO_ACTION_IDS
+        )
     missing_actions = BACKEND_VIDEO_ACTION_IDS - executed_actions
     dispatch_actions = console_dispatch_action_ids()
     missing_dispatch_actions = BACKEND_VIDEO_ACTION_IDS - dispatch_actions
@@ -155,6 +165,21 @@ async def run_matrix(
         "duplicate_trace_scenarios": len(reports) - len(traces),
         "duration_sec": round(time.perf_counter() - started_at, 3),
         "coverage": {
+            **evidence_payload,
+            "graph_action_count": len(evidence_payload["graph_actions"]),
+            "ui_dispatch_action_count": len(
+                evidence_payload["ui_dispatch_actions"]
+            ),
+            "integrated_backend_action_count": len(
+                evidence_payload["integrated_backend_actions"]
+            ),
+            "worker_node_type_count": len(
+                evidence_payload["worker_node_types"]
+            ),
+            "source_type_count": len(evidence_payload["source_types"]),
+            "provider_response_type_count": len(
+                evidence_payload["provider_response_types"]
+            ),
             "semantic_check_count": len(semantic_checks),
             "semantic_checks": sorted(semantic_checks),
             "executed_node_type_count": len(node_types),
