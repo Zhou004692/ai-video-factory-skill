@@ -88,6 +88,7 @@ def render_html_report(
     perceptual_media = _mapping(payload.get("perceptual_media_golden"))
     journey_suite = _mapping(payload.get("journey_suite"))
     browser_suite = _mapping(journey_suite.get("browser_suite"))
+    execution = _mapping(payload.get("execution"))
     status_label, status_class = _status(payload.get("status"))
 
     scenario_count = _number(payload.get("scenario_count"))
@@ -258,6 +259,13 @@ def render_html_report(
         )
     generated_at = _text(payload.get("generated_at"))
     provider_mode = _text(payload.get("provider_mode"))
+    execution_mode = str(execution.get("mode") or "full").lower()
+    execution_label = "增量回归" if execution_mode == "incremental" else "完整回归"
+    execution_reason = _text(execution.get("reason"), "未记录触发原因")
+    workspace_root = _text(execution.get("workspace_root"), "未记录")
+    incident_backed = (
+        "含真实事故回放" if execution.get("incident_backed") else "未包含真实事故回放"
+    )
     json_href = escape(json_filename, quote=True)
 
     return f"""<!doctype html>
@@ -325,6 +333,7 @@ def render_html_report(
       <div class="eyebrow">CONTINUOUS FLOW REGRESSION</div>
       <h1>Flow Guard 零费用回归报告</h1>
       <div class="meta"><span>生成时间：{generated_at}</span><span>Provider：{provider_mode}</span><a class="raw-link" href="{json_href}">查看原始 JSON</a></div>
+      <div class="meta"><span>范围：{execution_label}</span><span>原因：{execution_reason}</span><span>{incident_backed}</span><span>临时工作区：{workspace_root}</span></div>
     </div>
     <div class="hero-status {status_class}">{status_label}</div>
   </header>

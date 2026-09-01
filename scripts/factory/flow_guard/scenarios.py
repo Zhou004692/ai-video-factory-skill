@@ -117,6 +117,31 @@ def build_smoke_scenarios(
     return tuple(result)
 
 
+def build_incremental_scenarios() -> tuple[FlowScenario, ...]:
+    """Keep one fast path for every effective branch value and node type."""
+    values = (
+        ("stable", "none", "master", False),
+        ("enhanced", "anchor_review", "character_anchor", True),
+        ("experimental", "anchor_review", "scene_anchor", False),
+        ("stable", "master_review", "master", True),
+        ("enhanced", "budget", "bgm", False),
+        ("experimental", "provider_action", "local_compose", True),
+        ("stable", "recoverable_failure", "final_review", False),
+    )
+    return tuple(
+        FlowScenario(
+            scenario_id=f"inc-{index:02d}",
+            profile=profile,
+            pause=pause,
+            pause_node=node_type,
+            resolution=RESOLUTION_BY_PAUSE[pause],
+            restart=restart,
+        )
+        for index, (profile, pause, node_type, restart)
+        in enumerate(values, 1)
+    )
+
+
 def build_scenarios() -> tuple[FlowScenario, ...]:
     """Build constraint-valid branch paths with one restart per path."""
     profiles = tuple(str(item) for item in BRANCH_DIMENSIONS["profile"])

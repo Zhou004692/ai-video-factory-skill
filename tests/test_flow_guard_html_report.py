@@ -19,6 +19,11 @@ def sample_payload(*, status: str = "passed") -> dict[str, object]:
     return {
         "generated_at": "2026-09-01T02:18:42+00:00",
         "provider_mode": "seedance_2_5_mock",
+        "execution": {
+            "mode": "full", "suite": "full",
+            "reason": "手动执行完整回归", "incident_backed": True,
+            "workspace_root": "D:/ai-video-flow-guard",
+        },
         "status": status,
         "duration_sec": 1485.211,
         "scenario_count": 88,
@@ -194,6 +199,22 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("freeze_segment", html)
         self.assertIn("final_media_freeze_segment", html)
         self.assertIn('href="latest.json"', html)
+
+    def test_identifies_incremental_scope_and_reason_in_header(self):
+        payload = sample_payload()
+        payload["execution"] = {
+            "mode": "incremental", "suite": "smoke",
+            "reason": "普通代码变化：scripts/factory/source_analysis.py",
+            "incident_backed": True,
+            "workspace_root": "D:/ai-video-flow-guard",
+        }
+
+        html = render_html_report(payload)
+
+        self.assertIn("增量回归", html)
+        self.assertIn("普通代码变化", html)
+        self.assertIn("真实事故回放", html)
+        self.assertIn("D:/ai-video-flow-guard", html)
 
     def test_renders_failed_scenario_and_escapes_report_content(self):
         html = render_html_report(sample_payload(status="failed"))

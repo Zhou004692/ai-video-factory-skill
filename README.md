@@ -235,7 +235,7 @@ ZERO_COST_RELEASE_GATE_OK paid_provider_calls=0 external_requests=0
 
 ### 常态化流程巡检
 
-R4 Flow Guard 不等待用户在管理台触发，也绝不修改正式任务。它在临时 SQLite 和临时媒体目录中编译真实 Production Spec v2、遍历真实 Graph V2，并只用 Seedance 2.5 Replay/Mock 生成本地测试母片。默认 Full 套件不是固定抽取若干 pairwise 用例，而是从有效状态、暂停类型、故障节点、恢复动作和服务重启约束中生成 88 条可达路径；无效组合不会被计入覆盖率。
+R4 Flow Guard 不等待用户在管理台触发，也绝不修改正式任务。它在临时 SQLite 和临时媒体目录中编译真实 Production Spec v2、遍历真实 Graph V2，并只用 Seedance 2.5 Replay/Mock 生成本地测试母片。回归分为三层：常态监听使用 7 条代表路径并强制附带 17 条真实事故回放；Smoke 使用 32 条 pairwise 组合路径；Full 从有效状态、暂停类型、故障节点、恢复动作和服务重启约束中生成 88 条可达路径并执行全部真实管理台、媒体金标和影子审计。无效组合不会被计入覆盖率。
 
 为避免“模拟测试全绿、正式流程仍卡住”，Full 套件增加了以下独立证据层：
 
@@ -254,21 +254,25 @@ Full 套件还会执行 3 条“来源 → 简报 → 剧本 → 制作设置 �
 .\.venv\Scripts\python.exe scripts\flow_guard.py run
 ```
 
-常态运行默认监听相关代码，发生变更后自动执行 Full 套件：
+常态监听采用自适应调度：普通代码变化执行约 3–4 分钟的 Incremental 套件（7 条代表路径 + 17 条事故回放）；Flow Guard 自身、管理台 UI、生产图/规格/运行时等关键边界变化立即升级为 Full；即使没有关键变化，每 24 小时也会强制执行一次 Full，避免长期只依赖增量结果：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\flow_guard.py watch
 ```
 
-开发调试时使用 Smoke 套件获得快速反馈；发布门禁也显式使用 Smoke，避免与常态 Full 巡检重复执行浏览器旅程：
+也可以手动执行 Incremental 或 Smoke。Incremental 用于快速复核已知卡点，Smoke 用于中型组合覆盖；发布门禁显式使用 Smoke，避免与周期 Full 重复执行浏览器旅程：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\flow_guard.py run --suite smoke --max-scenarios 8
+.\.venv\Scripts\python.exe scripts\flow_guard.py run --suite incremental
 ```
 
-`--max-scenarios` 只用于本地快速定位，不作为正式 Full 巡检配置。代码变化检测周期默认为 30 秒。
+```powershell
+.\.venv\Scripts\python.exe scripts\flow_guard.py run --suite smoke
+```
 
-每轮巡检会同时生成两份报告：面向使用者的 `data/flow_guard/latest.html`，以及保留完整事实的机器报告 `data/flow_guard/latest.json`。HTML 可直接用浏览器打开，包含结果总览、证据覆盖与缺口、正式服务旅程、真实管理台旅程、正式库只读影子审计、本地视频表演金标、成片感知质量变异校准、历史事故逐条回放和失败路径；事故区会直接展示原始故障签名、检测边界、语料清单错误和失败测试输出，不必再翻查 JSON 才能定位。报告不依赖本地服务或外部网络。使用 `--report data/flow_guard/custom.json` 指定其他文件名时，会同步生成同名的 `custom.html`。
+每轮开始前会检查临时盘空间，默认至少保留 4 GB；系统会自动选择空间充足的本地磁盘，运行结束即删除 PID 归属的测试目录，下一轮也会回收已退出进程遗留的 `run-*` 目录。可通过 `--temp-root D:\path` 或环境变量 `AI_VIDEO_FLOW_GUARD_TEMP_ROOT` 固定临时盘。显式目录空间不足时会在生成媒体前直接失败并给出处理方法，不会继续写满系统盘。`--max-scenarios` 只用于本地快速定位，不作为正式 Full 巡检配置；代码变化检测周期默认 30 秒，完整回归周期可用 `--full-interval-hours` 调整。
+
+每轮巡检会同时生成两份报告：面向使用者的 `data/flow_guard/latest.html`，以及保留完整事实的机器报告 `data/flow_guard/latest.json`。报告头部明确标识本轮是 Incremental、Smoke 还是 Full、触发原因、是否包含事故回放及使用的临时盘，避免把增量全绿误读为完整门禁通过。机器报告还保存上次可信 Full 时间和当前源码指纹；watcher 重启后如果指纹不一致，会把停机期间的未知变化按关键变化处理并强制 Full，不会误用旧增量基线。HTML 可直接用浏览器打开，包含结果总览、证据覆盖与缺口、正式服务旅程、真实管理台旅程、正式库只读影子审计、本地视频表演金标、成片感知质量变异校准、历史事故逐条回放和失败路径；事故区会直接展示原始故障签名、检测边界、语料清单错误和失败测试输出，不必再翻查 JSON 才能定位。报告不依赖本地服务或外部网络。使用 `--report data/flow_guard/custom.json` 指定其他文件名时，会同步生成同名的 `custom.html`。
 
 报告包含执行耗时、有效路径数、唯一执行轨迹、节点类型覆盖、管理台动作覆盖、语义断言、历史变异杀伤率、服务/浏览器旅程和媒体指标。失败报告会保留可复现的场景参数、状态序列、下一步动作、节点错误和已执行修复。自动修复仅允许重建可再生投影、恢复过期本地租约、重试已修复且未付费、无远端任务、无输出产物的契约节点，并且每个节点只有一次版本化重试机会；不会提高预算、创建 Provider 任务、接受候选、改写冻结规格或删除媒体。
 

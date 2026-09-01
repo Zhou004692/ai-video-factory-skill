@@ -34,6 +34,12 @@ class FlowGuardScenarioTests(unittest.TestCase):
             "suite", inspect.signature(flow_guard_cli._select_scenarios).parameters
         )
 
+    def test_watch_scope_includes_management_server_and_guard_entrypoint(self):
+        watched = {Path(path).name for path in flow_guard_cli.WATCH_PATHS}
+
+        self.assertIn("management_server.py", watched)
+        self.assertIn("flow_guard.py", watched)
+
     def test_smoke_matrix_covers_every_dimension_pair(self):
         builder = getattr(scenario_model, "build_smoke_scenarios", None)
         self.assertTrue(callable(builder))
@@ -43,6 +49,36 @@ class FlowGuardScenarioTests(unittest.TestCase):
 
         self.assertTrue(all_pairs_covered(scenarios, BRANCH_DIMENSIONS))
         self.assertLessEqual(len(scenarios), 48)
+
+    def test_incremental_matrix_is_small_but_covers_each_effective_branch_value(self):
+        builder = getattr(scenario_model, "build_incremental_scenarios", None)
+        self.assertTrue(callable(builder))
+        if not callable(builder):
+            return
+        scenarios = builder()
+
+        self.assertLessEqual(len(scenarios), 10)
+        self.assertEqual(
+            {item.profile for item in scenarios},
+            set(BRANCH_DIMENSIONS["profile"]),
+        )
+        self.assertEqual(
+            {item.pause for item in scenarios},
+            set(BRANCH_DIMENSIONS["pause"]),
+        )
+        self.assertEqual(
+            {item.resolution for item in scenarios},
+            set(BRANCH_DIMENSIONS["resolution"]),
+        )
+        self.assertEqual(
+            {item.pause_node for item in scenarios},
+            set(scenario_model.FAULT_NODE_TYPES),
+        )
+        self.assertEqual({item.restart for item in scenarios}, {False, True})
+        self.assertTrue(all(
+            item.provider_mode == "mock" and item.max_paid_calls == 0
+            for item in scenarios
+        ))
 
     def test_full_matrix_covers_every_effective_fault_node_path(self):
         scenarios = build_scenarios()
