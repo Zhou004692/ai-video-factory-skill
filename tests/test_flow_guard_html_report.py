@@ -76,12 +76,15 @@ def sample_payload(*, status: str = "passed") -> dict[str, object]:
         },
         "historical_incident_replays": {
             "status": "passed",
-            "incident_count": 5,
-            "passed": 5,
+            "incident_count": 17,
+            "passed": 17,
             "failed": 0,
+            "manifest_errors": [],
             "results": [{
                 "incident_id": "test21",
                 "title": "视频手势与说话人解析",
+                "failure_signature": "手势：无明显手势",
+                "detection_boundary": "source_analysis → performance_ir",
                 "status": "passed",
                 "expected_guards": ["gesture_preserved", "speaker_bound"],
                 "test_count": 2,
@@ -179,6 +182,9 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("missing_shot_master", html)
         self.assertIn("历史事故逐条回放", html)
         self.assertIn("test21", html)
+        self.assertIn("17 条真实事故", html)
+        self.assertIn("手势：无明显手势", html)
+        self.assertIn("source_analysis → performance_ir", html)
         self.assertIn("gesture_preserved", html)
         self.assertIn("本地视频表演金标", html)
         self.assertIn("speaker_cluster_preserved", html)
@@ -196,6 +202,25 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("shot_master_missing", html)
         self.assertIn("unsafe &lt;script&gt;alert(1)&lt;/script&gt;", html)
         self.assertNotIn("unsafe <script>", html)
+
+    def test_renders_incident_manifest_and_replay_failure_details(self):
+        payload = sample_payload(status="failed")
+        incidents = payload["historical_incident_replays"]
+        incidents["status"] = "failed"
+        incidents["passed"] = 0
+        incidents["failed"] = 17
+        incidents["manifest_errors"] = ["duplicate incident_id: test21"]
+        incidents["results"][0]["status"] = "failed"
+        incidents["results"][0]["exit_code"] = 1
+        incidents["results"][0]["stderr_tail"] = "contract mismatch <unsafe>"
+
+        html = render_html_report(payload)
+
+        self.assertIn("事故语料清单错误", html)
+        self.assertIn("duplicate incident_id: test21", html)
+        self.assertIn("回放失败详情", html)
+        self.assertIn("contract mismatch &lt;unsafe&gt;", html)
+        self.assertNotIn("contract mismatch <unsafe>", html)
 
     def test_write_report_persists_json_and_sibling_html(self):
         with tempfile.TemporaryDirectory() as directory:

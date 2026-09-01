@@ -149,15 +149,39 @@ def render_html_report(
     for raw in _items(incidents.get("results")):
         item = _mapping(raw)
         passed = str(item.get("status") or "").lower() == "passed"
+        replay_detail = "<span class=\"muted\">—</span>"
+        if not passed:
+            diagnostic = (
+                str(item.get("stderr_tail") or "").strip()
+                or str(item.get("stdout_tail") or "").strip()
+                or f"exit_code={_number(item.get('exit_code'), 1)}"
+            )
+            replay_detail = (
+                '<details class="technical-detail"><summary>回放失败详情</summary>'
+                f'<pre>{_text(diagnostic)}</pre></details>'
+            )
         incident_rows.append(
             "<tr>"
             f'<td><code>{_text(item.get("incident_id"))}</code></td>'
             f'<td>{_text(item.get("title"))}</td>'
+            f'<td><code>{_text(item.get("failure_signature"))}</code></td>'
+            f'<td>{_text(item.get("detection_boundary"))}</td>'
             f'<td><span class="status {"success" if passed else "danger"}">'
             f'{"通过" if passed else "失败"}</span></td>'
             f'<td>{_chips(_items(item.get("expected_guards")))}</td>'
             f'<td>{_number(item.get("test_count"))}</td>'
+            f'<td>{replay_detail}</td>'
             "</tr>"
+        )
+    incident_manifest_errors = _items(incidents.get("manifest_errors"))
+    incident_manifest_alert = ""
+    if incident_manifest_errors:
+        error_items = "".join(
+            f"<li>{_text(message)}</li>" for message in incident_manifest_errors
+        )
+        incident_manifest_alert = (
+            '<div class="manifest-alert"><strong>事故语料清单错误</strong>'
+            f'<ul>{error_items}</ul></div>'
         )
 
     perceptual_rows = []
@@ -280,6 +304,10 @@ def render_html_report(
     .status.danger {{ color:var(--bad); background:var(--bad-bg); }}
     .status.neutral {{ color:var(--muted); background:#f3f4f6; }}
     .failure-card {{ border-left:4px solid var(--bad); background:var(--bad-bg); padding:14px 16px; margin-top:10px; border-radius:6px; }}
+    .manifest-alert {{ margin:12px 0; border-left:4px solid var(--bad); border-radius:6px; padding:10px 14px; color:var(--bad); background:var(--bad-bg); }}
+    .manifest-alert ul {{ margin:6px 0 0; padding-left:18px; }}
+    .technical-detail summary {{ cursor:pointer; color:var(--bad); white-space:nowrap; }}
+    .technical-detail pre {{ max-width:560px; max-height:180px; overflow:auto; margin:8px 0 0; padding:8px; border-radius:6px; color:#4b1d17; background:#fff; white-space:pre-wrap; word-break:break-word; }}
     .findings {{ margin:10px 0 0; padding-left:18px; }}
     .findings li {{ margin:5px 0; }}
     .findings code {{ margin-right:10px; font-weight:700; }}
@@ -378,8 +406,9 @@ def render_html_report(
 
   <section>
     <h2>历史事故逐条回放</h2>
-    <div class="meta">测试 21–25 的用户可见故障分别运行，任一失败都会阻断整轮 Flow Guard。</div>
-    <div class="table-wrap"><table><thead><tr><th>事故</th><th>问题</th><th>结果</th><th>预期护栏</th><th>测试数</th></tr></thead><tbody>{''.join(incident_rows) or '<tr><td colspan="5" class="muted">未运行历史事故回放</td></tr>'}</tbody></table></div>
+    <div class="meta">{_number(incidents.get('incident_count'))} 条真实事故分别运行；每条都记录原始故障签名和生产边界，任一失败都会阻断整轮 Flow Guard。</div>
+    {incident_manifest_alert}
+    <div class="table-wrap"><table><thead><tr><th>事故</th><th>问题</th><th>故障签名</th><th>检测边界</th><th>结果</th><th>预期护栏</th><th>测试数</th><th>失败定位</th></tr></thead><tbody>{''.join(incident_rows) or '<tr><td colspan="8" class="muted">未运行历史事故回放</td></tr>'}</tbody></table></div>
   </section>
 
   <section>
