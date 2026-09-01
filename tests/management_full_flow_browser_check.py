@@ -1,8 +1,6 @@
 """Writable, zero-cost browser regression for the complete management flow."""
 from __future__ import annotations
 
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -23,7 +21,6 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from factory import (  # noqa: E402
     db,
     full_flow_regression,
-    production_graph_runner,
     provider_replay,
     script_drafts,
     topic_briefs,
@@ -178,18 +175,34 @@ def _wait_for_ui_action(page, selector: str, *, timeout: int = 30_000) -> None:
     )
 
 
-def _run_graph(database, job_id: str, media_root: Path) -> str:
-    handlers = full_flow_regression.build_zero_cost_handlers(
-        database, media_root=media_root
-    )
-    def execute():
-        return asyncio.run(production_graph_runner.run_graph_job(
-            database, job_id, configured_limit=4, handlers=handlers
-        ))
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        result = executor.submit(execute).result()
-    return str(result.job_state)
+def _wait_for_job_state(
+    database,
+    job_id: str,
+    expected: str,
+    *,
+    timeout_sec: float = 180,
+) -> set[int]:
+    """Observe the supervisor-owned child process and terminal job state."""
+    deadline = time.monotonic() + timeout_sec
+    worker_pids: set[int] = set()
+    last = None
+    while time.monotonic() < deadline:
+        row = database.execute(
+            "SELECT state,error,failure_code,production_worker_pid "
+            "FROM jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        if row:
+            last = dict(row)
+            pid = row["production_worker_pid"]
+            if isinstance(pid, int) and pid > 0:
+                worker_pids.add(pid)
+            if str(row["state"]) == expected:
+                return worker_pids
+            if str(row["state"]) in {"FAILED", "BLOCKED"}:
+                raise AssertionError(f"worker failed before {expected}: {last}")
+        time.sleep(0.1)
+    raise AssertionError(f"timed out waiting for {expected}: {last}")
 
 
 def main() -> int:
@@ -211,7 +224,8 @@ def main() -> int:
             "FACTORY_DATA_DIR": str(temp_root),
             "FACTORY_PROVIDER_MODE": "replay",
             "FACTORY_REPLAY_FIXTURE_ROOT": str(fixture_root),
-            "FACTORY_REPLAY_DISABLE_WORKERS": "1",
+            "FACTORY_FLOW_GUARD_ZERO_COST_WORKER": "1",
+            "FACTORY_FLOW_GUARD_MEDIA_ROOT": str(media_root),
             "ARK_LLM_MODEL": REPLAY_LLM_MODEL,
             "PRODUCTION_EXECUTION_ENGINE": "graph_v2",
             "PROVIDER_RECONCILE_ENABLED": "false",
@@ -311,24 +325,22 @@ def main() -> int:
                         risk.check()
                     page.locator("#produce-confirm").click()
                     page.wait_for_function(
-                        "jobId => state.videos?.jobs?.some(item => item.job_id === jobId && item.state === 'PRODUCTION_QUEUED')",
+                        "jobId => state.videos?.jobs?.some(item => item.job_id === jobId && ['PRODUCTION_QUEUED','PRODUCTION_RUNNING','ANCHOR_REVIEW_REQUIRED'].includes(item.state))",
                         arg=job_id,
                     )
 
-                    assert _run_graph(database, job_id, media_root) == "ANCHOR_REVIEW_REQUIRED"
+                    first_worker_pids = _wait_for_job_state(
+                        database, job_id, "ANCHOR_REVIEW_REQUIRED"
+                    )
+                    assert first_worker_pids, "supervisor worker PID was never observed"
                     page.reload(wait_until="networkidle")
                     _open_job(page, job_id)
                     page.wait_for_selector("#anchor-generation-status")
                     page.locator("#drawer-next-action").click()
-                    page.wait_for_timeout(300)
-
-                    from factory.steps import s6_compose
-                    previous_assets = s6_compose.ASSETS_DIR
-                    s6_compose.ASSETS_DIR = media_root
-                    try:
-                        assert _run_graph(database, job_id, media_root) == "COMPOSED"
-                    finally:
-                        s6_compose.ASSETS_DIR = previous_assets
+                    second_worker_pids = _wait_for_job_state(
+                        database, job_id, "COMPOSED"
+                    )
+                    assert second_worker_pids, "resume worker PID was never observed"
 
                     page.reload(wait_until="networkidle")
                     _open_job(page, job_id)
@@ -351,6 +363,14 @@ def main() -> int:
                     assert row["state"] == "READY_TO_PUBLISH", dict(row)
                     assert int(row["cost_cents"] or 0) == 0, dict(row)
                     assert Path(str(row["final_path"])).is_file(), dict(row)
+                    worker_node_types = sorted({
+                        str(item["node_type"])
+                        for item in database.execute(
+                            "SELECT DISTINCT node_type FROM production_nodes "
+                            "WHERE job_id=? AND state='SUCCEEDED'",
+                            (job_id,),
+                        ).fetchall()
+                    })
 
                     # A changed provider request must fail closed and remain
                     # recoverable from the same visible action, in Chinese.
@@ -393,9 +413,9 @@ def main() -> int:
             "review_final_video",
             "submit_publish",
         ],
-        "worker_node_types": [],
+        "worker_node_types": worker_node_types,
         "source_types": ["manual"],
-        "provider_response_types": ["replay_success"],
+        "provider_response_types": ["zero_cost_worker_replay"],
     }, sort_keys=True))
     print("MANAGEMENT_FULL_FLOW_BROWSER_CHECK_OK")
     return 0

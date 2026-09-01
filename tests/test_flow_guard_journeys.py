@@ -17,6 +17,16 @@ from factory.flow_guard import journeys  # noqa: E402
 
 
 class FlowGuardJourneyTests(unittest.TestCase):
+    def test_full_browser_journey_uses_supervisor_worker_not_inline_graph(self):
+        source = (
+            ROOT / "tests" / "management_full_flow_browser_check.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("FACTORY_FLOW_GUARD_ZERO_COST_WORKER", source)
+        self.assertNotIn("FACTORY_REPLAY_DISABLE_WORKERS", source)
+        self.assertNotIn("def _run_graph", source)
+        self.assertIn("production_worker_pid", source)
+
     def test_journey_suite_supports_browser_execution(self):
         parameters = inspect.signature(
             getattr(journeys, "run_full_journey_suite")

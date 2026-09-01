@@ -18,6 +18,32 @@ from factory.management_api import ManagementService  # noqa: E402
 
 
 class FullFlowRegressionTests(unittest.TestCase):
+    def test_zero_cost_worker_handlers_require_explicit_replay_boundary(self):
+        database = sqlite3.connect(":memory:")
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(os.environ, {
+                "FACTORY_PROVIDER_MODE": "live",
+                "FACTORY_FLOW_GUARD_ZERO_COST_WORKER": "1",
+                "FACTORY_DATA_DIR": directory,
+                "FACTORY_FLOW_GUARD_MEDIA_ROOT": directory,
+            }, clear=False):
+                with self.assertRaisesRegex(RuntimeError, "replay mode"):
+                    full_flow_regression.build_zero_cost_worker_handlers(database)
+            with mock.patch.dict(os.environ, {
+                "FACTORY_PROVIDER_MODE": "replay",
+                "FACTORY_FLOW_GUARD_ZERO_COST_WORKER": "1",
+                "FACTORY_DATA_DIR": directory,
+                "FACTORY_FLOW_GUARD_MEDIA_ROOT": directory,
+            }, clear=False):
+                handlers = full_flow_regression.build_zero_cost_worker_handlers(
+                    database
+                )
+        self.assertIn("master", handlers)
+        self.assertIn("local_compose", handlers)
+        database.close()
+
     def test_manual_source_reaches_compiled_graph_without_paid_provider_calls(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

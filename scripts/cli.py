@@ -41,6 +41,7 @@ from factory import (  # noqa: E402
     creative_learning,
     production_metrics,
     production_adapters,
+    full_flow_regression,
     error_registry,
     production_graph_runner,
     performance_feedback,
@@ -992,11 +993,19 @@ def produce_graph(job_id, dispatched):
     os.environ["FACTORY_REQUIRE_V2_CONTRACT"] = "1"
     try:
         try:
+            zero_cost_worker = str(os.environ.get(
+                "FACTORY_FLOW_GUARD_ZERO_COST_WORKER", ""
+            )).strip().casefold() in {"1", "true", "yes", "on"}
+            handlers = (
+                full_flow_regression.build_zero_cost_worker_handlers(database)
+                if zero_cost_worker
+                else production_adapters.build_handlers(database)
+            )
             result = asyncio.run(production_graph_runner.run_graph_job(
                 database,
                 job_id,
                 configured_limit=configured_limit,
-                handlers=production_adapters.build_handlers(database),
+                handlers=handlers,
             ))
         except Exception as exc:
             outcome = error_registry.describe_failure(

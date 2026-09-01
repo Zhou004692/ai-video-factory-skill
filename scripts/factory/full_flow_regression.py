@@ -526,6 +526,28 @@ def build_zero_cost_handlers(
     }
 
 
+def build_zero_cost_worker_handlers(database: sqlite3.Connection):
+    """Build subprocess-worker fixtures behind an explicit safe boundary."""
+    enabled = str(os.environ.get(
+        "FACTORY_FLOW_GUARD_ZERO_COST_WORKER", ""
+    )).strip().casefold() in {"1", "true", "yes", "on"}
+    if not enabled:
+        raise RuntimeError("zero-cost worker boundary is not enabled")
+    if str(os.environ.get("FACTORY_PROVIDER_MODE") or "").strip().casefold() != "replay":
+        raise RuntimeError("zero-cost worker requires replay mode")
+    data_root = str(os.environ.get("FACTORY_DATA_DIR") or "").strip()
+    media_value = str(os.environ.get(
+        "FACTORY_FLOW_GUARD_MEDIA_ROOT"
+    ) or "").strip()
+    if not data_root or not media_value:
+        raise RuntimeError("zero-cost worker requires isolated data and media roots")
+    data_path = Path(data_root).expanduser().resolve()
+    media_root = Path(media_value).expanduser().resolve()
+    if not media_root.is_relative_to(data_path):
+        raise RuntimeError("zero-cost worker media root must stay inside isolated data")
+    return build_zero_cost_handlers(database, media_root=media_root)
+
+
 def run_source_to_ready_to_publish(
     service,
     scenario: dict,
