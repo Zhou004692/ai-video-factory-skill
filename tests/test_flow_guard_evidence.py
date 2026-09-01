@@ -22,6 +22,7 @@ class FlowGuardEvidenceTests(unittest.TestCase):
         evidence.record("graph_action", "review_final_video")
         evidence.record("ui_dispatch", "submit_publish")
         evidence.record("backend_action", "review_continuity_anchors")
+        evidence.record("worker_action", "review_continuity_anchors")
         evidence.record("worker_node", "master")
         evidence.record("source_type", "video_replay")
         evidence.record("provider_response", "replay_success")
@@ -35,6 +36,9 @@ class FlowGuardEvidenceTests(unittest.TestCase):
             ["review_continuity_anchors"],
         )
         self.assertEqual(payload["worker_node_types"], ["master"])
+        self.assertEqual(
+            payload["worker_actions"], ["review_continuity_anchors"]
+        )
         self.assertEqual(payload["source_types"], ["video_replay"])
         self.assertEqual(payload["provider_response_types"], ["replay_success"])
 

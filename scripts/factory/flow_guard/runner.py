@@ -14,6 +14,7 @@ from .incidents import run_historical_incident_replays
 from .management_actions import (
     BACKEND_VIDEO_ACTION_IDS,
     console_dispatch_action_ids,
+    evaluate_action_evidence,
     normalize_flow_action,
 )
 from .model import ExplorationReport, FlowScenario
@@ -199,6 +200,13 @@ async def run_matrix(
     missing_actions = BACKEND_VIDEO_ACTION_IDS - executed_actions
     dispatch_actions = console_dispatch_action_ids()
     missing_dispatch_actions = BACKEND_VIDEO_ACTION_IDS - dispatch_actions
+    action_evidence_contracts = evaluate_action_evidence(evidence_payload)
+    action_evidence_gaps = [
+        item for item in action_evidence_contracts if not item["complete"]
+    ]
+    complete_action_evidence_count = (
+        len(action_evidence_contracts) - len(action_evidence_gaps)
+    )
     node_types = {
         node_id.split(":", 1)[0]
         for report in reports for node_id in report.started_nodes
@@ -216,6 +224,7 @@ async def run_matrix(
                 and perceptual_media["status"] in {"passed", "skipped"}
                 and journey["status"] in {"passed", "skipped"}
                 and not missing_dispatch_actions
+                and (not include_journeys or not action_evidence_gaps)
             )
             else "failed"
         ),
@@ -256,6 +265,7 @@ async def run_matrix(
             "worker_node_type_count": len(
                 evidence_payload["worker_node_types"]
             ),
+            "worker_action_count": len(evidence_payload["worker_actions"]),
             "source_type_count": len(evidence_payload["source_types"]),
             "provider_response_type_count": len(
                 evidence_payload["provider_response_types"]
@@ -279,6 +289,15 @@ async def run_matrix(
                 len(executed_actions) / len(BACKEND_VIDEO_ACTION_IDS) * 100,
                 2,
             ),
+            "action_evidence_required": bool(include_journeys),
+            "action_evidence_complete_count": complete_action_evidence_count,
+            "action_evidence_coverage_pct": round(
+                complete_action_evidence_count
+                / len(action_evidence_contracts) * 100,
+                2,
+            ),
+            "action_evidence_gaps": action_evidence_gaps,
+            "action_evidence_contracts": action_evidence_contracts,
         },
         "reports": [
             {

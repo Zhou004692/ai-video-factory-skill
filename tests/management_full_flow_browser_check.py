@@ -413,6 +413,7 @@ def main() -> int:
             "review_final_video",
             "submit_publish",
         ],
+        "worker_actions": ["review_continuity_anchors"],
         "worker_node_types": worker_node_types,
         "source_types": ["manual"],
         "provider_response_types": ["zero_cost_worker_replay"],

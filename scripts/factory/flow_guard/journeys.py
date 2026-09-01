@@ -222,8 +222,14 @@ def run_management_browser_suite(
         (
             "management_fault_decisions",
             PROJECT_ROOT / "tests" / "management_fault_browser_check.py",
-            11,
+            26,
             ("--release-gate",),
+        ),
+        (
+            "management_action_backend",
+            PROJECT_ROOT / "tests" / "management_action_backend_check.py",
+            7,
+            (),
         ),
     )
     evidence = []

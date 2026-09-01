@@ -313,6 +313,44 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await run_matrix((unsafe,), work_root=Path(directory))
 
+    async def test_full_matrix_fails_closed_when_required_action_evidence_is_missing(self):
+        async def fake_explorer(item, *, work_root, max_steps=32):
+            return ExplorationReport(
+                scenario_id=item.scenario_id,
+                status="passed",
+                final_state="READY_TO_PUBLISH",
+            )
+
+        def fake_journey_runner(work_root):
+            return {
+                "status": "passed", "journey_count": 1,
+                "passed": 1, "failed": 0, "paid_provider_calls": 0,
+                "journeys": [],
+                "coverage_evidence": {
+                    "ui_dispatch_actions": ["confirm_budget"],
+                    "integrated_backend_actions": ["confirm_budget"],
+                    "worker_actions": [],
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = await run_matrix(
+                (scenario("missing-action-evidence"),),
+                work_root=Path(directory),
+                explorer=fake_explorer,
+                include_journeys=True,
+                journey_runner=fake_journey_runner,
+            )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertLess(
+            summary["coverage"]["action_evidence_coverage_pct"], 100
+        )
+        gaps = summary["coverage"]["action_evidence_gaps"]
+        self.assertIn("confirm_budget", {
+            item["action_id"] for item in gaps
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

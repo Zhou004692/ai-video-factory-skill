@@ -47,9 +47,19 @@ def sample_payload(*, status: str = "passed") -> dict[str, object]:
             "graph_actions": ["review_final_video"],
             "ui_dispatch_actions": ["submit_publish"],
             "integrated_backend_actions": ["review_continuity_anchors"],
+            "worker_actions": ["review_continuity_anchors"],
             "worker_node_types": ["master"],
             "source_types": ["manual"],
             "provider_response_types": ["replay_success"],
+            "action_evidence_complete_count": 23,
+            "action_evidence_coverage_pct": 95.83,
+            "action_evidence_contracts": [{
+                "action_id": "retry_failed_job",
+                "required": ["ui_dispatch", "backend_action"],
+                "observed": ["ui_dispatch"],
+                "missing": ["backend_action"],
+                "complete": False,
+            }],
         },
         "mutation_calibration": {
             "status": "passed",
@@ -162,6 +172,8 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("Worker 实际节点", html)
         self.assertNotIn("浏览器动态动作", html)
         self.assertIn("retry_failed_job", html)
+        self.assertIn("管理台动作证据矩阵", html)
+        self.assertIn("backend_action", html)
         self.assertIn("manual_three_person_multiscene", html)
         self.assertIn("management_fault_decisions", html)
         self.assertIn("missing_shot_master", html)

@@ -12,6 +12,7 @@ _FIELDS = (
     "graph_actions",
     "ui_dispatch_actions",
     "integrated_backend_actions",
+    "worker_actions",
     "worker_node_types",
     "source_types",
     "provider_response_types",
@@ -21,6 +22,7 @@ _KIND_TO_FIELD = {
     "graph_action": "graph_actions",
     "ui_dispatch": "ui_dispatch_actions",
     "backend_action": "integrated_backend_actions",
+    "worker_action": "worker_actions",
     "worker_node": "worker_node_types",
     "source_type": "source_types",
     "provider_response": "provider_response_types",
@@ -34,6 +36,7 @@ class CoverageEvidence:
     graph_actions: set[str] = field(default_factory=set)
     ui_dispatch_actions: set[str] = field(default_factory=set)
     integrated_backend_actions: set[str] = field(default_factory=set)
+    worker_actions: set[str] = field(default_factory=set)
     worker_node_types: set[str] = field(default_factory=set)
     source_types: set[str] = field(default_factory=set)
     provider_response_types: set[str] = field(default_factory=set)

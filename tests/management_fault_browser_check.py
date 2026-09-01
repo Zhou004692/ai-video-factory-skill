@@ -342,6 +342,47 @@ def anchor_generation_job() -> dict:
     return job
 
 
+def action_job(action_id: str) -> dict:
+    """Minimal zero-cost fixture that exposes one real dispatcher branch."""
+    job_id = "J-BROWSER-ACTION-" + action_id.replace("_", "-").upper()
+    job = base_job(job_id, "FAILED", title=f"Action evidence: {action_id}")
+    job.update({
+        "next_action": {"id": action_id, "label": f"Run {action_id}"},
+        "partial_production": False,
+        "preflight": {
+            "budget_ok": True,
+            "estimated_paid_calls": 0,
+            "estimated_cost_cents": 0,
+            "current_cost_cents": 0,
+            "projected_total_cost_cents": 0,
+            "budget_cents": 3000,
+        },
+        "budget_confirmation": {
+            "minimum_budget_without_retry_cents": 3000,
+            "current_budget_cents": 3000,
+            "current_cost_cents": 0,
+        },
+    })
+    if action_id in {
+        "retry_identity_anchor", "resume_local_postproduction",
+    }:
+        job.update({
+            "resumable": True,
+            "shots": [{
+                "idx": 1, "state": "FAILED", "provider": "mock",
+                "duration_sec": 4, "cost_cents": 0,
+                "manual_review_required": False, "quality_reasons": [],
+                "quality_status": "", "candidate_preview_url": None,
+                "error": "zero-cost fixture",
+            }],
+            "planned_masters": [{"idx": 1, "duration": 4, "type": "dialogue"}],
+            "master_count": 1,
+            "remaining_master_count": 1,
+            "total_master_duration_sec": 4,
+        })
+    return job
+
+
 def api_payload(path: str, job: dict) -> dict:
     if path == "/api/videos":
         return {"jobs": [job]}
@@ -370,6 +411,18 @@ def api_payload(path: str, job: dict) -> dict:
         return {"sources": [], "briefs": [], "drafts": []}
     if path == "/api/publishing":
         return {"submissions": [], "publications": []}
+    if path == "/api/characters":
+        return {"characters": []}
+    if path == "/api/config":
+        return {"fields": []}
+    if path.endswith("/doctor"):
+        return {
+            "entity_id": job["job_id"], "title": job["title"],
+            "status": "action_required", "headline": "需要人工复核",
+            "findings": [], "safe_actions": [],
+            "confirmation_actions": [], "external_actions": [],
+            "audit_history": [],
+        }
     return {}
 
 
@@ -653,7 +706,59 @@ def run_anchor_generation_waiting(browser, base_url: str) -> None:
     assert_clean(page, errors, bad)
 
 
-def run_browser_gate() -> None:
+def run_action_branch(browser, base_url: str, action_id: str) -> None:
+    """Exercise and assert a dispatcher branch before granting UI evidence."""
+    job = action_job(action_id)
+    page, posts, errors, bad = scenario_page(browser, base_url, job)
+    page.locator(f'[data-video-id="{job["job_id"]}"]').click()
+    page.locator("#drawer-next-action").click()
+
+    rebuild_actions = {
+        "recompile_production_spec", "retry_failed_job",
+        "revise_output_prompt", "replace_private_reference",
+        "replace_copyright_reference",
+    }
+    if action_id == "confirm_budget":
+        page.locator("#save-production-settings").wait_for(state="visible")
+    elif action_id == "increase_job_budget":
+        assert page.locator("#confirm-video-budget").is_visible()
+    elif action_id == "configure_music_provider":
+        page.wait_for_timeout(100)
+        assert "config" in page.url
+    elif action_id in rebuild_actions:
+        assert page.locator("#confirm-director-rebuild").is_visible()
+        page.locator("#confirm-director-rebuild").click()
+        wait_for_post(page, posts, "/rebuild-director")
+    elif action_id == "repair_execution_contract":
+        wait_for_post(page, posts, "/execution-contract/repair")
+    elif action_id in {"retry_identity_anchor", "resume_local_postproduction"}:
+        wait_for_post(page, posts, "/resume")
+    elif action_id == "retry_automatically":
+        page.wait_for_timeout(100)
+        assert page.locator("#toast.show").is_visible()
+    elif action_id == "review_quality_failure":
+        page.wait_for_timeout(100)
+        assert page.locator("#modal-title").inner_text() == "任务诊断与修复"
+    elif action_id == "preserve_and_diagnose":
+        page.wait_for_timeout(100)
+        assert page.locator("#modal-title").inner_text() == "任务诊断与修复"
+    elif action_id == "publish_video":
+        page.wait_for_timeout(100)
+        assert "publishing" in page.url
+    else:
+        raise AssertionError(f"unsupported action branch: {action_id}")
+    assert_clean(page, errors, bad)
+
+
+def run_browser_gate() -> set[str]:
+    observed_actions = {
+        "reconcile_provider_task",
+        "reconcile_rejected_provider_cost",
+        "resume_failed_video",
+        "review_master_candidates",
+        "view_progress",
+        "view_provider_account_guide",
+    }
     with management_server() as base_url, sync_playwright() as playwright:
         executable = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE", "").strip()
         edge = Path(
@@ -678,8 +783,28 @@ def run_browser_gate() -> None:
             run_provider_reconcile(browser, base_url, rejected=True)
             run_failed_details(browser, base_url)
             run_anchor_generation_waiting(browser, base_url)
+            for action_id in (
+                "configure_music_provider",
+                "confirm_budget",
+                "increase_job_budget",
+                "preserve_and_diagnose",
+                "publish_video",
+                "recompile_production_spec",
+                "repair_execution_contract",
+                "replace_copyright_reference",
+                "replace_private_reference",
+                "resume_local_postproduction",
+                "retry_automatically",
+                "retry_failed_job",
+                "retry_identity_anchor",
+                "review_quality_failure",
+                "revise_output_prompt",
+            ):
+                run_action_branch(browser, base_url, action_id)
+                observed_actions.add(action_id)
         finally:
             browser.close()
+    return observed_actions
 
 
 def run_unit_gate() -> None:
@@ -698,21 +823,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.release_gate:
         run_unit_gate()
-    run_browser_gate()
+    observed_actions = run_browser_gate()
     print(BROWSER_EVIDENCE_PREFIX + json.dumps({
-        "ui_dispatch_actions": [
-            "reconcile_provider_task",
-            "reconcile_rejected_provider_cost",
-            "resume_failed_video",
-            "review_master_candidates",
-            "view_progress",
-        ],
+        "ui_dispatch_actions": sorted(observed_actions),
         "integrated_backend_actions": [],
+        "worker_actions": [],
         "worker_node_types": [],
         "source_types": [],
         "provider_response_types": ["stubbed_api"],
     }, sort_keys=True))
-    print("management production-fault browser check: PASS (11 scenarios)")
+    print("management production-fault browser check: PASS (26 scenarios)")
 
 
 if __name__ == "__main__":

@@ -216,6 +216,22 @@ def render_html_report(
     worker_nodes = _items(coverage.get("worker_node_types"))
     source_types = _items(coverage.get("source_types"))
     provider_responses = _items(coverage.get("provider_response_types"))
+    worker_actions = _items(coverage.get("worker_actions"))
+    action_contracts = _items(coverage.get("action_evidence_contracts"))
+    action_rows = []
+    for raw in action_contracts:
+        item = _mapping(raw)
+        complete = bool(item.get("complete"))
+        action_rows.append(
+            "<tr>"
+            f'<td><code>{_text(item.get("action_id"))}</code></td>'
+            f'<td>{_chips(_items(item.get("required")))}</td>'
+            f'<td>{_chips(_items(item.get("observed")))}</td>'
+            f'<td>{_chips(_items(item.get("missing")), empty="无")}</td>'
+            f'<td><span class="status {"success" if complete else "danger"}">'
+            f'{"完整" if complete else "缺证据"}</span></td>'
+            "</tr>"
+        )
     generated_at = _text(payload.get("generated_at"))
     provider_mode = _text(payload.get("provider_mode"))
     json_href = escape(json_filename, quote=True)
@@ -291,6 +307,7 @@ def render_html_report(
     {_summary_card("历史故障检出", f"{mutation_killed} / {mutation_count}", f"杀伤率 {_percent(payload.get('historical_mutation_score_pct'))}")}
     {_summary_card("付费调用", str(paid_calls), "必须保持为 0")}
     {_summary_card("真实证据动作", f"{len(ui_actions)} UI / {len(backend_actions)} 后端", f"Worker {len(worker_nodes)} 类")}
+    {_summary_card("管理动作证据", f"{_number(coverage.get('action_evidence_complete_count'))} / {_number(coverage.get('console_action_count'))}", f"覆盖率 {_percent(coverage.get('action_evidence_coverage_pct'))}")}
     {_summary_card("完整耗时", _duration(payload.get('duration_sec')))}
   </div>
 
@@ -301,6 +318,7 @@ def render_html_report(
       <div class="coverage-item"><span class="muted">UI 实际派发</span><strong>{len(ui_actions)} 项</strong>{_chips(ui_actions)}</div>
       <div class="coverage-item"><span class="muted">后端真实处理</span><strong>{len(backend_actions)} 项</strong>{_chips(backend_actions)}</div>
       <div class="coverage-item"><span class="muted">Worker 实际节点</span><strong>{len(worker_nodes)} 类</strong>{_chips(worker_nodes)}</div>
+      <div class="coverage-item"><span class="muted">Worker 动作调度</span><strong>{len(worker_actions)} 项</strong>{_chips(worker_actions)}</div>
       <div class="coverage-item"><span class="muted">来源类型</span><strong>{len(source_types)} 类</strong>{_chips(source_types)}</div>
       <div class="coverage-item"><span class="muted">Provider 响应类型</span><strong>{len(provider_responses)} 类</strong>{_chips(provider_responses)}</div>
       <div class="coverage-item"><span class="muted">语义与媒体校验</span><strong>{_number(coverage.get('semantic_check_count'))} 项</strong>{_chips(_items(coverage.get('semantic_checks')))}</div>
@@ -308,6 +326,12 @@ def render_html_report(
       <div class="coverage-item"><span class="muted">管理台动作分发契约</span><strong>{_percent(coverage.get('dispatch_contract_coverage_pct'))}</strong><span class="muted">{_number(coverage.get('dispatch_contract_action_count'))} 个动作均存在入口</span></div>
       <div class="coverage-item wide"><span class="muted">尚未获得任何运行证据的动作</span><div>{_chips(missing_actions, empty="全部覆盖")}</div></div>
     </div>
+  </section>
+
+  <section>
+    <h2>管理台动作证据矩阵</h2>
+    <div class="meta">Full 模式逐动作核验 UI 实际派发、后端真实处理与 Worker 调度；缺少任一必需证据都会使整轮回归失败。</div>
+    <div class="table-wrap"><table><thead><tr><th>动作</th><th>必需证据</th><th>已观察</th><th>缺口</th><th>结论</th></tr></thead><tbody>{''.join(action_rows) or '<tr><td colspan="5" class="muted">未生成动作证据契约</td></tr>'}</tbody></table></div>
   </section>
 
   <section>

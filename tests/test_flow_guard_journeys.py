@@ -94,6 +94,7 @@ class FlowGuardJourneyTests(unittest.TestCase):
                 stderr="",
             ),
             SimpleNamespace(returncode=1, stdout="", stderr="fault failed"),
+            SimpleNamespace(returncode=1, stdout="", stderr="backend failed"),
         ))
 
         def fake_command_runner(*args, **kwargs):
@@ -117,6 +118,7 @@ class FlowGuardJourneyTests(unittest.TestCase):
         responses = iter((
             SimpleNamespace(returncode=0, stdout="full passed", stderr=""),
             SimpleNamespace(returncode=1, stdout="", stderr="fault failed"),
+            SimpleNamespace(returncode=1, stdout="", stderr="backend failed"),
         ))
 
         report = journeys.run_management_browser_suite(
