@@ -99,6 +99,19 @@ def sample_payload(*, status: str = "passed") -> dict[str, object]:
                 "paused_node_count": 1, "regression_codes": [],
             }],
         },
+        "perceptual_media_golden": {
+            "status": "passed",
+            "mutation_count": 4,
+            "killed": 4,
+            "survived": 0,
+            "clean_findings": [],
+            "results": [{
+                "mutation_id": "freeze_segment",
+                "expected_code": "final_media_freeze_segment",
+                "killed": True,
+                "observed_codes": ["final_media_freeze_segment"],
+            }],
+        },
         "journey_suite": {
             "journeys": [{
                 "scenario_id": "manual_three_person_multiscene",
@@ -159,6 +172,9 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("speaker_cluster_preserved", html)
         self.assertIn("正式库只读影子审计", html)
         self.assertIn("J-PROD-25", html)
+        self.assertIn("成片感知质量变异校准", html)
+        self.assertIn("freeze_segment", html)
+        self.assertIn("final_media_freeze_segment", html)
         self.assertIn('href="latest.json"', html)
 
     def test_renders_failed_scenario_and_escapes_report_content(self):

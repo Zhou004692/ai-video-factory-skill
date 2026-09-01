@@ -85,6 +85,7 @@ def render_html_report(
     incidents = _mapping(payload.get("historical_incident_replays"))
     video_golden = _mapping(payload.get("video_source_golden"))
     shadow_audit = _mapping(payload.get("production_shadow_audit"))
+    perceptual_media = _mapping(payload.get("perceptual_media_golden"))
     journey_suite = _mapping(payload.get("journey_suite"))
     browser_suite = _mapping(journey_suite.get("browser_suite"))
     status_label, status_class = _status(payload.get("status"))
@@ -156,6 +157,20 @@ def render_html_report(
             f'{"通过" if passed else "失败"}</span></td>'
             f'<td>{_chips(_items(item.get("expected_guards")))}</td>'
             f'<td>{_number(item.get("test_count"))}</td>'
+            "</tr>"
+        )
+
+    perceptual_rows = []
+    for raw in _items(perceptual_media.get("results")):
+        item = _mapping(raw)
+        killed = bool(item.get("killed"))
+        perceptual_rows.append(
+            "<tr>"
+            f'<td><code>{_text(item.get("mutation_id"))}</code></td>'
+            f'<td><code>{_text(item.get("expected_code"))}</code></td>'
+            f'<td><span class="status {"success" if killed else "danger"}">'
+            f'{"已检出" if killed else "未检出"}</span></td>'
+            f'<td>{_chips(_items(item.get("observed_codes")))}</td>'
             "</tr>"
         )
 
@@ -324,6 +339,17 @@ def render_html_report(
       <div class="coverage-item wide"><span class="muted">已通过语义护栏</span><div>{_chips(_items(video_golden.get('passed_guards')))}</div></div>
       <div class="coverage-item wide"><span class="muted">失败护栏</span><div>{_chips(_items(video_golden.get('failed_guards')), empty="无")}</div></div>
     </div>
+  </section>
+
+  <section>
+    <h2>成片感知质量变异校准</h2>
+    <div class="meta">正常运动视频必须无告警；冻结、黑帧、帧时间戳断层和音画时长错位必须分别被检出。全程仅使用本地 FFmpeg，不产生模型费用。</div>
+    <div class="coverage-grid">
+      <div class="coverage-item"><span class="muted">正常样本告警</span><strong>{len(_items(perceptual_media.get('clean_findings')))} 项</strong>{_chips(_items(perceptual_media.get('clean_findings')), empty="无")}</div>
+      <div class="coverage-item"><span class="muted">变异检出</span><strong>{_number(perceptual_media.get('killed'))} / {_number(perceptual_media.get('mutation_count'))}</strong><span class="muted">检出率 {_percent(perceptual_media.get('score_pct'))}</span></div>
+      <div class="coverage-item wide"><span class="muted">漏检变异</span><div>{"<span class='muted'>无</span>" if not _number(perceptual_media.get('survived')) else f"<span class='status danger'>{_number(perceptual_media.get('survived'))} 项</span>"}</div></div>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th>变异样本</th><th>预期问题码</th><th>结果</th><th>实际检出</th></tr></thead><tbody>{''.join(perceptual_rows) or '<tr><td colspan="4" class="muted">未运行成片感知质量校准</td></tr>'}</tbody></table></div>
   </section>
 
   <section>

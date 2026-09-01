@@ -68,9 +68,10 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
             ["review_continuity_anchors"],
         )
         self.assertEqual(coverage["worker_node_types"], ["master"])
-        self.assertEqual(coverage["source_types"], ["manual"])
+        self.assertEqual(coverage["source_types"], ["manual", "video_replay"])
         self.assertEqual(
-            coverage["provider_response_types"], ["replay_success"]
+            coverage["provider_response_types"],
+            ["replay_success", "replay_vision_asr"],
         )
 
     async def test_failed_full_journey_fails_the_matrix(self):
@@ -200,6 +201,33 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(summary["status"], "failed")
         self.assertEqual(summary["production_shadow_audit"]["status"], "failed")
+
+    async def test_perceptual_media_calibration_failure_fails_full_matrix(self):
+        async def fake_explorer(item, *, work_root, max_steps=32):
+            return ExplorationReport(
+                scenario_id=item.scenario_id,
+                status="passed",
+                final_state="READY_TO_PUBLISH",
+            )
+
+        def failed_perceptual(work_root):
+            return {
+                "status": "failed", "mutation_count": 4,
+                "killed": 3, "survived": 1,
+                "paid_provider_calls": 0,
+                "results": [],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = await run_matrix(
+                (scenario("perceptual"),),
+                work_root=Path(directory),
+                include_perceptual_media=True,
+                perceptual_media_runner=failed_perceptual,
+            )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["perceptual_media_golden"]["survived"], 1)
 
     async def test_matrix_summary_is_machine_readable_and_zero_cost(self):
         async def fake_explorer(item, *, work_root, max_steps=32):

@@ -200,7 +200,9 @@ def evaluate_production_spec(spec: object) -> tuple[Finding, ...]:
     return tuple(findings)
 
 
-def evaluate_media_artifact(path: object) -> dict[str, object]:
+def evaluate_media_artifact(
+    path: object, *, perceptual: bool = False
+) -> dict[str, object]:
     """Return independent file and decode evidence for one final video."""
     media_path = Path(str(path or ""))
     if not media_path.is_file():
@@ -265,6 +267,25 @@ def evaluate_media_artifact(path: object) -> dict[str, object]:
             severity="error",
             detail="final media must contain a positive-duration video stream",
         ))
+    perceptual_metrics: dict[str, object] = {}
+    if perceptual and not findings:
+        try:
+            from .perceptual_media import analyze_perceptual_media
+
+            analysis = analyze_perceptual_media(media_path)
+            perceptual_metrics = dict(analysis.get("metrics") or {})
+            for code in analysis.get("finding_codes") or []:
+                findings.append(Finding(
+                    code=str(code),
+                    severity="error",
+                    detail=f"perceptual final-media check detected {code}",
+                ))
+        except Exception as exc:
+            findings.append(Finding(
+                code="final_media_perceptual_check_failed",
+                severity="error",
+                detail=f"perceptual final-media check failed: {exc}",
+            ))
     return {
         "findings": tuple(findings),
         "metrics": {
@@ -273,6 +294,7 @@ def evaluate_media_artifact(path: object) -> dict[str, object]:
             "has_video": has_video,
             "has_audio": has_audio,
             "size_bytes": media_path.stat().st_size,
+            "perceptual": perceptual_metrics,
         },
     }
 

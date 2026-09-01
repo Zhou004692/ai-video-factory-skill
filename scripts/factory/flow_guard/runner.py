@@ -18,6 +18,7 @@ from .management_actions import (
 )
 from .model import ExplorationReport, FlowScenario
 from .mutations import run_historical_mutation_calibration
+from .perceptual_media import run_perceptual_media_golden
 from .video_golden import run_video_performance_golden
 from .shadow_audit import audit_production_shadow
 
@@ -27,6 +28,7 @@ JourneyRunner = Callable[[Path], dict[str, object]]
 IncidentRunner = Callable[[], dict[str, object]]
 VideoGoldenRunner = Callable[[Path], dict[str, object]]
 ShadowAuditRunner = Callable[[], dict[str, object]]
+PerceptualMediaRunner = Callable[[Path], dict[str, object]]
 
 
 def source_fingerprint(paths: Sequence[Path]) -> str:
@@ -66,6 +68,8 @@ async def run_matrix(
     include_video_golden: bool | None = None,
     shadow_audit_runner: ShadowAuditRunner = audit_production_shadow,
     include_shadow_audit: bool | None = None,
+    perceptual_media_runner: PerceptualMediaRunner = run_perceptual_media_golden,
+    include_perceptual_media: bool | None = None,
 ) -> dict[str, object]:
     """Run scenarios in isolation and return a stable machine-readable result."""
     started_at = time.perf_counter()
@@ -141,6 +145,19 @@ async def run_matrix(
             "jobs": [],
         }
     )
+    if include_perceptual_media is None:
+        include_perceptual_media = include_journeys
+    perceptual_media = (
+        await asyncio.to_thread(
+            perceptual_media_runner, work_root / "perceptual-media-golden"
+        )
+        if include_perceptual_media
+        else {
+            "status": "skipped", "paid_provider_calls": 0,
+            "clean_findings": [], "mutation_count": 0,
+            "killed": 0, "survived": 0, "results": [],
+        }
+    )
     traces = {
         (
             report.observed_states,
@@ -196,6 +213,7 @@ async def run_matrix(
                 and incidents["status"] in {"passed", "skipped"}
                 and video_golden["status"] in {"passed", "skipped"}
                 and shadow_audit["status"] in {"passed", "skipped"}
+                and perceptual_media["status"] in {"passed", "skipped"}
                 and journey["status"] in {"passed", "skipped"}
                 and not missing_dispatch_actions
             )
@@ -222,6 +240,7 @@ async def run_matrix(
         "historical_incident_replays": incidents,
         "video_source_golden": video_golden,
         "production_shadow_audit": shadow_audit,
+        "perceptual_media_golden": perceptual_media,
         "unique_trace_count": len(traces),
         "duplicate_trace_scenarios": len(reports) - len(traces),
         "duration_sec": round(time.perf_counter() - started_at, 3),

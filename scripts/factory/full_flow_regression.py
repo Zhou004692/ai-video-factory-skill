@@ -356,12 +356,11 @@ def _fixture_image(path: Path, *, color: str = "0xD9E7E0") -> Path:
 
 def _fixture_video(path: Path, *, duration_sec: float, index: int) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    colors = ("0x426B5B", "0x55718A", "0x8A6C55", "0x6C668A")
     frequency = 440 + (max(1, int(index)) * 80)
     duration = max(0.5, float(duration_sec))
     _run_ffmpeg([
         "-f", "lavfi", "-i",
-        f"color=c={colors[(index - 1) % len(colors)]}:s=320x568:r=25:d={duration}",
+        f"testsrc2=s=320x568:r=25:d={duration}",
         "-f", "lavfi", "-i", f"sine=frequency={frequency}:duration={duration}",
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-shortest", str(path),

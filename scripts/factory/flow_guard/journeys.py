@@ -158,7 +158,7 @@ def _run_journey(
             "SELECT COUNT(*) FROM provider_calls WHERE cost_cents>0"
         ).fetchone()[0] or 0)
         final_path = Path(str(report.get("final_path") or ""))
-        media = evaluate_media_artifact(final_path)
+        media = evaluate_media_artifact(final_path, perceptual=True)
         media_codes = [item.code for item in media["findings"]]
         required_stages = {
             "source", "brief", "scripts", "approved", "compiled",

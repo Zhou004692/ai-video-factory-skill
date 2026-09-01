@@ -48,7 +48,7 @@ class FlowGuardSemanticInvariantTests(unittest.TestCase):
             video = full_flow_regression._fixture_video(
                 Path(directory) / "valid.mp4", duration_sec=1.0, index=1
             )
-            result = invariants.evaluate_media_artifact(video)
+            result = invariants.evaluate_media_artifact(video, perceptual=True)
 
         self.assertEqual(result["findings"], ())
         metrics = result.get("metrics") or {}
@@ -56,6 +56,7 @@ class FlowGuardSemanticInvariantTests(unittest.TestCase):
         self.assertGreater(metrics.get("fps", 0), 0)
         self.assertTrue(metrics.get("has_video", False))
         self.assertTrue(metrics.get("has_audio", False))
+        self.assertIn("perceptual", metrics)
 
     def _valid_spec(self):
         return {
