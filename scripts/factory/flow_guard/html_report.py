@@ -84,6 +84,7 @@ def render_html_report(
     mutation = _mapping(payload.get("mutation_calibration"))
     incidents = _mapping(payload.get("historical_incident_replays"))
     video_golden = _mapping(payload.get("video_source_golden"))
+    shadow_audit = _mapping(payload.get("production_shadow_audit"))
     journey_suite = _mapping(payload.get("journey_suite"))
     browser_suite = _mapping(journey_suite.get("browser_suite"))
     status_label, status_class = _status(payload.get("status"))
@@ -155,6 +156,22 @@ def render_html_report(
             f'{"通过" if passed else "失败"}</span></td>'
             f'<td>{_chips(_items(item.get("expected_guards")))}</td>'
             f'<td>{_number(item.get("test_count"))}</td>'
+            "</tr>"
+        )
+
+    shadow_rows = []
+    for raw in _items(shadow_audit.get("jobs")):
+        item = _mapping(raw)
+        if not item.get("paused_node_count") and not _items(
+            item.get("regression_codes")
+        ):
+            continue
+        shadow_rows.append(
+            "<tr>"
+            f'<td><code>{_text(item.get("job_id"))}</code></td>'
+            f'<td>{_text(item.get("state"))}</td>'
+            f'<td>{_number(item.get("paused_node_count"))}</td>'
+            f'<td>{_chips(_items(item.get("regression_codes")), empty="无")}</td>'
             "</tr>"
         )
 
@@ -286,6 +303,17 @@ def render_html_report(
   <section>
     <h2>管理台浏览器旅程</h2>
     <div class="table-wrap"><table><thead><tr><th>套件</th><th>结果</th><th>场景数</th><th>退出码</th></tr></thead><tbody>{''.join(browser_rows) or '<tr><td colspan="4" class="muted">未执行浏览器旅程</td></tr>'}</tbody></table></div>
+  </section>
+
+  <section>
+    <h2>正式库只读影子审计</h2>
+    <div class="meta">只读检查最近 {_number(shadow_audit.get('audited_job_count'))} 个真实任务；业务暂停单独展示，结构回归才阻断测试。数据库：{_text(shadow_audit.get('database_path'))}</div>
+    <div class="coverage-grid">
+      <div class="coverage-item"><span class="muted">需外部处理</span><strong>{_number(shadow_audit.get('action_required_job_count'))} 个任务</strong></div>
+      <div class="coverage-item"><span class="muted">需人工复核</span><strong>{_number(shadow_audit.get('review_required_job_count'))} 个任务</strong></div>
+      <div class="coverage-item wide"><span class="muted">结构回归代码</span><div>{_chips(_items(shadow_audit.get('regression_codes')), empty="无")}</div></div>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th>任务</th><th>状态</th><th>暂停节点</th><th>结构回归</th></tr></thead><tbody>{''.join(shadow_rows) or '<tr><td colspan="4" class="muted">未发现暂停任务或结构回归</td></tr>'}</tbody></table></div>
   </section>
 
   <section>

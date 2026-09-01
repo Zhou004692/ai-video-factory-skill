@@ -87,6 +87,18 @@ def sample_payload(*, status: str = "passed") -> dict[str, object]:
             ],
             "failed_guards": [],
         },
+        "production_shadow_audit": {
+            "status": "passed",
+            "database_path": "data/factory.db",
+            "audited_job_count": 24,
+            "action_required_job_count": 1,
+            "review_required_job_count": 2,
+            "regression_codes": [],
+            "jobs": [{
+                "job_id": "J-PROD-25", "state": "ACTION_REQUIRED",
+                "paused_node_count": 1, "regression_codes": [],
+            }],
+        },
         "journey_suite": {
             "journeys": [{
                 "scenario_id": "manual_three_person_multiscene",
@@ -145,6 +157,8 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("gesture_preserved", html)
         self.assertIn("本地视频表演金标", html)
         self.assertIn("speaker_cluster_preserved", html)
+        self.assertIn("正式库只读影子审计", html)
+        self.assertIn("J-PROD-25", html)
         self.assertIn('href="latest.json"', html)
 
     def test_renders_failed_scenario_and_escapes_report_content(self):

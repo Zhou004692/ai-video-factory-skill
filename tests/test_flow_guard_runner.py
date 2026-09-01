@@ -174,6 +174,33 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
             summary["coverage"]["provider_response_types"],
         )
 
+    async def test_shadow_regression_fails_matrix_but_business_pause_alone_does_not(self):
+        async def fake_explorer(item, *, work_root, max_steps=32):
+            return ExplorationReport(
+                scenario_id=item.scenario_id,
+                status="passed",
+                final_state="READY_TO_PUBLISH",
+            )
+
+        def failed_shadow():
+            return {
+                "status": "failed", "audited_job_count": 1,
+                "regression_codes": ["frozen_spec_missing"],
+                "action_required_job_count": 1,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = await run_matrix(
+                (scenario("shadow"),),
+                work_root=Path(directory),
+                explorer=fake_explorer,
+                include_shadow_audit=True,
+                shadow_audit_runner=failed_shadow,
+            )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["production_shadow_audit"]["status"], "failed")
+
     async def test_matrix_summary_is_machine_readable_and_zero_cost(self):
         async def fake_explorer(item, *, work_root, max_steps=32):
             self.assertTrue(work_root.name.startswith(item.scenario_id))

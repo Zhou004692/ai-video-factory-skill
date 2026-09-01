@@ -19,12 +19,14 @@ from .management_actions import (
 from .model import ExplorationReport, FlowScenario
 from .mutations import run_historical_mutation_calibration
 from .video_golden import run_video_performance_golden
+from .shadow_audit import audit_production_shadow
 
 
 Explorer = Callable[..., Awaitable[ExplorationReport]]
 JourneyRunner = Callable[[Path], dict[str, object]]
 IncidentRunner = Callable[[], dict[str, object]]
 VideoGoldenRunner = Callable[[Path], dict[str, object]]
+ShadowAuditRunner = Callable[[], dict[str, object]]
 
 
 def source_fingerprint(paths: Sequence[Path]) -> str:
@@ -62,6 +64,8 @@ async def run_matrix(
     include_incidents: bool | None = None,
     video_golden_runner: VideoGoldenRunner = run_video_performance_golden,
     include_video_golden: bool | None = None,
+    shadow_audit_runner: ShadowAuditRunner = audit_production_shadow,
+    include_shadow_audit: bool | None = None,
 ) -> dict[str, object]:
     """Run scenarios in isolation and return a stable machine-readable result."""
     started_at = time.perf_counter()
@@ -125,6 +129,18 @@ async def run_matrix(
             "passed_guards": [], "failed_guards": [],
         }
     )
+    if include_shadow_audit is None:
+        include_shadow_audit = include_journeys
+    shadow_audit = (
+        await asyncio.to_thread(shadow_audit_runner)
+        if include_shadow_audit
+        else {
+            "status": "skipped", "audited_job_count": 0,
+            "action_required_job_count": 0,
+            "review_required_job_count": 0, "regression_codes": [],
+            "jobs": [],
+        }
+    )
     traces = {
         (
             report.observed_states,
@@ -179,6 +195,7 @@ async def run_matrix(
                 and mutation["status"] == "passed"
                 and incidents["status"] in {"passed", "skipped"}
                 and video_golden["status"] in {"passed", "skipped"}
+                and shadow_audit["status"] in {"passed", "skipped"}
                 and journey["status"] in {"passed", "skipped"}
                 and not missing_dispatch_actions
             )
@@ -204,6 +221,7 @@ async def run_matrix(
         "historical_incidents_failed": incidents["failed"],
         "historical_incident_replays": incidents,
         "video_source_golden": video_golden,
+        "production_shadow_audit": shadow_audit,
         "unique_trace_count": len(traces),
         "duplicate_trace_scenarios": len(reports) - len(traces),
         "duration_sec": round(time.perf_counter() - started_at, 3),
