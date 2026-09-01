@@ -83,6 +83,7 @@ def render_html_report(
     coverage = _mapping(payload.get("coverage"))
     mutation = _mapping(payload.get("mutation_calibration"))
     incidents = _mapping(payload.get("historical_incident_replays"))
+    video_golden = _mapping(payload.get("video_source_golden"))
     journey_suite = _mapping(payload.get("journey_suite"))
     browser_suite = _mapping(journey_suite.get("browser_suite"))
     status_label, status_class = _status(payload.get("status"))
@@ -285,6 +286,16 @@ def render_html_report(
   <section>
     <h2>管理台浏览器旅程</h2>
     <div class="table-wrap"><table><thead><tr><th>套件</th><th>结果</th><th>场景数</th><th>退出码</th></tr></thead><tbody>{''.join(browser_rows) or '<tr><td colspan="4" class="muted">未执行浏览器旅程</td></tr>'}</tbody></table></div>
+  </section>
+
+  <section>
+    <h2>本地视频表演金标</h2>
+    <div class="coverage-grid">
+      <div class="coverage-item"><span class="muted">结果</span><strong>{_status(video_golden.get('status'))[0]}</strong><span class="muted">{_text(video_golden.get('source_type'))}</span></div>
+      <div class="coverage-item"><span class="muted">解析证据帧</span><strong>{_number(video_golden.get('analysis_frame_count'))} 帧</strong></div>
+      <div class="coverage-item wide"><span class="muted">已通过语义护栏</span><div>{_chips(_items(video_golden.get('passed_guards')))}</div></div>
+      <div class="coverage-item wide"><span class="muted">失败护栏</span><div>{_chips(_items(video_golden.get('failed_guards')), empty="无")}</div></div>
+    </div>
   </section>
 
   <section>

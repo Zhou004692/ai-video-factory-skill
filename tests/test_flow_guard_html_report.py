@@ -77,6 +77,16 @@ def sample_payload(*, status: str = "passed") -> dict[str, object]:
                 "test_count": 2,
             }],
         },
+        "video_source_golden": {
+            "status": "passed",
+            "source_type": "video_replay",
+            "analysis_frame_count": 3,
+            "passed_guards": [
+                "gesture_preserved", "emotion_preserved",
+                "speaker_cluster_preserved",
+            ],
+            "failed_guards": [],
+        },
         "journey_suite": {
             "journeys": [{
                 "scenario_id": "manual_three_person_multiscene",
@@ -133,6 +143,8 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("历史事故逐条回放", html)
         self.assertIn("test21", html)
         self.assertIn("gesture_preserved", html)
+        self.assertIn("本地视频表演金标", html)
+        self.assertIn("speaker_cluster_preserved", html)
         self.assertIn('href="latest.json"', html)
 
     def test_renders_failed_scenario_and_escapes_report_content(self):

@@ -141,6 +141,39 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["historical_incident_count"], 1)
         self.assertEqual(summary["historical_incidents_failed"], 1)
 
+    async def test_video_golden_failure_fails_full_matrix_and_records_source(self):
+        async def fake_explorer(item, *, work_root, max_steps=32):
+            return ExplorationReport(
+                scenario_id=item.scenario_id,
+                status="passed",
+                final_state="READY_TO_PUBLISH",
+            )
+
+        def fake_golden(work_root):
+            return {
+                "status": "failed", "source_type": "video_replay",
+                "provider_response_type": "replay_vision_asr",
+                "paid_provider_calls": 0,
+                "failed_guards": ["gesture_preserved"],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = await run_matrix(
+                (scenario("video-golden"),),
+                work_root=Path(directory),
+                explorer=fake_explorer,
+                include_video_golden=True,
+                video_golden_runner=fake_golden,
+            )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["video_source_golden"]["status"], "failed")
+        self.assertIn("video_replay", summary["coverage"]["source_types"])
+        self.assertIn(
+            "replay_vision_asr",
+            summary["coverage"]["provider_response_types"],
+        )
+
     async def test_matrix_summary_is_machine_readable_and_zero_cost(self):
         async def fake_explorer(item, *, work_root, max_steps=32):
             self.assertTrue(work_root.name.startswith(item.scenario_id))

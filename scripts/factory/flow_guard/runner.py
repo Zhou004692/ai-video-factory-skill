@@ -18,11 +18,13 @@ from .management_actions import (
 )
 from .model import ExplorationReport, FlowScenario
 from .mutations import run_historical_mutation_calibration
+from .video_golden import run_video_performance_golden
 
 
 Explorer = Callable[..., Awaitable[ExplorationReport]]
 JourneyRunner = Callable[[Path], dict[str, object]]
 IncidentRunner = Callable[[], dict[str, object]]
+VideoGoldenRunner = Callable[[Path], dict[str, object]]
 
 
 def source_fingerprint(paths: Sequence[Path]) -> str:
@@ -58,6 +60,8 @@ async def run_matrix(
     journey_runner: JourneyRunner = run_full_journey_suite,
     incident_runner: IncidentRunner = run_historical_incident_replays,
     include_incidents: bool | None = None,
+    video_golden_runner: VideoGoldenRunner = run_video_performance_golden,
+    include_video_golden: bool | None = None,
 ) -> dict[str, object]:
     """Run scenarios in isolation and return a stable machine-readable result."""
     started_at = time.perf_counter()
@@ -108,6 +112,19 @@ async def run_matrix(
             "results": [],
         }
     )
+    if include_video_golden is None:
+        include_video_golden = include_journeys
+    video_golden = (
+        await asyncio.to_thread(
+            video_golden_runner, work_root / "video-source-golden"
+        )
+        if include_video_golden
+        else {
+            "status": "skipped", "source_type": "",
+            "provider_response_type": "", "paid_provider_calls": 0,
+            "passed_guards": [], "failed_guards": [],
+        }
+    )
     traces = {
         (
             report.observed_states,
@@ -132,6 +149,10 @@ async def run_matrix(
     for action in graph_actions:
         coverage_evidence.record("graph_action", action)
     coverage_evidence.merge(journey.get("coverage_evidence") or {})
+    coverage_evidence.record("source_type", video_golden.get("source_type"))
+    coverage_evidence.record(
+        "provider_response", video_golden.get("provider_response_type")
+    )
     evidence_payload = coverage_evidence.as_dict()
     executed_actions = set(graph_actions)
     executed_actions.update(evidence_payload["ui_dispatch_actions"])
@@ -157,6 +178,7 @@ async def run_matrix(
                 and not paid_calls
                 and mutation["status"] == "passed"
                 and incidents["status"] in {"passed", "skipped"}
+                and video_golden["status"] in {"passed", "skipped"}
                 and journey["status"] in {"passed", "skipped"}
                 and not missing_dispatch_actions
             )
@@ -181,6 +203,7 @@ async def run_matrix(
         "historical_incidents_passed": incidents["passed"],
         "historical_incidents_failed": incidents["failed"],
         "historical_incident_replays": incidents,
+        "video_source_golden": video_golden,
         "unique_trace_count": len(traces),
         "duplicate_trace_scenarios": len(reports) - len(traces),
         "duration_sec": round(time.perf_counter() - started_at, 3),

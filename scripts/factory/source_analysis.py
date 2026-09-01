@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Callable
 
-from . import media_sources
+from . import creative_ir, media_sources
 from .clients import image_vision
 
 
@@ -303,6 +303,9 @@ def normalize_structure_report(raw: dict, *, duration_sec: float,
                 _text(item) for item in visible_character_ids if _text(item)
             ],
             "speaker": speaker,
+            "speech_mode": creative_ir.normalize_speech_mode(
+                segment.get("speech_mode"), speaker=speaker
+            ),
             "speaker_track_id": speaker_track_id,
             "voice_cluster_id": voice_cluster_id,
             "speaker_confidence": speaker_confidence,
