@@ -10,6 +10,7 @@ from typing import Awaitable, Callable, Sequence
 from .explorer import explore_scenario
 from .evidence import CoverageEvidence
 from .journeys import run_full_journey_suite
+from .incidents import run_historical_incident_replays
 from .management_actions import (
     BACKEND_VIDEO_ACTION_IDS,
     console_dispatch_action_ids,
@@ -21,6 +22,7 @@ from .mutations import run_historical_mutation_calibration
 
 Explorer = Callable[..., Awaitable[ExplorationReport]]
 JourneyRunner = Callable[[Path], dict[str, object]]
+IncidentRunner = Callable[[], dict[str, object]]
 
 
 def source_fingerprint(paths: Sequence[Path]) -> str:
@@ -54,6 +56,8 @@ async def run_matrix(
     max_steps: int = 32,
     include_journeys: bool = False,
     journey_runner: JourneyRunner = run_full_journey_suite,
+    incident_runner: IncidentRunner = run_historical_incident_replays,
+    include_incidents: bool | None = None,
 ) -> dict[str, object]:
     """Run scenarios in isolation and return a stable machine-readable result."""
     started_at = time.perf_counter()
@@ -93,6 +97,17 @@ async def run_matrix(
     graph_paid_calls = sum(report.paid_provider_calls for report in reports)
     paid_calls = graph_paid_calls + int(journey["paid_provider_calls"])
     mutation = run_historical_mutation_calibration()
+    if include_incidents is None:
+        include_incidents = include_journeys
+    incidents = (
+        await asyncio.to_thread(incident_runner)
+        if include_incidents
+        else {
+            "status": "skipped", "incident_count": 0,
+            "passed": 0, "failed": 0, "paid_provider_calls": 0,
+            "results": [],
+        }
+    )
     traces = {
         (
             report.observed_states,
@@ -141,6 +156,7 @@ async def run_matrix(
                 not failed
                 and not paid_calls
                 and mutation["status"] == "passed"
+                and incidents["status"] in {"passed", "skipped"}
                 and journey["status"] in {"passed", "skipped"}
                 and not missing_dispatch_actions
             )
@@ -161,6 +177,10 @@ async def run_matrix(
         "historical_mutations_survived": mutation["survived"],
         "historical_mutation_score_pct": mutation["score_pct"],
         "mutation_calibration": mutation,
+        "historical_incident_count": incidents["incident_count"],
+        "historical_incidents_passed": incidents["passed"],
+        "historical_incidents_failed": incidents["failed"],
+        "historical_incident_replays": incidents,
         "unique_trace_count": len(traces),
         "duplicate_trace_scenarios": len(reports) - len(traces),
         "duration_sec": round(time.perf_counter() - started_at, 3),

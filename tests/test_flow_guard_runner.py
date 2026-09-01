@@ -113,6 +113,34 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
             summary["coverage"]["executed_console_actions"],
         )
 
+    async def test_failed_historical_incident_fails_the_matrix(self):
+        async def fake_explorer(item, *, work_root, max_steps=32):
+            return ExplorationReport(
+                scenario_id=item.scenario_id,
+                status="passed",
+                final_state="READY_TO_PUBLISH",
+            )
+
+        def fake_incident_runner():
+            return {
+                "status": "failed", "incident_count": 1,
+                "passed": 0, "failed": 1, "paid_provider_calls": 0,
+                "results": [{"incident_id": "test23", "status": "failed"}],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = await run_matrix(
+                (scenario("incident-blocked"),),
+                work_root=Path(directory),
+                explorer=fake_explorer,
+                incident_runner=fake_incident_runner,
+                include_incidents=True,
+            )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["historical_incident_count"], 1)
+        self.assertEqual(summary["historical_incidents_failed"], 1)
+
     async def test_matrix_summary_is_machine_readable_and_zero_cost(self):
         async def fake_explorer(item, *, work_root, max_steps=32):
             self.assertTrue(work_root.name.startswith(item.scenario_id))

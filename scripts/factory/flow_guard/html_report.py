@@ -82,6 +82,7 @@ def render_html_report(
     """Return a self-contained HTML report safe to open from the filesystem."""
     coverage = _mapping(payload.get("coverage"))
     mutation = _mapping(payload.get("mutation_calibration"))
+    incidents = _mapping(payload.get("historical_incident_replays"))
     journey_suite = _mapping(payload.get("journey_suite"))
     browser_suite = _mapping(journey_suite.get("browser_suite"))
     status_label, status_class = _status(payload.get("status"))
@@ -138,6 +139,21 @@ def render_html_report(
             f'<td><span class="status {"success" if killed else "danger"}">'
             f'{"已检出" if killed else "未检出"}</span></td>'
             f'<td>{_chips(_items(item.get("observed_codes")))}</td>'
+            "</tr>"
+        )
+
+    incident_rows = []
+    for raw in _items(incidents.get("results")):
+        item = _mapping(raw)
+        passed = str(item.get("status") or "").lower() == "passed"
+        incident_rows.append(
+            "<tr>"
+            f'<td><code>{_text(item.get("incident_id"))}</code></td>'
+            f'<td>{_text(item.get("title"))}</td>'
+            f'<td><span class="status {"success" if passed else "danger"}">'
+            f'{"通过" if passed else "失败"}</span></td>'
+            f'<td>{_chips(_items(item.get("expected_guards")))}</td>'
+            f'<td>{_number(item.get("test_count"))}</td>'
             "</tr>"
         )
 
@@ -269,6 +285,12 @@ def render_html_report(
   <section>
     <h2>管理台浏览器旅程</h2>
     <div class="table-wrap"><table><thead><tr><th>套件</th><th>结果</th><th>场景数</th><th>退出码</th></tr></thead><tbody>{''.join(browser_rows) or '<tr><td colspan="4" class="muted">未执行浏览器旅程</td></tr>'}</tbody></table></div>
+  </section>
+
+  <section>
+    <h2>历史事故逐条回放</h2>
+    <div class="meta">测试 21–25 的用户可见故障分别运行，任一失败都会阻断整轮 Flow Guard。</div>
+    <div class="table-wrap"><table><thead><tr><th>事故</th><th>问题</th><th>结果</th><th>预期护栏</th><th>测试数</th></tr></thead><tbody>{''.join(incident_rows) or '<tr><td colspan="5" class="muted">未运行历史事故回放</td></tr>'}</tbody></table></div>
   </section>
 
   <section>
