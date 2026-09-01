@@ -11,6 +11,7 @@ import time
 
 from factory.flow_guard.runner import run_matrix, source_fingerprint
 from factory.flow_guard.scenarios import build_scenarios, build_smoke_scenarios
+from factory.flow_guard.html_report import render_html_report
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +39,10 @@ def _write_report(path: Path, summary: dict[str, object]) -> None:
     }
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    path.with_suffix(".html").write_text(
+        render_html_report(payload, json_filename=path.name),
         encoding="utf-8",
     )
 
