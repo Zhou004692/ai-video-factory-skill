@@ -57,6 +57,19 @@ class QuietStaticHandler(SimpleHTTPRequestHandler):
         return
 
 
+def wait_for_post(page, posts: list[dict], suffix: str, *, timeout_ms: int = 5000) -> None:
+    """Wait for an asynchronous UI request instead of relying on wall time."""
+    elapsed = 0
+    while elapsed < timeout_ms:
+        if any(item["path"].endswith(suffix) for item in posts):
+            return
+        page.wait_for_timeout(50)
+        elapsed += 50
+    raise AssertionError(
+        f"timed out waiting for POST {suffix}; observed={posts}"
+    )
+
+
 @contextmanager
 def management_server():
     configured = os.environ.get("MANAGEMENT_URL", "").strip().rstrip("/")
@@ -482,7 +495,8 @@ def run_lip_sync_evidence_repair(browser, base_url: str) -> None:
     page.locator("#lip-sync-end").fill("4.6")
     page.locator("#lip-sync-reason").fill("\u53ea\u4fee\u590d\u8be5\u53e5\u53e3\u578b")
     page.locator("#confirm-lip-sync-repair").click()
-    page.wait_for_timeout(200)
+    wait_for_post(page, posts, "/lip-sync-repair")
+    wait_for_post(page, posts, "/compile")
 
     repair_posts = [
         item for item in posts if item["path"].endswith("/lip-sync-repair")
