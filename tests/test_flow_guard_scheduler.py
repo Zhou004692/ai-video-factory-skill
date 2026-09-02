@@ -169,10 +169,48 @@ class FlowGuardCliIntegrationTests(unittest.TestCase):
 
             kwargs = runner.await_args.kwargs
             self.assertTrue(kwargs["include_incidents"])
+            self.assertTrue(kwargs["include_shadow_audit"])
             payload = json.loads(report.read_text(encoding="utf-8"))
             self.assertEqual(payload["execution"]["mode"], "incremental")
             self.assertEqual(payload["execution"]["suite"], "incremental")
             self.assertEqual(result, 0)
+
+    def test_latest_report_preserves_separate_full_and_incremental_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "latest.json"
+            flow_guard_cli._write_report(report, {
+                "status": "passed",
+                "execution": {"mode": "full", "suite": "full"},
+            })
+            flow_guard_cli._write_report(report, {
+                "status": "partial",
+                "execution": {"mode": "incremental", "suite": "incremental"},
+            })
+
+            latest = json.loads(report.read_text(encoding="utf-8"))
+            full = json.loads(
+                report.with_name("latest-full.json").read_text(encoding="utf-8")
+            )
+            incremental = json.loads(
+                report.with_name("latest-incremental.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(latest["status"], "partial")
+        self.assertEqual(full["execution"]["mode"], "full")
+        self.assertEqual(full["status"], "passed")
+        self.assertEqual(incremental["execution"]["mode"], "incremental")
+
+    def test_incremental_report_does_not_link_to_missing_full_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "latest.json"
+            flow_guard_cli._write_report(report, {
+                "status": "partial",
+                "execution": {"mode": "incremental", "suite": "incremental"},
+            })
+
+            html = report.with_suffix(".html").read_text(encoding="utf-8")
+
+        self.assertNotIn('href="latest-full.html"', html)
 
     def test_watch_once_uses_recent_full_report_as_incremental_baseline(self):
         with tempfile.TemporaryDirectory() as directory:

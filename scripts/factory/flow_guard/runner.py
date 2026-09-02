@@ -32,6 +32,35 @@ ShadowAuditRunner = Callable[[], dict[str, object]]
 PerceptualMediaRunner = Callable[[Path], dict[str, object]]
 
 
+def _assurance_summary(
+    *,
+    journey: dict[str, object],
+    incidents: dict[str, object],
+    video_golden: dict[str, object],
+    shadow_audit: dict[str, object],
+    perceptual_media: dict[str, object],
+    action_evidence_required: bool,
+) -> dict[str, object]:
+    checks = {
+        "formal_management_journeys": str(journey.get("status") or "unknown"),
+        "historical_incident_replays": str(incidents.get("status") or "unknown"),
+        "video_source_golden": str(video_golden.get("status") or "unknown"),
+        "production_shadow_audit": str(shadow_audit.get("status") or "unknown"),
+        "perceptual_media_golden": str(perceptual_media.get("status") or "unknown"),
+        "management_action_evidence": (
+            "required" if action_evidence_required else "skipped"
+        ),
+    }
+    skipped = sorted(
+        name for name, status in checks.items() if status == "skipped"
+    )
+    return {
+        "level": "full" if not skipped else "partial",
+        "required_checks": checks,
+        "skipped_required_checks": skipped,
+    }
+
+
 def source_fingerprint(paths: Sequence[Path]) -> str:
     """Hash relevant source contents so watch mode runs only after changes."""
     digest = hashlib.sha256()
@@ -211,23 +240,41 @@ async def run_matrix(
         node_id.split(":", 1)[0]
         for report in reports for node_id in report.started_nodes
     }
+    assurance = _assurance_summary(
+        journey=journey,
+        incidents=incidents,
+        video_golden=video_golden,
+        shadow_audit=shadow_audit,
+        perceptual_media=perceptual_media,
+        action_evidence_required=bool(include_journeys),
+    )
+    operational_attention_count = int(
+        shadow_audit.get("actionable_pause_job_count") or 0
+    )
+    checks_passed = (
+        not failed
+        and not paid_calls
+        and mutation["status"] == "passed"
+        and incidents["status"] in {"passed", "skipped"}
+        and video_golden["status"] in {"passed", "skipped"}
+        and shadow_audit["status"] in {"passed", "attention", "skipped"}
+        and perceptual_media["status"] in {"passed", "skipped"}
+        and journey["status"] in {"passed", "skipped"}
+        and not missing_dispatch_actions
+        and (not include_journeys or not action_evidence_gaps)
+    )
+    if not checks_passed:
+        overall_status = "failed"
+    elif operational_attention_count:
+        overall_status = "attention"
+    elif assurance["level"] == "partial":
+        overall_status = "partial"
+    else:
+        overall_status = "passed"
     return {
-        "status": (
-            "passed"
-            if (
-                not failed
-                and not paid_calls
-                and mutation["status"] == "passed"
-                and incidents["status"] in {"passed", "skipped"}
-                and video_golden["status"] in {"passed", "skipped"}
-                and shadow_audit["status"] in {"passed", "skipped"}
-                and perceptual_media["status"] in {"passed", "skipped"}
-                and journey["status"] in {"passed", "skipped"}
-                and not missing_dispatch_actions
-                and (not include_journeys or not action_evidence_gaps)
-            )
-            else "failed"
-        ),
+        "status": overall_status,
+        "assurance": assurance,
+        "operational_attention_count": operational_attention_count,
         "scenario_count": len(reports),
         "passed": len(reports) - failed,
         "failed": failed,

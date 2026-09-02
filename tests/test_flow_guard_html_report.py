@@ -216,6 +216,40 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("真实事故回放", html)
         self.assertIn("D:/ai-video-flow-guard", html)
 
+    def test_partial_report_names_skipped_evidence_instead_of_showing_green(self):
+        payload = sample_payload(status="partial")
+        payload["assurance"] = {
+            "level": "partial",
+            "skipped_required_checks": [
+                "formal_management_journeys",
+                "production_shadow_audit",
+            ],
+            "full_baseline_at": "2026-09-01T17:27:36+00:00",
+        }
+
+        html = render_html_report(payload)
+
+        self.assertIn("局部验证", html)
+        self.assertIn("formal_management_journeys", html)
+        self.assertIn("production_shadow_audit", html)
+        self.assertNotIn('hero-status success">局部验证', html)
+
+    def test_renders_job_level_failure_even_without_paused_node(self):
+        payload = sample_payload(status="attention")
+        payload["production_shadow_audit"]["jobs"] = [{
+            "job_id": "J-FAILED-WITHOUT-NODE",
+            "state": "FAILED",
+            "paused_node_count": 0,
+            "availability_status": "actionable",
+            "recovery_action": "preserve_and_diagnose",
+            "regression_codes": [],
+        }]
+
+        html = render_html_report(payload)
+
+        self.assertIn("J-FAILED-WITHOUT-NODE", html)
+        self.assertIn("preserve_and_diagnose", html)
+
     def test_renders_failed_scenario_and_escapes_report_content(self):
         html = render_html_report(sample_payload(status="failed"))
 

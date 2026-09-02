@@ -202,6 +202,45 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["status"], "failed")
         self.assertEqual(summary["production_shadow_audit"]["status"], "failed")
 
+    async def test_actionable_production_pause_is_visible_as_attention(self):
+        async def fake_explorer(item, *, work_root, max_steps=32):
+            return ExplorationReport(
+                scenario_id=item.scenario_id,
+                status="passed",
+                final_state="READY_TO_PUBLISH",
+            )
+
+        def attention_shadow():
+            return {
+                "status": "attention", "audited_job_count": 1,
+                "action_required_job_count": 1,
+                "review_required_job_count": 0,
+                "actionable_pause_job_count": 1,
+                "unactionable_pause_job_count": 0,
+                "regression_codes": [],
+                "jobs": [{
+                    "job_id": "J-PAUSED", "state": "PROVIDER_ACTION_REQUIRED",
+                    "paused_node_count": 1,
+                    "availability_status": "actionable",
+                    "recovery_action": "reconcile_provider_task",
+                }],
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            summary = await run_matrix(
+                (scenario("shadow-attention"),),
+                work_root=Path(directory),
+                explorer=fake_explorer,
+                include_shadow_audit=True,
+                shadow_audit_runner=attention_shadow,
+            )
+
+        self.assertEqual(summary["status"], "attention")
+        self.assertEqual(summary["assurance"]["level"], "partial")
+        self.assertEqual(
+            summary["operational_attention_count"], 1,
+        )
+
     async def test_perceptual_media_calibration_failure_fails_full_matrix(self):
         async def fake_explorer(item, *, work_root, max_steps=32):
             return ExplorationReport(
@@ -254,7 +293,16 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
                 explorer=fake_explorer,
             )
 
-        self.assertEqual(summary["status"], "passed")
+        self.assertEqual(summary["status"], "partial")
+        self.assertEqual(summary["assurance"]["level"], "partial")
+        self.assertIn(
+            "formal_management_journeys",
+            summary["assurance"]["skipped_required_checks"],
+        )
+        self.assertIn(
+            "production_shadow_audit",
+            summary["assurance"]["skipped_required_checks"],
+        )
         self.assertEqual(summary["scenario_count"], 2)
         self.assertEqual(summary["passed"], 2)
         self.assertEqual(summary["paid_provider_calls"], 0)

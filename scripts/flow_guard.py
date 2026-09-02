@@ -50,19 +50,41 @@ def _select_scenarios(max_scenarios: int | None, suite: str = "full"):
 def _write_report(path: Path, summary: dict[str, object]) -> None:
     path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
+    execution = summary.get("execution") or {}
+    mode = (
+        str(execution.get("mode") or "full").lower()
+        if isinstance(execution, dict) else "full"
+    )
+    mode = mode if mode in {"full", "incremental"} else "full"
+    mode_path = path.with_name(f"{path.stem}-{mode}{path.suffix}")
+    full_path = path.with_name(f"{path.stem}-full{path.suffix}")
+    incremental_path = path.with_name(
+        f"{path.stem}-incremental{path.suffix}"
+    )
+    report_artifacts = {
+        "latest_html": path.with_suffix(".html").name,
+    }
+    if mode == "full" or full_path.exists():
+        report_artifacts["full_html"] = full_path.with_suffix(".html").name
+    if mode == "incremental" or incremental_path.exists():
+        report_artifacts["incremental_html"] = (
+            incremental_path.with_suffix(".html").name
+        )
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "provider_mode": "seedance_2_5_mock",
+        "report_artifacts": report_artifacts,
         **summary,
     }
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    path.with_suffix(".html").write_text(
-        render_html_report(payload, json_filename=path.name),
-        encoding="utf-8",
-    )
+    for target in dict.fromkeys((mode_path, path)):
+        target.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        target.with_suffix(".html").write_text(
+            render_html_report(payload, json_filename=target.name),
+            encoding="utf-8",
+        )
 
 
 def _manual_decision(arguments: argparse.Namespace) -> RunDecision:
@@ -94,6 +116,7 @@ def run_once(
             max_steps=arguments.max_steps,
             include_journeys=decision.suite == "full",
             include_incidents=decision.include_incidents,
+            include_shadow_audit=True,
         ))
     summary = {
         **summary,
@@ -111,12 +134,23 @@ def run_once(
             "source_fingerprint": source_fingerprint(WATCH_PATHS),
         },
     }
+    assurance = summary.get("assurance")
+    if isinstance(assurance, dict):
+        assurance["full_baseline_at"] = (
+            decision.full_baseline_at.isoformat()
+            if decision.full_baseline_at else None
+        )
     if not arguments.no_write_report:
         _write_report(arguments.report, summary)
     print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
-    if summary["status"] == "passed":
+    if summary["status"] in {"passed", "partial", "attention"}:
+        verdict = {
+            "passed": "FLOW_GUARD_OK",
+            "partial": "FLOW_GUARD_PARTIAL",
+            "attention": "FLOW_GUARD_ATTENTION",
+        }[str(summary["status"])]
         print(
-            "FLOW_GUARD_OK provider=seedance_2_5_mock "
+            f"{verdict} provider=seedance_2_5_mock "
             f"scenarios={summary['scenario_count']} "
             f"journeys={summary['journey_count']} "
             f"mutation_score={summary['historical_mutation_score_pct']} "

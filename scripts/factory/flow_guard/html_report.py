@@ -49,6 +49,12 @@ def _status(value: object) -> tuple[str, str]:
         return "通过", "success"
     if normalized == "failed":
         return "失败", "danger"
+    if normalized == "partial":
+        return "局部验证", "warning"
+    if normalized == "attention":
+        return "发现待处理", "warning"
+    if normalized == "skipped":
+        return "未执行", "neutral"
     return _text(value, "未知"), "neutral"
 
 
@@ -89,6 +95,8 @@ def render_html_report(
     journey_suite = _mapping(payload.get("journey_suite"))
     browser_suite = _mapping(journey_suite.get("browser_suite"))
     execution = _mapping(payload.get("execution"))
+    assurance = _mapping(payload.get("assurance"))
+    report_artifacts = _mapping(payload.get("report_artifacts"))
     status_label, status_class = _status(payload.get("status"))
 
     scenario_count = _number(payload.get("scenario_count"))
@@ -202,8 +210,10 @@ def render_html_report(
     shadow_rows = []
     for raw in _items(shadow_audit.get("jobs")):
         item = _mapping(raw)
-        if not item.get("paused_node_count") and not _items(
-            item.get("regression_codes")
+        if (
+            not item.get("paused_node_count")
+            and str(item.get("availability_status") or "clear") == "clear"
+            and not _items(item.get("regression_codes"))
         ):
             continue
         shadow_rows.append(
@@ -211,6 +221,8 @@ def render_html_report(
             f'<td><code>{_text(item.get("job_id"))}</code></td>'
             f'<td>{_text(item.get("state"))}</td>'
             f'<td>{_number(item.get("paused_node_count"))}</td>'
+            f'<td>{_text(item.get("availability_status"), "unknown")}</td>'
+            f'<td><code>{_text(item.get("recovery_action"))}</code></td>'
             f'<td>{_chips(_items(item.get("regression_codes")), empty="无")}</td>'
             "</tr>"
         )
@@ -266,6 +278,24 @@ def render_html_report(
     incident_backed = (
         "含真实事故回放" if execution.get("incident_backed") else "未包含真实事故回放"
     )
+    skipped_checks = _items(assurance.get("skipped_required_checks"))
+    baseline_at = _text(assurance.get("full_baseline_at"), "未记录")
+    assurance_banner = ""
+    if skipped_checks:
+        assurance_banner = (
+            '<section class="assurance-alert"><h2>本轮仅为局部验证</h2>'
+            '<p>以下关键证据未执行，因此不能得出“系统完整无问题”的结论。</p>'
+            f'<div>{_chips(skipped_checks)}</div>'
+            f'<p class="muted">最近完整回归基线：{baseline_at}</p></section>'
+        )
+    report_links = "".join(
+        f'<a class="raw-link" href="{escape(str(href), quote=True)}">{label}</a>'
+        for label, href in (
+            ("最新完整报告", report_artifacts.get("full_html")),
+            ("最新增量报告", report_artifacts.get("incremental_html")),
+        )
+        if href
+    )
     json_href = escape(json_filename, quote=True)
 
     return f"""<!doctype html>
@@ -275,7 +305,7 @@ def render_html_report(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Flow Guard 零费用回归报告</title>
   <style>
-    :root {{ color-scheme: light; --blue:#356bff; --ink:#222; --muted:#6b7280; --line:#e5e7eb; --bg:#f5f7fa; --good:#237a4b; --good-bg:#edf7f1; --bad:#b42318; --bad-bg:#fff1f0; }}
+    :root {{ color-scheme: light; --blue:#356bff; --ink:#222; --muted:#6b7280; --line:#e5e7eb; --bg:#f5f7fa; --good:#237a4b; --good-bg:#edf7f1; --warn:#9a6700; --warn-bg:#fff7d6; --bad:#b42318; --bad-bg:#fff1f0; }}
     * {{ box-sizing:border-box; }}
     body {{ margin:0; color:var(--ink); background:var(--bg); font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif; }}
     main {{ width:min(1440px,calc(100% - 48px)); margin:28px auto 64px; }}
@@ -290,6 +320,7 @@ def render_html_report(
     .hero-status {{ min-width:118px; padding:12px 18px; border-radius:10px; text-align:center; font-size:18px; font-weight:700; }}
     .hero-status.success {{ color:var(--good); background:var(--good-bg); }}
     .hero-status.danger {{ color:var(--bad); background:var(--bad-bg); }}
+    .hero-status.warning {{ color:var(--warn); background:var(--warn-bg); }}
     .hero-status.neutral {{ color:var(--muted); background:#f3f4f6; }}
     .metrics {{ display:grid; grid-template-columns:repeat(6,minmax(140px,1fr)); gap:12px; margin:16px 0; }}
     .metric {{ background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px 18px; }}
@@ -310,9 +341,12 @@ def render_html_report(
     .status {{ display:inline-block; margin-left:6px; padding:1px 8px; border-radius:999px; font-size:12px; font-weight:700; white-space:nowrap; }}
     .status.success {{ color:var(--good); background:var(--good-bg); }}
     .status.danger {{ color:var(--bad); background:var(--bad-bg); }}
+    .status.warning {{ color:var(--warn); background:var(--warn-bg); }}
     .status.neutral {{ color:var(--muted); background:#f3f4f6; }}
     .failure-card {{ border-left:4px solid var(--bad); background:var(--bad-bg); padding:14px 16px; margin-top:10px; border-radius:6px; }}
     .manifest-alert {{ margin:12px 0; border-left:4px solid var(--bad); border-radius:6px; padding:10px 14px; color:var(--bad); background:var(--bad-bg); }}
+    .assurance-alert {{ border-left:4px solid var(--warn); color:#5f4500; background:var(--warn-bg); }}
+    .assurance-alert h2 {{ color:var(--warn); }}
     .manifest-alert ul {{ margin:6px 0 0; padding-left:18px; }}
     .technical-detail summary {{ cursor:pointer; color:var(--bad); white-space:nowrap; }}
     .technical-detail pre {{ max-width:560px; max-height:180px; overflow:auto; margin:8px 0 0; padding:8px; border-radius:6px; color:#4b1d17; background:#fff; white-space:pre-wrap; word-break:break-word; }}
@@ -334,9 +368,12 @@ def render_html_report(
       <h1>Flow Guard 零费用回归报告</h1>
       <div class="meta"><span>生成时间：{generated_at}</span><span>Provider：{provider_mode}</span><a class="raw-link" href="{json_href}">查看原始 JSON</a></div>
       <div class="meta"><span>范围：{execution_label}</span><span>原因：{execution_reason}</span><span>{incident_backed}</span><span>临时工作区：{workspace_root}</span></div>
+      <div class="meta">{report_links}</div>
     </div>
     <div class="hero-status {status_class}">{status_label}</div>
   </header>
+
+  {assurance_banner}
 
   <div class="metrics">
     {_summary_card("有效路径", f"{scenario_passed} / {scenario_count}", f"唯一轨迹 {_number(payload.get('unique_trace_count'))} 条")}
@@ -345,6 +382,7 @@ def render_html_report(
     {_summary_card("付费调用", str(paid_calls), "必须保持为 0")}
     {_summary_card("真实证据动作", f"{len(ui_actions)} UI / {len(backend_actions)} 后端", f"Worker {len(worker_nodes)} 类")}
     {_summary_card("管理动作证据", f"{_number(coverage.get('action_evidence_complete_count'))} / {_number(coverage.get('console_action_count'))}", f"覆盖率 {_percent(coverage.get('action_evidence_coverage_pct'))}")}
+    {_summary_card("正式任务待处理", str(_number(payload.get('operational_attention_count'))), "可推进但仍需处理")}
     {_summary_card("完整耗时", _duration(payload.get('duration_sec')))}
   </div>
 
@@ -383,13 +421,15 @@ def render_html_report(
 
   <section>
     <h2>正式库只读影子审计</h2>
-    <div class="meta">只读检查最近 {_number(shadow_audit.get('audited_job_count'))} 个真实任务；业务暂停单独展示，结构回归才阻断测试。数据库：{_text(shadow_audit.get('database_path'))}</div>
+    <div class="meta">只读检查最近 {_number(shadow_audit.get('audited_job_count'))} 个真实任务；可推进暂停显示为待处理，无恢复动作或缺少管理台入口则阻断测试。数据库：{_text(shadow_audit.get('database_path'))}</div>
     <div class="coverage-grid">
       <div class="coverage-item"><span class="muted">需外部处理</span><strong>{_number(shadow_audit.get('action_required_job_count'))} 个任务</strong></div>
       <div class="coverage-item"><span class="muted">需人工复核</span><strong>{_number(shadow_audit.get('review_required_job_count'))} 个任务</strong></div>
+      <div class="coverage-item"><span class="muted">可继续处理</span><strong>{_number(shadow_audit.get('actionable_pause_job_count'))} 个任务</strong></div>
+      <div class="coverage-item"><span class="muted">无法继续</span><strong>{_number(shadow_audit.get('unactionable_pause_job_count'))} 个任务</strong></div>
       <div class="coverage-item wide"><span class="muted">结构回归代码</span><div>{_chips(_items(shadow_audit.get('regression_codes')), empty="无")}</div></div>
     </div>
-    <div class="table-wrap"><table><thead><tr><th>任务</th><th>状态</th><th>暂停节点</th><th>结构回归</th></tr></thead><tbody>{''.join(shadow_rows) or '<tr><td colspan="4" class="muted">未发现暂停任务或结构回归</td></tr>'}</tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>任务</th><th>状态</th><th>暂停节点</th><th>可推进性</th><th>恢复动作</th><th>结构回归</th></tr></thead><tbody>{''.join(shadow_rows) or '<tr><td colspan="6" class="muted">未发现暂停任务或结构回归</td></tr>'}</tbody></table></div>
   </section>
 
   <section>

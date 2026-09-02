@@ -238,7 +238,8 @@ def managed_workspace(root: Path) -> Iterator[Path]:
 
 def parse_report_full_timestamp(payload: dict[str, object]) -> datetime | None:
     """Read a trustworthy Full timestamp, including pre-adaptive reports."""
-    if payload.get("status") != "passed" or payload.get("paid_provider_calls") != 0:
+    status = str(payload.get("status") or "")
+    if status == "failed" or payload.get("paid_provider_calls") != 0:
         return None
     execution = payload.get("execution") or {}
     if isinstance(execution, dict) and execution.get("mode") == "incremental":
@@ -250,6 +251,8 @@ def parse_report_full_timestamp(payload: dict[str, object]) -> datetime | None:
         except ValueError:
             return None
     if isinstance(execution, dict) and execution.get("mode") not in {None, "full"}:
+        return None
+    if status not in {"passed", "attention"}:
         return None
     if not execution and int(payload.get("journey_count") or 0) <= 0:
         return None
