@@ -1,4 +1,8 @@
-"""Deterministic local-video golden corpus for performance reconstruction."""
+"""Synthetic-media, prefilled-answer propagation checks for reconstruction.
+
+ASR and visual/performance answers are scripted. This suite does not measure
+recognition accuracy or the content quality of real video.
+"""
 from __future__ import annotations
 
 import json

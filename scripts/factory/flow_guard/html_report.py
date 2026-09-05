@@ -5,6 +5,7 @@ from collections.abc import Iterable, Mapping
 from html import escape
 from typing import Any
 
+from .assurance import normalize_evidence_boundaries
 
 def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
@@ -53,7 +54,7 @@ def _status(value: object) -> tuple[str, str]:
         return "局部验证", "warning"
     if normalized == "attention":
         return "发现待处理", "warning"
-    if normalized == "skipped":
+    if normalized in {"skipped", "not_run"}:
         return "未执行", "neutral"
     return _text(value, "未知"), "neutral"
 
@@ -96,8 +97,30 @@ def render_html_report(
     browser_suite = _mapping(journey_suite.get("browser_suite"))
     execution = _mapping(payload.get("execution"))
     assurance = _mapping(payload.get("assurance"))
+    boundaries = normalize_evidence_boundaries(payload.get("evidence_boundaries"))
     report_artifacts = _mapping(payload.get("report_artifacts"))
     status_label, status_class = _status(payload.get("status"))
+    if payload.get("status") == "passed":
+        if boundaries["metadata_status"] == "unknown":
+            status_label, status_class = "范围未知", "warning"
+        else:
+            status_label = "技术检查通过"
+
+    boundary_rows = []
+    for key, evidence in boundaries["dimensions"].items():
+        label, css_class = _status(evidence["status"])
+        boundary_rows.append(
+            "<tr>"
+            f'<td><code>{_text(key)}</code><div class="muted">{_text(evidence["level"])}</div></td>'
+            f'<td><span class="status {css_class}">{label}</span>'
+            f'<div><code>{_text(evidence["status"])}</code></div></td>'
+            f'<td><code>{_text(evidence["source_kind"])}</code></td>'
+            f'<td>{_text(evidence["replacement_boundary"])}</td>'
+            f'<td>{_chips(evidence["proves"], empty="无已知证明范围")}</td>'
+            f'<td>{_chips(evidence["does_not_prove"])}</td>'
+            f'<td>{_chips(evidence["observed_checks"], empty="无已记录检查")}</td>'
+            "</tr>"
+        )
 
     scenario_count = _number(payload.get("scenario_count"))
     scenario_passed = _number(payload.get("passed"))
@@ -271,8 +294,10 @@ def render_html_report(
         )
     generated_at = _text(payload.get("generated_at"))
     provider_mode = _text(payload.get("provider_mode"))
-    execution_mode = str(execution.get("mode") or "full").lower()
-    execution_label = "增量回归" if execution_mode == "incremental" else "完整回归"
+    execution_mode = str(execution.get("mode") or "unknown").lower()
+    execution_label = {
+        "incremental": "增量回归（技术套件）", "full": "完整回归（技术套件）",
+    }.get(execution_mode, "范围未知")
     execution_reason = _text(execution.get("reason"), "未记录触发原因")
     workspace_root = _text(execution.get("workspace_root"), "未记录")
     incident_backed = (
@@ -280,13 +305,27 @@ def render_html_report(
     )
     skipped_checks = _items(assurance.get("skipped_required_checks"))
     baseline_at = _text(assurance.get("full_baseline_at"), "未记录")
-    assurance_banner = ""
+    assurance_banner = (
+        '<section class="assurance-alert"><h2>仅代表技术测试范围，不代表产品全部通过</h2>'
+        '<p>Full / passed 仅是配置套件的结果；必须结合下方来源与替换边界理解。'
+        '严格生产 handler 端到端、真实识别准确率、真实成片内容质量均未执行（not_run）。'
+        '合成媒体、预填答案或脚本审核不能代替这些证据。</p>'
+        '<p>人工待审核不等于程序故障；影子审计仅检查处理入口映射，不能证明恢复动作已执行或任务已恢复。</p>'
+        '</section>'
+    )
+    if boundaries["metadata_status"] == "unknown":
+        assurance_banner += (
+            '<section class="assurance-alert"><h2>证据边界元数据缺失或不完整</h2>'
+            '<p>旧报告或不完整元数据的证明范围按 unknown / not_run 处理；'
+            '不从 passed、Full 或 Provider 模式推断可信通过。</p>'
+            f'<p>原套件状态（仅保留兼容记录）：{_text(payload.get("status"))}</p></section>'
+        )
     if skipped_checks:
-        assurance_banner = (
+        assurance_banner += (
             '<section class="assurance-alert"><h2>本轮仅为局部验证</h2>'
             '<p>以下关键证据未执行，因此不能得出“系统完整无问题”的结论。</p>'
             f'<div>{_chips(skipped_checks)}</div>'
-            f'<p class="muted">最近完整回归基线：{baseline_at}</p></section>'
+            f'<p class="muted">最近完整技术套件基线：{baseline_at}</p></section>'
         )
     report_links = "".join(
         f'<a class="raw-link" href="{escape(str(href), quote=True)}">{label}</a>'
@@ -303,7 +342,7 @@ def render_html_report(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Flow Guard 零费用回归报告</title>
+  <title>Flow Guard 零费用技术回归报告</title>
   <style>
     :root {{ color-scheme: light; --blue:#356bff; --ink:#222; --muted:#6b7280; --line:#e5e7eb; --bg:#f5f7fa; --good:#237a4b; --good-bg:#edf7f1; --warn:#9a6700; --warn-bg:#fff7d6; --bad:#b42318; --bad-bg:#fff1f0; }}
     * {{ box-sizing:border-box; }}
@@ -365,7 +404,7 @@ def render_html_report(
   <header>
     <div>
       <div class="eyebrow">CONTINUOUS FLOW REGRESSION</div>
-      <h1>Flow Guard 零费用回归报告</h1>
+      <h1>Flow Guard 零费用技术回归报告</h1>
       <div class="meta"><span>生成时间：{generated_at}</span><span>Provider：{provider_mode}</span><a class="raw-link" href="{json_href}">查看原始 JSON</a></div>
       <div class="meta"><span>范围：{execution_label}</span><span>原因：{execution_reason}</span><span>{incident_backed}</span><span>临时工作区：{workspace_root}</span></div>
       <div class="meta">{report_links}</div>
@@ -375,6 +414,12 @@ def render_html_report(
 
   {assurance_banner}
 
+  <section>
+    <h2>证据边界</h2>
+    <div class="meta">“可证明”是通过项的有限范围，不是失败或未执行项的成功结论。未知来源不自动升级；详细动作事实见原始 JSON 与下方证据矩阵。</div>
+    <div class="table-wrap"><table><thead><tr><th>维度 / 层级</th><th>状态</th><th>来源类型</th><th>替换边界</th><th>可证明（仅通过项）</th><th>不能证明</th><th>已记录检查</th></tr></thead><tbody>{''.join(boundary_rows)}</tbody></table></div>
+  </section>
+
   <div class="metrics">
     {_summary_card("有效路径", f"{scenario_passed} / {scenario_count}", f"唯一轨迹 {_number(payload.get('unique_trace_count'))} 条")}
     {_summary_card("业务与管理台旅程", f"{journey_passed} / {journey_count}")}
@@ -382,7 +427,7 @@ def render_html_report(
     {_summary_card("付费调用", str(paid_calls), "必须保持为 0")}
     {_summary_card("真实证据动作", f"{len(ui_actions)} UI / {len(backend_actions)} 后端", f"Worker {len(worker_nodes)} 类")}
     {_summary_card("管理动作证据", f"{_number(coverage.get('action_evidence_complete_count'))} / {_number(coverage.get('console_action_count'))}", f"覆盖率 {_percent(coverage.get('action_evidence_coverage_pct'))}")}
-    {_summary_card("正式任务待处理", str(_number(payload.get('operational_attention_count'))), "可推进但仍需处理")}
+    {_summary_card("正式任务待处理", str(_number(payload.get('operational_attention_count'))), "仅入口映射，未执行恢复")}
     {_summary_card("完整耗时", _duration(payload.get('duration_sec')))}
   </div>
 
@@ -411,6 +456,7 @@ def render_html_report(
 
   <section>
     <h2>正式服务旅程</h2>
+    <div class="meta">服务/API 与本地合成使用正式代码；人物、场景、母片和 BGM 使用高层 handler 夹具。核心旅程 ASR 关闭，最终审核检查脚本化，不构成内容质量验收。</div>
     <div class="table-wrap"><table><thead><tr><th>旅程</th><th>结果</th><th>最终状态</th><th>人物</th><th>场景</th><th>纯旁白母片</th><th>问题</th></tr></thead><tbody>{''.join(service_rows) or '<tr><td colspan="7" class="muted">未执行正式服务旅程</td></tr>'}</tbody></table></div>
   </section>
 
@@ -421,19 +467,20 @@ def render_html_report(
 
   <section>
     <h2>正式库只读影子审计</h2>
-    <div class="meta">只读检查最近 {_number(shadow_audit.get('audited_job_count'))} 个真实任务；可推进暂停显示为待处理，无恢复动作或缺少管理台入口则阻断测试。数据库：{_text(shadow_audit.get('database_path'))}</div>
+    <div class="meta">只读检查最近 {_number(shadow_audit.get('audited_job_count'))} 个真实任务；状态、结构与入口映射不等于实际恢复执行。人工等待与程序故障需分别判断；无动作映射或缺少管理台入口会阻断该检查。数据库：{_text(shadow_audit.get('database_path'))}</div>
     <div class="coverage-grid">
       <div class="coverage-item"><span class="muted">需外部处理</span><strong>{_number(shadow_audit.get('action_required_job_count'))} 个任务</strong></div>
       <div class="coverage-item"><span class="muted">需人工复核</span><strong>{_number(shadow_audit.get('review_required_job_count'))} 个任务</strong></div>
-      <div class="coverage-item"><span class="muted">可继续处理</span><strong>{_number(shadow_audit.get('actionable_pause_job_count'))} 个任务</strong></div>
-      <div class="coverage-item"><span class="muted">无法继续</span><strong>{_number(shadow_audit.get('unactionable_pause_job_count'))} 个任务</strong></div>
+      <div class="coverage-item"><span class="muted">已映射处理入口</span><strong>{_number(shadow_audit.get('actionable_pause_job_count'))} 个任务</strong></div>
+      <div class="coverage-item"><span class="muted">缺少处理入口映射</span><strong>{_number(shadow_audit.get('unactionable_pause_job_count'))} 个任务</strong></div>
       <div class="coverage-item wide"><span class="muted">结构回归代码</span><div>{_chips(_items(shadow_audit.get('regression_codes')), empty="无")}</div></div>
     </div>
-    <div class="table-wrap"><table><thead><tr><th>任务</th><th>状态</th><th>暂停节点</th><th>可推进性</th><th>恢复动作</th><th>结构回归</th></tr></thead><tbody>{''.join(shadow_rows) or '<tr><td colspan="6" class="muted">未发现暂停任务或结构回归</td></tr>'}</tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>任务</th><th>状态</th><th>暂停节点</th><th>入口映射状态</th><th>映射动作（未执行）</th><th>结构回归</th></tr></thead><tbody>{''.join(shadow_rows) or '<tr><td colspan="6" class="muted">无任务明细；是否执行以证据边界状态为准</td></tr>'}</tbody></table></div>
   </section>
 
   <section>
     <h2>本地视频表演金标</h2>
+    <div class="meta">合成媒体配预填 ASR / 视觉表演答案；只验证答案传播、归一化和剧本绑定，不验证从视频识别表演的准确率。</div>
     <div class="coverage-grid">
       <div class="coverage-item"><span class="muted">结果</span><strong>{_status(video_golden.get('status'))[0]}</strong><span class="muted">{_text(video_golden.get('source_type'))}</span></div>
       <div class="coverage-item"><span class="muted">解析证据帧</span><strong>{_number(video_golden.get('analysis_frame_count'))} 帧</strong></div>
@@ -443,14 +490,14 @@ def render_html_report(
   </section>
 
   <section>
-    <h2>成片感知质量变异校准</h2>
-    <div class="meta">正常运动视频必须无告警；冻结、黑帧、帧时间戳断层和音画时长错位必须分别被检出。全程仅使用本地 FFmpeg，不产生模型费用。</div>
+    <h2>媒体技术缺陷变异校准</h2>
+    <div class="meta">合成运动样本必须无告警；冻结、黑帧、帧时间戳断层和音画时长错位必须分别被检出。全程仅使用本地 FFmpeg；不证明人物、口型、表演、叙事或剪辑质量。</div>
     <div class="coverage-grid">
       <div class="coverage-item"><span class="muted">正常样本告警</span><strong>{len(_items(perceptual_media.get('clean_findings')))} 项</strong>{_chips(_items(perceptual_media.get('clean_findings')), empty="无")}</div>
       <div class="coverage-item"><span class="muted">变异检出</span><strong>{_number(perceptual_media.get('killed'))} / {_number(perceptual_media.get('mutation_count'))}</strong><span class="muted">检出率 {_percent(perceptual_media.get('score_pct'))}</span></div>
       <div class="coverage-item wide"><span class="muted">漏检变异</span><div>{"<span class='muted'>无</span>" if not _number(perceptual_media.get('survived')) else f"<span class='status danger'>{_number(perceptual_media.get('survived'))} 项</span>"}</div></div>
     </div>
-    <div class="table-wrap"><table><thead><tr><th>变异样本</th><th>预期问题码</th><th>结果</th><th>实际检出</th></tr></thead><tbody>{''.join(perceptual_rows) or '<tr><td colspan="4" class="muted">未运行成片感知质量校准</td></tr>'}</tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>变异样本</th><th>预期问题码</th><th>结果</th><th>实际检出</th></tr></thead><tbody>{''.join(perceptual_rows) or '<tr><td colspan="4" class="muted">未运行媒体技术缺陷校准</td></tr>'}</tbody></table></div>
   </section>
 
   <section>

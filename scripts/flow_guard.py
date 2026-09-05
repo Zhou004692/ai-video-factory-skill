@@ -1,4 +1,4 @@
-"""Continuously explore production branches with Seedance 2.5 mocks only."""
+"""Run zero-cost technical regressions with explicit fixture evidence scope."""
 from __future__ import annotations
 
 import argparse
@@ -16,6 +16,7 @@ from factory.flow_guard.scenarios import (
     build_smoke_scenarios,
 )
 from factory.flow_guard.html_report import render_html_report
+from factory.flow_guard.assurance import normalize_evidence_boundaries
 from factory.flow_guard.scheduler import (
     RunDecision,
     changed_source_paths,
@@ -72,9 +73,10 @@ def _write_report(path: Path, summary: dict[str, object]) -> None:
         )
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "provider_mode": "seedance_2_5_mock",
+        "provider_mode": "zero_cost_high_level_fixtures",
         "report_artifacts": report_artifacts,
         **summary,
+        "evidence_boundaries": normalize_evidence_boundaries(summary.get("evidence_boundaries")),
     }
     for target in dict.fromkeys((mode_path, path)):
         target.write_text(
@@ -150,11 +152,12 @@ def run_once(
             "attention": "FLOW_GUARD_ATTENTION",
         }[str(summary["status"])]
         print(
-            f"{verdict} provider=seedance_2_5_mock "
+            f"{verdict} provider=zero_cost_high_level_fixtures scope=technical_suite "
             f"scenarios={summary['scenario_count']} "
             f"journeys={summary['journey_count']} "
             f"mutation_score={summary['historical_mutation_score_pct']} "
-            "paid_provider_calls=0"
+            "paid_provider_calls=0 strict_transport_replay=not_run "
+            "recognition_accuracy=not_run actual_content_quality=not_run"
         )
         return 0
     print("FLOW_GUARD_FAILED reproducible blockers were recorded")
@@ -252,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.add_argument(
             "--full-interval-hours", type=float, default=24.0,
-            help="maximum time between complete production gates in watch mode",
+            help="maximum time between full technical suites in watch mode (not production E2E)",
         )
         subparser.add_argument("--once", action="store_true")
     return parser

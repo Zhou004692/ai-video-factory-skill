@@ -7,6 +7,7 @@ from pathlib import Path
 import time
 from typing import Awaitable, Callable, Sequence
 
+from .assurance import build_evidence_boundaries
 from .explorer import explore_scenario
 from .evidence import CoverageEvidence
 from .journeys import run_full_journey_suite
@@ -56,6 +57,7 @@ def _assurance_summary(
     )
     return {
         "level": "full" if not skipped else "partial",
+        "scope": "technical_suite_completeness_not_production_quality",
         "required_checks": checks,
         "skipped_required_checks": skipped,
     }
@@ -271,9 +273,30 @@ async def run_matrix(
         overall_status = "partial"
     else:
         overall_status = "passed"
+    evidence_boundaries = build_evidence_boundaries({
+        "graph_scenarios": {
+            "status": ("failed" if failed else "passed") if reports else "skipped",
+            "reports": [report.as_dict() for report in reports],
+        },
+        "journey_suite": journey,
+        "historical_incident_replays": incidents,
+        "mutation_calibration": mutation,
+        "video_source_golden": video_golden,
+        "production_shadow_audit": shadow_audit,
+        "perceptual_media_golden": perceptual_media,
+    }, {
+        "graph_scenarios": explorer,
+        "journey_suite": journey_runner,
+        "historical_incident_replays": incident_runner,
+        "mutation_calibration": run_historical_mutation_calibration,
+        "video_source_golden": video_golden_runner,
+        "production_shadow_audit": shadow_audit_runner,
+        "perceptual_media_golden": perceptual_media_runner,
+    })
     return {
         "status": overall_status,
         "assurance": assurance,
+        "evidence_boundaries": evidence_boundaries,
         "operational_attention_count": operational_attention_count,
         "scenario_count": len(reports),
         "passed": len(reports) - failed,

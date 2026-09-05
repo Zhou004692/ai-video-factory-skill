@@ -1,9 +1,11 @@
 """Deterministic zero-cost regression through the management-service API.
 
 This module deliberately exercises the same service methods as the management
-console.  Only provider responses are replayed; content validation, database
-state, script approval, storyboard creation and Production Graph V2 compilation
-remain the real application code.
+console. Brief/script responses are replayed at a high level; character/scene
+anchors, masters and BGM use replacement business handlers and synthetic media.
+Service validation, approval, compilation, scheduling and local composition use
+application code. Core journeys disable ASR and submit scripted final approvals;
+this is not strict production-handler E2E or content-quality verification.
 """
 from __future__ import annotations
 
@@ -383,11 +385,12 @@ def build_zero_cost_handlers(
     *,
     media_root: Path,
 ):
-    """Build graph handlers that replace only paid provider boundaries.
+    """Build high-level fixture handlers, not transport-only provider mocks.
 
     Graph scheduling, state transitions, human gates and local composition are
-    untouched.  Fixture handlers materialize the artifacts a paid provider
-    would return and always record zero cost.
+    retained. Character/scene/master/BGM handlers generate synthetic media and
+    directly persist fixture states/artifacts, bypassing production generation
+    handlers. The resulting zero-cost workflow does not prove content quality.
     """
     media_root = Path(media_root).resolve()
 

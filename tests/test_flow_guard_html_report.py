@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import flow_guard as flow_guard_cli  # noqa: E402
 from factory.flow_guard.html_report import render_html_report  # noqa: E402
+from factory.flow_guard import runner  # noqa: E402
 
 
 def sample_payload(*, status: str = "passed") -> dict[str, object]:
@@ -165,10 +166,74 @@ def sample_payload(*, status: str = "passed") -> dict[str, object]:
 
 
 class FlowGuardHtmlReportTests(unittest.TestCase):
+    def test_legacy_passed_report_is_unknown_not_trusted_green(self):
+        html = render_html_report(sample_payload())
+
+        self.assertIn("证据边界元数据缺失或不完整", html)
+        self.assertIn("范围未知", html)
+        self.assertNotIn('hero-status success', html.split("<body>", 1)[1])
+        self.assertIn("strict_transport_replay", html)
+        self.assertIn("not_run", html)
+        self.assertIn("仅代表技术测试范围", html)
+
+    def test_report_exposes_boundaries_and_escapes_provenance(self):
+        builder = getattr(runner, "build_evidence_boundaries", None)
+        self.assertIsNotNone(builder, "machine-readable evidence boundaries missing")
+        payload = sample_payload()
+        payload["evidence_boundaries"] = builder({
+            "video_source_golden": payload["video_source_golden"],
+        }, {"video_source_golden": runner.run_video_performance_golden})
+        evidence = payload["evidence_boundaries"]["dimensions"]["video_performance_propagation"]
+        evidence["replacement_boundary"] += " <unsafe>"
+
+        html = render_html_report(payload)
+
+        for label in ("来源类型", "替换边界", "可证明", "不能证明", "技术检查通过"):
+            self.assertIn(label, html)
+        self.assertIn("synthetic_media_with_prefilled_answers", html)
+        self.assertIn("&lt;unsafe&gt;", html)
+        self.assertNotIn("<unsafe>", html)
+        self.assertIn("恢复动作已执行", html)
+        self.assertIn("人工待审核不等于程序故障", html)
+
+    def test_passed_dimension_without_provenance_is_not_rendered_as_passed(self):
+        payload = sample_payload()
+        payload["evidence_boundaries"] = {
+            "schema_version": 1, "metadata_status": "recorded",
+            "dimensions": {"strict_transport_replay": {"status": "passed"}},
+        }
+
+        html = render_html_report(payload)
+
+        self.assertIn("范围未知", html)
+        self.assertNotIn('hero-status success', html.split("<body>", 1)[1])
+
+    def test_incomplete_not_run_metadata_cannot_restore_green_legacy_status(self):
+        payload = sample_payload()
+        payload["evidence_boundaries"] = {
+            "schema_version": 1,
+            "dimensions": {"formal_service_with_high_level_fixture": {"status": "not_run"}},
+        }
+
+        html = render_html_report(payload)
+
+        self.assertIn("范围未知", html)
+        self.assertNotIn('hero-status success', html.split("<body>", 1)[1])
+
+    def test_unsupported_schema_and_malformed_status_are_safe_unknown(self):
+        for metadata in ({"schema_version": 99}, {
+            "schema_version": 1,
+            "dimensions": {"component_propagation": {"status": ["passed"]}},
+        }):
+            with self.subTest(metadata=metadata):
+                payload = sample_payload()
+                payload["evidence_boundaries"] = metadata
+                self.assertIn("范围未知", render_html_report(payload))
+
     def test_renders_readable_summary_coverage_journeys_and_mutations(self):
         html = render_html_report(sample_payload())
 
-        self.assertIn("Flow Guard 零费用回归报告", html)
+        self.assertIn("Flow Guard 零费用技术回归报告", html)
         self.assertIn("88 / 88", html)
         self.assertIn("15 / 15", html)
         self.assertIn("9 / 9", html)
@@ -195,7 +260,7 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("speaker_cluster_preserved", html)
         self.assertIn("正式库只读影子审计", html)
         self.assertIn("J-PROD-25", html)
-        self.assertIn("成片感知质量变异校准", html)
+        self.assertIn("媒体技术缺陷变异校准", html)
         self.assertIn("freeze_segment", html)
         self.assertIn("final_media_freeze_segment", html)
         self.assertIn('href="latest.json"', html)
@@ -289,9 +354,12 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
                 json.loads(report_path.read_text(encoding="utf-8"))["status"],
                 "passed",
             )
+            saved = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertIn("evidence_boundaries", saved)
+            self.assertEqual(saved["evidence_boundaries"]["metadata_status"], "unknown")
             html = html_path.read_text(encoding="utf-8")
             self.assertIn('href="flow-result.json"', html)
-            self.assertIn("Flow Guard 零费用回归报告", html)
+            self.assertIn("Flow Guard 零费用技术回归报告", html)
 
 
 if __name__ == "__main__":
