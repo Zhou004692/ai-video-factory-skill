@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 import sys
 import tempfile
@@ -165,6 +166,32 @@ def sample_payload(*, status: str = "passed") -> dict[str, object]:
     }
 
 
+def fully_observed_payload(*, skipped: bool = False) -> dict[str, object]:
+    """Build report fixtures without executing the media/service runners."""
+    payload = sample_payload()
+    observations = {
+        "graph_scenarios": {"status": "passed", "reports": payload["reports"]},
+        "journey_suite": {**payload["journey_suite"], "status": "passed"},
+        **{key: payload[key] for key in (
+            "video_source_golden", "perceptual_media_golden",
+            "production_shadow_audit", "historical_incident_replays", "mutation_calibration",
+        )},
+    }
+    implementations = {
+        "graph_scenarios": runner.explore_scenario,
+        "journey_suite": runner.run_full_journey_suite,
+        "video_source_golden": runner.run_video_performance_golden,
+        "perceptual_media_golden": runner.run_perceptual_media_golden,
+        "production_shadow_audit": runner.audit_production_shadow,
+        "historical_incident_replays": runner.run_historical_incident_replays,
+        "mutation_calibration": runner.run_historical_mutation_calibration,
+    }
+    if skipped:
+        observations = {key: {"status": "skipped"} for key in observations}
+    payload["evidence_boundaries"] = runner.build_evidence_boundaries(observations, implementations)
+    return payload
+
+
 class FlowGuardHtmlReportTests(unittest.TestCase):
     def test_legacy_passed_report_is_unknown_not_trusted_green(self):
         html = render_html_report(sample_payload())
@@ -188,13 +215,81 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
 
         html = render_html_report(payload)
 
-        for label in ("来源类型", "替换边界", "可证明", "不能证明", "技术检查通过"):
+        for label in ("来源类型", "替换边界", "可证明", "不能证明", "范围未知"):
             self.assertIn(label, html)
         self.assertIn("synthetic_media_with_prefilled_answers", html)
         self.assertIn("&lt;unsafe&gt;", html)
         self.assertNotIn("<unsafe>", html)
         self.assertIn("恢复动作已执行", html)
         self.assertIn("人工待审核不等于程序故障", html)
+
+    def test_one_known_skip_with_unknown_dimensions_cannot_make_headline_green(self):
+        payload = sample_payload()
+        payload["evidence_boundaries"] = runner.build_evidence_boundaries(
+            {"journey_suite": {"status": "skipped"}},
+            {"journey_suite": runner.run_full_journey_suite},
+        )
+
+        html = render_html_report(payload)
+
+        self.assertIn('hero-status warning">范围未知', html)
+        self.assertIn("证据边界元数据缺失或不完整", html)
+        self.assertEqual(payload["status"], "passed")
+
+    def test_known_adverse_dimension_overrides_stale_passed_headline(self):
+        for state, label, css in (
+            ("failed", "技术检查失败", "danger"),
+            ("attention", "发现待处理", "warning"),
+            ("partial", "局部验证", "warning"),
+        ):
+            with self.subTest(state=state):
+                payload = sample_payload()
+                payload["evidence_boundaries"] = runner.build_evidence_boundaries({
+                    "video_source_golden": {**payload["video_source_golden"], "status": state},
+                }, {"video_source_golden": runner.run_video_performance_golden})
+                before = deepcopy(payload)
+
+                html = render_html_report(payload)
+
+                self.assertIn(f'hero-status {css}">{label}', html)
+                self.assertEqual(payload, before)
+
+    def test_all_technical_skips_are_not_green(self):
+        html = render_html_report(fully_observed_payload(skipped=True))
+
+        self.assertIn('hero-status warning">未执行技术检查', html)
+
+    def test_known_technical_pass_ignores_fixed_unimplemented_quality_axes(self):
+        payload = fully_observed_payload()
+        for key in ("strict_transport_replay", "recognition_accuracy", "actual_content_quality"):
+            self.assertEqual(payload["evidence_boundaries"]["dimensions"][key]["status"], "not_run")
+
+        self.assertIn('hero-status success">技术检查通过', render_html_report(payload))
+
+    def test_partial_technical_execution_is_not_green(self):
+        payload = fully_observed_payload()
+        skipped = fully_observed_payload(skipped=True)
+        key = "formal_service_with_high_level_fixture"
+        payload["evidence_boundaries"]["dimensions"][key] = skipped["evidence_boundaries"]["dimensions"][key]
+
+        self.assertIn('hero-status warning">局部验证', render_html_report(payload))
+
+    def test_legacy_uppercase_passed_is_not_green(self):
+        payload = sample_payload(status="PASSED")
+
+        self.assertIn('hero-status warning">范围未知', render_html_report(payload))
+        self.assertEqual(payload["status"], "PASSED")
+
+    def test_overall_adverse_status_is_not_overridden_by_passing_dimensions(self):
+        for state, label, css in (
+            ("FAILED", "技术检查失败", "danger"),
+            ("attention", "发现待处理", "warning"),
+            ("partial", "局部验证", "warning"),
+        ):
+            with self.subTest(state=state):
+                payload = fully_observed_payload()
+                payload["status"] = state
+                self.assertIn(f'hero-status {css}">{label}', render_html_report(payload))
 
     def test_passed_dimension_without_provenance_is_not_rendered_as_passed(self):
         payload = sample_payload()

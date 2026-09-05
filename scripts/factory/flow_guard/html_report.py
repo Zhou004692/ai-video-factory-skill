@@ -99,12 +99,30 @@ def render_html_report(
     assurance = _mapping(payload.get("assurance"))
     boundaries = normalize_evidence_boundaries(payload.get("evidence_boundaries"))
     report_artifacts = _mapping(payload.get("report_artifacts"))
-    status_label, status_class = _status(payload.get("status"))
-    if payload.get("status") == "passed":
-        if boundaries["metadata_status"] == "unknown":
-            status_label, status_class = "范围未知", "warning"
-        else:
-            status_label = "技术检查通过"
+    # The compatibility verdict cannot override known failures or missing
+    # technical provenance. Fixed, unimplemented quality axes are separate.
+    technical_statuses = {
+        item["status"] for key, item in boundaries["dimensions"].items()
+        if key not in {"strict_transport_replay", "recognition_accuracy", "actual_content_quality"}
+    }
+    overall_status = str(payload.get("status") or "unknown").strip().lower()
+    unknown_scope = (
+        boundaries["metadata_status"] == "unknown" or "unknown" in technical_statuses
+    )
+    if overall_status == "failed" or "failed" in technical_statuses:
+        status_label, status_class = "技术检查失败", "danger"
+    elif overall_status == "attention" or "attention" in technical_statuses:
+        status_label, status_class = "发现待处理", "warning"
+    elif overall_status == "partial" or "partial" in technical_statuses:
+        status_label, status_class = "局部验证", "warning"
+    elif unknown_scope or overall_status not in {"passed", "skipped", "not_run"}:
+        status_label, status_class = "范围未知", "warning"
+    elif technical_statuses == {"not_run"}:
+        status_label, status_class = "未执行技术检查", "warning"
+    elif "not_run" in technical_statuses or overall_status in {"skipped", "not_run"}:
+        status_label, status_class = "局部验证", "warning"
+    else:
+        status_label, status_class = "技术检查通过", "success"
 
     boundary_rows = []
     for key, evidence in boundaries["dimensions"].items():
@@ -313,7 +331,7 @@ def render_html_report(
         '<p>人工待审核不等于程序故障；影子审计仅检查处理入口映射，不能证明恢复动作已执行或任务已恢复。</p>'
         '</section>'
     )
-    if boundaries["metadata_status"] == "unknown":
+    if unknown_scope:
         assurance_banner += (
             '<section class="assurance-alert"><h2>证据边界元数据缺失或不完整</h2>'
             '<p>旧报告或不完整元数据的证明范围按 unknown / not_run 处理；'

@@ -109,9 +109,9 @@ def _observed_checks(check_id: str, result: Mapping) -> list[str]:
         count = result.get("audited_job_count")
         return [f"audited_job_count={count}"] if type(count) is int and count >= 0 else []
     if check_id == "video_source_golden":
-        return [str(value) for field in ("passed_guards", "failed_guards")
+        return [value for field in ("passed_guards", "failed_guards")
                 if isinstance(result.get(field), (list, tuple))
-                for value in result.get(field, []) if isinstance(value, str) and value]
+                for value in result.get(field, []) if isinstance(value, str) and value.strip()]
     field, name = {
         "graph_scenarios": ("reports", "scenario_id"),
         "journey_suite": ("journeys", "scenario_id"),
@@ -122,8 +122,9 @@ def _observed_checks(check_id: str, result: Mapping) -> list[str]:
     items = result.get(field)
     if not isinstance(items, (list, tuple)):
         return []
-    return [str(item[name]) for item in items
-            if isinstance(item, Mapping) and item.get(name)]
+    return [item[name] for item in items
+            if isinstance(item, Mapping) and isinstance(item.get(name), str)
+            and item[name].strip()]
 
 
 def build_evidence_boundaries(observations: Mapping, implementations: Mapping) -> dict:

@@ -104,6 +104,30 @@ class FlowGuardEvidenceTests(unittest.TestCase):
                 }, {"journey_suite": runner.run_full_journey_suite})
                 self.assertEqual(boundaries["dimensions"]["formal_service_with_high_level_fixture"]["status"], "unknown")
 
+    def test_structured_observation_ids_must_be_nonblank_strings(self):
+        for check, field, id_field, implementation, dimension in (
+            ("graph_scenarios", "reports", "scenario_id", runner.explore_scenario, "component_propagation"),
+            ("journey_suite", "journeys", "scenario_id", runner.run_full_journey_suite, "formal_service_with_high_level_fixture"),
+            ("perceptual_media_golden", "results", "mutation_id", runner.run_perceptual_media_golden, "media_technical_checks"),
+            ("historical_incident_replays", "results", "incident_id", runner.run_historical_incident_replays, "historical_incident_replays"),
+            ("mutation_calibration", "results", "mutation_id", runner.run_historical_mutation_calibration, "structural_mutation_checks"),
+        ):
+            for invalid in ({"unexpected": "object"}, 42, True, ["id"], "   "):
+                with self.subTest(check=check, invalid=invalid):
+                    boundaries = self.boundaries({check: {
+                        "status": "passed", field: [{id_field: invalid}],
+                    }}, {check: implementation})
+                    self.assertEqual(boundaries["dimensions"][dimension]["status"], "unknown")
+                    self.assertEqual(boundaries["dimensions"][dimension]["observed_checks"], [])
+
+    def test_video_guards_reject_blank_observations(self):
+        boundaries = self.boundaries({"video_source_golden": {
+            "status": "passed", "passed_guards": ["  ", "\t"], "failed_guards": [],
+        }}, {"video_source_golden": runner.run_video_performance_golden})
+
+        self.assertEqual(boundaries["dimensions"]["video_performance_propagation"]["status"], "unknown")
+        self.assertEqual(boundaries["dimensions"]["video_performance_propagation"]["observed_checks"], [])
+
     def test_skipped_checks_are_not_run_and_outcomes_remain_distinct(self):
         for status in ("partial", "attention", "failed", "skipped"):
             with self.subTest(status=status):
