@@ -169,19 +169,26 @@ def normalize_evidence_boundaries(value: object) -> dict:
             continue
         strings = ("level", "source_kind", "replacement_boundary")
         lists = ("proves", "does_not_prove", "observed_checks")
+        if not all(isinstance(item.get(field), str) and item[field].strip()
+                   for field in strings):
+            continue
+        if not all(isinstance(item.get(field), list)
+                   and all(isinstance(part, str) and part.strip() for part in item[field])
+                   for field in lists):
+            continue
+        if item["level"] != _CATALOG[key][2] or not item["does_not_prove"]:
+            continue
         if status == "not_run":
+            if item["source_kind"] != "unknown" or item["proves"] or item["observed_checks"]:
+                continue
             payload["dimensions"][key]["status"] = "not_run"
-            if (all(isinstance(item.get(field), str) and item[field] for field in strings)
-                    and all(isinstance(item.get(field), list) for field in lists)):
-                payload["metadata_status"] = "recorded"
+            payload["metadata_status"] = "recorded"
             continue
         if status not in _OUTCOMES:
             continue
-        if not all(isinstance(item.get(field), str) and item[field] not in {"", "unknown"}
-                   for field in strings):
+        if item["source_kind"] != _CATALOG[key][3]:
             continue
-        if not all(isinstance(item.get(field), list) and item[field]
-                   and all(isinstance(part, str) and part for part in item[field]) for field in lists):
+        if not item["proves"] or not item["observed_checks"]:
             continue
         payload["dimensions"][key] = deepcopy({
             field: item[field] for field in ("status", *strings, *lists)

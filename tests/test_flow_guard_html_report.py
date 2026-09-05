@@ -220,6 +220,22 @@ class FlowGuardHtmlReportTests(unittest.TestCase):
         self.assertIn("范围未知", html)
         self.assertNotIn('hero-status success', html.split("<body>", 1)[1])
 
+    def test_malformed_not_run_lists_do_not_turn_legacy_passed_green(self):
+        payload = sample_payload()
+        payload["evidence_boundaries"] = {
+            "schema_version": 1,
+            "dimensions": {"component_propagation": {
+                "status": "not_run", "level": "component_propagation",
+                "source_kind": "unknown", "replacement_boundary": "unknown run",
+                "proves": [None], "does_not_prove": [None], "observed_checks": [None],
+            }},
+        }
+
+        html = render_html_report(payload)
+
+        self.assertIn("范围未知", html)
+        self.assertNotIn('hero-status success', html.split("<body>", 1)[1])
+
     def test_unsupported_schema_and_malformed_status_are_safe_unknown(self):
         for metadata in ({"schema_version": 99}, {
             "schema_version": 1,

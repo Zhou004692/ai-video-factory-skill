@@ -16,6 +16,7 @@ from factory.flow_guard.evidence import (  # noqa: E402
     parse_browser_evidence,
 )
 from factory.flow_guard import runner  # noqa: E402
+from factory.flow_guard.assurance import normalize_evidence_boundaries  # noqa: E402
 
 
 class FlowGuardEvidenceTests(unittest.TestCase):
@@ -113,6 +114,54 @@ class FlowGuardEvidenceTests(unittest.TestCase):
                 self.assertEqual(evidence["status"], "not_run" if status == "skipped" else status)
                 if status == "skipped":
                     self.assertEqual(evidence["source_kind"], "unknown")
+
+    def test_normalization_rejects_malformed_or_contradictory_not_run_lists(self):
+        for field in ("proves", "does_not_prove", "observed_checks"):
+            for invalid in ([None], [1], [""], ["   "], "not-a-list"):
+                with self.subTest(field=field, invalid=invalid):
+                    boundaries = self.boundaries({"journey_suite": {"status": "skipped"}},
+                        {"journey_suite": runner.run_full_journey_suite})
+                    boundaries["dimensions"]["formal_service_with_high_level_fixture"][field] = invalid
+
+                    normalized = normalize_evidence_boundaries(boundaries)
+
+                    self.assertEqual(normalized["metadata_status"], "unknown")
+                    self.assertEqual(normalized["dimensions"]["formal_service_with_high_level_fixture"]["status"], "unknown")
+        for field in ("proves", "observed_checks"):
+            with self.subTest(nonempty_not_run_field=field):
+                boundaries = self.boundaries({"journey_suite": {"status": "skipped"}},
+                    {"journey_suite": runner.run_full_journey_suite})
+                boundaries["dimensions"]["formal_service_with_high_level_fixture"][field] = ["claimed-check"]
+                self.assertEqual(normalize_evidence_boundaries(boundaries)["metadata_status"], "unknown")
+
+    def test_normalization_rejects_incompatible_dimension_level_and_source(self):
+        for status in ("passed", "not_run"):
+            for field, invalid in (
+                ("level", "strict_transport_replay"),
+                ("level", "media_technical_checks"),
+                ("source_kind", "none"),
+                ("source_kind", "synthetic_media"),
+            ):
+                with self.subTest(status=status, field=field, invalid=invalid):
+                    boundaries = self.boundaries({"graph_scenarios": {
+                        "status": status, "reports": [{"scenario_id": "graph"}],
+                    }}, {"graph_scenarios": runner.explore_scenario})
+                    boundaries["dimensions"]["component_propagation"][field] = invalid
+
+                    normalized = normalize_evidence_boundaries(boundaries)
+
+                    self.assertEqual(normalized["metadata_status"], "unknown")
+                    self.assertEqual(normalized["dimensions"]["component_propagation"]["status"], "unknown")
+
+    def test_normalization_preserves_valid_skips_and_unimplemented_dimensions(self):
+        boundaries = self.boundaries({"journey_suite": {"status": "skipped"}},
+            {"journey_suite": runner.run_full_journey_suite})
+        normalized = normalize_evidence_boundaries(boundaries)
+
+        self.assertEqual(normalized, boundaries)
+        for key in ("strict_transport_replay", "recognition_accuracy", "actual_content_quality"):
+            self.assertEqual(normalized["dimensions"][key]["status"], "not_run")
+            self.assertEqual(normalized["dimensions"][key]["observed_checks"], [])
 
     def test_shadow_lookup_does_not_claim_recovery_execution_or_fault_equivalence(self):
         boundaries = self.boundaries({
