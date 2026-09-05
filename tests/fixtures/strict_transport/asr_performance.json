@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "fixture_id": "asr-performance-transport-v1",
+  "source_kind": "authored_contract",
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit",
+        "headers": {
+          "x-api-resource-id": "volc.seedasr.auc",
+          "x-api-request-id": "11111111-1111-4111-8111-111111111111",
+          "x-api-sequence": "-1",
+          "x-api-key": "strict-test-key",
+          "content-type": "application/json"
+        },
+        "json": {
+          "user": {"uid": "strict-test-key"},
+          "audio": {"data": "c3RyaWN0LWF1ZGlv", "format": "wav"},
+          "request": {
+            "model_name": "bigmodel",
+            "enable_itn": true,
+            "enable_speaker_info": true,
+            "enable_emotion_detection": true,
+            "show_volume": true,
+            "show_speech_rate": true
+          }
+        }
+      },
+      "response": {"status_code": 200, "headers": {"X-Api-Status-Code": "20000000"}, "json": {}}
+    },
+    {
+      "request": {
+        "method": "POST", "url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query", "json": {},
+        "headers": {
+          "x-api-resource-id": "volc.seedasr.auc",
+          "x-api-request-id": "11111111-1111-4111-8111-111111111111",
+          "x-api-sequence": "-1", "x-api-key": "strict-test-key", "content-type": "application/json"
+        }
+      },
+      "response": {"status_code": 200, "headers": {"X-Api-Status-Code": "20000001"}, "json": {}}
+    },
+    {
+      "request": {
+        "method": "POST", "url": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query", "json": {},
+        "headers": {
+          "x-api-resource-id": "volc.seedasr.auc",
+          "x-api-request-id": "11111111-1111-4111-8111-111111111111",
+          "x-api-sequence": "-1", "x-api-key": "strict-test-key", "content-type": "application/json"
+        }
+      },
+      "response": {
+        "status_code": 200,
+        "headers": {"X-Api-Status-Code": "20000000"},
+        "json": {
+          "result": {
+            "text": "可以交付了。",
+            "utterances": [{"text": "可以交付了。", "start_time": 0, "end_time": 1200, "additions": {"speaker_id": "voice-1", "emotion": "calm", "tone": "firm"}}]
+          }
+        }
+      }
+    }
+  ]
+}

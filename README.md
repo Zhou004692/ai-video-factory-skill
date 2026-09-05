@@ -254,6 +254,8 @@ Full 套件还会执行 3 条“来源 → 简报 → 剧本 → 制作设置 �
 
 严格边界建设的第一步是 `tests.test_strict_provider_boundary`：在单进程中运行真实 Seedance、豆包和 ASR HTTPX 客户端，在 transport 层回放响应，并阻止原始 socket / DNS / 子进程外逃。它尚未接入 Full，不覆盖完整 Worker / 浏览器 / 进程树，也不验证真实识别或内容质量，因此不会把 Flow Guard 的 `strict_transport_replay` 改为通过。
 
+可独立运行 `python -m unittest tests.test_strict_provider_boundary -v`；固定请求契约、错误样本、隔离限制及后续接入门槛见 [严格传输回放说明](docs/testing/strict-transport-replay.md)。
+
 执行当前 Full 技术套件（不是所有产品功能的严格 E2E）：
 
 ```powershell

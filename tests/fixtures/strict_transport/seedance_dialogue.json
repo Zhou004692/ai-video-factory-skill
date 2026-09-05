@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "fixture_id": "seedance-dialogue-transport-v1",
+  "source_kind": "authored_contract",
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
+        "headers": {"authorization": "Bearer strict-test-key", "content-type": "application/json"},
+        "json": {
+          "model": "doubao-seedance-2-5-pro",
+          "content": [{"type": "text", "text": "工人在检查设备，客户在画外说：可以交付了。"}],
+          "duration": 4,
+          "resolution": "480p",
+          "output_format": "mp4",
+          "ratio": "9:16",
+          "generate_audio": true
+        }
+      },
+      "response": {"status_code": 200, "json": {"id": "strict-task-1"}}
+    },
+    {
+      "request": {"method": "GET", "url": "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/strict-task-1", "headers": {"authorization": "Bearer strict-test-key"}},
+      "response": {"status_code": 200, "json": {"id": "strict-task-1", "status": "running"}}
+    },
+    {
+      "request": {"method": "GET", "url": "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/strict-task-1", "headers": {"authorization": "Bearer strict-test-key"}},
+      "response": {
+        "status_code": 200,
+        "json": {
+          "id": "strict-task-1",
+          "status": "succeeded",
+          "content": {"video_url": "https://93.184.216.34/strict-master.mp4"},
+          "usage": {"completion_tokens": 100},
+          "created_at": 1,
+          "updated_at": 2
+        }
+      }
+    },
+    {
+      "request": {"method": "GET", "url": "https://93.184.216.34/strict-master.mp4", "headers": {"authorization": null, "x-api-key": null}},
+      "response": {"status_code": 200, "headers": {"content-type": "video/mp4"}, "text": "synthetic-transport-bytes-not-a-quality-golden"}
+    }
+  ]
+}
