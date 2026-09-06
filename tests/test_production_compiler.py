@@ -641,13 +641,14 @@ class SpeechSemanticsCompilerTests(unittest.TestCase):
         self.assertEqual(result.spec.runtime_storyboard["masters"][1]["type"], "broll")
 
     def test_explicit_global_mode_overrides_all_speaker_hints(self):
-        for mode, expected_cast, expected_speakers in (
-            ("on_screen", ("worker", "narrator"), ("worker", "narrator")),
-            ("off_screen", (), ()), ("narration", (), ()),
+        for mode, speakers, expected_cast, expected_speakers in (
+            ("on_screen", ["worker", "narrator"], ("worker", "narrator"), ("worker", "narrator")),
+            ("off_screen", ["worker", "worker"], (), ()),
+            ("narration", ["worker", "worker"], (), ()),
         ):
             with self.subTest(mode=mode):
                 result = self.compile_source([{
-                    "speakers": ["worker", "narrator"],
+                    "speakers": speakers,
                     "speech_mode": mode, "dialogue": "Ready? Ready.",
                 }], characters=["worker", "narrator"])
                 self.assertTrue(result.compilable, result.issues)
@@ -656,11 +657,13 @@ class SpeechSemanticsCompilerTests(unittest.TestCase):
                 self.assertEqual("lip_sync" in result.spec.masters[0].quality_gates,
                                  mode == "on_screen")
 
-    def test_homogeneous_implicit_speaker_lists_remain_supported(self):
+    def test_onscreen_lists_and_duplicate_audio_speakers_remain_supported(self):
+        # Different background voices were formerly accepted but the real request
+        # kept only the first. They now require separate attributed beats below.
         for speakers, characters, expected in (
             (["worker", "lead"], ["worker", "lead"], ("worker", "lead")),
-            (["旁白", "narrator"], [], ()),
-            (["背景台词", "offscreen"], [], ()),
+            (["narrator", "narrator"], [], ()),
+            (["背景台词", "背景台词"], [], ()),
         ):
             with self.subTest(speakers=speakers):
                 result = self.compile_source([{
@@ -669,7 +672,26 @@ class SpeechSemanticsCompilerTests(unittest.TestCase):
                 self.assertTrue(result.compilable, result.issues)
                 self.assertEqual(result.spec.masters[0].speaker_ids, expected)
                 self.assertEqual(result.spec.runtime_storyboard["masters"][0]
-                                 ["audio_speakers"], speakers)
+                                 ["audio_speakers"], list(dict.fromkeys(speakers)))
+
+    def test_multiple_background_voices_require_executable_turn_attribution(self):
+        for beat in (
+            {"speakers": ["customer_a", "customer_b"], "speech_mode": "off_screen"},
+            {"speakers": ["customer_a", "customer_b"], "speech_mode": "narration"},
+            {"speakers": ["旁白", "narrator"]},
+            {"speakers": ["背景台词", "offscreen"]},
+            {"speakers": ["customer_a", "customer_b"], "speech_mode": "off_screen",
+             "dialogue_blocks": [{"speaker": "customer_a", "text": "Ready?"},
+                                 {"speaker": "customer_b", "text": "Yes."}]},
+        ):
+            with self.subTest(beat=beat):
+                result = self.compile_source([{"dialogue": "Ready?Yes.", **beat}])
+                self.assertFalse(result.compilable)
+                self.assertEqual({issue.code for issue in result.blockers}, {"speech_turn_ambiguous"})
+                self.assertIn("turn-1", result.blockers[0].message)
+                self.assertIn("每个节拍一个说话人", result.blockers[0].message)
+                if "dialogue_blocks" in beat:
+                    self.assertIn("dialogue_blocks", result.blockers[0].message)
 
     def test_unknown_visible_identity_is_still_blocking(self):
         for beat, codes in (
@@ -909,6 +931,46 @@ class RuntimeSpeechDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["request_kwargs"]["references"],
                          ["https://example.invalid/yard.png"])
         self.assertIn("旁白", request["prompt"])
+
+    async def test_background_request_preserves_explicit_open_mouth_reaction(self):
+        spec = self.prepare([{
+            "speaker": "customer_voice", "speech_mode": "off_screen", "dialogue": "Ready?",
+            "facial_expression": "惊讶地张嘴", "body_action": "喘息后靠近设备",
+        }])
+        request = await self.request_at_boundary(spec)
+        self.assertIn("惊讶地张嘴", request["prompt"])
+        self.assertIn("喘息后靠近设备", request["prompt"])
+        self.assertNotIn("全程闭嘴", request["prompt"])
+        self.assertIn("不朗读画外台词", request["prompt"])
+        self.assertIn("不随画外语音做口型同步", request["prompt"])
+
+    async def test_unattributed_background_voices_fail_before_request_loses_a_voice(self):
+        beat = {"id": "ambiguous-audio", "speakers": ["customer_a", "customer_b"],
+                "speech_mode": "off_screen", "dialogue": "Ready?"}
+        result = production_compiler.compile_ir(
+            creative_ir.from_storyboard({"beats": [beat]}), job_id="J-ambiguous-audio",
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=10000,
+        )
+        if result.compilable:
+            # This was previously accepted; exercise the real request path to expose
+            # the missing second voice rather than only changing a field assertion.
+            request = await self.request_at_boundary(self.prepare([beat]))
+            self.assertIn("customer_b", request["prompt"])
+        self.assertFalse(result.compilable)
+        self.assertEqual({issue.code for issue in result.blockers}, {"speech_turn_ambiguous"})
+        self.assertIn("ambiguous-audio", result.blockers[0].message)
+        self.assertIn("每个节拍一个说话人", result.blockers[0].message)
+
+    async def test_attributed_separate_background_turns_keep_each_voice_and_line(self):
+        spec = self.prepare([
+            {"speaker": "customer_a", "speech_mode": "off_screen", "dialogue": "Ready?"},
+            {"speaker": "customer_b", "speech_mode": "off_screen", "dialogue": "Let's go."},
+        ])
+        request = await self.request_at_boundary(spec)
+        self.assertIn("customer_a说出 {台词：Ready?}", request["prompt"])
+        self.assertIn("customer_b说出 {台词：Let's go.}", request["prompt"])
+        self.assertEqual(request["expected_text"], "Ready?Let's go.")
 
     async def test_explicit_visible_cast_is_not_filtered_by_audio_name_hints(self):
         spec = self.prepare([{

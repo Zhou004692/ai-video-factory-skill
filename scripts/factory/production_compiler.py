@@ -234,6 +234,22 @@ def _deterministic_issues(
                     "或确认所有说话人使用同一模式后显式设置 speech_mode"
                 ),
             ))
+        elif (
+            beat.dialogue and len(set(beat.speakers)) > 1
+            and not on_screen_speakers(beat)
+        ):
+            issues.append(ContractIssue(
+                code="speech_turn_ambiguous",
+                severity="blocking",
+                stage="creative_ir",
+                subject=beat.beat_id,
+                message=(
+                    f"创作节拍 {beat.beat_id} 的多个背景声音缺少可执行的逐人台词归属；"
+                    "请拆为每个节拍一个说话人并保留各自台词。"
+                    + ("当前编译不消费 dialogue_blocks 的话轮归属，请转换为逐人节拍。"
+                       if beat.extensions.get("dialogue_blocks") else "")
+                ),
+            ))
         for character in explicit_visible_cast(beat):
             if character and character.casefold() not in aliases:
                 issues.append(ContractIssue(
