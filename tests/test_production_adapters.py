@@ -48,6 +48,8 @@ class ProductionAdapterTests(unittest.IsolatedAsyncioTestCase):
             "spec_hash": "spec-adapter",
             "characters": self.storyboard["characters"],
             "runtime_storyboard": self.storyboard,
+            "nodes": [{"node_id": "master:1", "node_type": "master", "input": {"master_idx": 1}}],
+            "edges": [],
         }
         self.database.execute(
             "INSERT INTO jobs("
@@ -98,6 +100,7 @@ class ProductionAdapterTests(unittest.IsolatedAsyncioTestCase):
             characters_override=self.storyboard["characters"],
             target_master_indexes={1},
             prepare_anchors=False,
+            required_scene_anchor_keys=set(),
         )
         self.assertEqual(output["master_idx"], 1)
 

@@ -1692,9 +1692,11 @@ async def _ensure_scene_visual_anchors(
     }
     anchor_specs = (
         scene_assets.required_scene_anchors(storyboard, normalized_keys)
-        if normalized_keys
+        if anchor_keys is not None
         else scene_assets.recurring_scene_anchors(storyboard)
     )
+    if anchor_keys is not None and normalized_keys != {spec["anchor_key"] for spec in anchor_specs}:
+        raise ValueError("required scene anchor keys do not resolve in storyboard")
     for ordinal, spec in enumerate(anchor_specs, start=1):
         spec = anchor_generation.decorate_scene_anchor(
             spec,
@@ -4420,6 +4422,7 @@ async def run(
     characters_override: list[dict] | None = None,
     target_master_indexes: set[int] | None = None,
     prepare_anchors: bool = True,
+    required_scene_anchor_keys: set[str] | None = None,
 ) -> None:
     db = conn()
     job = db.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
@@ -4526,12 +4529,27 @@ async def run(
     ))
     results: list[tuple[int, Exception | None]] = []
     required_character_ids = _required_character_ids(target_units)
-    required_scene_keys: set[str] = set()
-    for unit in target_units:
-        for field in ("scene_anchor_key", "site_anchor_key"):
-            value = str(unit.get(field) or "").strip().casefold()
-            if value:
-                required_scene_keys.add(value)
+    if required_scene_anchor_keys is None:
+        derived_scene_keys = {
+            str(unit.get(field) or "").strip().casefold()
+            for unit in target_units for field in ("scene_anchor_key", "site_anchor_key")
+            if str(unit.get(field) or "").strip()
+        }
+        # Legacy empty derivation retained the job-wide recurrence fallback.
+        required_scene_keys = derived_scene_keys or None
+        scene_storyboard = sb
+    else:
+        required_scene_keys = {
+            str(value or "").strip().casefold() for value in required_scene_anchor_keys
+        }
+        scene_storyboard = {**sb, "masters": target_units}
+        resolved_keys = {
+            item["anchor_key"] for item in scene_assets.required_scene_anchors(
+                scene_storyboard, required_scene_keys,
+            )
+        }
+        if required_scene_keys != resolved_keys:
+            raise ValueError("required scene anchor keys do not resolve for selected masters")
     anchor_characters = [
         character for character in characters
         if not required_character_ids
@@ -4546,7 +4564,7 @@ async def run(
     )
     scene_anchors = (
         await _ensure_scene_visual_anchors(
-            job_id, sb, anchor_keys=required_scene_keys,
+            job_id, scene_storyboard, anchor_keys=required_scene_keys,
             existing_only=not prepare_anchors,
         ) if rows else {}
     )

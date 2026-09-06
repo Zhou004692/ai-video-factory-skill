@@ -206,6 +206,88 @@ def _frozen_spec(
     return spec, node_input if isinstance(node_input, dict) else {}
 
 
+def _required_scene_anchor_keys(spec: dict, master_idx: int) -> set[str]:
+    """Read one master's asset requirements from the frozen graph, not identity.
+
+    A stable singleton keeps its scene identity without a paid scene node.
+    Missing graph structure is not evidence that dependencies are empty.
+    """
+    nodes, edges = spec.get("nodes"), spec.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        raise FrozenSpecMismatchError("frozen graph nodes/edges are missing or invalid")
+    by_id: dict[str, dict] = {}
+    for item in nodes:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("node_id"), str)
+            or not item["node_id"].strip()
+            or not isinstance(item.get("node_type"), str)
+            or not item["node_type"].strip()
+            or not isinstance(item.get("input"), dict)
+        ):
+            raise FrozenSpecMismatchError("frozen graph node is invalid")
+        if item["node_id"] in by_id:
+            raise FrozenSpecMismatchError("frozen graph node ids are not unique")
+        by_id[item["node_id"]] = item
+    for edge in edges:
+        if not isinstance(edge, dict) or any(
+            not isinstance(edge.get(field), str) or not edge[field].strip()
+            for field in ("from_node_id", "to_node_id", "edge_type")
+        ):
+            raise FrozenSpecMismatchError("frozen graph edge is invalid")
+        if edge["from_node_id"] not in by_id or edge["to_node_id"] not in by_id:
+            raise FrozenSpecMismatchError("frozen graph edge endpoint is missing")
+    master_id = f"master:{master_idx}"
+    masters = [item for item in nodes if item["node_type"] == "master"
+               and type(item["input"].get("master_idx")) is int
+               and item["input"]["master_idx"] == master_idx]
+    if len(masters) != 1 or masters[0]["node_id"] != master_id:
+        raise FrozenSpecMismatchError("current master is missing or mismatched in frozen graph")
+    runtime_units = spec.get("runtime_storyboard", {}).get("masters")
+    if not isinstance(runtime_units, list) or any(not isinstance(unit, dict) for unit in runtime_units):
+        raise FrozenSpecMismatchError("frozen runtime masters are invalid")
+    current = [unit for unit in runtime_units if type(unit.get("idx")) is int and unit["idx"] == master_idx]
+    if len(current) != 1:
+        raise FrozenSpecMismatchError("current frozen runtime master is missing or duplicated")
+    identity_keys = {
+        str(current[0].get(field) or "").strip().casefold()
+        for field in ("scene_anchor_key", "site_anchor_key")
+        if current[0].get(field)
+    }
+    required: set[str] = set()
+    incoming = [edge for edge in edges if edge["to_node_id"] == master_id]
+    for edge in incoming:
+        if edge["edge_type"] != "scene_reference":
+            continue
+        source = by_id[edge["from_node_id"]]
+        key = source["input"].get("scene_key")
+        if (
+            source["node_type"] != "scene_anchor"
+            or not isinstance(key, str) or not key.strip()
+            or source["node_id"] != f"scene_anchor:{key}"
+            or key.strip().casefold() not in identity_keys
+        ):
+            raise FrozenSpecMismatchError("frozen scene reference does not match current master")
+        required.add(key.strip().casefold())
+    # A canonical node for this scene/site may not lose its reference edge.
+    # Also reject a renamed/mistyped node instead of treating it as no asset.
+    for item in nodes:
+        key = item["input"].get("scene_key")
+        relevant = item["node_id"] in {f"scene_anchor:{value}" for value in identity_keys}
+        relevant = relevant or (item["node_type"] == "scene_anchor" and isinstance(key, str)
+                                and key.strip().casefold() in identity_keys)
+        if not relevant:
+            continue
+        if (item["node_type"] != "scene_anchor" or not isinstance(key, str)
+                or item["node_id"] != f"scene_anchor:{key}"
+                or key.strip().casefold() not in required
+                or not any(edge["from_node_id"] == item["node_id"] for edge in incoming)
+                or any(edge["from_node_id"] == item["node_id"] and edge["edge_type"] != "scene_reference"
+                       for edge in incoming)):
+            raise FrozenSpecMismatchError("frozen scene anchor is missing its scene_reference edge")
+    return required
+
+
 async def run_master_node(
     database: sqlite3.Connection, node: sqlite3.Row,
 ) -> production_executor.NodeOutcome | dict[str, object]:
@@ -216,6 +298,7 @@ async def run_master_node(
         raise FrozenSpecMismatchError("master node has no valid index") from exc
     if master_idx <= 0 or str(node["node_id"]) != f"master:{master_idx}":
         raise FrozenSpecMismatchError("master node id and frozen input disagree")
+    required_scene_keys = _required_scene_anchor_keys(spec, master_idx)
     storyboard = _overlay_mutable_runtime_controls(
         database,
         str(node["job_id"]),
@@ -228,6 +311,7 @@ async def run_master_node(
         characters_override=characters,
         target_master_indexes={master_idx},
         prepare_anchors=False,
+        required_scene_anchor_keys=required_scene_keys,
     )
     shot = database.execute(
         "SELECT state,video_path,video_qa,error FROM shots "

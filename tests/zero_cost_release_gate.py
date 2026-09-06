@@ -34,6 +34,7 @@ LEVEL_COMMANDS: dict[str, tuple[tuple[str, ...], ...]] = {
     "r1": ((
         "-m", "unittest",
         "tests.test_production_compiler",
+        "tests.test_frozen_scene_dependencies",
         "tests.test_production_graph",
         "tests.test_production_graph_runner",
         "tests.test_incident_replays",
