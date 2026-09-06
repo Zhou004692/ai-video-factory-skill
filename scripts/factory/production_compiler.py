@@ -219,6 +219,17 @@ def _deterministic_issues(
                     f"请使用 {', '.join(SPEECH_MODES)}"
                 ),
             ))
+        elif explicit_mode == "on_screen" and beat.dialogue.strip() and not beat.speakers:
+            issues.append(ContractIssue(
+                code="speaker_missing",
+                severity="blocking",
+                stage="creative_ir",
+                subject=beat.beat_id,
+                message=(
+                    f"创作节拍 {beat.beat_id} 明确要求入镜对白但未指定说话人；"
+                    "请通过 speaker/speakers 指定人物表中的入镜说话人"
+                ),
+            ))
         elif beat.dialogue and len({
             normalize_speech_mode(explicit_mode, speaker=speaker)
             for speaker in beat.speakers

@@ -593,6 +593,35 @@ class SpeechSemanticsCompilerTests(unittest.TestCase):
         self.assertEqual(result.spec.masters[0].speaker_ids, ())
         self.assertNotIn("lip_sync", result.spec.masters[0].quality_gates)
 
+    def test_explicit_onscreen_dialogue_requires_an_executable_speaker(self):
+        for fields in ({}, {"speaker": ""}, {"speakers": []},
+                       {"speaker": "  ", "speakers": ["", "  "]}):
+            with self.subTest(fields=fields):
+                result = self.compile_source([{
+                    "id": "missing-voice", "cast": ["worker"],
+                    "speech_mode": "on_screen", "dialogue": "Ready.", **fields,
+                }])
+                self.assertFalse(result.compilable)
+                self.assertIsNone(result.spec)
+                self.assertEqual({issue.code for issue in result.blockers}, {"speaker_missing"})
+                self.assertEqual(result.blockers[0].subject, "missing-voice")
+                self.assertIn("missing-voice", result.blockers[0].message)
+                self.assertIn("speaker", result.blockers[0].message)
+
+    def test_missing_speaker_guard_preserves_silent_audio_and_legacy_inputs(self):
+        for fields in (
+            {"speech_mode": "on_screen", "dialogue": ""},
+            {"speech_mode": "on_screen", "dialogue": "  "},
+            {"speech_mode": "off_screen", "dialogue": "Ready."},
+            {"speech_mode": "narration", "dialogue": "Ready."},
+            {"dialogue": "Ready."},
+        ):
+            with self.subTest(fields=fields):
+                result = self.compile_source([{"cast": ["worker"], **fields}])
+                self.assertTrue(result.compilable, result.issues)
+                self.assertEqual(result.spec.masters[0].character_ids, ("worker",))
+                self.assertEqual(result.spec.masters[0].speaker_ids, ())
+
     def test_silent_onscreen_actor_cannot_trigger_lip_sync_for_other_audio(self):
         for beats in (
             [{"speaker": "worker", "dialogue": ""}],
@@ -961,6 +990,28 @@ class RuntimeSpeechDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({issue.code for issue in result.blockers}, {"speech_turn_ambiguous"})
         self.assertIn("ambiguous-audio", result.blockers[0].message)
         self.assertIn("每个节拍一个说话人", result.blockers[0].message)
+
+    async def test_explicit_onscreen_without_speaker_cannot_reach_background_request(self):
+        beat = {"id": "missing-voice", "cast": ["worker"], "speech_mode": "on_screen",
+                "dialogue": "Ready.", "action": "worker speaks"}
+        source = {"characters": [{"id": "worker"}], "beats": [beat]}
+        result = production_compiler.compile_ir(
+            creative_ir.from_storyboard(source), job_id="J-missing-voice",
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=10000, runtime_storyboard=source,
+        )
+        if result.compilable:
+            # Exercise the former real request path: a visible actor cannot become
+            # an anonymous background voice merely because its speaker is missing.
+            request = await self.request_at_boundary(self.prepare([beat]))
+            self.fail(
+                "Explicit on-screen dialogue reached the provider boundary without a speaker: "
+                f"require_lip_sync={request['require_lip_sync']}; prompt={request['prompt']}"
+            )
+        self.assertFalse(result.compilable)
+        self.assertIsNone(result.spec)
+        self.assertEqual({issue.code for issue in result.blockers}, {"speaker_missing"})
+        self.assertIn("missing-voice", result.blockers[0].message)
 
     async def test_attributed_separate_background_turns_keep_each_voice_and_line(self):
         spec = self.prepare([
