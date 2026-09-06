@@ -5,7 +5,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Mapping
 
-from .creative_ir import CreativeIR
+from .creative_ir import CreativeIR, lip_sync_required, visible_cast
 
 
 FAST_ACTION_MARKERS = (
@@ -44,22 +44,6 @@ def classify_mode(score: int) -> str:
     return "experimental"
 
 
-def _beat_cast(beat) -> tuple[str, ...]:
-    raw = beat.extensions.get("characters") or beat.extensions.get("cast") or ()
-    if isinstance(raw, str):
-        raw = [raw]
-    cast = [
-        str(item.get("id") if isinstance(item, Mapping) else item).strip()
-        for item in raw if str(
-            item.get("id") if isinstance(item, Mapping) else item
-        ).strip()
-    ]
-    for speaker in beat.speakers:
-        if speaker and speaker not in cast:
-            cast.append(speaker)
-    return tuple(cast)
-
-
 def _scene_key(beat, index: int) -> str:
     explicit = str(
         beat.extensions.get("scene_id")
@@ -82,7 +66,7 @@ def _dialogue_density(creative: CreativeIR) -> float:
 
 
 def analyze(creative: CreativeIR) -> ComplexityReport:
-    casts = [_beat_cast(beat) for beat in creative.beats]
+    casts = [visible_cast(beat) for beat in creative.beats]
     appearances = Counter(character for cast in casts for character in set(cast))
     scene_keys = {
         _scene_key(beat, index)
@@ -95,7 +79,7 @@ def analyze(creative: CreativeIR) -> ComplexityReport:
         1 for count in appearances.values() if count > 1
     )
     dialogue_beats = sum(
-        1 for beat in creative.beats if beat.dialogue and beat.speakers
+        1 for beat in creative.beats if lip_sync_required(beat)
     )
     fast_action_count = sum(
         1 for beat in creative.beats
@@ -138,7 +122,7 @@ def analyze(creative: CreativeIR) -> ComplexityReport:
         recommendations.append("为重复核心空间生成场景锚点，跨空间使用显式转场")
     if max_on_screen > 2:
         risks.append("multi_character_staging")
-        recommendations.append("多人同镜采用固定站位合同，必要时拆为正反打和反应镜头")
+        recommendations.append("多人同镜保持身份与空间连续性，按剧情设计动态走位，必要时拆为正反打和反应镜头")
     if fast_action_count:
         risks.append("action_complexity")
         recommendations.append("复杂动作拆为连续动作节点，后一节点继承前一节点结果")

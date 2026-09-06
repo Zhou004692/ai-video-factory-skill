@@ -12,7 +12,11 @@ from typing import Literal, Mapping
 
 from . import master_dependencies, production_complexity
 from .clients import music, seedance
-from .creative_ir import CreativeBeat, CreativeIR, normalize_speech_mode
+from .creative_ir import (
+    CreativeBeat, CreativeIR, SPEECH_MODES, explicit_visible_cast,
+    lip_sync_required, normalize_speech_mode, on_screen_speakers,
+    visible_cast as _beat_cast,
+)
 from .production_contract import ContractIssue
 
 
@@ -158,23 +162,6 @@ def _speech_duration(dialogue: str) -> float:
     return round(max(0.0, len(compact) / 4.2), 2)
 
 
-def _beat_cast(beat: CreativeBeat) -> tuple[str, ...]:
-    raw = beat.extensions.get("characters") or beat.extensions.get("cast") or ()
-    if isinstance(raw, str):
-        raw = [raw]
-    cast = [
-        str(value.get("id") if isinstance(value, Mapping) else value).strip()
-        for value in raw
-        if str(value.get("id") if isinstance(value, Mapping) else value).strip()
-    ]
-    if normalize_speech_mode(
-        beat.extensions.get("speech_mode"),
-        speaker=beat.speakers[0] if beat.speakers else "",
-    ) == "on_screen":
-        cast.extend(speaker for speaker in beat.speakers if speaker not in cast)
-    return _unique(cast)
-
-
 def _scene_key(beat: CreativeBeat, index: int) -> str:
     explicit = str(
         beat.extensions.get("scene_id")
@@ -219,14 +206,35 @@ def _deterministic_issues(
         ))
     root_path = Path(root).expanduser().resolve() if root is not None else None
     for index, beat in enumerate(creative.beats, 1):
-        raw_cast = beat.extensions.get("characters") or beat.extensions.get("cast") or ()
-        if isinstance(raw_cast, str):
-            raw_cast = [raw_cast]
-        for raw_character in raw_cast:
-            character = str(
-                raw_character.get("id")
-                if isinstance(raw_character, Mapping) else raw_character
-            ).strip()
+        raw_mode = beat.extensions.get("speech_mode")
+        explicit_mode = str(raw_mode).strip().lower() if raw_mode is not None else ""
+        if explicit_mode and explicit_mode not in SPEECH_MODES:
+            issues.append(ContractIssue(
+                code="speech_mode_invalid",
+                severity="blocking",
+                stage="creative_ir",
+                subject=beat.beat_id,
+                message=(
+                    f"创作节拍 {beat.beat_id} 的 speech_mode={explicit_mode!r} 无效；"
+                    f"请使用 {', '.join(SPEECH_MODES)}"
+                ),
+            ))
+        elif beat.dialogue and len({
+            normalize_speech_mode(explicit_mode, speaker=speaker)
+            for speaker in beat.speakers
+        }) > 1:
+            issues.append(ContractIssue(
+                code="speech_mode_ambiguous",
+                severity="blocking",
+                stage="creative_ir",
+                subject=beat.beat_id,
+                message=(
+                    f"创作节拍 {beat.beat_id} 的说话人包含不同语音模式；"
+                    "请按说话轮次拆分节拍并分别指定 speech_mode，"
+                    "或确认所有说话人使用同一模式后显式设置 speech_mode"
+                ),
+            ))
+        for character in explicit_visible_cast(beat):
             if character and character.casefold() not in aliases:
                 issues.append(ContractIssue(
                     code="character_unknown",
@@ -235,11 +243,7 @@ def _deterministic_issues(
                     subject=f"{beat.beat_id}:{character}",
                     message=f"创作节拍 {beat.beat_id} 的出镜人物 {character} 未出现在人物表中",
                 ))
-        for speaker in beat.speakers:
-            if normalize_speech_mode(
-                beat.extensions.get("speech_mode"), speaker=speaker
-            ) != "on_screen":
-                continue
+        for speaker in on_screen_speakers(beat):
             if speaker.casefold() not in aliases:
                 issues.append(ContractIssue(
                     code="speaker_unknown",
@@ -620,7 +624,7 @@ def _compiled_runtime_storyboard(
             if isinstance(continuity_scene, Mapping)
             else ""
         ).strip() or "；".join(scenes)
-        has_dialogue = bool(spec.dialogue)
+        has_dialogue = bool(spec.dialogue.strip())
         performance_beats = _runtime_performance_beats(group)
         for performance_beat in performance_beats:
             performance_beat.pop("site_anchor_key", None)
@@ -690,10 +694,15 @@ def _compiled_runtime_storyboard(
     return storyboard
 
 
-def _quality_gates(mode: str, has_dialogue: bool) -> tuple[str, ...]:
+def _quality_gates(
+    mode: str, has_dialogue: bool, *, requires_lip_sync: bool,
+) -> tuple[str, ...]:
     gates = ["unexpected_readable_text", "duration_complete"]
     if has_dialogue:
-        gates.extend(("transcript_complete", "lip_sync", "subtitle_sync"))
+        gates.append("transcript_complete")
+        if requires_lip_sync:
+            gates.append("lip_sync")
+        gates.append("subtitle_sync")
     if mode in {"enhanced", "experimental"}:
         gates.extend(("character_consistency", "scene_continuity", "staging"))
     if mode == "experimental":
@@ -863,14 +872,9 @@ def compile_ir(
         speakers = _unique(
             speaker
             for unit in group
-            if normalize_speech_mode(
-                unit.beat.extensions.get("speech_mode"),
-                speaker=unit.beat.speakers[0] if unit.beat.speakers else "",
-            ) == "on_screen"
-            for speaker in unit.beat.speakers
+            if unit.dialogue.strip()
+            for speaker in on_screen_speakers(unit.beat)
         )
-        if not speakers and cast:
-            speakers = (cast[0],)
         requirements = _unique(
             requirement
             for unit in group
@@ -895,7 +899,7 @@ def compile_ir(
         generation_duration = seedance.normalize_generation_duration(
             editorial_duration
         )
-        has_dialogue = any(unit.dialogue for unit in group)
+        has_dialogue = any(unit.dialogue.strip() for unit in group)
         masters.append(MasterSpecV2(
             idx=idx,
             scene_key=group[0].scene_key,
@@ -908,7 +912,12 @@ def compile_ir(
             action="；".join(_unique(unit.beat.action for unit in group)),
             preserved_requirements=requirements,
             adaptation_actions=_unique(actions),
-            quality_gates=_quality_gates(complexity.mode, has_dialogue),
+            quality_gates=_quality_gates(
+                complexity.mode, has_dialogue,
+                requires_lip_sync=any(
+                    unit.dialogue.strip() and lip_sync_required(unit.beat) for unit in group
+                ),
+            ),
             depends_on=depends_on,
             estimated_cost_cents=seedance.estimate_cost_cents(
                 generation_duration, "480p"

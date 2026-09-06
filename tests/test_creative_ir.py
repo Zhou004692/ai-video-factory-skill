@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from copy import deepcopy
 from pathlib import Path
 import sys
 import unittest
@@ -16,6 +17,50 @@ from factory import creative_ir
 
 
 class CreativeIRTests(unittest.TestCase):
+    def test_master_speech_mode_is_inherited_unless_a_turn_overrides_it(self):
+        source = {
+            "masters": [{
+                "idx": 3, "scene": "yard", "cast": ["worker"],
+                "speaker": "customer_voice", "speech_mode": "off_screen",
+                "performance_beats": [
+                    {"dialogue": "Ready?", "tone": "question"},
+                    {"speaker": "worker", "dialogue": "Ready.",
+                     "speech_mode": "on_screen"},
+                    {"speaker": "narrator", "dialogue": "They leave.",
+                     "speech_mode": "narration"},
+                ],
+            }],
+        }
+        original = deepcopy(source)
+
+        result = creative_ir.from_storyboard(source)
+
+        self.assertEqual(
+            [beat.extensions.get("speech_mode") for beat in result.beats],
+            ["off_screen", "on_screen", "narration"],
+        )
+        self.assertEqual(result.beats[0].speakers, ("customer_voice",))
+        self.assertEqual(result.beats[0].extensions["tone"], "question")
+        self.assertEqual(creative_ir.from_dict(result.as_dict()), result)
+        self.assertEqual(source, original)
+
+    def test_normalization_keeps_legacy_fallback_and_explicit_mode_priority(self):
+        for value, speaker, expected in (
+            (None, "背景台词", "off_screen"),
+            (None, "旁白", "narration"),
+            (None, "worker", "on_screen"),
+            (" ON_SCREEN ", "旁白", "on_screen"),
+            ("off_screen", "worker", "off_screen"),
+            ("narration", "worker", "narration"),
+            ("unsupported", "worker", "on_screen"),
+            ("unsupported", "背景台词", "off_screen"),
+        ):
+            with self.subTest(value=value, speaker=speaker):
+                self.assertEqual(
+                    creative_ir.normalize_speech_mode(value, speaker=speaker),
+                    expected,
+                )
+
     def test_normalized_ir_can_be_restored_losslessly(self):
         source = load_profile_fixture("experimental_multi_character_action")
         first = creative_ir.from_storyboard(source)

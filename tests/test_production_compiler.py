@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
 import sys
 import tempfile
 import unittest
@@ -529,6 +530,212 @@ class ProductionCompilerTests(unittest.TestCase):
             ("bgm", "local_compose"),
             {(edge.from_node_id, edge.to_node_id) for edge in result.spec.edges},
         )
+
+
+class SpeechSemanticsCompilerTests(unittest.TestCase):
+    def compile_source(self, beats, characters=None):
+        source = {
+            "characters": [{"id": item} for item in (
+                characters if characters is not None else ["worker"]
+            )],
+            "beats": [{"id": f"turn-{index}", "scene": "yard",
+                       "duration_sec": 4, **beat}
+                      for index, beat in enumerate(beats, 1)],
+        }
+        return production_compiler.compile_ir(
+            creative_ir.from_storyboard(source), job_id="J-speech",
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=10000, runtime_storyboard=source,
+        )
+
+    def test_audio_only_modes_never_fabricate_an_onscreen_speaker(self):
+        for mode, speaker in (("off_screen", "customer_voice"),
+                              ("narration", "worker"),
+                              (None, "旁白"), (None, "背景台词")):
+            for visible in ([], ["worker"]):
+                with self.subTest(mode=mode, speaker=speaker, visible=visible):
+                    beat = {"speaker": speaker, "dialogue": "Ready?",
+                            "characters": visible, "tone": "quiet"}
+                    if mode:
+                        beat["speech_mode"] = mode
+                    result = self.compile_source([beat])
+                    self.assertTrue(result.compilable, result.issues)
+                    master = result.spec.masters[0]
+                    self.assertEqual(master.character_ids, tuple(visible))
+                    self.assertEqual(master.speaker_ids, ())
+                    self.assertNotIn("lip_sync", master.quality_gates)
+                    self.assertIn("transcript_complete", master.quality_gates)
+                    self.assertIn("subtitle_sync", master.quality_gates)
+                    self.assertEqual(result.spec.complexity["dimensions"]
+                                     ["lip_sync_required_count"], 0)
+                    runtime = result.spec.runtime_storyboard["masters"][0]
+                    self.assertEqual(runtime["speaker"], "")
+                    self.assertEqual(runtime["speakers"], [])
+                    self.assertEqual(runtime["audio_speakers"], [speaker])
+                    self.assertEqual(runtime["voiceover"], "Ready?")
+                    self.assertEqual(runtime["subtitle"], "Ready?")
+                    self.assertEqual(runtime["performance_beats"][0]["tone"], "quiet")
+                    identity_edges = [edge.from_node_id for edge in result.spec.edges
+                                      if edge.edge_type == "identity_reference"]
+                    self.assertEqual(identity_edges,
+                                     [f"character_anchor:{item}" for item in visible])
+
+    def test_explicit_visible_audio_character_is_preserved_without_lip_sync(self):
+        result = self.compile_source([{
+            "speaker": "worker", "speech_mode": "off_screen",
+            "dialogue": "Inner thought", "cast": [{"id": "worker"}],
+        }])
+        self.assertTrue(result.compilable, result.issues)
+        self.assertEqual(result.spec.masters[0].character_ids, ("worker",))
+        self.assertEqual(result.spec.masters[0].speaker_ids, ())
+        self.assertNotIn("lip_sync", result.spec.masters[0].quality_gates)
+
+    def test_silent_onscreen_actor_cannot_trigger_lip_sync_for_other_audio(self):
+        for beats in (
+            [{"speaker": "worker", "dialogue": ""}],
+            [{"speaker": "worker", "dialogue": ""},
+             {"speaker": "narrator", "dialogue": "They leave."}],
+            [{"characters": ["worker"]}],
+        ):
+            with self.subTest(beats=beats):
+                result = self.compile_source(beats)
+                self.assertTrue(result.compilable, result.issues)
+                self.assertEqual(result.spec.masters[0].character_ids, ("worker",))
+                self.assertEqual(result.spec.masters[0].speaker_ids, ())
+                runtime = result.spec.runtime_storyboard["masters"][0]
+                self.assertEqual(runtime["speaker"], "")
+                self.assertEqual(runtime["speakers"], [])
+                self.assertNotIn("lip_sync", result.spec.masters[0].quality_gates)
+                if not any(beat.get("dialogue") for beat in beats):
+                    self.assertNotIn("transcript_complete", result.spec.masters[0].quality_gates)
+                    self.assertNotIn("subtitle_sync", result.spec.masters[0].quality_gates)
+
+    def test_mixed_inferred_modes_in_one_turn_need_explicit_correction(self):
+        for speakers in (["worker", "背景台词", "narrator"],
+                         ["narrator", "背景台词", "worker"]):
+            with self.subTest(speakers=speakers):
+                result = self.compile_source([{
+                    "speakers": speakers, "dialogue": "Ready? Ready.",
+                }])
+                self.assertFalse(result.compilable)
+                self.assertEqual({issue.code for issue in result.blockers},
+                                 {"speech_mode_ambiguous"})
+                self.assertEqual(result.blockers[0].stage, "creative_ir")
+                self.assertEqual(result.blockers[0].subject, "turn-1")
+
+    def test_whitespace_only_duration_split_has_no_spoken_quality_gates(self):
+        result = self.compile_source([{
+            "speaker": "worker", "dialogue": "A B", "duration_sec": 90,
+        }])
+        self.assertTrue(result.compilable, result.issues)
+        self.assertEqual([master.dialogue for master in result.spec.masters],
+                         ["A", " ", "B"])
+        silent = result.spec.masters[1]
+        self.assertEqual(silent.character_ids, ("worker",))
+        self.assertEqual(silent.speaker_ids, ())
+        self.assertTrue({"lip_sync", "transcript_complete", "subtitle_sync"}
+                        .isdisjoint(silent.quality_gates))
+        self.assertEqual(result.spec.runtime_storyboard["masters"][1]["type"], "broll")
+
+    def test_explicit_global_mode_overrides_all_speaker_hints(self):
+        for mode, expected_cast, expected_speakers in (
+            ("on_screen", ("worker", "narrator"), ("worker", "narrator")),
+            ("off_screen", (), ()), ("narration", (), ()),
+        ):
+            with self.subTest(mode=mode):
+                result = self.compile_source([{
+                    "speakers": ["worker", "narrator"],
+                    "speech_mode": mode, "dialogue": "Ready? Ready.",
+                }], characters=["worker", "narrator"])
+                self.assertTrue(result.compilable, result.issues)
+                self.assertEqual(result.spec.masters[0].character_ids, expected_cast)
+                self.assertEqual(result.spec.masters[0].speaker_ids, expected_speakers)
+                self.assertEqual("lip_sync" in result.spec.masters[0].quality_gates,
+                                 mode == "on_screen")
+
+    def test_homogeneous_implicit_speaker_lists_remain_supported(self):
+        for speakers, characters, expected in (
+            (["worker", "lead"], ["worker", "lead"], ("worker", "lead")),
+            (["旁白", "narrator"], [], ()),
+            (["背景台词", "offscreen"], [], ()),
+        ):
+            with self.subTest(speakers=speakers):
+                result = self.compile_source([{
+                    "speakers": speakers, "dialogue": "Ready? Ready.",
+                }], characters=characters)
+                self.assertTrue(result.compilable, result.issues)
+                self.assertEqual(result.spec.masters[0].speaker_ids, expected)
+                self.assertEqual(result.spec.runtime_storyboard["masters"][0]
+                                 ["audio_speakers"], speakers)
+
+    def test_unknown_visible_identity_is_still_blocking(self):
+        for beat, codes in (
+            ({"speaker": "unknown", "dialogue": "Ready."}, {"speaker_unknown"}),
+            ({"speaker": "narrator", "speech_mode": "on_screen",
+              "dialogue": "Ready."}, {"speaker_unknown"}),
+            ({"speaker": "unknown", "speech_mode": "off_screen",
+              "characters": ["unknown"], "dialogue": "Ready."}, {"character_unknown"}),
+            ({"speakers": ["narrator", "unknown"], "dialogue": "Ready."},
+             {"speech_mode_ambiguous", "speaker_unknown"}),
+        ):
+            with self.subTest(beat=beat):
+                result = self.compile_source([beat])
+                self.assertFalse(result.compilable)
+                self.assertEqual({issue.code for issue in result.blockers}, codes)
+
+    def test_invalid_explicit_modes_are_reported_without_changing_normalization(self):
+        for mode in ("offscreen", "on_sceen", "unsupported", 0, False, []):
+            with self.subTest(mode=mode):
+                result = self.compile_source([{
+                    "speaker": "worker", "speech_mode": mode, "dialogue": "Ready.",
+                }])
+                self.assertFalse(result.compilable)
+                self.assertEqual({issue.code for issue in result.blockers},
+                                 {"speech_mode_invalid"})
+                self.assertEqual(result.blockers[0].stage, "creative_ir")
+                self.assertIn(str(mode).lower(), result.blockers[0].message)
+                self.assertEqual(creative_ir.normalize_speech_mode(mode), "on_screen")
+
+    def test_separate_turn_modes_preserve_audio_and_performance_metadata(self):
+        source = {
+            "characters": [{"id": "worker"}],
+            "masters": [{
+                "idx": 1, "scene": "yard", "cast": ["worker"],
+                "speaker": "customer_voice", "speech_mode": "off_screen",
+                "duration": 12,
+                "performance_beats": [
+                    {"dialogue": "Ready?", "duration": 4, "tone": "question",
+                     "facial_expression": "listening", "gesture": "checks machine"},
+                    {"speaker": "worker", "dialogue": "Ready.", "duration": 4,
+                     "speech_mode": "on_screen", "tone": "confident"},
+                    {"speaker": "narrator", "dialogue": "They leave.", "duration": 4,
+                     "speech_mode": "narration", "tone": "calm"},
+                ],
+            }],
+        }
+        original = deepcopy(source)
+        result = production_compiler.compile_ir(
+            creative_ir.from_storyboard(source), job_id="J-turns",
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=10000, runtime_storyboard=source,
+        )
+        self.assertTrue(result.compilable, result.issues)
+        self.assertEqual(len(result.spec.masters), 1)
+        master = result.spec.masters[0]
+        self.assertEqual(master.character_ids, ("worker",))
+        self.assertEqual(master.speaker_ids, ("worker",))
+        self.assertIn("lip_sync", master.quality_gates)
+        self.assertEqual(result.spec.complexity["dimensions"]["lip_sync_required_count"], 1)
+        runtime = result.spec.runtime_storyboard["masters"][0]
+        self.assertEqual(runtime["audio_speakers"], ["customer_voice", "worker", "narrator"])
+        self.assertEqual(runtime["voiceover"], "Ready?Ready.They leave.")
+        turns = runtime["performance_beats"]
+        self.assertEqual([turn["speech_mode"] for turn in turns],
+                         ["off_screen", "on_screen", "narration"])
+        self.assertEqual([turn["tone"] for turn in turns], ["question", "confident", "calm"])
+        self.assertEqual(turns[0]["facial_expression"], "listening")
+        self.assertEqual(turns[0]["gesture"], "checks machine")
+        self.assertEqual(source, original)
 
 
 if __name__ == "__main__":

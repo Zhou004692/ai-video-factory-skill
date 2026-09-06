@@ -107,6 +107,32 @@ class CreativeIR:
         }
 
 
+def explicit_visible_cast(beat: CreativeBeat) -> tuple[str, ...]:
+    """Keep explicitly visible identities, independent of their audio mode."""
+    raw = beat.extensions.get("characters") or beat.extensions.get("cast") or ()
+    return tuple(dict.fromkeys(_tuple_text(raw)))
+
+
+def on_screen_speakers(beat: CreativeBeat) -> tuple[str, ...]:
+    """Infer each voice independently unless a valid beat mode overrides it."""
+    return tuple(dict.fromkeys(
+        speaker for speaker in beat.speakers
+        if normalize_speech_mode(
+            beat.extensions.get("speech_mode"), speaker=speaker,
+        ) == "on_screen"
+    ))
+
+
+def visible_cast(beat: CreativeBeat) -> tuple[str, ...]:
+    """Audio-only identities never imply visibility; explicit cast still does."""
+    return tuple(dict.fromkeys((*explicit_visible_cast(beat), *on_screen_speakers(beat))))
+
+
+def lip_sync_required(beat: CreativeBeat) -> bool:
+    """Only a beat with actual on-screen dialogue needs mouth synchronization."""
+    return bool(beat.dialogue and on_screen_speakers(beat))
+
+
 def _speakers(beat: Mapping[str, object]) -> tuple[str, ...]:
     explicit = _tuple_text(beat.get("speakers"))
     if explicit:
@@ -166,6 +192,8 @@ def _beats_from_masters(source: Mapping[str, object]) -> list[CreativeBeat]:
                     "duration_sec": raw_beat.get("duration") or raw_master.get("duration"),
                     **dict(raw_beat),
                 }
+                if "speech_mode" in raw_master and "speech_mode" not in raw_beat:
+                    combined["speech_mode"] = raw_master["speech_mode"]
                 result.append(_creative_beat(
                     combined, len(result) + 1, source_master_idx=master_idx,
                 ))
