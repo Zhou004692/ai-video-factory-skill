@@ -1867,6 +1867,57 @@ class StoryboardLongSceneTests(unittest.TestCase):
 
 
 class VideoQATests(unittest.TestCase):
+    def test_background_speech_can_disable_only_lip_sync_not_transcript_or_visual_checks(self):
+        self.assertIn("require_lip_sync", inspect.signature(video_qa.evaluate).parameters)
+        for transcript, visible_text, expected_reasons in (
+            ("Ready for delivery", False, ()),
+            ("Ready", False, ("transcript_mismatch",)),
+            ("Ready for delivery", True, ("unexpected_readable_text",)),
+        ):
+            with self.subTest(transcript=transcript, visible_text=visible_text):
+                raw = {"transcript": transcript, "confidence": 1.0, "lip_sync": False,
+                       "has_readable_text": visible_text,
+                       "lip_sync_evidence": {"overall_alignment": 0.2, "confidence": 0.99,
+                                             "segments": []}}
+                decision = video_qa.evaluate(
+                    raw, expect_speech=True, expected_text="Ready for delivery",
+                    require_lip_sync=False, forbid_readable_text=True,
+                )
+                self.assertEqual(decision.reasons, expected_reasons)
+                self.assertEqual(decision.passed, not expected_reasons)
+                self.assertIs(raw["lip_sync"], False)
+                self.assertEqual(raw["lip_sync_evidence"]["overall_alignment"], 0.2)
+
+    def test_onscreen_speech_keeps_default_lip_sync_gate(self):
+        decision = video_qa.evaluate(
+            {"transcript": "Ready", "confidence": 1.0, "lip_sync": False},
+            expect_speech=True, expected_text="Ready",
+        )
+        self.assertEqual(decision.reasons, ("lip_sync_mismatch",))
+
+    def test_background_analyzer_preserves_blind_evidence_without_lip_sync_requirement(self):
+        observed = {"transcript": "Ready", "confidence": 1.0, "lip_sync": False}
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(observed)}}],
+        }
+        client = Mock()
+        client.__enter__ = Mock(return_value=client)
+        client.__exit__ = Mock(return_value=False)
+        client.post.return_value = response
+        with patch.dict(os.environ, {"ARK_API_KEY": "local-test"}), patch.object(
+            video_qa.httpx, "Client", return_value=client,
+        ):
+            raw, decision = video_qa.analyze(
+                "https://example.invalid/video.mp4", expect_speech=True,
+                expected_text="Ready", require_lip_sync=False,
+            )
+        self.assertTrue(decision.passed)
+        self.assertIs(raw["lip_sync"], False)
+        self.assertEqual(raw["transcript"], "Ready")
+        prompt = client.post.call_args.kwargs["json"]["messages"][0]["content"][1]["text"]
+        self.assertNotIn("口型证据必须覆盖整段视频", prompt)
+
     def test_continuity_analyzer_compares_current_video_to_canonical_and_previous_refs(self):
         response = Mock(status_code=200)
         response.json.return_value = {
@@ -4364,6 +4415,40 @@ class Seedance25DialogueTests(unittest.TestCase):
 
 
 class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_background_generation_keeps_transcript_qa_without_lip_sync_gate(self):
+        raw = {"lip_sync": False, "visual_comparison": {"alignment": 1.0},
+               "lip_sync_evidence": {"overall_alignment": 0.2, "confidence": 0.99,
+                                     "segments": []}}
+        analyze = Mock(return_value=(raw, video_qa.QADecision(True, ())))
+
+        async def generated(**kwargs):
+            kwargs["metadata_out"].update({
+                "task_id": "local-background", "usage": {"completion_tokens": 1000},
+            })
+            return b"video"
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            s3_shots.seedance, "text_to_video", new=AsyncMock(side_effect=generated),
+        ), patch.object(
+            s3_shots.tos, "upload", return_value="https://example.invalid/background.mp4",
+        ), patch.object(
+            s3_shots.video_qa, "analyze", new=analyze,
+        ), patch.object(
+            s3_shots.ffmpeg, "extract_audio_wav", new=AsyncMock(),
+        ):
+            result = await s3_shots._generate_seedance_video(
+                prompt="Worker listens silently to off-screen voice",
+                route=video_routing.VideoRoute("seedance25", "seedance25", True, True),
+                request_kwargs={"duration": 4, "resolution": "480p"},
+                out_path=Path(tmp) / "background.mp4", key_hint="local-background",
+                expected_text="Ready", require_lip_sync=False,
+                fixed_transcription=bigasr.Transcription("Ready"),
+            )
+        self.assertTrue(analyze.call_args.kwargs["expect_speech"])
+        self.assertFalse(analyze.call_args.kwargs["require_lip_sync"])
+        self.assertEqual(result.transcription.text, "Ready")
+        self.assertIs(raw["lip_sync"], False)
+
     async def _measure_broll_concurrency(
         self, *, masters: list[dict], characters: list[dict] | None = None
     ) -> tuple[int, list[str]]:

@@ -2178,11 +2178,13 @@ def _scene_cast_characters(
     those names is safer than the previous behaviour of injecting every story
     character into every shot.
     """
+    background_voiceover = shot.get("render_mode") == "background_voiceover"
     explicit = list(shot.get("cast") or [])
-    explicit.extend(shot.get("speakers") or [])
-    for block in shot.get("dialogue_blocks") or []:
-        if isinstance(block, dict) and block.get("speaker"):
-            explicit.append(block["speaker"])
+    if not background_voiceover:
+        explicit.extend(shot.get("speakers") or [])
+        for block in shot.get("dialogue_blocks") or []:
+            if isinstance(block, dict) and block.get("speaker"):
+                explicit.append(block["speaker"])
     explicit_names: set[str] = set()
     for item in explicit:
         if isinstance(item, dict):
@@ -2210,6 +2212,9 @@ def _scene_cast_characters(
             speaker=str(beat.get("speaker") or "").strip(),
         ) == "on_screen"
     }
+    if background_voiceover:
+        # Compiled visibility is authoritative even for names such as narrator.
+        explicit_on_screen.update(explicit_names)
     for character_id, character in characters.items():
         if character_id == speaker_id:
             continue
@@ -2229,7 +2234,7 @@ def _scene_cast_characters(
             )
             if str(value or "").strip()
         }
-        included = bool(names & explicit_names) if explicit_names else any(
+        included = bool(names & explicit_names) if explicit_names or background_voiceover else any(
             name in haystack for name in names
         )
         if not included:
@@ -2686,6 +2691,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                                     billing_provider: str = "seedance",
                                     forbid_people: bool = False,
                                     expected_text: str | None = None,
+                                    require_lip_sync: bool = True,
                                     require_broll_semantics: bool = False,
                                     continuity_context: dict | None = None,
                                     paid_batch_id: str | None = None,
@@ -3162,6 +3168,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 video_qa.analyze,
                 url,
                 expect_speech=bool(expected_text),
+                require_lip_sync=require_lip_sync,
                 expected_visual=prompt,
                 forbid_people=forbid_people,
                 forbid_readable_text=True,
@@ -3182,6 +3189,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             decision = video_qa.evaluate(
                 raw,
                 expect_speech=bool(expected_text) and asr_enabled,
+                require_lip_sync=require_lip_sync,
                 expected_text=expected_text if asr_enabled else None,
                 expected_visual=prompt,
                 forbid_people=forbid_people,
@@ -3782,6 +3790,36 @@ def _build_scene_voiceover_video_prompt(
     return "\n".join(parts)
 
 
+def _build_background_voiceover_prompt(
+    shot: dict, *, cast_characters: list[dict], reference_manifest: list[dict],
+) -> str:
+    """Keep visible performance separate from the exact off-screen audio."""
+    editorial_duration = float(shot.get("duration_sec") or 8)
+    duration = seedance.normalize_generation_duration(editorial_duration)
+    cast_names = [
+        str(character.get("script_character_name") or character.get("name")
+            or character.get("id") or "") for character in cast_characters
+    ]
+    return "\n".join([
+        "创作意图：画外声音推动剧情，明确出镜人物仅作无声表演，不生成口播。",
+        "素材职责（编号严格对应本次请求顺序）：",
+        *reference_attention.compile_prompt_duties(reference_manifest),
+        f"可见人物：{'、'.join(cast_names) if cast_names else '无，不得新增出镜人物'}。",
+        f"场景：{non_text_visual_text(shot.get('scene') or '')}",
+        f"动作：{non_text_visual_text(shot.get('action') or '')}",
+        f"运镜：{non_text_visual_text(shot.get('camera') or '')}",
+        "连续整数秒导演时间轴：",
+        *_cinematic_director_time_beats(
+            shot, duration=duration, editorial_duration=editorial_duration,
+        ),
+        "台词只进入音轨，严格按各节拍的声音身份、顺序、表演和全文说出，不得增删改写。",
+        "音频人物不因发声而入镜；明确出镜人物保持身份、动作与空间连续性，"
+        "全程闭嘴，不做口型同步。身份素材只约束可见人物，不指定画外音声线。",
+        f"<环境音：{_sound_design_for(shot)}>；无 BGM。",
+        "禁止任何可读文字、字幕、品牌、设备编号、车牌、字母、数字、二维码或水印。",
+    ])
+
+
 def _blocking_anchor_text(blocking_anchor: dict | None) -> str:
     blocking = blocking_anchor or {}
     positions = []
@@ -4140,6 +4178,10 @@ async def _gen_broll(job_id: str, shot: dict,
     async with sem:
         try:
             _mark_shot_generating(job_id, shot["idx"])
+            background_voiceover = bool(
+                scene_voiceover
+                and sb_shot.get("render_mode") == "background_voiceover"
+            )
             precision_reason = precision_motion_reason(sb_shot)
             if precision_reason:
                 raise RuntimeError(
@@ -4201,12 +4243,19 @@ async def _gen_broll(job_id: str, shot: dict,
             else:
                 request_kwargs = (
                     _scene_voiceover_request_kwargs(runtime_shot, voice_anchor)
-                    if scene_voiceover else _broll_request_kwargs(
+                    if scene_voiceover and not background_voiceover else _broll_request_kwargs(
                         runtime_shot,
                         cast_characters=cast_characters,
                         identity_anchors=identity_anchors,
                         scene_reference=scene_reference,
                     )
+                )
+            if background_voiceover and not extend_mode:
+                if voice_anchor is not None:
+                    request_kwargs["reference_audios"] = [str(voice_anchor.audio_path)]
+                prompt_full = _build_background_voiceover_prompt(
+                    runtime_shot, cast_characters=cast_characters or [],
+                    reference_manifest=request_kwargs.get("reference_manifest") or [],
                 )
             if not scene_voiceover and not extend_mode:
                 prompt_full = _build_broll_video_prompt(
@@ -4222,7 +4271,7 @@ async def _gen_broll(job_id: str, shot: dict,
                 request_kwargs["reference_audios"] = [
                     str(fixed_voice_track.audio_path)
                 ]
-            if extend_mode or (not scene_voiceover and (
+            if extend_mode or ((not scene_voiceover or background_voiceover) and (
                 request_kwargs.get("reference_videos")
                 or request_kwargs.get("references")
             )):
@@ -4246,13 +4295,18 @@ async def _gen_broll(job_id: str, shot: dict,
                 key_hint=f"{job_id}-shot-{shot['idx']:02d}",
                 job_id=job_id,
                 shot_idx=shot["idx"],
-                forbid_people=scene_voiceover,
+                forbid_people=scene_voiceover and not (background_voiceover and cast_characters),
+                require_lip_sync=not background_voiceover,
                 expected_text=(
                     sb_shot.get("voiceover") or shot.get("voiceover")
                     if scene_voiceover and not extend_mode else None
                 ),
                 require_broll_semantics=not scene_voiceover,
                 continuity_context=(
+                    _continuity_qa_context(
+                        runtime_shot, {}, cast_characters=cast_characters,
+                        identity_anchors=identity_anchors, scene_reference=scene_reference,
+                    ) if background_voiceover else
                     {
                         "contract": sb_shot.get("continuity_contract") or {},
                         "identity_image_urls": [],
@@ -4328,6 +4382,12 @@ def _required_character_ids(units: list[dict]) -> set[str]:
             required.add(normalized)
 
     for unit in units:
+        if unit.get("render_mode") == "background_voiceover":
+            for member in unit.get("cast") or []:
+                value = member.get("id") if isinstance(member, dict) else member
+                if normalized := str(value or "").strip():
+                    required.add(normalized)
+            continue
         explicit_on_screen = {
             str(beat.get("speaker") or "").strip().casefold()
             for beat in (unit.get("performance_beats") or [])
@@ -4669,7 +4729,9 @@ async def run(
                 idx, error, identity_key, scene_key,
                 next_anchor, generated_voice,
             )
-        elif shot["narrative_type"] == "dialogue" and render_mode == "scene":
+        elif shot["narrative_type"] == "dialogue" and render_mode in {
+            "scene", "background_voiceover",
+        }:
             speaker_id = shot["speaker_id"]
             scene_character = chars.get(speaker_id)
             voice_key = (
@@ -4708,6 +4770,13 @@ async def run(
                 voice_anchor=voice_anchors.get(voice_key),
                 fixed_voice_track=fixed_voice_track,
                 scene_reference=spatial_reference,
+                cast_characters=(
+                    _scene_cast_characters(sb_shot, chars, "")
+                    if render_mode == "background_voiceover" else None
+                ),
+                identity_anchors=(
+                    identity_anchors if render_mode == "background_voiceover" else None
+                ),
                 paid_batch_id=paid_batch_id,
                 asr_enabled=(sb.get("production_settings") or {}).get(
                     "asr_enabled", True

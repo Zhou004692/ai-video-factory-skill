@@ -147,6 +147,7 @@ def _visual_comparison_prompt(expected: str, observed: str) -> str:
 
 
 def evaluate(result: dict, *, expect_speech: bool,
+             require_lip_sync: bool = True,
              expected_text: str | None = None,
              expected_visual: str | None = None,
              forbid_people: bool = False,
@@ -184,7 +185,7 @@ def evaluate(result: dict, *, expect_speech: bool,
         )
         for segment in lip_sync_evidence["segments"]
     )
-    if expect_speech and (
+    if expect_speech and require_lip_sync and (
         result.get("lip_sync") is False or located_mismatch
     ):
         reasons.append("lip_sync_mismatch")
@@ -355,6 +356,7 @@ def analyze_continuity(
 
 
 def analyze(video_url: str, *, expect_speech: bool,
+            require_lip_sync: bool = True,
             expected_text: str | None = None,
             expected_visual: str | None = None,
             forbid_people: bool = False,
@@ -395,7 +397,7 @@ def analyze(video_url: str, *, expect_speech: bool,
             "hand_closeup_ratio 为手或手指特写占整个视频时长的比例 0 到 1。"
             "不要因为单帧短暂出现设备就判定主体已出现。"
         )
-    if expect_speech:
+    if expect_speech and require_lip_sync:
         prompt += (
             "\n口型证据必须覆盖整段视频后再判断。overall_alignment、alignment 和 "
             "confidence 范围为 0 到 1；offset_ms 为嘴部动作相对语音的有符号毫秒偏差。"
@@ -452,6 +454,7 @@ def analyze(video_url: str, *, expect_speech: bool,
     return raw, evaluate(
         raw,
         expect_speech=expect_speech,
+        require_lip_sync=require_lip_sync,
         expected_text=expected_text,
         expected_visual=expected_visual,
         forbid_people=forbid_people,

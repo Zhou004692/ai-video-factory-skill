@@ -625,6 +625,13 @@ def _compiled_runtime_storyboard(
             else ""
         ).strip() or "；".join(scenes)
         has_dialogue = bool(spec.dialogue.strip())
+        render_mode = "broll"
+        if has_dialogue:
+            render_mode = str(base.get("render_mode") or "cinematic_character")
+            if not spec.speaker_ids:
+                render_mode = "background_voiceover"
+            elif render_mode.strip().casefold() == "background_voiceover":
+                render_mode = "cinematic_character"
         performance_beats = _runtime_performance_beats(group)
         for performance_beat in performance_beats:
             performance_beat.pop("site_anchor_key", None)
@@ -658,10 +665,7 @@ def _compiled_runtime_storyboard(
             "preserved_requirements": list(spec.preserved_requirements),
             "adaptation_actions": list(spec.adaptation_actions),
             "quality_gates": list(spec.quality_gates),
-            "render_mode": (
-                str(base.get("render_mode") or "cinematic_character")
-                if has_dialogue else "broll"
-            ),
+            "render_mode": render_mode,
         })
         runtime_masters.append(base)
     storyboard["masters"] = runtime_masters

@@ -3,9 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from copy import deepcopy
+import base64
+import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tests.fixtures.production_profiles import load_profile_fixture
 
@@ -736,6 +739,215 @@ class SpeechSemanticsCompilerTests(unittest.TestCase):
         self.assertEqual(turns[0]["facial_expression"], "listening")
         self.assertEqual(turns[0]["gesture"], "checks machine")
         self.assertEqual(source, original)
+
+    def test_onscreen_turn_replaces_a_stale_background_voiceover_route(self):
+        source = {
+            "characters": [{"id": "worker"}],
+            "masters": [{
+                "idx": 1, "scene": "yard", "cast": ["worker"],
+                "render_mode": "background_voiceover",
+                "performance_beats": [{
+                    "speaker": "worker", "speech_mode": "on_screen",
+                    "dialogue": "Ready.", "duration": 4,
+                }],
+            }],
+        }
+        result = production_compiler.compile_ir(
+            creative_ir.from_storyboard(source), job_id="J-stale-route",
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=10000, runtime_storyboard=source,
+        )
+        self.assertTrue(result.compilable, result.issues)
+        self.assertEqual(result.spec.runtime_storyboard["masters"][0]["render_mode"],
+                         "cinematic_character")
+
+
+class RuntimeSpeechDispatchTests(unittest.IsolatedAsyncioTestCase):
+    """Real compiler/materialization/dispatch with approved local anchor fixtures.
+
+    Only infrastructure paths and the final provider boundary are replaced.
+    These tests prove routing and request semantics, not provider/media quality.
+    """
+
+    def setUp(self):
+        from factory import db
+        from factory.steps import s3_shots
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+        def tracked_connection():
+            database = db.conn()
+            self.addCleanup(database.close)
+            return database
+
+        for patcher in (
+            mock.patch.object(db, "database_path", return_value=self.root / "factory.db"),
+            mock.patch.object(s3_shots, "conn", side_effect=tracked_connection),
+            mock.patch.object(s3_shots, "ASSETS_DIR", self.root / "assets"),
+            mock.patch("socket.socket.connect", side_effect=AssertionError("network forbidden")),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.anchor_path = self.root / "approved.png"
+        self.anchor_path.write_bytes(base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jz1kAAAAASUVORK5CYII="
+        ))
+
+    def prepare(self, beats, *, visible=True, approval="APPROVED", character_ids=("worker",)):
+        from factory import character_assets, db, production_adapters, production_config
+
+        characters = ([{"id": item, "name": item.title(),
+                        "generation_mode": "ai_generated"}
+                       for item in character_ids] if visible else [])
+        source = {
+            "characters": characters,
+            "production_settings": {
+                "character_anchor_generator": "seedream_5_0",
+                "scene_anchor_generator": "seedream_5_0",
+                "generation_snapshot": production_config.freeze_generation_snapshot(
+                    {"audio_mode": "seedance_native", "qa_enabled": True}, env={},
+                ),
+            },
+            "beats": [{"id": f"turn-{index}", "scene": "yard",
+                       "duration_sec": 4, "cast": list(character_ids) if visible else [],
+                       **beat} for index, beat in enumerate(beats, 1)],
+        }
+        result = production_compiler.compile_ir(
+            creative_ir.from_storyboard(source), job_id="J-runtime-speech",
+            capabilities=production_compiler.ProviderCapabilities.seedance_2_5(),
+            budget_cents=10000, runtime_storyboard=source,
+        )
+        self.assertTrue(result.compilable, result.issues)
+        spec = result.spec
+        database = db.conn()
+        try:
+            database.execute(
+                "INSERT INTO jobs(job_id,topic_id,title,state,storyboard) VALUES(?,?,?,?,?)",
+                (spec.job_id, "T-speech", "Runtime speech", "PRODUCTION_RUNNING",
+                 json.dumps(spec.runtime_storyboard)),
+            )
+            production_adapters.materialize_frozen_execution_inputs(database, spec)
+            for character in characters:
+                database.execute(
+                    "INSERT INTO character_identity_anchors(job_id,identity_key,character_id,"
+                    "display_name,source_type,state,anchor_mode,image_path,image_url,"
+                    "generator,approval_state) VALUES(?,?,?,?,?,'READY','static_image',?,?,?,?)",
+                    (spec.job_id, character_assets.character_identity_key(character),
+                     character["id"], character["name"], "seedream_identity_image",
+                     str(self.anchor_path), f"https://example.invalid/{character['id']}.png",
+                     "seedream_5_0", approval),
+                )
+            # Explicit pre-approved fixture for the executor's current scene requirement;
+            # this does not assert that the compiler has scheduled the scene anchor.
+            for scene_key in {master.scene_key for master in spec.masters}:
+                database.execute(
+                    "INSERT INTO scene_visual_anchors(job_id,anchor_key,state,image_path,"
+                    "image_url,generator,approval_state) VALUES(?,?,'READY',?,?,?,?)",
+                    (spec.job_id, scene_key, str(self.anchor_path),
+                     "https://example.invalid/yard.png", "seedream_5_0", approval),
+                )
+            database.commit()
+        finally:
+            database.close()
+        return spec
+
+    async def request_at_boundary(self, spec):
+        from factory.steps import s3_shots
+
+        with mock.patch.object(
+            s3_shots, "_generate_seedance_video",
+            new=mock.AsyncMock(side_effect=RuntimeError("LOCAL_PROVIDER_BOUNDARY")),
+        ) as generate:
+            with self.assertRaisesRegex(RuntimeError, "LOCAL_PROVIDER_BOUNDARY"):
+                await s3_shots.run(
+                    spec.job_id, storyboard_override=spec.runtime_storyboard,
+                    characters_override=list(spec.characters),
+                    target_master_indexes={1}, prepare_anchors=False,
+                )
+        self.assertEqual(generate.await_count, 1)
+        return generate.await_args.kwargs
+
+    async def test_offscreen_visible_actor_reaches_voiceover_request_without_fake_speaker(self):
+        spec = self.prepare([{
+            "speaker": "customer_voice", "speech_mode": "off_screen",
+            "dialogue": "Ready?", "action": "worker checks machine",
+            "tone": "curious", "gesture": "checks latch",
+        }])
+        request = await self.request_at_boundary(spec)
+        self.assertEqual(spec.masters[0].speaker_ids, ())
+        self.assertEqual(request["expected_text"], "Ready?")
+        self.assertFalse(request["forbid_people"])
+        self.assertFalse(request["require_lip_sync"])
+        self.assertFalse(request["require_broll_semantics"])
+        self.assertTrue(request["route"].generate_audio)
+        self.assertTrue(request["route"].qa_required)
+        self.assertEqual(request["request_kwargs"]["references"],
+                         ["https://example.invalid/yard.png", "https://example.invalid/worker.png"])
+        manifest = request["request_kwargs"]["reference_manifest"]
+        self.assertEqual([item["duty"] for item in manifest],
+                         ["scene_continuity", "supporting_identity"])
+        self.assertIn("customer_voice", request["prompt"])
+        self.assertIn("Ready?", request["prompt"])
+        self.assertIn("curious", request["prompt"])
+        self.assertIn("checks latch", request["prompt"])
+        self.assertIn("不做口型", request["prompt"])
+        self.assertNotIn("不得出现任何可识别人脸", request["prompt"])
+        self.assertEqual(request["continuity_context"]["identity_image_urls"],
+                         ["https://example.invalid/worker.png"])
+
+    async def test_narration_without_visible_cast_keeps_audio_and_scene_reference(self):
+        spec = self.prepare([{
+            "speaker": "narrator", "speech_mode": "narration", "dialogue": "They leave.",
+        }], visible=False)
+        request = await self.request_at_boundary(spec)
+        self.assertEqual(spec.masters[0].character_ids, ())
+        self.assertEqual(request["expected_text"], "They leave.")
+        self.assertTrue(request["forbid_people"])
+        self.assertFalse(request["require_lip_sync"])
+        self.assertEqual(request["request_kwargs"]["references"],
+                         ["https://example.invalid/yard.png"])
+        self.assertIn("旁白", request["prompt"])
+
+    async def test_explicit_visible_cast_is_not_filtered_by_audio_name_hints(self):
+        spec = self.prepare([{
+            "speaker": "customer_voice", "speech_mode": "off_screen", "dialogue": "Ready?",
+        }], character_ids=("worker", "narrator"))
+        request = await self.request_at_boundary(spec)
+        self.assertEqual(spec.masters[0].character_ids, ("worker", "narrator"))
+        self.assertIn("https://example.invalid/narrator.png",
+                      request["request_kwargs"]["references"])
+        self.assertIn("https://example.invalid/narrator.png",
+                      request["continuity_context"]["identity_image_urls"])
+
+    async def test_mixed_turns_keep_the_normal_onscreen_execution_route(self):
+        spec = self.prepare([
+            {"speaker": "customer_voice", "speech_mode": "off_screen", "dialogue": "Ready?"},
+            {"speaker": "worker", "speech_mode": "on_screen", "dialogue": "Ready."},
+        ])
+        request = await self.request_at_boundary(spec)
+        self.assertEqual(spec.masters[0].speaker_ids, ("worker",))
+        self.assertEqual(spec.runtime_storyboard["masters"][0]["render_mode"], "cinematic_character")
+        self.assertEqual(request["expected_text"], "Ready?Ready.")
+        self.assertIn("customer_voice", request["prompt"])
+        self.assertIn("worker", request["prompt"])
+        self.assertTrue(request.get("require_lip_sync", True))
+
+    async def test_voiceover_route_does_not_bypass_pending_anchor_review(self):
+        from factory.steps import s3_shots
+
+        spec = self.prepare([{
+            "speaker": "narrator", "speech_mode": "narration", "dialogue": "They leave.",
+        }], approval="PENDING_REVIEW")
+        with mock.patch.object(s3_shots, "_generate_seedance_video", new=mock.AsyncMock()) as generate:
+            with self.assertRaises(s3_shots.ContinuityAnchorReviewPendingError):
+                await s3_shots.run(
+                    spec.job_id, storyboard_override=spec.runtime_storyboard,
+                    characters_override=list(spec.characters),
+                    target_master_indexes={1}, prepare_anchors=False,
+                )
+        generate.assert_not_awaited()
 
 
 if __name__ == "__main__":
