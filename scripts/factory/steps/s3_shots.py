@@ -55,6 +55,7 @@ class SeedanceGenerationResult:
     cost_cents: int
     provider_calls: tuple[dict, ...]
     transcription: bigasr.Transcription = bigasr.Transcription("")
+    transcription_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -472,7 +473,8 @@ class SeedanceQualityError(RuntimeError):
                  reasons: tuple[str, ...] = (),
                  candidate_path: Path | None = None,
                  candidate_url: str | None = None,
-                 transcription: bigasr.Transcription | None = None):
+                 transcription: bigasr.Transcription | None = None,
+                 transcription_available: bool = False):
         super().__init__(message)
         self.cost_cents = cost_cents
         self.provider_calls = provider_calls
@@ -480,6 +482,7 @@ class SeedanceQualityError(RuntimeError):
         self.candidate_path = candidate_path
         self.candidate_url = candidate_url
         self.transcription = transcription or bigasr.Transcription("")
+        self.transcription_available = bool(transcription_available)
         if candidate_path is not None and Path(candidate_path).is_file():
             self.pause_state = "PRODUCTION_REVIEW_REQUIRED"
 
@@ -941,7 +944,7 @@ def _record_failed_generation(db, job_id: str, idx: int,
         except AttributeError:
             pass
     if isinstance(exc, SeedanceQualityError) and has_candidate:
-        if exc.transcription.text or exc.transcription.utterances:
+        if exc.transcription_available:
             master_transcriptions.persist(
                 db, job_id, idx, candidate_path, exc.transcription,
             )
@@ -1023,10 +1026,7 @@ def _commit_generated_shot(
             "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
             (cost, job_id),
         )
-        if (
-            result.video_path.is_file()
-            and (result.transcription.text or result.transcription.utterances)
-        ):
+        if result.video_path.is_file() and result.transcription_available:
             master_transcriptions.persist(
                 database, job_id, idx, result.video_path,
                 result.transcription,
@@ -3207,8 +3207,9 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
 
     async def assess(url: str, audio_path: Path | None
                      ) -> tuple[dict, video_qa.QADecision,
-                                bigasr.Transcription]:
+                                bigasr.Transcription, bool]:
         transcription = fixed_transcription or bigasr.Transcription("")
+        transcription_available = fixed_transcription is not None
         try:
             raw, _ = await asyncio.to_thread(
                 video_qa.analyze,
@@ -3229,6 +3230,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 transcription = await asyncio.to_thread(
                     bigasr.transcribe_detailed, audio_path
                 )
+                transcription_available = True
                 transcript = transcription.text
             raw["transcript"] = transcript
             raw["confidence"] = 1.0
@@ -3265,12 +3267,13 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                         ])),
                         decision.transcript_similarity,
                     )
-            return raw, decision, transcription
+            return raw, decision, transcription, transcription_available
         except Exception as exc:
             return (
                 {"notes": f"qa_error: {exc}"},
                 video_qa.QADecision(False, ("qa_error",)),
                 transcription,
+                transcription_available,
             )
 
     video, video_path, video_url, audio_path = await generate(
@@ -3286,9 +3289,12 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             }, ensure_ascii=False),
             route.generate_audio, route.model, audio_path, spent_cost_cents,
             tuple(provider_calls), fixed_transcription or bigasr.Transcription(""),
+            fixed_transcription is not None,
         )
 
-    raw, decision, transcription = await assess(video_url, audio_path)
+    raw, decision, transcription, transcription_available = await assess(
+        video_url, audio_path
+    )
     qa_note = json.dumps(
         {
             "result": raw,
@@ -3309,6 +3315,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             candidate_path=review_path,
             candidate_url=video_url,
             transcription=transcription,
+            transcription_available=transcription_available,
         )
 
     if decision.passed:
@@ -3317,6 +3324,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             video, video_path, video_url, qa_note, route.generate_audio, route.model,
             audio_path, spent_cost_cents, tuple(provider_calls),
             transcription,
+            transcription_available,
         )
 
     if require_broll_semantics:
@@ -3330,6 +3338,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             candidate_path=review_path,
             candidate_url=video_url,
             transcription=transcription,
+            transcription_available=transcription_available,
         )
 
     projected_retry_cost = (
@@ -3356,6 +3365,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 video, video_path, video_url, qa_note,
                 route.generate_audio, route.model, audio_path,
                 spent_cost_cents, tuple(provider_calls), transcription,
+                transcription_available,
             )
         review_path = preserve_candidate()
         raise SeedanceQualityError(
@@ -3368,6 +3378,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             candidate_path=review_path,
             candidate_url=video_url,
             transcription=transcription,
+            transcription_available=transcription_available,
         )
 
     preserve_retry_attempt()
@@ -3376,9 +3387,10 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         route.generate_audio,
         generation_prompt=_quality_retry_prompt(prompt, decision.reasons),
     )
-    retry_raw, retry_decision, retry_transcription = await assess(
-        video_url, audio_path
-    )
+    (
+        retry_raw, retry_decision, retry_transcription,
+        retry_transcription_available,
+    ) = await assess(video_url, audio_path)
     if not retry_decision.passed:
         if not (_HARD_RETRY_REASONS & set(retry_decision.reasons)):
             review_path = preserve_candidate()
@@ -3391,6 +3403,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 candidate_path=review_path,
                 candidate_url=video_url,
                 transcription=retry_transcription,
+                transcription_available=retry_transcription_available,
             )
         discard_candidate()
         raise SeedanceQualityError(
@@ -3416,6 +3429,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         cost_cents=spent_cost_cents,
         provider_calls=tuple(provider_calls),
         transcription=retry_transcription,
+        transcription_available=retry_transcription_available,
     )
 
 
@@ -3568,11 +3582,13 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                     candidate_path=result.video_path,
                     candidate_url=result.video_url,
                     transcription=result.transcription,
+                    transcription_available=result.transcription_available,
                 )
 
-            _persist_master_transcription(
-                job_id, shot["idx"], result.transcription
-            )
+            if result.transcription_available:
+                _persist_master_transcription(
+                    job_id, shot["idx"], result.transcription
+                )
 
             _commit_generated_shot(job_id, shot["idx"], result)
             return (
@@ -4350,9 +4366,10 @@ async def _gen_broll(job_id: str, shot: dict,
                     candidate_path=result.video_path,
                     candidate_url=result.video_url,
                     transcription=result.transcription,
+                    transcription_available=result.transcription_available,
                 )
 
-            if scene_voiceover:
+            if scene_voiceover and result.transcription_available:
                 _persist_master_transcription(
                     job_id, shot["idx"], result.transcription
                 )

@@ -49,6 +49,13 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             .read_text(encoding="utf-8")
         )
 
+    def empty_asr_contract(self):
+        contract = self.contract()
+        contract["steps"][10]["response"]["json"] = {
+            "result": {"text": "", "utterances": []},
+        }
+        return contract
+
     def prepare(self, replay: StrictMasterComposeReplay):
         snapshot = production_config.freeze_generation_snapshot({
             "audio_mode": "seedance_native",
@@ -299,6 +306,42 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(evidence["content_quality_verified"])
         self.assertFalse(evidence["process_tree_verified"])
 
+    async def test_successful_empty_asr_is_reused_without_second_request(self):
+        with StrictMasterComposeReplay(
+            contract=self.empty_asr_contract()
+        ) as replay:
+            self.prepare(replay)
+            result = await self.run_job(replay)
+
+            self.assertEqual(result.job_state, "COMPOSED")
+            self.assertEqual(len(replay.requests), 11)
+            self.assertEqual(self.asr_submit_count(replay), 1)
+            self.assert_single_paid_master_submission(replay)
+            artifact = replay.database.execute(
+                "SELECT transcription_json FROM master_transcriptions "
+                "WHERE job_id=? AND master_idx=1", (JOB_ID,),
+            ).fetchone()
+            payload = json.loads(artifact["transcription_json"])
+            self.assertEqual(payload["text"], "")
+            self.assertEqual(payload["utterances"], [])
+            current = replay.database.execute(
+                "SELECT storyboard FROM jobs WHERE job_id=?", (JOB_ID,),
+            ).fetchone()
+            storyboard = json.loads(current["storyboard"])
+            edit = storyboard["shots"][0]
+            self.assertEqual(edit.get("subtitle_cues") or [], [])
+            self.assertEqual(edit.get("speech_timeline_version"), 3)
+
+            before = (len(replay.requests), len(replay.processes), 7)
+            second = await self.run_job(replay)
+            self.assertEqual(second.started_nodes, ())
+            self.assertEqual((
+                len(replay.requests), len(replay.processes),
+                replay.database.execute(
+                    "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,),
+                ).fetchone()[0],
+            ), before)
+
     async def test_qa_transport_error_never_becomes_quality_success(self):
         contract = self.contract()
         contract["steps"] = contract["steps"][:7]
@@ -324,6 +367,10 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             self.assert_single_paid_master_submission(replay)
             self.assertEqual(len(replay.requests), 7)
             self.assertEqual(self.asr_submit_count(replay), 0)
+            self.assertEqual(replay.database.execute(
+                "SELECT COUNT(*) FROM master_transcriptions WHERE job_id=?",
+                (JOB_ID,),
+            ).fetchone()[0], 0)
             before = (len(replay.requests), len(replay.processes), 7)
             second = await self.run_job(replay)
             self.assertEqual(second.started_nodes, ())
@@ -335,7 +382,7 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             ), before)
 
     async def test_quality_candidate_acceptance_resumes_same_frozen_graph(self):
-        contract = self.contract()
+        contract = self.empty_asr_contract()
         comparison = contract["steps"][7]["response"]["json"]
         comparison["choices"][0]["message"]["content"] = json.dumps({
             "alignment": 0.1,
@@ -362,6 +409,13 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT media_sha256 FROM master_transcriptions "
                 "WHERE job_id=? AND master_idx=1", (JOB_ID,),
             ).fetchone()[0], candidate_sha)
+            empty_candidate = json.loads(replay.database.execute(
+                "SELECT transcription_json FROM master_transcriptions "
+                "WHERE job_id=? AND master_idx=1 AND media_sha256=?",
+                (JOB_ID, candidate_sha),
+            ).fetchone()[0])
+            self.assertEqual(empty_candidate["text"], "")
+            self.assertEqual(empty_candidate["utterances"], [])
             request_count = len(replay.requests)
             cost = replay.database.execute(
                 "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,)
@@ -462,6 +516,10 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             self.assert_single_paid_master_submission(replay)
             self.assertEqual(len(replay.requests), 9)
             self.assertEqual(self.asr_submit_count(replay), 1)
+            self.assertEqual(replay.database.execute(
+                "SELECT COUNT(*) FROM master_transcriptions WHERE job_id=?",
+                (JOB_ID,),
+            ).fetchone()[0], 0)
             before = (len(replay.requests), len(replay.processes), 7)
             second = await self.run_job(replay)
             self.assertEqual(second.started_nodes, ())

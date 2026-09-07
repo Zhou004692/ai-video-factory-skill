@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sqlite3
 import sys
 import tempfile
@@ -67,21 +68,62 @@ class MasterTranscriptionTests(unittest.TestCase):
             "WHERE job_id='J-ASR' AND master_idx=1"
         ).fetchone()[0], 2)
 
-        self.database.execute(
-            "UPDATE master_transcriptions SET transcription_json='{' "
-            "WHERE job_id='J-ASR' AND master_idx=1 AND media_sha256=?",
-            (master_transcriptions.media_sha256(second),),
+        silent = self.root / "master-silent.mp4"
+        silent.write_bytes(b"authored silent master")
+        master_transcriptions.persist(
+            self.database, "J-ASR", 1, silent, bigasr.Transcription(""),
         )
         self.database.commit()
-        self.assertIsNone(master_transcriptions.load_matching(
-            self.database, "J-ASR", 1, second,
-        ))
-        self.assertEqual(
-            master_transcriptions.load_matching(
-                self.database, "J-ASR", 1, first,
-            ).text,
-            "original",
+        empty = master_transcriptions.load_matching(
+            self.database, "J-ASR", 1, silent,
         )
+        self.assertIsNotNone(empty)
+        self.assertEqual(empty.text, "")
+        self.assertEqual(empty.utterances, ())
+
+        invalid_payloads = (
+            "{",
+            json.dumps({
+                "text": "", "speech_start_ms": float("inf"),
+                "speech_end_ms": None, "utterances": [],
+            }),
+            json.dumps({
+                "text": "bad", "speech_start_ms": 0,
+                "speech_end_ms": 1,
+                "utterances": [{
+                    "text": "bad", "start_ms": -1, "end_ms": 1,
+                }],
+            }),
+            json.dumps({
+                "text": "bad", "speech_start_ms": 3,
+                "speech_end_ms": 2, "utterances": [],
+            }),
+            json.dumps({
+                "text": "bad", "speech_start_ms": 0,
+                "speech_end_ms": 1,
+                "utterances": [{
+                    "text": "bad", "start_ms": 0, "end_ms": 1,
+                    "speaker_confidence": float("inf"),
+                }],
+            }),
+        )
+        for invalid in invalid_payloads:
+            with self.subTest(invalid=invalid):
+                self.database.execute(
+                    "UPDATE master_transcriptions SET transcription_json=? "
+                    "WHERE job_id='J-ASR' AND master_idx=1 AND media_sha256=?",
+                    (invalid, master_transcriptions.media_sha256(second)),
+                )
+                self.database.commit()
+                self.assertIsNone(master_transcriptions.load_matching(
+                    self.database, "J-ASR", 1, second,
+                ))
+                self.assertEqual(
+                    master_transcriptions.load_matching(
+                        self.database, "J-ASR", 1, first,
+                    ).text,
+                    "original",
+                )
 
         second.write_bytes(b"different untranscribed bytes")
         self.assertIsNone(master_transcriptions.load_matching(

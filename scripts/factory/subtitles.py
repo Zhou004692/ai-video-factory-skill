@@ -90,15 +90,18 @@ def apply_master_transcription(
             "start_ms": speech_start_ms,
             "end_ms": speech_end_ms,
         })()]
-    if not timed:
-        return False
-
     changed = False
     for edit in storyboard.get("shots") or []:
         audio_idx = int(edit.get(
             "audio_master_idx", edit.get("video_master_idx", -1)
         ))
         if audio_idx != int(master_idx):
+            continue
+        if not timed:
+            if edit.get("subtitle") is not None or edit.get("subtitle_cues"):
+                edit["subtitle"] = None
+                edit["subtitle_cues"] = []
+                changed = True
             continue
         edit_start = float(edit.get("audio_start") or 0)
         edit_end = edit_start + float(edit.get("duration") or 0)

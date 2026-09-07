@@ -304,7 +304,7 @@ class StrictMasterComposeReplay(StrictHandlerReplay):
         target = self._local_path(tail[-1], {".mp4"})
         vf = tail[15]
         textfiles = re.findall(r"textfile='([^']+)'", vf)
-        if len(textfiles) != 2:
+        if len(textfiles) not in {0, 2}:
             self._fail("strict replay requires the authored director subtitles")
         for value in textfiles:
             windows_path = value.replace("\\:", ":").replace("/", "\\")
@@ -315,15 +315,19 @@ class StrictMasterComposeReplay(StrictHandlerReplay):
             "bordercolor=black@0.9:x=(w-text_w)/2:y=h*0.80{offset}:"
             "line_spacing=10:enable='between(t,0.100,1.600)'"
         )
-        expected_vf = ",".join((
+        filters = [
             "setpts=PTS-STARTPTS",
             "scale=1080:1920:force_original_aspect_ratio=decrease",
             "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
             "setsar=1",
             "fps=24",
-            drawtext.format(path=textfiles[0], offset="-34"),
-            drawtext.format(path=textfiles[1], offset="+34"),
-        ))
+        ]
+        if textfiles:
+            filters.extend((
+                drawtext.format(path=textfiles[0], offset="-34"),
+                drawtext.format(path=textfiles[1], offset="+34"),
+            ))
+        expected_vf = ",".join(filters)
         audio_filter = (
             "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,"
             "apad,atrim=duration=4.000,asetpts=N/SR/TB"
@@ -340,7 +344,10 @@ class StrictMasterComposeReplay(StrictHandlerReplay):
             target,
         ]
         if tail != expected:
-            self._fail("strict replay forbids altered director-cut arguments")
+            self._fail(
+                "strict replay forbids altered director-cut arguments: "
+                + repr(tail)
+            )
         tail[3], tail[7], tail[-1] = video, audio, target
 
     def _validate_normalize(self, tail):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 import sqlite3
 
@@ -36,6 +37,26 @@ def _payload(transcription: bigasr.Transcription) -> dict:
     }
 
 
+def _timestamp(value: object, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a non-negative integer")
+    number = float(value)
+    if not math.isfinite(number) or not number.is_integer() or number < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return int(number)
+
+
+def _confidence(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("speaker_confidence must be finite")
+    number = float(value)
+    if not math.isfinite(number) or not 0 <= number <= 1:
+        raise ValueError("speaker_confidence must be between zero and one")
+    return number
+
+
 def _parse(raw: str) -> bigasr.Transcription:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
@@ -44,30 +65,38 @@ def _parse(raw: str) -> bigasr.Transcription:
     for item in payload.get("utterances") or []:
         if not isinstance(item, dict):
             raise ValueError("master transcription utterance must be an object")
+        start_ms = _timestamp(item["start_ms"], "utterance.start_ms")
+        end_ms = _timestamp(item["end_ms"], "utterance.end_ms")
+        if end_ms <= start_ms:
+            raise ValueError("utterance.end_ms must be after start_ms")
         utterances.append(bigasr.TimedUtterance(
             text=str(item.get("text") or ""),
-            start_ms=int(item["start_ms"]),
-            end_ms=int(item["end_ms"]),
+            start_ms=start_ms,
+            end_ms=end_ms,
             speaker_id=str(item.get("speaker_id") or ""),
-            speaker_confidence=(
-                None if item.get("speaker_confidence") is None
-                else float(item["speaker_confidence"])
-            ),
+            speaker_confidence=_confidence(item.get("speaker_confidence")),
             emotion=str(item.get("emotion") or ""),
             tone=str(item.get("tone") or ""),
             pace=str(item.get("pace") or ""),
             volume=str(item.get("volume") or ""),
         ))
+    speech_start_ms = (
+        None if payload.get("speech_start_ms") is None
+        else _timestamp(payload["speech_start_ms"], "speech_start_ms")
+    )
+    speech_end_ms = (
+        None if payload.get("speech_end_ms") is None
+        else _timestamp(payload["speech_end_ms"], "speech_end_ms")
+    )
+    if (
+        speech_start_ms is not None and speech_end_ms is not None
+        and speech_end_ms < speech_start_ms
+    ):
+        raise ValueError("speech_end_ms must not precede speech_start_ms")
     return bigasr.Transcription(
         text=str(payload.get("text") or ""),
-        speech_start_ms=(
-            None if payload.get("speech_start_ms") is None
-            else int(payload["speech_start_ms"])
-        ),
-        speech_end_ms=(
-            None if payload.get("speech_end_ms") is None
-            else int(payload["speech_end_ms"])
-        ),
+        speech_start_ms=speech_start_ms,
+        speech_end_ms=speech_end_ms,
         utterances=tuple(utterances),
     )
 
@@ -112,5 +141,7 @@ def load_matching(
         return None
     try:
         return _parse(str(row["transcription_json"]))
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (
+        KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError,
+    ):
         return None
