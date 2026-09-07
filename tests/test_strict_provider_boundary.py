@@ -36,6 +36,47 @@ def fixture(name: str) -> dict:
 
 
 class StrictTransportGuardTests(unittest.TestCase):
+    def test_authored_json_contract_matches_selected_shape_without_prompt_capture(self):
+        sample = fixture("doubao_brief.json")
+        request = sample["steps"][0]["request"]
+        prompt = request["json"]["messages"][1]["content"]
+        request["json_contract"] = {
+            "root_keys": sorted(request["json"]),
+            "equals": {
+                "model": "strict-llm-model",
+                "messages.0.role": "system",
+            },
+            "contains": {
+                "messages.0.content": ["Return JSON only."],
+            },
+        }
+        request.pop("json")
+        with StrictTransportReplay(sample):
+            data, _usage = doubao_llm.complete_json(
+                prompt,
+                system="Return JSON only.", max_tokens=3000,
+                model="strict-llm-model",
+            )
+        self.assertEqual(data["speech_mode"], "off_screen")
+
+    def test_authored_json_contract_rejects_mutated_required_content(self):
+        sample = fixture("doubao_brief.json")
+        request = sample["steps"][0]["request"]
+        prompt = request["json"]["messages"][1]["content"]
+        request["json_contract"] = {
+            "root_keys": sorted(request["json"]),
+            "equals": {"model": "strict-llm-model"},
+            "contains": {"messages.1.content": ["must-never-match"]},
+        }
+        request.pop("json")
+        with self.assertRaisesRegex(StrictReplayViolation, "JSON contract mismatch"):
+            with StrictTransportReplay(sample):
+                doubao_llm.complete_json(
+                    prompt,
+                    system="Return JSON only.", max_tokens=3000,
+                    model="strict-llm-model",
+                )
+
     def test_captured_popen_class_cannot_escape_symbol_guard(self):
         captured = subprocess.Popen
         with mock.patch.object(captured, "__init__", side_effect=AssertionError("must not launch")) as constructor:

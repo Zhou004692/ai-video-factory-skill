@@ -3284,16 +3284,19 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         ensure_ascii=False,
     )
 
-    if decision.passed or (
-        decision.reasons == ("qa_error",) and not require_broll_semantics
-    ):
-        if decision.reasons == ("qa_error",):
-            qa_note = json.dumps({
-                "status": "manual_review_required",
-                "result": raw,
-                "reasons": decision.reasons,
-                "provider_calls": provider_calls,
-            }, ensure_ascii=False)
+    if decision.reasons == ("qa_error",):
+        review_path = preserve_candidate()
+        raise SeedanceQualityError(
+            "Seedance 2.5 quality verification was unavailable; "
+            "candidate requires manual review",
+            cost_cents=spent_cost_cents,
+            provider_calls=tuple(provider_calls),
+            reasons=decision.reasons,
+            candidate_path=review_path,
+            candidate_url=video_url,
+        )
+
+    if decision.passed:
         video_path, audio_path = commit_candidate(video_path, audio_path)
         return SeedanceGenerationResult(
             video, video_path, video_url, qa_note, route.generate_audio, route.model,

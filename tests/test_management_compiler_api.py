@@ -836,8 +836,12 @@ class ManagementCompilerApiTests(unittest.TestCase):
             "SELECT state FROM production_nodes "
             "WHERE job_id='J-FINAL-GRAPH' AND node_id='final_review'"
         ).fetchone()
+        job = self.database.execute(
+            "SELECT state FROM jobs WHERE job_id='J-FINAL-GRAPH'"
+        ).fetchone()
         self.assertTrue(result["publish_unlocked"])
         self.assertEqual(node["state"], "SUCCEEDED")
+        self.assertEqual(job["state"], "READY_TO_PUBLISH")
 
     def test_video_detail_projects_graph_into_five_business_stages(self):
         self.database.execute(

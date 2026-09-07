@@ -5309,6 +5309,16 @@ class ManagementService:
                         "notes": str(notes or "").strip(),
                     },
                 )
+            projection = production_projection.reconcile(
+                self.database, job_id
+            )
+            if projection.projected_job_state != str(row["state"]):
+                self.database.execute(
+                    "UPDATE jobs SET state=?,error=NULL,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
+                    (projection.projected_job_state, job_id),
+                )
+                self.database.commit()
         return {
             "job_id": job_id, "decision": decision,
             "publish_unlocked": decision == "approved",

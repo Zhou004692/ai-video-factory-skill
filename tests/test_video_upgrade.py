@@ -6906,18 +6906,21 @@ class SeedanceGenerationGateTests(unittest.IsolatedAsyncioTestCase):
                     s3_shots.video_qa, "analyze",
                     new=Mock(side_effect=RuntimeError("qa endpoint unavailable")),
                 ):
-            result = await s3_shots._generate_seedance_video(
-                prompt="presenter in office",
-                route=route,
-                request_kwargs={"duration": 6, "resolution": "480p"},
-                out_path=Path(tmp) / "shot.mp4",
-                key_hint="job-shot-qa-error",
-            )
+            with self.assertRaises(s3_shots.SeedanceQualityError) as raised:
+                await s3_shots._generate_seedance_video(
+                    prompt="presenter in office",
+                    route=route,
+                    request_kwargs={"duration": 6, "resolution": "480p"},
+                    out_path=Path(tmp) / "shot.mp4",
+                    key_hint="job-shot-qa-error",
+                )
+            self.assertTrue(raised.exception.candidate_path.is_file())
+            candidate_bytes = raised.exception.candidate_path.read_bytes()
 
         self.assertEqual(generate.await_count, 1)
-        self.assertEqual(result.video, b"video")
-        self.assertIn("manual_review_required", result.qa_note)
-        self.assertIn("qa_error", result.qa_note)
+        self.assertEqual(raised.exception.reasons, ("qa_error",))
+        self.assertEqual(raised.exception.cost_cents, 406)
+        self.assertEqual(candidate_bytes, b"video")
 
     async def test_job_budget_blocks_paid_call_before_provider_submission(self):
         route = video_routing.VideoRoute(

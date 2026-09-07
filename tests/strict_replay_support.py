@@ -56,7 +56,10 @@ class StrictTransportReplay:
             if not isinstance(step, dict) or not isinstance(step.get("request"), dict):
                 raise ValueError("strict replay requires recorded request objects")
             request = step["request"]
-            if set(request) - {"method", "url", "json", "body_sha256", "headers"}:
+            if set(request) - {
+                "method", "url", "json", "json_contract", "body_sha256",
+                "headers",
+            }:
                 raise ValueError("strict replay request has unsupported fields")
             headers = request.get("headers")
             if not isinstance(headers, dict) or not all(
@@ -67,8 +70,25 @@ class StrictTransportReplay:
                 raise ValueError("strict replay requires explicit lowercase header constraints")
             if not request.get("method") or not str(request.get("url", "")).startswith("https://"):
                 raise ValueError("strict replay requires an explicit HTTPS request")
-            if "json" in request and "body_sha256" in request:
+            body_contracts = sum(
+                key in request
+                for key in ("json", "json_contract", "body_sha256")
+            )
+            if body_contracts > 1:
                 raise ValueError("strict replay request has ambiguous body")
+            if "json_contract" in request:
+                contract = request["json_contract"]
+                if not isinstance(contract, dict) or set(contract) - {
+                    "root_keys", "equals", "contains", "base64_sha256",
+                }:
+                    raise ValueError("strict replay JSON contract is invalid")
+                if not isinstance(contract.get("root_keys"), list):
+                    raise ValueError("strict replay JSON contract requires root_keys")
+                for field in ("equals", "contains", "base64_sha256"):
+                    if field in contract and not isinstance(contract[field], dict):
+                        raise ValueError(
+                            f"strict replay JSON contract {field} must be an object"
+                        )
             response = step.get("response")
             if not isinstance(response, dict):
                 raise ValueError("strict replay requires an HTTP response")
@@ -99,6 +119,54 @@ class StrictTransportReplay:
         self._violations.append(message)
         raise StrictReplayViolation(message)
 
+    @staticmethod
+    def _json_path(payload: object, path: str) -> object:
+        current = payload
+        for part in str(path).split("."):
+            if isinstance(current, list):
+                try:
+                    current = current[int(part)]
+                except (ValueError, IndexError) as exc:
+                    raise KeyError(path) from exc
+            elif isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                raise KeyError(path)
+        return current
+
+    def _match_json_contract(self, actual: object, contract: dict) -> None:
+        if not isinstance(actual, dict):
+            self._fail("strict replay JSON contract mismatch: root is not an object")
+        if sorted(actual) != sorted(str(key) for key in contract["root_keys"]):
+            self._fail("strict replay JSON contract mismatch: root keys")
+        try:
+            for path, expected in (contract.get("equals") or {}).items():
+                if self._json_path(actual, path) != expected:
+                    self._fail(
+                        f"strict replay JSON contract mismatch: equals {path}"
+                    )
+            for path, expected_values in (contract.get("contains") or {}).items():
+                value = self._json_path(actual, path)
+                if not isinstance(expected_values, list) or not all(
+                    str(expected) in str(value) for expected in expected_values
+                ):
+                    self._fail(
+                        f"strict replay JSON contract mismatch: contains {path}"
+                    )
+            for path, expected_hash in (
+                contract.get("base64_sha256") or {}
+            ).items():
+                encoded = self._json_path(actual, path)
+                decoded = base64.b64decode(str(encoded), validate=True)
+                if hashlib.sha256(decoded).hexdigest() != expected_hash:
+                    self._fail(
+                        f"strict replay JSON contract mismatch: SHA256 {path}"
+                    )
+        except (KeyError, ValueError, TypeError) as exc:
+            self._fail(
+                "strict replay JSON contract mismatch: invalid path or value"
+            )
+
     def _respond(self, request: httpx.Request) -> httpx.Response:
         actual = {"method": request.method, "url": str(request.url)}
         content = request.read()
@@ -118,12 +186,27 @@ class StrictTransportReplay:
         actual["headers"] = {
             name: request.headers.get(name) for name in step["request"]["headers"]
         }
-        expected_hash, actual_hash = _fingerprint(step["request"]), _fingerprint(actual)
-        if expected_hash != actual_hash:
-            self._fail(
-                f"strict replay request mismatch at step {self._position + 1}: "
-                f"expected={expected_hash} actual={actual_hash}"
-            )
+        expected = step["request"]
+        if "json_contract" in expected:
+            actual_without_json = dict(actual)
+            actual_json = actual_without_json.pop("json", None)
+            expected_without_contract = dict(expected)
+            contract = expected_without_contract.pop("json_contract")
+            expected_hash = _fingerprint(expected_without_contract)
+            actual_hash = _fingerprint(actual_without_json)
+            if expected_hash != actual_hash:
+                self._fail(
+                    f"strict replay request mismatch at step {self._position + 1}: "
+                    f"expected={expected_hash} actual={actual_hash}"
+                )
+            self._match_json_contract(actual_json, contract)
+        else:
+            expected_hash, actual_hash = _fingerprint(expected), _fingerprint(actual)
+            if expected_hash != actual_hash:
+                self._fail(
+                    f"strict replay request mismatch at step {self._position + 1}: "
+                    f"expected={expected_hash} actual={actual_hash}"
+                )
         self.requests.append({
             "method": request.method,
             "route": f"{request.url.scheme}://{request.url.host}{request.url.path}",

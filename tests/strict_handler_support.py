@@ -11,12 +11,15 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
+import socket
 import subprocess
 import tempfile
 from types import SimpleNamespace
 from unittest import mock
+import uuid
 
 import httpx
 import requests
@@ -26,6 +29,12 @@ from tests.strict_replay_support import StrictTransportReplay
 
 FIXTURES = Path(__file__).parent / "fixtures" / "strict_transport"
 MEDIA_SHA256 = "67e7dfbf127ad16fba7fbb1d8e2a9433d62c13533a67167abb86be32743fbfe0"
+MASTER_MEDIA_SHA256 = "5e729fe4dd835115728487f6135f0f415a164cf042b8d4a593e6c6b220917ef6"
+_MEDIA_FIXTURES = {
+    "anchor_red_media.json": MEDIA_SHA256,
+    "master_av_media.json": MASTER_MEDIA_SHA256,
+}
+_ORIGINAL_SOCKET_SEND = socket.socket.send
 
 
 class StrictHandlerReplay(StrictTransportReplay):
@@ -37,12 +46,14 @@ class StrictHandlerReplay(StrictTransportReplay):
         for step in fixture["steps"]:
             response = step["response"]
             if "media_fixture" in response:
-                if response.pop("media_fixture") != "anchor_red_media.json":
+                media_name = response.pop("media_fixture")
+                expected_sha = _MEDIA_FIXTURES.get(media_name)
+                if expected_sha is None:
                     raise ValueError("unknown authored media fixture")
-                media = json.loads((FIXTURES / "anchor_red_media.json").read_text(encoding="utf-8"))
-                if media["sha256"] != MEDIA_SHA256:
+                media = json.loads((FIXTURES / media_name).read_text(encoding="utf-8"))
+                if media["sha256"] != expected_sha:
                     raise ValueError("authored media SHA256 changed")
-                response.update(body_base64=media["body_base64"], body_sha256=MEDIA_SHA256)
+                response.update(body_base64=media["body_base64"], body_sha256=expected_sha)
         super().__init__(fixture)
         self.processes = []
         self._connections = []
@@ -190,3 +201,236 @@ class StrictHandlerReplay(StrictTransportReplay):
         return {**super().evidence(), "scope": "in_process_transport_real_character_anchor",
                 "local_media_processes": len(self.processes), "external_provider_fees_cents": 0,
                 "simulated_accounting": True}
+
+
+class StrictMasterComposeReplay(StrictHandlerReplay):
+    """Strict transport plus an allow-list for the formal local media pipeline."""
+
+    def __init__(self, *, contract=None, fail_operation=None):
+        if contract is None:
+            contract = json.loads(
+                (FIXTURES / "master_compose.json").read_text(encoding="utf-8")
+            )
+        super().__init__(contract=contract)
+        self.media_sha256 = MASTER_MEDIA_SHA256
+        if fail_operation not in {None, "mix"}:
+            raise ValueError("unknown authored local-media fault")
+        self.fail_operation = fail_operation
+
+    def _media_command(self, args):
+        if not isinstance(args, (tuple, list)) or not args or not all(
+            isinstance(value, str) for value in args
+        ):
+            self._fail("strict replay forbids subprocess command")
+        args = list(args)
+        executable = Path(args[0])
+        if not executable.is_absolute():
+            self._fail("strict replay forbids noncanonical subprocess executable")
+        resolved = executable.resolve()
+        command = args[1:]
+        if resolved == self.ffprobe:
+            return self._approved_ffprobe(command)
+        if resolved == self.ffmpeg:
+            return self._approved_ffmpeg(command)
+        self._fail("strict replay forbids unknown subprocess executable")
+
+    def _approved_ffprobe(self, command):
+        prefix = ["-v", "error"]
+        if command[:2] != prefix:
+            self._fail("strict replay forbids unapproved ffprobe arguments")
+        approved = (
+            ["-show_entries", "format=duration", "-of",
+             "default=noprint_wrappers=1:nokey=1"],
+            ["-select_streams", "a", "-show_entries", "stream=codec_type",
+             "-of", "default=noprint_wrappers=1"],
+            ["-show_streams", "-show_format", "-of", "json", "-i"],
+        )
+        tail = command[2:]
+        for signature in approved:
+            if tail[:-1] == signature:
+                source = self._local_path(tail[-1], {".mp4", ".mp3", ".wav"})
+                return [str(self.ffprobe), *prefix, *signature, source]
+        self._fail("strict replay forbids unapproved ffprobe arguments")
+
+    def _approved_ffmpeg(self, command):
+        base = ["-y", "-hide_banner", "-loglevel", "error"]
+        if command[:4] != base:
+            self._fail("strict replay forbids unapproved ffmpeg arguments")
+        tail = command[4:]
+        # BigASR source extraction.
+        if (
+            len(tail) == 8 and tail[0] == "-i"
+            and tail[2:7] == ["-vn", "-ac", "1", "-ar", "16000"]
+        ):
+            source = self._local_path(tail[1], {".mp4"})
+            target = self._local_path(tail[7], {".wav"})
+            return [str(self.ffmpeg), *base, "-i", source, *tail[2:7], target]
+        # Formal zero-cost BGM provider; still executes real local FFmpeg.
+        if (
+            len(tail) == 11
+            and tail[:6] == ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "60"]
+            and tail[6:10] == ["-q:a", "9", "-acodec", "libmp3lame"]
+        ):
+            target = self._local_path(tail[10], {".mp3"})
+            return [str(self.ffmpeg), *base, *tail[:10], target]
+        # Legacy one-master normalization used by the frozen formal graph.
+        if tail[:1] == ["-i"] and tail.count("-i") == 1 and "-vf" in tail:
+            self._validate_normalize(tail)
+            return [str(self.ffmpeg), *base, *tail]
+        # One-input concat generated by the formal concat_shots implementation.
+        if tail[:1] == ["-i"] and tail.count("-i") == 1 and "-filter_complex" in tail:
+            self._validate_concat(tail)
+            return [str(self.ffmpeg), *base, *tail]
+        # Final BGM mix: exact two local inputs, stream-copy video, AAC audio.
+        if tail[:1] == ["-i"] and tail.count("-i") == 2 and "aloop=loop=-1:size=2e9" in " ".join(tail):
+            self._validate_mix(tail)
+            if self.fail_operation == "mix":
+                failure_target = self.root / "authored-mix-failure.mp4"
+                failure_target.mkdir()
+                tail[-1] = str(failure_target)
+            return [str(self.ffmpeg), *base, *tail]
+        self._fail("strict replay forbids unapproved ffmpeg arguments: " + repr(tail))
+
+    def _validate_normalize(self, tail):
+        if len(tail) != 21 or tail[0] != "-i" or tail[2] != "-vf":
+            self._fail("strict replay forbids malformed shot normalization")
+        source = self._local_path(tail[1], {".mp4"})
+        expected_tail = [
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-pix_fmt", "yuv420p",
+        ]
+        if tail[4:20] != expected_tail:
+            self._fail("strict replay forbids altered shot normalization codecs")
+        vf = tail[tail.index("-vf") + 1]
+        prefix = (
+            "setpts=PTS-STARTPTS,"
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
+            "setsar=1,fps=24,"
+        )
+        textfiles = re.findall(r"textfile='([^']+)'", vf)
+        if len(textfiles) != 2:
+            self._fail("strict replay requires the authored two-line subtitle")
+        for value in textfiles:
+            windows_path = value.replace("\\:", ":").replace("/", "\\")
+            self._local_path(windows_path, {".txt"})
+        drawtext = (
+            "drawtext=fontfile='C\\:/Windows/Fonts/msyhbd.ttc':"
+            "textfile='{path}':fontcolor=white:fontsize=51:borderw=4:"
+            "bordercolor=black@0.9:x=(w-text_w)/2:y=h*0.80{offset}:"
+            "line_spacing=10"
+        )
+        expected_vf = ",".join((
+            prefix.rstrip(","),
+            drawtext.format(path=textfiles[0], offset="-34"),
+            drawtext.format(path=textfiles[1], offset="+34"),
+            "fade=t=in:st=0:d=0.15",
+            "fade=t=out:st=3.85:d=0.15",
+        ))
+        if vf != expected_vf:
+            self._fail("strict replay forbids altered shot normalization filter")
+        target = self._local_path(tail[-1], {".mp4"})
+        tail[1], tail[-1] = source, target
+
+    def _validate_concat(self, tail):
+        if len(tail) != 33:
+            self._fail("strict replay forbids altered concat arguments")
+        source = self._local_path(tail[1], {".mp4"})
+        filt = tail[tail.index("-filter_complex") + 1]
+        if filt != (
+            "[0:v:0]fps=24,setpts=PTS-STARTPTS[v0];"
+            "[0:a:0]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a0];"
+            "[v0][a0]concat=n=1:v=1:a=1[v][a]"
+        ):
+            self._fail("strict replay forbids altered concat graph")
+        target = self._local_path(tail[-1], {".mp4"})
+        expected = [
+            "-i", source, "-filter_complex", filt,
+            "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-r", "24", "-fps_mode", "cfr", "-pix_fmt", "yuv420p",
+            "-video_track_timescale", "12288", "-movflags", "+faststart", target,
+        ]
+        if tail != expected:
+            self._fail("strict replay forbids altered concat arguments")
+        tail[1], tail[-1] = source, target
+
+    def _validate_mix(self, tail):
+        if len(tail) != 19:
+            self._fail("strict replay forbids altered BGM mix arguments")
+        first_i = tail.index("-i")
+        second_i = tail.index("-i", first_i + 1)
+        video = self._local_path(tail[first_i + 1], {".mp4"})
+        bgm = self._local_path(tail[second_i + 1], {".mp3"})
+        filt = tail[tail.index("-filter_complex") + 1]
+        if filt != (
+            "[1:a]volume=-12.0dB,aloop=loop=-1:size=2e9[b];"
+            "[0:a][b]amix=inputs=2:duration=first:dropout_transition=0[a]"
+        ):
+            self._fail("strict replay forbids altered BGM mix graph")
+        target = self._local_path(tail[-1], {".mp4"})
+        expected = [
+            "-i", video, "-i", bgm, "-filter_complex", filt,
+            "-map", "0:v", "-map", "[a]", "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", target,
+        ]
+        if tail != expected:
+            self._fail("strict replay forbids altered BGM mix arguments")
+        tail[first_i + 1], tail[second_i + 1], tail[-1] = video, bgm, target
+
+    def __enter__(self):
+        super().__enter__()
+        stack = self._stack
+        try:
+            from factory.clients import bigasr
+            from factory.steps import s3_shots, s5_bgm, s6_compose
+
+            self.assets = self.root / "data" / "assets"
+            self.assets.mkdir(parents=True)
+            stack.enter_context(mock.patch.object(s3_shots, "ASSETS_DIR", self.assets))
+            stack.enter_context(mock.patch.object(s5_bgm, "ASSETS_DIR", self.assets))
+            stack.enter_context(mock.patch.object(s6_compose, "ASSETS_DIR", self.assets))
+            stack.enter_context(mock.patch.object(tempfile, "tempdir", str(self.root)))
+            stack.enter_context(mock.patch.object(
+                bigasr.uuid, "uuid4",
+                return_value=uuid.UUID("11111111-1111-4111-8111-111111111111"),
+            ))
+            # ``asyncio.to_thread`` wakes the Windows proactor through its
+            # private loopback socket.  Permit only that one-byte wakeup;
+            # every other socket send remains denied by StrictTransportReplay.
+            def proactor_wakeup(sock, data, *args, **kwargs):
+                try:
+                    local = sock.getsockname()
+                    peer = sock.getpeername()
+                except OSError:
+                    self._fail("strict replay forbids socket.send")
+                if (
+                    data != b"\0" or args or kwargs
+                    or local[0] not in {"127.0.0.1", "::1"}
+                    or peer[0] not in {"127.0.0.1", "::1"}
+                ):
+                    self._fail("strict replay forbids socket.send")
+                return _ORIGINAL_SOCKET_SEND(sock, data)
+
+            stack.enter_context(mock.patch.object(socket.socket, "send", proactor_wakeup))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "ARK_VIDEO_QA_MODEL": "strict-video-qa-model",
+                "DEFAULT_MUSIC_PROVIDER": "silent",
+                "APPEND_CTA": "false",
+                "GEN_THUMBNAIL": "false",
+                "GEN_MARKETING_THUMBNAIL": "false",
+                "TEMP": str(self.root),
+                "TMP": str(self.root),
+            }))
+            return self
+        except BaseException:
+            self.__exit__(*__import__("sys").exc_info())
+            raise
+
+    def evidence(self):
+        return {
+            **super().evidence(),
+            "scope": "in_process_transport_real_master_compose",
+        }
