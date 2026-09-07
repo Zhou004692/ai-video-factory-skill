@@ -79,11 +79,35 @@ class StrictTransportReplay:
             if "json_contract" in request:
                 contract = request["json_contract"]
                 if not isinstance(contract, dict) or set(contract) - {
-                    "root_keys", "equals", "contains", "base64_sha256",
+                    "root_keys", "object_keys", "array_lengths", "equals",
+                    "contains", "base64_sha256",
                 }:
                     raise ValueError("strict replay JSON contract is invalid")
                 if not isinstance(contract.get("root_keys"), list):
                     raise ValueError("strict replay JSON contract requires root_keys")
+                object_keys = contract.get("object_keys") or {}
+                if not isinstance(object_keys, dict) or not all(
+                    isinstance(path, str) and path
+                    and isinstance(keys, list)
+                    and len(keys) == len(set(keys))
+                    and all(isinstance(key, str) and key for key in keys)
+                    for path, keys in object_keys.items()
+                ):
+                    raise ValueError(
+                        "strict replay JSON contract object_keys must map paths "
+                        "to unique key lists"
+                    )
+                array_lengths = contract.get("array_lengths") or {}
+                if not isinstance(array_lengths, dict) or not all(
+                    isinstance(path, str) and path
+                    and isinstance(length, int) and not isinstance(length, bool)
+                    and length >= 0
+                    for path, length in array_lengths.items()
+                ):
+                    raise ValueError(
+                        "strict replay JSON contract array_lengths must map paths "
+                        "to non-negative integers"
+                    )
                 for field in ("equals", "contains", "base64_sha256"):
                     if field in contract and not isinstance(contract[field], dict):
                         raise ValueError(
@@ -140,6 +164,24 @@ class StrictTransportReplay:
         if sorted(actual) != sorted(str(key) for key in contract["root_keys"]):
             self._fail("strict replay JSON contract mismatch: root keys")
         try:
+            for path, expected_keys in (
+                contract.get("object_keys") or {}
+            ).items():
+                value = self._json_path(actual, path)
+                if not isinstance(value, dict) or sorted(value) != sorted(
+                    expected_keys
+                ):
+                    self._fail(
+                        f"strict replay JSON contract mismatch: object keys {path}"
+                    )
+            for path, expected_length in (
+                contract.get("array_lengths") or {}
+            ).items():
+                value = self._json_path(actual, path)
+                if not isinstance(value, list) or len(value) != expected_length:
+                    self._fail(
+                        f"strict replay JSON contract mismatch: array length {path}"
+                    )
             for path, expected in (contract.get("equals") or {}).items():
                 if self._json_path(actual, path) != expected:
                     self._fail(

@@ -77,6 +77,105 @@ class StrictTransportGuardTests(unittest.TestCase):
                     model="strict-llm-model",
                 )
 
+    def test_authored_json_contract_rejects_extra_nested_object_field(self):
+        sample = fixture("master_compose.json")
+        sample["steps"] = sample["steps"][:1]
+        request = sample["steps"][0]["request"]
+        payload = {
+            "model": "doubao-seedance-2-5-260628",
+            "content": [{
+                "type": "text",
+                "text": "Ready for delivery. A boom lift inspection in daylight",
+            }],
+            "duration": 4,
+            "resolution": "480p",
+            "output_format": "mp4",
+            "ratio": "1:1",
+            "generate_audio": True,
+        }
+        payload["content"][0]["unexpected"] = "must be rejected"
+        with self.assertRaisesRegex(
+            StrictReplayViolation, "JSON contract mismatch: object keys"
+        ):
+            with StrictTransportReplay(sample):
+                httpx.post(
+                    request["url"],
+                    headers={"Authorization": "Bearer strict-test-key"},
+                    json=payload,
+                )
+
+    def test_authored_json_contract_rejects_extra_array_item(self):
+        sample = fixture("master_compose.json")
+        sample["steps"] = sample["steps"][:1]
+        request = sample["steps"][0]["request"]
+        payload = {
+            "model": "doubao-seedance-2-5-260628",
+            "content": [{
+                "type": "text",
+                "text": "Ready for delivery. A boom lift inspection in daylight",
+            }],
+            "duration": 4,
+            "resolution": "480p",
+            "output_format": "mp4",
+            "ratio": "1:1",
+            "generate_audio": True,
+        }
+        payload["content"].append({"type": "text", "text": "extra"})
+        with self.assertRaisesRegex(
+            StrictReplayViolation, "JSON contract mismatch: array length"
+        ):
+            with StrictTransportReplay(sample):
+                httpx.post(
+                    request["url"],
+                    headers={"Authorization": "Bearer strict-test-key"},
+                    json=payload,
+                )
+
+    def test_master_compose_contract_closes_critical_nested_shapes(self):
+        steps = fixture("master_compose.json")["steps"]
+        seedance = steps[0]["request"]["json_contract"]
+        self.assertEqual(seedance["array_lengths"], {"content": 1})
+        self.assertEqual(
+            seedance["object_keys"], {"content.0": ["text", "type"]}
+        )
+
+        analyze = steps[6]["request"]["json_contract"]
+        self.assertEqual(
+            analyze["array_lengths"],
+            {"messages": 1, "messages.0.content": 2},
+        )
+        self.assertEqual(set(analyze["object_keys"]), {
+            "response_format", "messages.0", "messages.0.content.0",
+            "messages.0.content.0.video_url", "messages.0.content.1",
+        })
+
+        comparison = steps[7]["request"]["json_contract"]
+        self.assertEqual(comparison["array_lengths"], {"messages": 2})
+        self.assertEqual(set(comparison["object_keys"]), {
+            "response_format", "messages.0", "messages.1",
+        })
+
+        asr = steps[8]["request"]["json_contract"]
+        self.assertEqual(set(asr["object_keys"]), {
+            "audio", "request", "user",
+        })
+
+    def test_nested_shape_contract_rejects_ambiguous_declarations(self):
+        invalid_shapes = (
+            {"object_keys": {"content.0": ["type", "type"]}},
+            {"object_keys": {1: ["type"]}},
+            {"array_lengths": {"content": True}},
+        )
+        for mutation in invalid_shapes:
+            with self.subTest(mutation=mutation):
+                sample = fixture("master_compose.json")
+                sample["steps"] = sample["steps"][:1]
+                sample["steps"][0]["request"]["json_contract"].update(
+                    mutation
+                )
+                with self.assertRaisesRegex(ValueError, "JSON contract"):
+                    StrictTransportReplay(sample)
+
     def test_captured_popen_class_cannot_escape_symbol_guard(self):
         captured = subprocess.Popen
         with mock.patch.object(captured, "__init__", side_effect=AssertionError("must not launch")) as constructor:

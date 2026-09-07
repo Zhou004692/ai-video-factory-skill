@@ -11,6 +11,12 @@
         "headers": {"authorization": "Bearer strict-test-key", "content-type": "application/json"},
         "json_contract": {
           "root_keys": ["content", "duration", "generate_audio", "model", "output_format", "ratio", "resolution"],
+          "object_keys": {
+            "content.0": ["text", "type"]
+          },
+          "array_lengths": {
+            "content": 1
+          },
           "equals": {
             "model": "doubao-seedance-2-5-260628",
             "content.0.type": "text",
@@ -73,12 +79,25 @@
         "headers": {"authorization": "Bearer strict-test-key", "content-type": "application/json"},
         "json_contract": {
           "root_keys": ["messages", "model", "response_format", "temperature"],
+          "object_keys": {
+            "response_format": ["type"],
+            "messages.0": ["content", "role"],
+            "messages.0.content.0": ["type", "video_url"],
+            "messages.0.content.0.video_url": ["url"],
+            "messages.0.content.1": ["text", "type"]
+          },
+          "array_lengths": {
+            "messages": 1,
+            "messages.0.content": 2
+          },
           "equals": {
             "model": "strict-video-qa-model",
             "temperature": 0,
+            "response_format.type": "json_object",
             "messages.0.role": "user",
             "messages.0.content.0.type": "video_url",
-            "messages.0.content.0.video_url.url": "https://strict-bucket.tos-cn-beijing.volces.com/strict-fixtures/J-strict-master-shot-01-1700000000-302721f6.mp4"
+            "messages.0.content.0.video_url.url": "https://strict-bucket.tos-cn-beijing.volces.com/strict-fixtures/J-strict-master-shot-01-1700000000-302721f6.mp4",
+            "messages.0.content.1.type": "text"
           },
           "contains": {"messages.0.content.1.text": ["observed_visual", "has_readable_text"]}
         }
@@ -98,7 +117,15 @@
         "headers": {"authorization": "Bearer strict-test-key", "content-type": "application/json"},
         "json_contract": {
           "root_keys": ["max_tokens", "messages", "model", "response_format", "temperature"],
-          "equals": {"model": "strict-video-qa-model", "max_tokens": 600, "temperature": 0.7, "messages.1.role": "user"},
+          "object_keys": {
+            "response_format": ["type"],
+            "messages.0": ["content", "role"],
+            "messages.1": ["content", "role"]
+          },
+          "array_lengths": {
+            "messages": 2
+          },
+          "equals": {"model": "strict-video-qa-model", "max_tokens": 600, "temperature": 0.7, "response_format.type": "json_object", "messages.0.role": "system", "messages.1.role": "user"},
           "contains": {"messages.1.content": ["A boom lift inspection in daylight"]}
         }
       },
@@ -117,6 +144,11 @@
         "headers": {"x-api-resource-id": "volc.seedasr.auc", "x-api-request-id": "11111111-1111-4111-8111-111111111111", "x-api-sequence": "-1", "x-api-key": "strict-test-key", "content-type": "application/json"},
         "json_contract": {
           "root_keys": ["audio", "request", "user"],
+          "object_keys": {
+            "audio": ["data", "format"],
+            "request": ["enable_emotion_detection", "enable_itn", "enable_speaker_info", "model_name", "show_speech_rate", "show_volume"],
+            "user": ["uid"]
+          },
           "equals": {
             "user.uid": "strict-test-key",
             "audio.format": "wav",

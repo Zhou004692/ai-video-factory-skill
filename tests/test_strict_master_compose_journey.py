@@ -123,6 +123,52 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             handlers=production_adapters.build_handlers(replay.database),
         )
 
+    def frozen_graph_snapshot(self, database):
+        """Capture only immutable graph identity and materialized inputs.
+
+        Execution state/output columns must change when review accepts and the
+        graph resumes, so they are asserted separately instead of being
+        mislabeled as part of the frozen contract.
+        """
+        spec_fields = (
+            "production_spec_hash", "production_spec_json",
+            "production_spec_version", "execution_engine",
+        )
+        job = database.execute(
+            "SELECT production_spec_hash,production_spec_json,"
+            "production_spec_version,execution_engine FROM jobs WHERE job_id=?",
+            (JOB_ID,),
+        ).fetchone()
+        materialized_fields = (
+            "idx", "duration_sec", "shot_type", "camera", "prompt",
+            "voiceover", "subtitle", "narrative_type", "speaker_id",
+            "anchor_character",
+        )
+        shot_columns = {
+            str(row["name"])
+            for row in database.execute("PRAGMA table_info(shots)").fetchall()
+        }
+        self.assertTrue(set(materialized_fields).issubset(shot_columns))
+        return {
+            "job_spec": {field: job[field] for field in spec_fields},
+            "production_nodes": [tuple(row) for row in database.execute(
+                "SELECT node_id,node_type,paid,spec_hash,input_json,"
+                "idempotency_key,estimated_cost_cents FROM production_nodes "
+                "WHERE job_id=? ORDER BY node_id",
+                (JOB_ID,),
+            ).fetchall()],
+            "production_edges": [tuple(row) for row in database.execute(
+                "SELECT from_node_id,to_node_id,edge_type FROM production_edges "
+                "WHERE job_id=? ORDER BY from_node_id,to_node_id,edge_type",
+                (JOB_ID,),
+            ).fetchall()],
+            "materialized_frozen_inputs": [tuple(row) for row in database.execute(
+                f"SELECT {','.join(materialized_fields)} FROM shots "
+                "WHERE job_id=? ORDER BY idx",
+                (JOB_ID,),
+            ).fetchall()],
+        }
+
     async def test_formal_master_composes_and_review_immediately_unlocks_publish(self):
         with StrictMasterComposeReplay() as replay:
             self.prepare(replay)
@@ -251,7 +297,7 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             "reason": "manual decision required",
         })
         with StrictMasterComposeReplay(contract=contract) as replay:
-            self.prepare(replay)
+            spec = self.prepare(replay)
             paused = await self.run_job(replay)
             self.assertEqual(paused.started_nodes, ("master:1",))
             self.assertEqual(paused.job_state, "PRODUCTION_REVIEW_REQUIRED")
@@ -267,6 +313,22 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             cost = replay.database.execute(
                 "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,)
             ).fetchone()[0]
+            before_accept = self.frozen_graph_snapshot(replay.database)
+            self.assertEqual(
+                before_accept["job_spec"]["production_spec_hash"],
+                spec.spec_hash,
+            )
+            self.assertEqual(
+                before_accept["job_spec"]["production_spec_json"],
+                json.dumps(spec.as_dict(), ensure_ascii=False),
+            )
+            self.assertEqual(
+                replay.database.execute(
+                    "SELECT state FROM production_nodes WHERE job_id=? "
+                    "AND node_id='master:1'", (JOB_ID,),
+                ).fetchone()[0],
+                "REVIEW_REQUIRED",
+            )
 
             service = ManagementService(
                 replay.database, replay.root, worker_mode="external"
@@ -275,11 +337,23 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
                 JOB_ID, 1, decision="accept_candidate"
             )
             self.assertEqual(accepted["remaining_review_count"], 0)
+            after_accept = self.frozen_graph_snapshot(replay.database)
+            self.assertEqual(after_accept, before_accept)
+            self.assertEqual(
+                replay.database.execute(
+                    "SELECT state FROM production_nodes WHERE job_id=? "
+                    "AND node_id='master:1'", (JOB_ID,),
+                ).fetchone()[0],
+                "SUCCEEDED",
+            )
             resumed = await self.run_job(replay)
             self.assertEqual(
                 resumed.started_nodes, ("bgm", "local_compose", "final_review")
             )
             self.assertEqual(resumed.job_state, "COMPOSED")
+            self.assertEqual(
+                self.frozen_graph_snapshot(replay.database), before_accept
+            )
             self.assertEqual(len(replay.requests), request_count)
             self.assertEqual(replay.database.execute(
                 "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,)
