@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "fixture_id": "real-character-anchor-v1",
+  "source_kind": "authored_contract",
+  "provenance": "Authored from the intended character anchor request and documented local synthetic bytes; never captured/generated from a runtime request. TOS epoch fixed at 1700000000 only; SDK signing datetime is unconstrained, signed body hash is fixed.",
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks",
+        "headers": {
+          "authorization": "Bearer strict-test-key",
+          "content-type": "application/json"
+        },
+        "json": {
+          "model": "doubao-seedance-2-5-260628",
+          "content": [
+            {
+              "type": "text",
+              "text": "CHARACTER MAKEUP / IDENTITY MASTER.\nCreate exactly one fictional person named Strict Worker.\nLocked appearance: navy coveralls\nNeutral three-quarter medium portrait, then a subtle natural head turn.\nShow the same face, age, hairstyle, skin tone, body build and wardrobe throughout the clip.\nPlain softly lit studio background. No other people, no cuts, no text, no logo, no watermark, no speech and no background music.\nThis clip is an identity reference for later cinematic scenes, not a finished story shot.\n\n画面文字通道关闭：画面中不得生成黄色或其他颜色的悬浮文案、字幕、标题、贴纸、标牌、数字、字母、界面或水印；所有台词只进入原生音轨，任何可读文字都属于失败结果。"
+            }
+          ],
+          "duration": 4,
+          "resolution": "480p",
+          "output_format": "mp4",
+          "ratio": "1:1"
+        }
+      },
+      "response": {
+        "status_code": 200,
+        "json": {
+          "id": "strict-anchor-task-1"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/strict-anchor-task-1",
+        "headers": {
+          "authorization": "Bearer strict-test-key"
+        }
+      },
+      "response": {
+        "status_code": 200,
+        "json": {
+          "id": "strict-anchor-task-1",
+          "status": "running"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/strict-anchor-task-1",
+        "headers": {
+          "authorization": "Bearer strict-test-key"
+        }
+      },
+      "response": {
+        "status_code": 200,
+        "json": {
+          "id": "strict-anchor-task-1",
+          "status": "succeeded",
+          "content": {
+            "video_url": "https://93.184.216.34/strict-anchor.mp4"
+          },
+          "usage": {
+            "completion_tokens": 1000
+          },
+          "created_at": 1,
+          "updated_at": 2
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://93.184.216.34/strict-anchor.mp4",
+        "headers": {
+          "authorization": null,
+          "x-api-key": null
+        }
+      },
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "content-type": "video/mp4"
+        },
+        "media_fixture": "anchor_red_media.json"
+      }
+    },
+    {
+      "request": {
+        "method": "HEAD",
+        "url": "https://strict-bucket.tos-cn-beijing.volces.com/strict-fixtures/J-strict-anchor-identity-47474751f39bc053ad40-1700000000-fcc3efc2.mp4",
+        "headers": {
+          "host": "strict-bucket.tos-cn-beijing.volces.com",
+          "x-tos-content-sha256": "UNSIGNED-PAYLOAD"
+        }
+      },
+      "response": {
+        "status_code": 404,
+        "headers": {
+          "x-tos-request-id": "strict-head-1"
+        },
+        "json": {
+          "Code": "NoSuchKey",
+          "Message": "Synthetic absent object"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "PUT",
+        "url": "https://strict-bucket.tos-cn-beijing.volces.com/strict-fixtures/J-strict-anchor-identity-47474751f39bc053ad40-1700000000-fcc3efc2.mp4",
+        "headers": {
+          "host": "strict-bucket.tos-cn-beijing.volces.com",
+          "x-tos-content-sha256": "UNSIGNED-PAYLOAD"
+        },
+        "body_sha256": "67e7dfbf127ad16fba7fbb1d8e2a9433d62c13533a67167abb86be32743fbfe0"
+      },
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "x-tos-request-id": "strict-put-1",
+          "etag": "strict-etag",
+          "x-tos-hash-crc64ecma": "6426923844654847695"
+        },
+        "text": ""
+      }
+    }
+  ]
+}

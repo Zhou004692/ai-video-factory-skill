@@ -2830,7 +2830,8 @@ class Seedance25DialogueTests(unittest.TestCase):
             video_path = Path(tmp) / "identity.mp4"
             video_path.write_bytes(b"video")
             preview_path = Path(tmp) / "frame.jpg"
-            preview_path.write_bytes(b"jpg")
+            # Mock extractor-output sentinel, not a decodable media fixture.
+            preview_path.write_bytes(b"\xff\xd8\xffmock-extracted-jpeg")
             result = s3_shots.SeedanceGenerationResult(
                 video=b"video", video_path=video_path,
                 video_url="https://cdn/identity.mp4", qa_note="{}",
@@ -2911,7 +2912,8 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             preview_path = Path(tmp) / "frame.jpg"
-            preview_path.write_bytes(b"jpg")
+            # Mock extractor-output sentinel; strict journey validates real JPEG.
+            preview_path.write_bytes(b"\xff\xd8\xffmock-extracted-jpeg")
             with (
                 patch.object(s3_shots, "conn", return_value=memory_db),
                 patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),

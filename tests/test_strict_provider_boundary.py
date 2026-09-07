@@ -36,6 +36,17 @@ def fixture(name: str) -> dict:
 
 
 class StrictTransportGuardTests(unittest.TestCase):
+    def test_captured_popen_class_cannot_escape_symbol_guard(self):
+        captured = subprocess.Popen
+        with mock.patch.object(captured, "__init__", side_effect=AssertionError("must not launch")) as constructor:
+            with self.assertRaisesRegex(StrictReplayViolation, "subprocess"):
+                with StrictTransportReplay(fixture("doubao_brief.json")):
+                    try:
+                        captured(["must-not-execute-guard-probe"])
+                    except StrictReplayViolation:
+                        pass
+            constructor.assert_not_called()
+
     def assert_boundary_rejected_before_delegate(self, owner, name):
         rejected_at_call = False
         # Install a harmless sentinel BEFORE entering the guard. Missing guards

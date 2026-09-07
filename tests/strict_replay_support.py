@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from copy import deepcopy
+import base64
 import hashlib
 import json
 import os
@@ -77,8 +78,12 @@ class StrictTransportReplay:
                 continue
             if not isinstance(response.get("status_code"), int):
                 raise ValueError("strict replay requires an HTTP status code")
-            if "json" in response and "text" in response:
+            if sum(key in response for key in ("json", "text", "body_base64")) > 1:
                 raise ValueError("strict replay response has ambiguous body")
+            if "body_base64" in response:
+                body = base64.b64decode(response["body_base64"], validate=True)
+                if hashlib.sha256(body).hexdigest() != response.get("body_sha256"):
+                    raise ValueError("strict replay response bytes do not match pinned SHA256")
         self.requests: list[dict] = []
         self._position = 0
         self._violations: list[str] = []
@@ -131,9 +136,12 @@ class StrictTransportReplay:
             raise _TRANSPORT_ERRORS[response["transport_error"]](
                 "recorded transport failure", request=request,
             )
-        body = {"json": deepcopy(response["json"])} if "json" in response else {
-            "text": str(response.get("text", "")),
-        }
+        if "body_base64" in response:
+            body = {"content": base64.b64decode(response["body_base64"], validate=True)}
+        else:
+            body = {"json": deepcopy(response["json"])} if "json" in response else {
+                "text": str(response.get("text", "")),
+            }
         return httpx.Response(
             response["status_code"], headers=response.get("headers", {}),
             request=request, **body,
@@ -161,7 +169,7 @@ class StrictTransportReplay:
                     stack.enter_context(mock.patch.object(socket.socket, method, self._deny(f"socket.{method}")))
             for method in ("getaddrinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr", "getnameinfo"):
                 stack.enter_context(mock.patch.object(socket, method, self._deny(f"DNS.{method}")))
-            stack.enter_context(mock.patch.object(subprocess, "Popen", self._deny("subprocess")))
+            self._guard_subprocess(stack)
             for method in dir(os):
                 if (method.startswith(("spawn", "exec")) or method in {"system", "startfile", "popen"}) and callable(getattr(os, method)):
                     stack.enter_context(mock.patch.object(os, method, self._deny(f"os.{method}")))
@@ -180,6 +188,12 @@ class StrictTransportReplay:
             stack.close()
             self._stack = None
             raise
+
+    def _guard_subprocess(self, stack):
+        # Captured subclasses (notably asyncio.windows_utils.Popen) bypass a
+        # patch of the module symbol, but still invoke this original __init__.
+        stack.enter_context(mock.patch.object(subprocess.Popen, "__init__", self._deny("subprocess")))
+        stack.enter_context(mock.patch.object(subprocess, "Popen", self._deny("subprocess")))
 
     def __exit__(self, exc_type, exc_value, traceback):
         assert self._stack is not None

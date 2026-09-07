@@ -1489,7 +1489,7 @@ async def _ensure_character_identity_anchors(
                 fallback_cost_cents=result.cost_cents,
             )
             database.execute(
-                "UPDATE character_identity_anchors SET state='READY',"
+                "UPDATE character_identity_anchors SET state='GENERATING',"
                 "video_path=?,video_url=?,preview_path=NULL,duration_sec=4,"
                 "cost_cents=cost_cents+?,generator=?,model=?,error=NULL,"
                 "updated_at=CURRENT_TIMESTAMP "
@@ -1504,6 +1504,28 @@ async def _ensure_character_identity_anchors(
                 (cost, job_id),
             )
             database.commit()
+            # A charged remote task is durable even if local decoding fails.
+            # Never publish a reviewable anchor before its real frame exists.
+            try:
+                preview_paths = await ffmpeg.extract_frames(
+                    result.video_path, anchor_dir / "preview", [1.0]
+                )
+                preview = Path(preview_paths[0]) if preview_paths else None
+                if preview is None or not preview.is_file():
+                    raise RuntimeError("missing extracted JPEG")
+                with preview.open("rb") as preview_file:
+                    if preview_file.read(3) != b"\xff\xd8\xff":
+                        raise RuntimeError("empty or invalid extracted JPEG")
+            except Exception as preview_exc:
+                raise RuntimeError(
+                    f"character identity preview extraction failed: {preview_exc}"
+                ) from preview_exc
+            database.execute(
+                "UPDATE character_identity_anchors SET state='READY',preview_path=?,"
+                "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND identity_key=?",
+                (str(preview), job_id, identity_key),
+            )
+            database.commit()
             anchors[identity_key] = DialogueAnchor(
                 result.video_url, 4, anchor_mode="dynamic_video"
             )
@@ -1515,28 +1537,6 @@ async def _ensure_character_identity_anchors(
             )
             database.commit()
             raise
-        try:
-            preview_paths = await ffmpeg.extract_frames(
-                result.video_path, anchor_dir / "preview", [1.0]
-            )
-            preview_path = str(preview_paths[0]) if preview_paths else ""
-            if preview_path:
-                database.execute(
-                    "UPDATE character_identity_anchors SET preview_path=?,"
-                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND identity_key=?",
-                    (preview_path, job_id, identity_key),
-                )
-                database.commit()
-        except Exception as preview_exc:
-            database.execute(
-                "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
-                (
-                    job_id, "character_identity_preview", "warning",
-                    f"{entry['display_name']} 定妆帧提取失败，身份母片仍可复用："
-                    f"{preview_exc}",
-                ),
-            )
-            database.commit()
     return anchors
 
 
