@@ -8103,6 +8103,22 @@ class ManagementService:
             raise ValueError("人物与场景锚点尚未全部生成完成")
 
         review_note = str(note or "").strip()
+        # Capture only fallback dependencies being approved now. A generic
+        # candidate review (or a marker without this dependency) must not be
+        # treated as permission to re-run a paid master.
+        fallback_dependents = self.database.execute(
+            "SELECT n.node_id,a.identity_key,a.video_url,a.video_path "
+            "FROM production_nodes n JOIN production_edges e "
+            "ON e.job_id=n.job_id AND e.to_node_id=n.node_id "
+            "AND e.edge_type='identity_reference' "
+            "JOIN character_identity_anchors a ON a.job_id=n.job_id "
+            "AND e.from_node_id='character_anchor:' || a.character_id "
+            "WHERE n.job_id=? AND n.node_type='master' "
+            "AND n.state='REVIEW_REQUIRED' AND n.error_code=? "
+            "AND a.source_type='seedance_identity_fallback' AND a.state='READY' "
+            "AND a.approval_state!='APPROVED' ORDER BY n.node_id,a.identity_key",
+            (job_id, s3_shots.ContinuityAnchorReviewPendingError.stable_code),
+        ).fetchall()
         self.database.execute(
             "UPDATE character_identity_anchors SET approval_state='APPROVED',"
             "approved_at=CURRENT_TIMESTAMP,review_note=?,"
@@ -8138,6 +8154,32 @@ class ManagementService:
                     ),
                     payload={"review_note": review_note},
                 )
+            approved_fallbacks: dict[str, list[dict[str, str]]] = {}
+            for fallback in fallback_dependents:
+                # Identity rows have no provider_task_id column. Bind the
+                # event to the stable artifact location, never to review time.
+                artifact = hashlib.sha256(json.dumps(
+                    [fallback["video_url"], fallback["video_path"]],
+                    ensure_ascii=False,
+                ).encode("utf-8")).hexdigest()
+                approved_fallbacks.setdefault(str(fallback["node_id"]), []).append({
+                    "identity_key": str(fallback["identity_key"]), "artifact": artifact,
+                })
+            for node_id, fallbacks in approved_fallbacks.items():
+                artifact_set = hashlib.sha256(json.dumps(
+                    fallbacks, ensure_ascii=False, sort_keys=True,
+                ).encode("utf-8")).hexdigest()
+                result = node_state_machine.transition_node_in_transaction(
+                    self.database, job_id, node_id, "resume_anchor_dependency",
+                    event_id=f"{job_id}:{node_id}:anchor-dependency-approved:{artifact_set}",
+                    payload={"review_note": review_note, "approved_fallbacks": fallbacks},
+                )
+                if result.applied:
+                    self.database.execute(
+                        "UPDATE production_nodes SET error_code=NULL,next_action=NULL "
+                        "WHERE job_id=? AND node_id=? AND state='READY'",
+                        (job_id, node_id),
+                    )
         queued = self.database.execute(
             "UPDATE jobs SET state='PRODUCTION_QUEUED',error=NULL,"
             "production_worker_pid=NULL,updated_at=CURRENT_TIMESTAMP "

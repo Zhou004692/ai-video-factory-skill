@@ -26,6 +26,8 @@ from factory import (  # noqa: E402
     orchestrator,
     provider_capacity,
     provider_tasks,
+    production_executor,
+    production_projection,
     production_planner,
     prompts,
     reference_attention,
@@ -2960,15 +2962,18 @@ class Seedance25DialogueTests(unittest.TestCase):
         self.assertEqual(identity["cost_cents"], call["cost_cents"])
         self.assertEqual(job_cost, call["cost_cents"])
 
-    def test_dialogue_privacy_rejection_falls_back_to_dynamic_identity(self):
+    def _privacy_fallback_case(self, preview_mode="valid", *, approve_and_retry=False):
         memory_db = sqlite3.connect(":memory:")
+        self.addCleanup(memory_db.close)
         memory_db.row_factory = sqlite3.Row
         memory_db.executescript(db.DDL)
         memory_db.execute("ALTER TABLE shots ADD COLUMN video_url TEXT")
         memory_db.execute(
             "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
             "VALUES(?,?,?,?,?,?)",
-            ("J-FALLBACK", "T", "Fallback", "PRODUCTION_RUNNING", "{}", 29),
+            ("J-FALLBACK", "T", "Fallback", "PRODUCTION_RUNNING", json.dumps({
+                "production_settings": {"character_anchor_generator": "seedream_5_0"},
+            }), 29),
         )
         memory_db.execute(
             "INSERT INTO shots(job_id,idx,duration_sec,voiceover,state) "
@@ -2988,8 +2993,10 @@ class Seedance25DialogueTests(unittest.TestCase):
             memory_db.execute(
                 "INSERT INTO character_identity_anchors("
                 "job_id,identity_key,character_id,display_name,source_type,"
-                "state,anchor_mode,image_path,image_url,cost_cents) "
-                "VALUES(?,?,?,?,?,'READY','static_image',?,?,29)",
+                "state,anchor_mode,image_path,image_url,cost_cents,approval_state,"
+                "approved_at,review_note,generator,model,preview_path) "
+                "VALUES(?,?,?,?,?,'READY','static_image',?,?,29,'APPROVED',"
+                "CURRENT_TIMESTAMP,'old approval','seedream_5_0','old-image-model','old-preview.jpg')",
                 (
                     "J-FALLBACK", identity_key, "customer", "Customer",
                     "seedream_identity_image", str(image_path),
@@ -3001,6 +3008,9 @@ class Seedance25DialogueTests(unittest.TestCase):
             video_path.write_bytes(b"video")
             audio_path = Path(tmp) / "result.wav"
             audio_path.write_bytes(b"wav")
+            preview_path = Path(tmp) / "fallback-frame.jpg"
+            # Unit extractor-output sentinel; strict journey validates real JPEG.
+            preview_path.write_bytes(b"\xff\xd8\xffmock-extracted-jpeg" if preview_mode == "valid" else b"invalid")
             result = s3_shots.SeedanceGenerationResult(
                 video=b"video",
                 video_path=video_path,
@@ -3010,7 +3020,8 @@ class Seedance25DialogueTests(unittest.TestCase):
                 model="doubao-seedance-2-5-260628",
                 audio_path=audio_path,
                 cost_cents=272,
-                provider_calls=(),
+                provider_calls=({"task_id": "fallback-identity-1", "intent": "generate",
+                                 "usage": {"completion_tokens": 38830}, "cost_cents": 272},),
             )
             anchors = {
                 identity_key: s3_shots.DialogueAnchor(
@@ -3019,7 +3030,7 @@ class Seedance25DialogueTests(unittest.TestCase):
                 )
             }
             with (
-                patch.object(s3_shots, "conn", return_value=memory_db),
+                patch.object(s3_shots, "conn", return_value=_NonClosingConnection(memory_db)),
                 patch.object(s3_shots, "ASSETS_DIR", Path(tmp)),
                 patch.object(
                     s3_shots, "_generate_seedance_video",
@@ -3031,9 +3042,13 @@ class Seedance25DialogueTests(unittest.TestCase):
                 ) as generate,
                 patch.object(
                     s3_shots.ffmpeg, "extract_frames",
-                    AsyncMock(return_value=[]),
+                    AsyncMock(
+                        return_value=[] if preview_mode == "empty" else [preview_path],
+                        side_effect=RuntimeError("decoder failed") if preview_mode == "exception" else None,
+                    ),
                 ),
                 patch.object(s3_shots, "_persist_master_transcription"),
+                patch.object(s3_shots, "_commit_generated_shot") as commit_scene,
             ):
                 idx, error, returned_anchor = asyncio.run(
                     s3_shots._gen_dialogue(
@@ -3050,18 +3065,92 @@ class Seedance25DialogueTests(unittest.TestCase):
                         identity_anchors=anchors,
                     )
                 )
+                row = dict(memory_db.execute("SELECT * FROM character_identity_anchors").fetchone())
+                self.assertEqual(generate.await_count, 2)
+                commit_scene.assert_not_called()
+                self.assertIsNone(returned_anchor)
+                self.assertEqual(idx, 1)
+                self.assertEqual(row["cost_cents"], 301)
+                self.assertEqual(memory_db.execute("SELECT cost_cents FROM jobs").fetchone()[0], 301)
+                self.assertEqual(memory_db.execute("SELECT cost_cents FROM provider_calls").fetchone()[0], 272)
+                self.assertEqual(row["approval_state"], "PENDING_REVIEW")
+                self.assertIsNone(row["approved_at"])
+                self.assertEqual(row["review_note"], "")
+                self.assertEqual(row["generator"], "seedance_2_5")
+                self.assertEqual(row["model"], result.model)
+                self.assertIsNone(row["image_path"])
+                self.assertIsNone(row["image_url"])
+                if approve_and_retry:
+                    with self.assertRaises(s3_shots.ContinuityAnchorReviewPendingError):
+                        asyncio.run(s3_shots._ensure_character_identity_anchors(
+                            "J-FALLBACK", [character], existing_only=True,
+                        ))
+                    with self.assertRaises(s3_shots.ContinuityAnchorReviewPendingError):
+                        s3_shots._assert_continuity_anchors_approved(memory_db, "J-FALLBACK")
+                    memory_db.execute("UPDATE character_identity_anchors SET approval_state='APPROVED'")
+                    memory_db.commit()
+                    reused = asyncio.run(s3_shots._ensure_character_identity_anchors(
+                        "J-FALLBACK", [character], existing_only=True,
+                    ))
+                    self.assertEqual(reused[identity_key].video_url, result.video_url)
+                    self.assertEqual(reused[identity_key].anchor_mode, "dynamic_video")
+                    self.assertEqual(generate.await_count, 2)
+                    self.assertEqual(memory_db.execute("SELECT cost_cents FROM jobs").fetchone()[0], 301)
+                    s3_shots._assert_continuity_anchors_approved(memory_db, "J-FALLBACK")
+                    _, resumed_error, resumed_anchor = asyncio.run(s3_shots._gen_dialogue(
+                        "J-FALLBACK", {"idx": 1, "duration_sec": 8, "voiceover": "Hello",
+                                       "shot_type": "dialogue"},
+                        character, {"voiceover": "Hello"}, asyncio.Semaphore(1),
+                        identity_anchors=reused,
+                    ))
+                    self.assertIsNone(resumed_error)
+                    self.assertIsNotNone(resumed_anchor)
+                    self.assertEqual(generate.await_count, 3)
+                    self.assertEqual(generate.await_args.kwargs["shot_idx"], 1)
+                    self.assertEqual(generate.await_args.kwargs["request_kwargs"]["reference_videos"],
+                                     [result.video_url])
+                    commit_scene.assert_called_once()
+                return error, row, anchors, identity_key
 
-        self.assertEqual(idx, 1)
-        self.assertIsNone(error)
-        self.assertIsNotNone(returned_anchor)
-        self.assertEqual(generate.await_count, 3)
-        self.assertEqual(anchors[identity_key].anchor_mode, "dynamic_video")
-        self.assertEqual(
-            generate.await_args_list[-1].kwargs["request_kwargs"][
-                "reference_videos"
-            ],
-            ["https://cdn/customer-dynamic.mp4"],
-        )
+    def test_dialogue_privacy_rejection_falls_back_to_dynamic_identity(self):
+        error, row, anchors, key = self._privacy_fallback_case()
+        self.assertIsInstance(error, s3_shots.ContinuityAnchorReviewPendingError)
+        self.assertEqual(error.pause_state, "ANCHOR_REVIEW_REQUIRED")
+        self.assertEqual(row["state"], "READY")
+        self.assertTrue(row["preview_path"].endswith("fallback-frame.jpg"))
+        self.assertEqual(anchors[key].anchor_mode, "dynamic_video")
+
+    def test_fallback_empty_invalid_or_failed_preview_cannot_become_reviewable(self):
+        for preview in ("empty", "invalid", "exception"):
+            with self.subTest(preview=preview):
+                error, row, anchors, key = self._privacy_fallback_case(preview)
+                self.assertEqual(row["state"], "FAILED")
+                self.assertIn("preview", str(error))
+                self.assertIsNone(row["preview_path"])
+                self.assertNotEqual(getattr(error, "pause_state", None), "ANCHOR_REVIEW_REQUIRED")
+                self.assertNotIn(key, anchors)
+
+    def test_approved_fallback_reuses_dynamic_anchor_despite_frozen_seedream(self):
+        self._privacy_fallback_case(approve_and_retry=True)
+
+    def test_fallback_requires_explicit_approval_even_in_auto_mode(self):
+        database = sqlite3.connect(":memory:")
+        self.addCleanup(database.close)
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute("INSERT INTO jobs(job_id,topic_id,title) VALUES('J-AUTO-FB','T','auto')")
+        for key, source in (("fallback", "seedance_identity_fallback"), ("ordinary", "seedance_identity_anchor")):
+            database.execute(
+                "INSERT INTO character_identity_anchors(job_id,identity_key,character_id,display_name,"
+                "source_type,state,approval_state) VALUES('J-AUTO-FB',?,?,?,?,'READY','PENDING_REVIEW')",
+                (key, key, key, source),
+            )
+        database.commit()
+        self.assertEqual(s3_shots._apply_anchor_review_mode(database, "J-AUTO-FB", "auto"), 1)
+        rows = dict(database.execute("SELECT identity_key,approval_state FROM character_identity_anchors"))
+        self.assertEqual(rows, {"fallback": "PENDING_REVIEW", "ordinary": "APPROVED"})
+        with self.assertRaises(s3_shots.ContinuityAnchorReviewPendingError):
+            s3_shots._assert_continuity_anchors_approved(database, "J-AUTO-FB")
 
     def test_identity_anchor_failure_blocks_all_scene_generation(self):
         memory_db = sqlite3.connect(":memory:")
@@ -7293,6 +7382,79 @@ class Seedance25StateMachineTests(unittest.TestCase):
         self.assertEqual(
             aggregate.pause_state, "PRODUCTION_REVIEW_REQUIRED"
         )
+
+    def test_anchor_review_aggregate_preserves_pause_and_fault_priority(self):
+        anchor = s3_shots.ContinuityAnchorReviewPendingError("replacement needs approval")
+        aggregate = s3_shots._aggregate_shot_failures([(1, anchor), (2, anchor)])
+        self.assertEqual(getattr(aggregate, "pause_state", None), "ANCHOR_REVIEW_REQUIRED")
+        self.assertTrue(aggregate.non_retryable)
+        self.assertEqual(production_executor._pause_outcome_from_exception(aggregate).event, "require_review")
+        mixed = s3_shots._aggregate_shot_failures([(1, anchor), (2, RuntimeError("disk failure"))])
+        self.assertFalse(hasattr(mixed, "pause_state"))
+        mixed_review = s3_shots._aggregate_shot_failures([
+            (1, anchor), (2, s3_shots.SeedanceManualReviewPendingError("ordinary candidate")),
+        ])
+        self.assertFalse(hasattr(mixed_review, "pause_state"))
+        provider = s3_shots._aggregate_shot_failures([
+            (1, anchor), (2, seedance.SeedanceAccountUnavailableError("account")),
+        ])
+        self.assertEqual(provider.pause_state, "PROVIDER_ACTION_REQUIRED")
+
+    def test_master_review_projects_pending_fallback_as_anchor_review(self):
+        database = sqlite3.connect(":memory:")
+        self.addCleanup(database.close)
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        database.execute("INSERT INTO jobs(job_id,topic_id,title) VALUES('J-FB-PROJECT','T','fallback')")
+        for node_id, node_type, state in (("character_anchor:lead", "character_anchor", "SUCCEEDED"),
+                                          ("master:1", "master", "READY")):
+            database.execute(
+                "INSERT INTO production_nodes(job_id,node_id,node_type,state,spec_hash,idempotency_key) "
+                "VALUES('J-FB-PROJECT',?,?,?,'frozen',?)", (node_id, node_type, state, node_id),
+            )
+        database.execute(
+            "INSERT INTO character_identity_anchors(job_id,identity_key,character_id,display_name,"
+            "source_type,state,approval_state) VALUES('J-FB-PROJECT','lead','lead','Lead',"
+            "'seedance_identity_fallback','READY','PENDING_REVIEW')"
+        )
+        database.commit()
+
+        async def pause_master(_node):
+            raise s3_shots._aggregate_shot_failures([
+                (1, s3_shots.ContinuityAnchorReviewPendingError("replacement needs approval")),
+            ])
+
+        wave = asyncio.run(production_executor.run_ready_wave(
+            database, "J-FB-PROJECT", configured_limit=1, handlers={"master": pause_master},
+        ))
+        self.assertEqual(wave.review_required, ("master:1",))
+        self.assertEqual(database.execute(
+            "SELECT state FROM production_nodes WHERE node_id='master:1'"
+        ).fetchone()[0], "REVIEW_REQUIRED")
+        self.assertEqual(database.execute(
+            "SELECT error_code FROM production_nodes WHERE node_id='master:1'"
+        ).fetchone()[0], "continuity_anchor_review_pending")
+        report = production_projection.reconcile(database, "J-FB-PROJECT")
+        self.assertEqual((report.projected_job_state, report.next_action),
+                         ("ANCHOR_REVIEW_REQUIRED", "approve_continuity_anchors"))
+        for node_state, job_state in (("ACTION_REQUIRED", "PROVIDER_ACTION_REQUIRED"),
+                                      ("BUDGET_REQUIRED", "BUDGET_CONFIRMATION_REQUIRED"), ("FAILED", "FAILED")):
+            database.execute("UPDATE production_nodes SET state=? WHERE node_id='master:1'", (node_state,))
+            self.assertEqual(production_projection.reconcile(database, "J-FB-PROJECT").projected_job_state, job_state)
+        database.execute("UPDATE production_nodes SET state='REVIEW_REQUIRED' WHERE node_id='master:1'")
+        database.execute("UPDATE character_identity_anchors SET approval_state='APPROVED'")
+        self.assertEqual(production_projection.reconcile(database, "J-FB-PROJECT").projected_job_state,
+                         "PRODUCTION_REVIEW_REQUIRED")
+        database.execute("UPDATE character_identity_anchors SET approval_state='PENDING_REVIEW',"
+                         "source_type='seedance_identity_fallback'")
+        database.execute("UPDATE production_nodes SET error_code='ordinary_candidate_review' WHERE node_id='master:1'")
+        self.assertEqual(production_projection.reconcile(database, "J-FB-PROJECT").projected_job_state,
+                         "PRODUCTION_REVIEW_REQUIRED")
+        database.execute("UPDATE character_identity_anchors SET approval_state='PENDING_REVIEW',"
+                         "source_type='seedance_identity_anchor'")
+        database.execute("UPDATE production_nodes SET error_code='continuity_anchor_review_pending' WHERE node_id='master:1'")
+        self.assertEqual(production_projection.reconcile(database, "J-FB-PROJECT").projected_job_state,
+                         "PRODUCTION_REVIEW_REQUIRED")
 
     def test_account_overdue_failure_stops_step_level_retry(self):
         aggregate = s3_shots._aggregate_shot_failures([

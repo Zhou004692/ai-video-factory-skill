@@ -1,6 +1,7 @@
 """Management-facing Production Spec v2 preflight tests."""
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import sqlite3
@@ -13,7 +14,8 @@ from unittest import mock
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-from factory import db as factory_db  # noqa: E402
+from factory import character_assets, db as factory_db, production_config, production_executor  # noqa: E402
+from factory.steps import s3_shots  # noqa: E402
 from factory.management_api import (  # noqa: E402
     ManagementService,
     _production_stage_projection,
@@ -311,6 +313,132 @@ class ManagementCompilerApiTests(unittest.TestCase):
         self.assertEqual(states["character_anchor:linxia"], "SUCCEEDED")
         self.assertEqual(states["scene_anchor:yard"], "SUCCEEDED")
         self.assertEqual(states["master:1"], "READY")
+
+    def test_fallback_approval_resumes_only_marked_dependent_master_and_reuses_artifact(self):
+        character = {"id": "linxia", "name": "Lin", "generation_mode": "ai_generated", "look": "adult"}
+        identity_key = character_assets.character_identity_key(character)
+        storyboard = {"characters": [character], "production_settings": {
+            "character_anchor_generator": "seedream_5_0",
+        }}
+        model = production_config.generation_snapshot(storyboard)["model"]
+        video_path = self.root / "approved-fallback.mp4"
+        # Loader-only sentinel: this test validates reuse, not media decoding.
+        video_path.write_bytes(b"existing-provider-artifact")
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,execution_engine,storyboard,cost_cents) "
+            "VALUES('J-FB-RESUME','T','fallback','PRODUCTION_RUNNING','graph_v2',?,272)",
+            (json.dumps(storyboard),),
+        )
+        for node_id, node_type, state, error_code in (
+            ("character_anchor:linxia", "character_anchor", "SUCCEEDED", None),
+            ("master:1", "master", "READY", None),
+            ("master:2", "master", "REVIEW_REQUIRED", "ordinary_candidate_review"),
+            ("master:3", "master", "REVIEW_REQUIRED", "continuity_anchor_review_pending"),
+            ("local_compose", "local_compose", "PENDING", None),
+        ):
+            self.database.execute(
+                "INSERT INTO production_nodes(job_id,node_id,node_type,state,error_code,spec_hash,idempotency_key) "
+                "VALUES('J-FB-RESUME',?,?,?,?,'spec',?)", (node_id, node_type, state, error_code, node_id),
+            )
+        self.database.executemany(
+            "INSERT INTO production_edges(job_id,from_node_id,to_node_id,edge_type) "
+            "VALUES('J-FB-RESUME',?,?,?)",
+            [("character_anchor:linxia", "master:1", "identity_reference"),
+             ("character_anchor:linxia", "master:2", "identity_reference"),
+             ("master:1", "local_compose", "video")],
+        )
+        self.database.execute(
+            "INSERT INTO character_identity_anchors(job_id,identity_key,character_id,display_name,source_type,"
+            "state,approval_state,generator,model,video_path,video_url,cost_cents) "
+            "VALUES('J-FB-RESUME',?,'linxia','Lin','seedance_identity_fallback','READY','PENDING_REVIEW',"
+            "'seedance_2_5',?,?, 'https://example.invalid/fallback-1.mp4',272)",
+            (identity_key, model, str(video_path)),
+        )
+        self.database.commit()
+
+        async def dependency_handler(_node):
+            # Real loader/approval gate produces the durable exception marker.
+            await s3_shots._ensure_character_identity_anchors(
+                "J-FB-RESUME", [character], storyboard=storyboard, existing_only=True,
+            )
+
+        with mock.patch.object(s3_shots, "conn", return_value=self.database):
+            wave = asyncio.run(production_executor.run_ready_wave(
+                self.database, "J-FB-RESUME", configured_limit=1, handlers={"master": dependency_handler},
+            ))
+        self.assertEqual(wave.review_required, ("master:1",))
+        self.assertEqual(self.database.execute(
+            "SELECT error_code FROM production_nodes WHERE node_id='master:1'"
+        ).fetchone()[0], "continuity_anchor_review_pending")
+        self.database.execute("UPDATE jobs SET state='ANCHOR_REVIEW_REQUIRED' WHERE job_id='J-FB-RESUME'")
+        self.database.commit()
+        with mock.patch.object(self.service, "dispatch_production_queue", return_value={"dispatched_jobs": []}):
+            self.service.approve_continuity_anchors("J-FB-RESUME", note="Approve changed identity method")
+        states = dict(self.database.execute("SELECT node_id,state FROM production_nodes").fetchall())
+        self.assertEqual(states, {"character_anchor:linxia": "SUCCEEDED", "master:1": "READY",
+                                 "master:2": "REVIEW_REQUIRED", "master:3": "REVIEW_REQUIRED",
+                                 "local_compose": "PENDING"})
+        cleared = self.database.execute(
+            "SELECT error_code,next_action FROM production_nodes WHERE node_id='master:1'"
+        ).fetchone()
+        self.assertEqual(tuple(cleared), (None, None))
+        anchor = self.database.execute("SELECT * FROM character_identity_anchors").fetchone()
+        self.assertEqual(anchor["approval_state"], "APPROVED")
+        self.assertTrue(anchor["approved_at"])
+        resumed = self.database.execute(
+            "SELECT * FROM production_node_events WHERE event='resume_anchor_dependency'"
+        ).fetchall()
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual((resumed[0]["from_state"], resumed[0]["to_state"]), ("REVIEW_REQUIRED", "READY"))
+        self.assertIn(identity_key, resumed[0]["payload_json"])
+
+        async def resumed_handler(_node):
+            anchors = await s3_shots._ensure_character_identity_anchors(
+                "J-FB-RESUME", [character], storyboard=storyboard, existing_only=True,
+            )
+            s3_shots._assert_continuity_anchors_approved(self.database, "J-FB-RESUME")
+            self.assertEqual(anchors[identity_key].video_url, "https://example.invalid/fallback-1.mp4")
+            # Stop at the next paid scene boundary: not a generated-scene claim.
+            return production_executor.NodeOutcome.require_review({"test_boundary": "scene_submission"})
+
+        with mock.patch.object(s3_shots, "conn", return_value=self.database), mock.patch.object(
+            s3_shots, "_generate_seedance_video", new_callable=mock.AsyncMock,
+        ) as generate:
+            wave = asyncio.run(production_executor.run_ready_wave(
+                self.database, "J-FB-RESUME", configured_limit=1, handlers={"master": resumed_handler},
+            ))
+        self.assertEqual(wave.started, ("master:1",))
+        self.assertEqual(wave.review_required, ("master:1",))
+        generate.assert_not_awaited()
+        self.assertEqual(self.database.execute("SELECT cost_cents FROM jobs").fetchone()[0], 272)
+        self.assertEqual(self.database.execute("SELECT COUNT(*) FROM provider_calls").fetchone()[0], 0)
+        # A repeated approval of the same already-approved identity must not
+        # resume this now-ordinary review or create another dependency event.
+        self.database.execute("UPDATE jobs SET state='ANCHOR_REVIEW_REQUIRED'")
+        self.database.commit()
+        with mock.patch.object(self.service, "dispatch_production_queue", return_value={"dispatched_jobs": []}):
+            self.service.approve_continuity_anchors("J-FB-RESUME")
+        self.assertEqual(self.database.execute(
+            "SELECT state FROM production_nodes WHERE node_id='master:1'"
+        ).fetchone()[0], "REVIEW_REQUIRED")
+        self.assertEqual(self.database.execute(
+            "SELECT COUNT(*) FROM production_node_events WHERE event='resume_anchor_dependency'"
+        ).fetchone()[0], 1)
+        # A different approved artifact needs its own event, not the previous event ID.
+        self.database.execute("UPDATE character_identity_anchors SET approval_state='PENDING_REVIEW',"
+                              "video_url='https://example.invalid/fallback-2.mp4'")
+        self.database.execute("UPDATE production_nodes SET error_code='continuity_anchor_review_pending' "
+                              "WHERE node_id='master:1'")
+        self.database.execute("UPDATE jobs SET state='ANCHOR_REVIEW_REQUIRED'")
+        self.database.commit()
+        with mock.patch.object(self.service, "dispatch_production_queue", return_value={"dispatched_jobs": []}):
+            self.service.approve_continuity_anchors("J-FB-RESUME")
+        self.assertEqual(self.database.execute(
+            "SELECT state FROM production_nodes WHERE node_id='master:1'"
+        ).fetchone()[0], "READY")
+        self.assertEqual(self.database.execute(
+            "SELECT COUNT(*) FROM production_node_events WHERE event='resume_anchor_dependency'"
+        ).fetchone()[0], 2)
 
     def test_accepting_master_candidate_completes_graph_node_and_unblocks_next(self):
         job_id = "J-MASTER-REVIEW-GRAPH"

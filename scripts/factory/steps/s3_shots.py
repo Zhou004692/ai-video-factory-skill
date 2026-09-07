@@ -528,6 +528,7 @@ class ContinuityAnchorReviewPendingError(RuntimeError):
 
     non_retryable = True
     pause_state = "ANCHOR_REVIEW_REQUIRED"
+    stable_code = "continuity_anchor_review_pending"
 
 
 def _assert_continuity_anchors_approved(database, job_id: str) -> None:
@@ -556,7 +557,9 @@ def _apply_anchor_review_mode(database, job_id: str, mode: str) -> int:
     character = database.execute(
         "UPDATE character_identity_anchors SET approval_state='APPROVED',"
         "approved_at=CURRENT_TIMESTAMP WHERE job_id=? AND state='READY' "
-        "AND approval_state!='APPROVED'",
+        # A privacy fallback changes identity method and buys another artifact;
+        # ordinary auto-review preference cannot approve this replacement.
+        "AND approval_state!='APPROVED' AND source_type!='seedance_identity_fallback'",
         (job_id,),
     )
     scene = database.execute(
@@ -831,6 +834,10 @@ def _aggregate_shot_failures(
         state == "PRODUCTION_REVIEW_REQUIRED" for state in pause_states
     ):
         aggregate.pause_state = "PRODUCTION_REVIEW_REQUIRED"
+    elif pause_states and all(
+        state == "ANCHOR_REVIEW_REQUIRED" for state in pause_states
+    ):
+        aggregate.pause_state = "ANCHOR_REVIEW_REQUIRED"
     return aggregate
 
 
@@ -1209,6 +1216,23 @@ def _finalize_paid_image(
         raise
 
 
+async def _extract_identity_preview(video_path: Path, output_dir: Path) -> Path:
+    """Only an extracted JPEG may make a newly generated identity reviewable."""
+    try:
+        previews = await ffmpeg.extract_frames(video_path, output_dir, [1.0])
+        preview = Path(previews[0]) if previews else None
+        if preview is None or not preview.is_file():
+            raise RuntimeError("missing extracted JPEG")
+        with preview.open("rb") as preview_file:
+            if preview_file.read(3) != b"\xff\xd8\xff":
+                raise RuntimeError("empty or invalid extracted JPEG")
+        return preview
+    except Exception as preview_exc:
+        raise RuntimeError(
+            f"character identity preview extraction failed: {preview_exc}"
+        ) from preview_exc
+
+
 async def _ensure_character_identity_anchors(
     job_id: str,
     characters: list[dict],
@@ -1266,6 +1290,22 @@ async def _ensure_character_identity_anchors(
             not entry["requires_paid_call"]
             or existing_generator == entry["generator"]
         )
+        if existing and existing["source_type"] == "seedance_identity_fallback":
+            compatible_fallback = bool(
+                existing["state"] == "READY"
+                and existing_generator == anchor_generation.SEEDANCE_25
+                and existing["model"] == generation_snapshot["model"]
+                and existing["anchor_mode"] == "dynamic_video"
+                and existing["video_url"] and existing["video_path"]
+                and Path(existing["video_path"]).is_file()
+            )
+            if compatible_fallback and existing["approval_state"] != "APPROVED":
+                raise ContinuityAnchorReviewPendingError(
+                    f"人物替换锚点等待审核：{existing['display_name']}"
+                )
+            # Only this explicitly approved, compatible replacement may
+            # override a frozen Seedream generator; generic mismatches cannot.
+            generator_matches = compatible_fallback and existing["approval_state"] == "APPROVED"
         if existing and existing["state"] == "READY" and generator_matches:
             if (
                 existing["anchor_mode"] == "static_image"
@@ -1506,20 +1546,9 @@ async def _ensure_character_identity_anchors(
             database.commit()
             # A charged remote task is durable even if local decoding fails.
             # Never publish a reviewable anchor before its real frame exists.
-            try:
-                preview_paths = await ffmpeg.extract_frames(
-                    result.video_path, anchor_dir / "preview", [1.0]
-                )
-                preview = Path(preview_paths[0]) if preview_paths else None
-                if preview is None or not preview.is_file():
-                    raise RuntimeError("missing extracted JPEG")
-                with preview.open("rb") as preview_file:
-                    if preview_file.read(3) != b"\xff\xd8\xff":
-                        raise RuntimeError("empty or invalid extracted JPEG")
-            except Exception as preview_exc:
-                raise RuntimeError(
-                    f"character identity preview extraction failed: {preview_exc}"
-                ) from preview_exc
+            preview = await _extract_identity_preview(
+                result.video_path, anchor_dir / "preview",
+            )
             database.execute(
                 "UPDATE character_identity_anchors SET state='READY',preview_path=?,"
                 "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND identity_key=?",
@@ -1549,7 +1578,7 @@ async def _fallback_static_identity_anchors(
 
     Seedance rejects an ordinary reference image before creating the paid
     scene task. The fallback therefore buys one four-second, non-speaking
-    native identity master and retries the scene once without the image.
+    native identity master and waits for explicit review before scene retry.
     """
     database = conn()
     job_row = database.execute(
@@ -1569,6 +1598,9 @@ async def _fallback_static_identity_anchors(
         current = identity_anchors.get(identity_key)
         if current is None or current.anchor_mode != "static_image":
             continue
+        # The rejected static reference must not survive as usable state if
+        # replacement generation or preview extraction fails.
+        identity_anchors.pop(identity_key)
         token = character_assets.identity_token(identity_key)
         anchor_dir = ASSETS_DIR / job_id / "character_identity" / token
         anchor_dir.mkdir(parents=True, exist_ok=True)
@@ -1576,9 +1608,11 @@ async def _fallback_static_identity_anchors(
         database.execute(
             "UPDATE character_identity_anchors SET state='GENERATING',"
             "source_type='seedance_identity_fallback',"
-            "anchor_mode='dynamic_video',error=NULL,"
+            "anchor_mode='dynamic_video',approval_state='PENDING_REVIEW',"
+            "approved_at=NULL,review_note='',preview_path=NULL,"
+            "image_path=NULL,image_url=NULL,generator=?,model=?,error=NULL,"
             "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND identity_key=?",
-            (job_id, identity_key),
+            (anchor_generation.SEEDANCE_25, generation_snapshot["model"], job_id, identity_key),
         )
         database.commit()
         try:
@@ -1615,14 +1649,14 @@ async def _fallback_static_identity_anchors(
                 fallback_cost_cents=result.cost_cents,
             )
             database.execute(
-                "UPDATE character_identity_anchors SET state='READY',"
+                "UPDATE character_identity_anchors SET state='GENERATING',"
                 "source_type='seedance_identity_fallback',"
                 "anchor_mode='dynamic_video',video_path=?,video_url=?,"
-                "duration_sec=4,cost_cents=cost_cents+?,error=NULL,"
+                "duration_sec=4,cost_cents=cost_cents+?,model=?,error=NULL,"
                 "updated_at=CURRENT_TIMESTAMP "
                 "WHERE job_id=? AND identity_key=?",
                 (
-                    str(result.video_path), result.video_url, cost,
+                    str(result.video_path), result.video_url, cost, result.model,
                     job_id, identity_key,
                 ),
             )
@@ -1640,24 +1674,20 @@ async def _fallback_static_identity_anchors(
                 ),
             )
             database.commit()
+            preview = await _extract_identity_preview(
+                result.video_path, anchor_dir / "fallback-preview",
+            )
+            database.execute(
+                "UPDATE character_identity_anchors SET state='READY',preview_path=?,"
+                "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND identity_key=?",
+                (str(preview), job_id, identity_key),
+            )
+            database.commit()
             identity_anchors[identity_key] = DialogueAnchor(
                 result.video_url,
                 4,
                 anchor_mode="dynamic_video",
             )
-            try:
-                previews = await ffmpeg.extract_frames(
-                    result.video_path, anchor_dir / "fallback-preview", [1.0]
-                )
-                if previews:
-                    database.execute(
-                        "UPDATE character_identity_anchors SET preview_path=? "
-                        "WHERE job_id=? AND identity_key=?",
-                        (str(previews[0]), job_id, identity_key),
-                    )
-                    database.commit()
-            except Exception:
-                pass
         except BaseException as exc:
             database.execute(
                 "UPDATE character_identity_anchors SET state='FAILED',error=?,"
@@ -3501,58 +3531,10 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                     [char, *(cast_characters or [])],
                     identity_anchors,
                 )
-                if not repair_mode:
-                    continuity_context = _continuity_qa_context(
-                        combined,
-                        char,
-                        cast_characters=cast_characters,
-                        identity_anchors=identity_anchors,
-                        scene_reference=scene_reference,
-                        scene_video_anchor=previous_scene_anchor,
-                        speaker_anchor=speaker_anchor,
-                    )
-                    prompt = _build_native_dialogue_prompt(
-                        combined,
-                        char,
-                        anchored=True,
-                        voice_anchored=bool(
-                            fixed_voice_track or native_voice_anchor
-                        ),
-                        scene_anchored=bool(scene_reference),
-                        previous_scene_anchored=(
-                            previous_scene_anchor is not None
-                        ),
-                    )
-                    request_kwargs = _dialogue_request_kwargs(
-                        combined,
-                        speaker_anchor,
-                        fixed_voice_audio=(
-                            fixed_voice_track.audio_path
-                            if fixed_voice_track else None
-                        ),
-                        native_voice_anchor=native_voice_anchor,
-                        character=char,
-                        cast_characters=cast_characters,
-                        identity_anchors=identity_anchors,
-                        scene_reference=scene_reference,
-                        scene_video_anchor=previous_scene_anchor,
-                    )
-                    prompt = _build_native_dialogue_prompt(
-                        combined,
-                        char,
-                        anchored=True,
-                        voice_anchored=bool(
-                            fixed_voice_track or native_voice_anchor
-                        ),
-                        scene_anchored=bool(scene_reference),
-                        previous_scene_anchored=(
-                            previous_scene_anchor is not None
-                        ),
-                        reference_manifest=request_kwargs.get(
-                            "reference_manifest"
-                        ),
-                    )
-                result = await generate_scene()
+                _assert_continuity_anchors_approved(conn(), job_id)
+                # No static reference was replaced: retrying the same rejected
+                # request would not help. Otherwise the review check above pauses.
+                raise
             if result.audio_path is None and not extend_mode:
                 raise RuntimeError("固定声线音轨未写入 Seedance 成片")
 

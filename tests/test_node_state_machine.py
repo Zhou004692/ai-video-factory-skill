@@ -74,6 +74,25 @@ class NodeStateMachineTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(state, "PENDING")
 
+    def test_anchor_dependency_resume_is_idempotent_without_completing_master(self):
+        self.database.execute("UPDATE production_nodes SET state='REVIEW_REQUIRED' WHERE node_id='master:1'")
+        before = dict(self.database.execute(
+            "SELECT node_id,state FROM production_nodes WHERE node_id!='master:1'"
+        ).fetchall())
+        for expected_applied in (True, False):
+            result = node_state_machine.transition_node(
+                self.database, "J-NODE", "master:1", "resume_anchor_dependency",
+                event_id="master:1:replacement-1", payload={"identity_key": "ai:linxia"},
+            )
+            self.assertEqual(result.applied, expected_applied)
+            self.assertEqual(result.state, "READY")
+        self.assertEqual(dict(self.database.execute(
+            "SELECT node_id,state FROM production_nodes WHERE node_id!='master:1'"
+        ).fetchall()), before)
+        event = self.database.execute("SELECT * FROM production_node_events").fetchone()
+        self.assertEqual((event["from_state"], event["to_state"]), ("REVIEW_REQUIRED", "READY"))
+        self.assertEqual(self.database.execute("SELECT COUNT(*) FROM production_node_events").fetchone()[0], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

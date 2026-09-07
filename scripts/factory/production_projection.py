@@ -92,6 +92,19 @@ def _projected_state(
     ):
         return "ANCHOR_REVIEW_REQUIRED", "approve_continuity_anchors"
     selected = next((state for state in PRIORITY if state in states), "PENDING")
+    if selected == "REVIEW_REQUIRED" and database.execute(
+        "SELECT 1 FROM character_identity_anchors a WHERE a.job_id=? "
+        "AND a.source_type='seedance_identity_fallback' AND a.state='READY' "
+        "AND a.approval_state!='APPROVED' AND EXISTS ("
+        "SELECT 1 FROM production_nodes n WHERE n.job_id=a.job_id "
+        "AND n.node_type='master' AND n.state='REVIEW_REQUIRED' "
+        "AND n.error_code='continuity_anchor_review_pending') LIMIT 1",
+        (job_id,),
+    ).fetchone():
+        # Replacement is created while a master runs, so the original anchor
+        # node may already be SUCCEEDED. Only an explicit dependency pause,
+        # not an unrelated candidate review, belongs to this replacement.
+        return "ANCHOR_REVIEW_REQUIRED", "approve_continuity_anchors"
     return {
         "ACTION_REQUIRED": ("PROVIDER_ACTION_REQUIRED", "reconcile_provider_task"),
         "BUDGET_REQUIRED": (
