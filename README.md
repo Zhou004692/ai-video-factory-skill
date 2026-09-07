@@ -256,9 +256,11 @@ Full 套件还会执行 3 条“来源 → 简报 → 剧本 → 制作设置 �
 
 报告新增 `evidence_boundaries`，逐维度记录 `status`、`source_kind`、`replacement_boundary`、`proves`、`does_not_prove` 和 `observed_checks`。当前 Flow Guard 的严格生产 handler / transport 回放、真实识别准确率、真实成片内容质量均为 `not_run`，不会因 `--suite full` 或通过标志自动升级。已知内置执行器的实际结果才能附带对应来源；自定义执行器、旧报告或结果缺失时按 `unknown` 处理。详细定义与后续证据要求见 [测试证据边界](docs/testing/assurance-boundaries.md)。
 
-严格边界建设的第一步是 `tests.test_strict_provider_boundary`：在单进程中运行真实 Seedance、豆包和 ASR HTTPX 客户端，在 transport 层回放响应，并阻止原始 socket / DNS / 子进程外逃。它尚未接入 Full，不覆盖完整 Worker / 浏览器 / 进程树，也不验证真实识别或内容质量，因此不会把 Flow Guard 的 `strict_transport_replay` 改为通过。
+严格边界建设已包含客户端传输契约和首条人物锚点正式处理器旅程。`tests.test_strict_provider_boundary` 在单进程中运行真实 Seedance、豆包和 ASR HTTPX 客户端；`tests.test_strict_full_flow` 进一步执行真实编译/冻结图、节点领取、人物锚点 handler、Seedance 提交/轮询/下载、TOS SDK 签名与上传、本地 FFmpeg 抽帧、模拟费用落库和人工审核暂停。两者都只在最终 transport 回放固定响应，并阻止未登记的 socket、DNS 和子进程外逃。
 
-可独立运行 `python -m unittest tests.test_strict_provider_boundary -v`；固定请求契约、错误样本、隔离限制及后续接入门槛见 [严格传输回放说明](docs/testing/strict-transport-replay.md)。
+人物锚点只有生成出可解码 JPEG 预览后才能进入审核；静态定妆照因隐私策略改用动态替代片时，必须重新人工确认。确认只恢复等待该锚点的未完成母片，不会批准普通母片候选，也不会重复购买替代片。
+
+可独立运行 `python -m unittest tests.test_strict_full_flow tests.test_strict_provider_boundary -v`。当前尚未接入 Flow Guard Full，不覆盖完整母片/ASR/QA、Worker 重启、浏览器或进程树，也不验证真实识别和内容质量，因此 Flow Guard 的整体 `strict_transport_replay` 仍保持 `not_run`。固定请求契约见 [严格传输回放说明](docs/testing/strict-transport-replay.md)，正式 handler 的状态、费用、恢复契约和未覆盖范围见 [人物锚点正式处理器回放](docs/testing/strict-character-anchor-journey.md)。
 
 当前已完成的独立切片、真实执行边界发现的卡点及剩余接入工作，见 [稳定交付实施记录](docs/testing/stable-delivery-progress.md)。定向测试通过不等同于整个改进计划或真实视频质量已验收。
 
