@@ -279,6 +279,8 @@ Full 套件还会执行 3 条“来源 → 简报 → 剧本 → 制作设置 �
 
 当前已完成的独立切片、真实执行边界发现的卡点及剩余接入工作，见 [稳定交付实施记录](docs/testing/stable-delivery-progress.md)。定向测试通过不等同于整个改进计划或真实视频质量已验收。
 
+已完成供应商任务的母片下载恢复现有独立跨进程切片：管理台继续处理后，新 CLI Worker 只查询和下载原任务，再执行正式 QA、ASR 和本地合成；不再次提交 Seedance 生成。浏览器验证预览媒体可播放并完成审核。混合已付费与未生成母片或任务证据不匹配时明确拒绝；Worker 硬退出留下未核对远端任务时保留 Provider 核对门槛。Flow Guard Full 将该切片单独列为 `strict_master_recovery` 必需检查，绑定本轮源码指纹；其通过不改变整体 `strict_transport_replay` 或真实质量的 `not_run`。范围、恢复条件及进程护栏限制见 [跨进程素材恢复](docs/testing/strict-process-recovery.md)。
+
 执行当前 Full 技术套件（不是所有产品功能的严格 E2E）：
 
 ```powershell

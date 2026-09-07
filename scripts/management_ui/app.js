@@ -1318,7 +1318,7 @@ confirmProduction=async function(job){
   (grid||modal.firstElementChild)?.insertAdjacentElement('beforebegin',panel);
   if(!compiled.compilable){const button=$('#produce-confirm',modal);if(button){button.disabled=true;button.textContent='请先修复生产准备'}}
 }
-async function resumeFailedVideo(job){try{const result=await api(`/api/videos/${encodeURIComponent(job.job_id)}/resume`,{method:'POST',body:'{}'});toast(`已保留 ${result.preserved_masters} 条母片，剩余 ${result.remaining_masters} 条待生成`);if(!await loadPage('videos'))return;const fresh=state.videos.jobs.find(item=>item.job_id===job.job_id);confirmProduction(fresh)}catch(e){toast(e.message,true)}}
+async function resumeFailedVideo(job){try{const result=await api(`/api/videos/${encodeURIComponent(job.job_id)}/resume`,{method:'POST',body:'{}'});if(['PRODUCTION_QUEUED','PRODUCTION_RUNNING'].includes(result.state)){toast('素材恢复已排队，将复用原生成任务');if(!await loadPage('videos'))return;const fresh=state.videos.jobs.find(item=>item.job_id===job.job_id);if(fresh)openVideoDrawer(fresh);return}toast(`已保留 ${result.preserved_masters} 条母片，剩余 ${result.remaining_masters} 条待生成`);if(!await loadPage('videos'))return;const fresh=state.videos.jobs.find(item=>item.job_id===job.job_id);confirmProduction(fresh)}catch(e){toast(e.message,true)}}
 async function openProductionSettings(job){
   if(job.partial_production){confirmProduction(job);return;}
   const [characterData,configData]=await Promise.all([

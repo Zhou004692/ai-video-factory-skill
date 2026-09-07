@@ -13,6 +13,7 @@
 | `production_shadow_lookup` | 正式 SQLite 只读快照与管理台动作映射 | 结构问题、当前状态、处理入口映射 | 恢复已经执行、任务已恢复、人工待审核就是故障 |
 | `historical_incident_replays` | 各历史事故回归夹具，具体见 `detection_boundary` | 已运行测试的指定护栏 | 未覆盖故障和完整生产链 |
 | `structural_mutation_checks` | 人工修改结构夹具 | 指定坏结构是否被检出 | 媒体识别和内容质量 |
+| `strict_master_recovery` | 正式管理台 HTTP、队列与两个 CLI Worker；仅外部 transport 固定回放，合成媒体，脚本审核 | 已完成任务的损坏下载恢复、不重复生成与记账、QA/ASR/合成衔接及浏览器预览/审核 | 完整来源到成片旅程、锚点恢复、操作系统级进程树隔离、真实内容质量 |
 | `strict_transport_replay` | **当前 Flow Guard 未接入，`not_run`** | 无 | 保留全部生产 handler、仅替换外部 transport 的完整旅程 |
 | `recognition_accuracy` | **未运行，`not_run`** | 无 | 从真实音视频获得台词、说话人、表情、手势等的准确率 |
 | `actual_content_quality` | **未运行，`not_run`** | 无 | 真实成片内容质量 |
@@ -64,12 +65,14 @@
 
 后续要声明严格端到端通过，需要保留真实业务 handler、隔离整个进程树的外部 I/O、记录实际请求/响应及产物来源，并逐条证明终态与恢复动作执行。识别准确率需要独立真实媒体及非预填答案的识别结果；内容质量需要明确量表、素材来源及真实验收证据。不能仅改开关或把旧 `passed` 换名字。
 
-## 本次验证范围
+`strict_master_recovery` 是独立有限维度：Full 必须实际运行内置恢复检查，保留成功 HTTP 媒体响应、终态、4+9 传输请求、两次 Worker 执行及一致的源码指纹；自定义 runner 不继承内置来源。它不替代上表的 `strict_transport_replay`。Python/socket/媒体命令护栏与浏览器本地 HTTP 路由限制不是操作系统沙箱，报告保留 `process_tree_verified=false`。详细限制见 [跨进程素材恢复](strict-process-recovery.md)。
 
-只运行纯单元测试，验证边界构建、未知默认、状态兼容、HTML 转义和报告落盘：
+## 初始报告口径验证范围
+
+本文件初始版本只运行纯单元测试，验证边界构建、未知默认、状态兼容、HTML 转义和报告落盘：
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest tests.test_flow_guard_evidence tests.test_flow_guard_html_report -v
 ```
 
-不连接模型、不生成真实媒体、不执行浏览器/Full 旅程、不读取或修改生产数据库。本次单元测试的通过不构成上表任何真实业务旅程的运行记录。
+该批次不连接模型、不生成真实媒体、不执行浏览器/Full 旅程、不读取或修改生产数据库。其单元测试通过不构成上表任何真实业务旅程的运行记录。后续跨进程恢复与 Flow Guard 运行结果见 [稳定交付实施记录](stable-delivery-progress.md)。

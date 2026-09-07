@@ -4322,6 +4322,86 @@ class ManagementService:
     def resume_failed_video(self, job_id: str) -> dict:
         return self.production_service.resume(job_id)
 
+    def _resume_completed_master_downloads(
+        self, job_id: str, retry_indexes: list[int], *, completed: int,
+    ) -> dict | None:
+        """Requeue bound completed tasks for GET-only recovery, atomically."""
+        job = self.database.execute(
+            "SELECT execution_engine FROM jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        if not retry_indexes or job["execution_engine"] != "graph_v2":
+            return None
+        with self.database:
+            self.database.execute("BEGIN IMMEDIATE")
+            placeholders = ",".join("?" for _ in retry_indexes)
+            known_paid_master = self.database.execute(
+                "SELECT 1 FROM shots s WHERE s.job_id=? "
+                f"AND s.idx IN ({placeholders}) AND (s.cost_cents>0 OR EXISTS("
+                "SELECT 1 FROM production_nodes n WHERE n.job_id=s.job_id "
+                "AND n.node_id='master:' || s.idx "
+                "AND (COALESCE(n.provider_task_id,'')<>'' OR n.actual_cost_cents>0)) "
+                "OR EXISTS(SELECT 1 FROM provider_calls c WHERE c.job_id=s.job_id "
+                "AND c.shot_idx=s.idx)) LIMIT 1",
+                (job_id, *retry_indexes),
+            ).fetchone()
+            if known_paid_master is None:
+                return None
+            recoverable = []
+            for idx in retry_indexes:
+                row = self.database.execute(
+                    "SELECT n.node_id,n.output_json,n.provider_task_id,c.usage_json "
+                    "FROM production_nodes n JOIN provider_calls c "
+                    "ON c.task_id=n.provider_task_id AND c.job_id=n.job_id "
+                    "JOIN jobs j ON j.job_id=n.job_id "
+                    "WHERE n.job_id=? AND n.node_id=? AND n.state='FAILED' "
+                    "AND n.node_type='master' AND n.spec_hash=j.production_spec_hash "
+                    "AND c.shot_idx=? AND c.provider='seedance' AND j.state='FAILED'",
+                    (job_id, f"master:{idx}", idx),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        "任务包含已付费母片，但部分待恢复母片尚未生成或缺少匹配的完成任务；"
+                        "请先核对母片任务，不能重新提交"
+                    )
+                try:
+                    usage = json.loads(row["usage_json"] or "{}")
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("已付费母片任务证据损坏，不能重新提交") from exc
+                if not isinstance(usage, dict) or usage.get("status") != "completed":
+                    raise ValueError("已付费母片任务未确认完成，不能重新提交")
+                recoverable.append((idx, row))
+            for idx, row in recoverable:
+                output = json.loads(row["output_json"] or "{}")
+                output.pop("_executor_checkpoint", None)
+                output["resume_provider_task_id"] = row["provider_task_id"]
+                node_state_machine.transition_node_in_transaction(
+                    self.database, job_id, row["node_id"], "retry",
+                    event_id=f"{job_id}:download-recovery:{secrets.token_hex(12)}",
+                    payload={"provider_task_id": row["provider_task_id"]},
+                )
+                self.database.execute(
+                    "UPDATE production_nodes SET output_json=?,lease_id=NULL,"
+                    "heartbeat_at=NULL,error_code=NULL,next_action=NULL "
+                    "WHERE job_id=? AND node_id=?",
+                    (json.dumps(output, ensure_ascii=False), job_id, row["node_id"]),
+                )
+                self.database.execute(
+                    "UPDATE shots SET state='PENDING',error=NULL,video_qa=NULL "
+                    "WHERE job_id=? AND idx=?", (job_id, idx),
+                )
+            state_machine.transition(
+                self.database, job_id, "queued",
+                event_id=f"{job_id}:download-recovery-queued:{secrets.token_hex(12)}",
+                updates={"error": None, "failure_code": None, "retries": 0,
+                         "production_worker_pid": None},
+            )
+        return {
+            "job_id": job_id, "state": "PRODUCTION_QUEUED",
+            "recovery_kind": "completed_master_download",
+            "preserved_masters": completed, "remaining_masters": len(retry_indexes),
+            "manual_review_masters": 0,
+        }
+
     def _resume_failed_video_impl(self, job_id: str) -> dict:
         job = self.database.execute(
             "SELECT state,bgm_path,failure_code,cost_cents FROM jobs WHERE job_id=?",
@@ -4404,6 +4484,14 @@ class ManagementService:
         structured_failure_codes = {
             str(job["failure_code"] or "").strip(), *shot_failure_codes,
         } - {""}
+        # A reaped Worker can leave a submitted task pending even though its
+        # process failure is internal_error. Reconcile that evidence before any
+        # generation decision; this exception never authorizes a new submit.
+        interrupted_provider_task = bool(
+            resume_from_state == "FAILED"
+            and structured_failure_codes == {"internal_error"}
+            and provider_tasks.unresolved_task_ids(self.database, job_id)
+        )
         music_configuration_retry_ready = bool(
             structured_failure_codes == {"music_configuration_invalid"}
             and shots
@@ -4422,13 +4510,14 @@ class ManagementService:
             and structured_failure_codes != {"account_unavailable"}
             and not identity_anchor_retry_ready
             and not music_configuration_retry_ready
+            and not interrupted_provider_task
         ):
             raise ValueError(
                 "该失败任务的稳定 failure code 不可恢复；"
                 "隐私、内容政策、版权及其他 Provider 拒绝禁止重新提交"
             )
-        if resume_from_state == "PROVIDER_ACTION_REQUIRED" or (
-            structured_failure_codes
+        if not interrupted_provider_task and (
+            resume_from_state == "PROVIDER_ACTION_REQUIRED" or structured_failure_codes
         ):
             unresolved = provider_tasks.unresolved_task_ids(self.database, job_id)
             if unresolved:
@@ -4604,6 +4693,11 @@ class ManagementService:
                 "local_postproduction": True,
             }
         self._assert_no_unresolved_provider_tasks(job_id)
+        recovered = self._resume_completed_master_downloads(
+            job_id, retry_indexes, completed=completed,
+        )
+        if recovered is not None:
+            return recovered
         if identity_anchor_retry_ready:
             self.database.execute(
                 "UPDATE character_identity_anchors SET state='PENDING',"

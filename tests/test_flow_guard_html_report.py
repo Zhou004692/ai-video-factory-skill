@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import flow_guard as flow_guard_cli  # noqa: E402
+from tests.test_flow_guard_strict_recovery import evidence as strict_evidence
 from factory.flow_guard.html_report import render_html_report  # noqa: E402
 from factory.flow_guard import runner  # noqa: E402
 
@@ -170,6 +171,12 @@ def fully_observed_payload(*, skipped: bool = False) -> dict[str, object]:
     """Build report fixtures without executing the media/service runners."""
     payload = sample_payload()
     observations = {
+        "strict_master_recovery": {
+            **strict_evidence(), "browser_evidence": strict_evidence(),
+            "source_fingerprint": "a" * 64, "source_fingerprint_after": "a" * 64,
+            "errors": [], "exit_code": 0, "process_tree_verified": False,
+            "strict_transport_replay": "not_run", "observed_checks": ["fixture_browser_http_resume"],
+        },
         "graph_scenarios": {"status": "passed", "reports": payload["reports"]},
         "journey_suite": {**payload["journey_suite"], "status": "passed"},
         **{key: payload[key] for key in (
@@ -178,6 +185,7 @@ def fully_observed_payload(*, skipped: bool = False) -> dict[str, object]:
         )},
     }
     implementations = {
+        "strict_master_recovery": runner.run_strict_master_recovery,
         "graph_scenarios": runner.explore_scenario,
         "journey_suite": runner.run_full_journey_suite,
         "video_source_golden": runner.run_video_performance_golden,

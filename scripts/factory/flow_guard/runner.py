@@ -23,6 +23,7 @@ from .mutations import run_historical_mutation_calibration
 from .perceptual_media import run_perceptual_media_golden
 from .video_golden import run_video_performance_golden
 from .shadow_audit import audit_production_shadow
+from .strict_recovery import run_strict_master_recovery, validate_runner_result
 
 
 Explorer = Callable[..., Awaitable[ExplorationReport]]
@@ -40,6 +41,7 @@ def _assurance_summary(
     video_golden: dict[str, object],
     shadow_audit: dict[str, object],
     perceptual_media: dict[str, object],
+    strict_master_recovery: dict[str, object],
     action_evidence_required: bool,
 ) -> dict[str, object]:
     checks = {
@@ -48,12 +50,13 @@ def _assurance_summary(
         "video_source_golden": str(video_golden.get("status") or "unknown"),
         "production_shadow_audit": str(shadow_audit.get("status") or "unknown"),
         "perceptual_media_golden": str(perceptual_media.get("status") or "unknown"),
+        "strict_master_recovery": str(strict_master_recovery.get("status") or "unknown"),
         "management_action_evidence": (
             "required" if action_evidence_required else "skipped"
         ),
     }
     skipped = sorted(
-        name for name, status in checks.items() if status == "skipped"
+        name for name, status in checks.items() if status in {"skipped", "not_run"}
     )
     return {
         "level": "full" if not skipped else "partial",
@@ -102,6 +105,7 @@ async def run_matrix(
     include_shadow_audit: bool | None = None,
     perceptual_media_runner: PerceptualMediaRunner = run_perceptual_media_golden,
     include_perceptual_media: bool | None = None,
+    strict_recovery_runner: Callable[[Path], dict[str, object]] = run_strict_master_recovery,
 ) -> dict[str, object]:
     """Run scenarios in isolation and return a stable machine-readable result."""
     started_at = time.perf_counter()
@@ -139,7 +143,32 @@ async def run_matrix(
         }
     )
     graph_paid_calls = sum(report.paid_provider_calls for report in reports)
+    if include_journeys:
+        try:
+            strict_master_recovery = await asyncio.to_thread(
+                strict_recovery_runner, work_root / "strict-master-recovery"
+            )
+            if not isinstance(strict_master_recovery, dict):
+                raise ValueError("strict recovery runner returned no structured result")
+            if strict_master_recovery.get("status") == "passed":
+                errors = validate_runner_result(strict_master_recovery)
+                if errors:
+                    strict_master_recovery = {
+                        **strict_master_recovery, "status": "failed", "errors": errors,
+                        "observed_checks": ["strict_browser_recovery_failed"],
+                    }
+        except Exception as error:
+            strict_master_recovery = {
+                "status": "failed", "paid_provider_calls": 0,
+                "errors": [f"{type(error).__name__}: {error}"],
+                "observed_checks": ["strict_browser_recovery_failed"],
+            }
+    else:
+        strict_master_recovery = {"status": "not_run", "paid_provider_calls": 0}
     paid_calls = graph_paid_calls + int(journey["paid_provider_calls"])
+    strict_paid_calls = strict_master_recovery.get("paid_provider_calls")
+    if type(strict_paid_calls) is int and strict_paid_calls > 0:
+        paid_calls += strict_paid_calls
     mutation = run_historical_mutation_calibration()
     if include_incidents is None:
         include_incidents = include_journeys
@@ -248,6 +277,7 @@ async def run_matrix(
         video_golden=video_golden,
         shadow_audit=shadow_audit,
         perceptual_media=perceptual_media,
+        strict_master_recovery=strict_master_recovery,
         action_evidence_required=bool(include_journeys),
     )
     operational_attention_count = int(
@@ -262,6 +292,11 @@ async def run_matrix(
         and shadow_audit["status"] in {"passed", "attention", "skipped"}
         and perceptual_media["status"] in {"passed", "skipped"}
         and journey["status"] in {"passed", "skipped"}
+        and (not include_journeys or (
+            strict_master_recovery.get("status") == "passed"
+            and strict_master_recovery.get("paid_provider_calls") == 0
+            and strict_master_recovery.get("external_requests") == 0
+        ))
         and not missing_dispatch_actions
         and (not include_journeys or not action_evidence_gaps)
     )
@@ -284,6 +319,7 @@ async def run_matrix(
         "video_source_golden": video_golden,
         "production_shadow_audit": shadow_audit,
         "perceptual_media_golden": perceptual_media,
+        "strict_master_recovery": strict_master_recovery,
     }, {
         "graph_scenarios": explorer,
         "journey_suite": journey_runner,
@@ -292,6 +328,7 @@ async def run_matrix(
         "video_source_golden": video_golden_runner,
         "production_shadow_audit": shadow_audit_runner,
         "perceptual_media_golden": perceptual_media_runner,
+        "strict_master_recovery": strict_recovery_runner,
     })
     return {
         "status": overall_status,
@@ -320,6 +357,7 @@ async def run_matrix(
         "video_source_golden": video_golden,
         "production_shadow_audit": shadow_audit,
         "perceptual_media_golden": perceptual_media,
+        "strict_master_recovery": strict_master_recovery,
         "unique_trace_count": len(traces),
         "duplicate_trace_scenarios": len(reports) - len(traces),
         "duration_sec": round(time.perf_counter() - started_at, 3),

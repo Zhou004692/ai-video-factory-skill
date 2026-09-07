@@ -2772,6 +2772,25 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
     candidate_path = out_path.with_name(
         f".{out_path.stem}.candidate{out_path.suffix}"
     )
+    recovery_call = None
+    if health_database is not None and job_id and shot_idx:
+        recovery_node = health_database.execute(
+            "SELECT n.provider_task_id,n.output_json FROM production_nodes n "
+            "JOIN jobs j ON j.job_id=n.job_id AND j.production_spec_hash=n.spec_hash "
+            "WHERE n.job_id=? AND n.node_id=? AND n.state='RUNNING'",
+            (job_id, f"master:{shot_idx}"),
+        ).fetchone()
+        if recovery_node is not None:
+            output = json.loads(recovery_node["output_json"] or "{}")
+            recovery_id = str(output.get("resume_provider_task_id") or "")
+            if recovery_id:
+                recovery_call = health_database.execute(
+                    "SELECT task_id,intent,usage_json,cost_cents FROM provider_calls "
+                    "WHERE task_id=? AND job_id=? AND shot_idx=? AND provider=?",
+                    (recovery_id, job_id, shot_idx, billing_provider),
+                ).fetchone()
+                if recovery_call is None or recovery_id != recovery_node["provider_task_id"]:
+                    raise RuntimeError("paid master recovery task ownership mismatch")
 
     def update_staged_artifact(task_id: str, artifact_path: Path) -> None:
         if health_database is None or not task_id:
@@ -2876,12 +2895,13 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             ))
         except (TypeError, ValueError):
             configured_capacity_limit = max(1, int(MAX_CONCURRENT_SHOTS))
-        _assert_paid_call_within_job_budget(
-            job_id,
-            spent_cost_cents=spent_cost_cents,
-            request_kwargs=call_kwargs,
-        )
-        if health_database is not None:
+        if recovery_call is None:
+            _assert_paid_call_within_job_budget(
+                job_id,
+                spent_cost_cents=spent_cost_cents,
+                request_kwargs=call_kwargs,
+            )
+        if health_database is not None and recovery_call is None:
             provider_health.assert_available(health_database, "seedance")
             provider_capacity.assert_submit_allowed(
                 health_database, "seedance"
@@ -3009,7 +3029,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             _persist_task_state(task_id, status, data)
 
         reservation_id: str | None = None
-        if health_database is not None and job_id:
+        if health_database is not None and job_id and recovery_call is None:
             budget_row = health_database.execute(
                 "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
             ).fetchone()
@@ -3033,17 +3053,29 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             except provider_tasks.ProviderTaskBudgetError as exc:
                 raise SeedanceBudgetError(str(exc)) from exc
         try:
-            video = await seedance.text_to_video(
-                prompt=_native_audio_prompt(
-                    generation_prompt, generate_audio, expected_text
-                ),
-                model=model,
-                generate_audio=generate_audio,
-                metadata_out=metadata,
-                on_task_created=persist_pending_task,
-                on_task_updated=persist_task_state,
-                **provider_kwargs,
-            )
+            if recovery_call is not None:
+                inspected = await seedance.inspect_task(recovery_call["task_id"])
+                video = inspected.get("video")
+                if inspected.get("status") != "completed" or not isinstance(
+                    video, (bytes, bytearray)
+                ) or not video:
+                    raise RuntimeError("paid master task has no downloadable completed media")
+                metadata.update(
+                    task_id=recovery_call["task_id"],
+                    usage=json.loads(recovery_call["usage_json"] or "{}"),
+                )
+            else:
+                video = await seedance.text_to_video(
+                    prompt=_native_audio_prompt(
+                        generation_prompt, generate_audio, expected_text
+                    ),
+                    model=model,
+                    generate_audio=generate_audio,
+                    metadata_out=metadata,
+                    on_task_created=persist_pending_task,
+                    on_task_updated=persist_task_state,
+                    **provider_kwargs,
+                )
             if reservation_id:
                 remote_task_id = str(metadata.get("task_id") or "").strip()
                 if remote_task_id:
@@ -3061,8 +3093,11 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                         health_database, reservation_id
                     )
                 reservation_id = None
-            call_cost = seedance.usage_cost_cents(metadata.get("usage") or {})
-            if not call_cost:
+            call_cost = (
+                int(recovery_call["cost_cents"] or 0) if recovery_call is not None
+                else seedance.usage_cost_cents(metadata.get("usage") or {})
+            )
+            if not call_cost and recovery_call is None:
                 fallback_duration = float(
                     request_kwargs.get("reference_video_duration_sec")
                     if str(request_kwargs.get("task_intent") or "generate") == "edit"
@@ -3369,8 +3404,11 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         int(provider_calls[-1]["cost_cents"])
         if provider_calls else _estimated_request_cost_cents(request_kwargs)
     )
-    denial = _auto_retry_denial(
-        decision.reasons, projected_retry_cost, generation_snapshot
+    denial = (
+        "paid master download recovery does not authorize generation"
+        if recovery_call is not None else _auto_retry_denial(
+            decision.reasons, projected_retry_cost, generation_snapshot
+        )
     )
     if denial is not None:
         # A transcript mismatch is a quality warning, not proof that the

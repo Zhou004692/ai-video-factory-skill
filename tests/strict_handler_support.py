@@ -38,7 +38,8 @@ _ORIGINAL_SOCKET_SEND = socket.socket.send
 
 
 class StrictHandlerReplay(StrictTransportReplay):
-    def __init__(self, *, contract=None):
+    def __init__(self, *, contract=None, work_root=None):
+        self.work_root = Path(work_root).resolve() if work_root is not None else None
         self.media_sha256 = MEDIA_SHA256
         fixture = deepcopy(contract) if contract is not None else json.loads(
             (FIXTURES / "character_anchor.json").read_text(encoding="utf-8")
@@ -127,24 +128,31 @@ class StrictHandlerReplay(StrictTransportReplay):
         return result
 
     def __enter__(self):
-        self._temporary = tempfile.TemporaryDirectory(prefix="strict-anchor-")
-        self.root = Path(self._temporary.name).resolve()
+        if self.work_root is None:
+            self._temporary = tempfile.TemporaryDirectory(prefix="strict-anchor-")
+            self.root = Path(self._temporary.name).resolve()
+        else:
+            self.root = self.work_root
+            if not (self.root / ".strict-replay-root").is_file():
+                raise ValueError("persistent strict replay requires an isolated root marker")
         self.ffmpeg = Path(shutil.which("ffmpeg") or "").resolve()
         self.ffprobe = Path(shutil.which("ffprobe") or "").resolve()
         if not self.ffmpeg.is_file() or not self.ffprobe.is_file():
-            self._temporary.cleanup()
+            if self._temporary is not None:
+                self._temporary.cleanup()
             raise RuntimeError("strict real handler replay requires local ffmpeg and ffprobe")
         try:
             super().__enter__()
             stack = self._stack
             # Register cleanup early; patches restore only after DB handles close.
-            stack.callback(self._temporary.cleanup)
+            if self._temporary is not None:
+                stack.callback(self._temporary.cleanup)
             from factory import db
             from factory.clients import tos
             from factory.steps import s3_shots
 
             self.assets = self.root / "assets"
-            self.assets.mkdir()
+            self.assets.mkdir(exist_ok=True)
             self.db_path = self.root / "factory.db"
             stack.enter_context(mock.patch.dict(os.environ, {
                 "FACTORY_DATA_DIR": str(self.root), "FACTORY_DB_PATH": str(self.db_path),
@@ -180,7 +188,8 @@ class StrictHandlerReplay(StrictTransportReplay):
             if self._stack is not None:
                 self._stack.close()
                 self._stack = None
-            self._temporary.cleanup()
+            if self._temporary is not None:
+                self._temporary.cleanup()
             raise
 
     def _close_connections(self):
@@ -206,12 +215,12 @@ class StrictHandlerReplay(StrictTransportReplay):
 class StrictMasterComposeReplay(StrictHandlerReplay):
     """Strict transport plus an allow-list for the formal local media pipeline."""
 
-    def __init__(self, *, contract=None, fail_operation=None):
+    def __init__(self, *, contract=None, fail_operation=None, work_root=None):
         if contract is None:
             contract = json.loads(
                 (FIXTURES / "master_compose.json").read_text(encoding="utf-8")
             )
-        super().__init__(contract=contract)
+        super().__init__(contract=contract, work_root=work_root)
         self.media_sha256 = MASTER_MEDIA_SHA256
         if fail_operation not in {None, "mix"}:
             raise ValueError("unknown authored local-media fault")
@@ -447,14 +456,14 @@ class StrictMasterComposeReplay(StrictHandlerReplay):
             from factory.steps import s3_shots, s5_bgm, s6_compose
 
             self.assets = self.root / "data" / "assets"
-            self.assets.mkdir(parents=True)
+            self.assets.mkdir(parents=True, exist_ok=True)
             stack.enter_context(mock.patch.object(s3_shots, "ASSETS_DIR", self.assets))
             stack.enter_context(mock.patch.object(s5_bgm, "ASSETS_DIR", self.assets))
             stack.enter_context(mock.patch.object(s6_compose, "ASSETS_DIR", self.assets))
             stack.enter_context(mock.patch.object(tempfile, "tempdir", str(self.root)))
             stack.enter_context(mock.patch.object(
-                bigasr.uuid, "uuid4",
-                return_value=uuid.UUID("11111111-1111-4111-8111-111111111111"),
+                bigasr, "uuid",
+                SimpleNamespace(uuid4=lambda: uuid.UUID("11111111-1111-4111-8111-111111111111")),
             ))
             # ``asyncio.to_thread`` wakes the Windows proactor through its
             # private loopback socket.  Permit only that one-byte wakeup;

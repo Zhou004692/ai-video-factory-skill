@@ -94,6 +94,7 @@ def render_html_report(
     shadow_audit = _mapping(payload.get("production_shadow_audit"))
     perceptual_media = _mapping(payload.get("perceptual_media_golden"))
     journey_suite = _mapping(payload.get("journey_suite"))
+    strict_recovery = _mapping(payload.get("strict_master_recovery"))
     browser_suite = _mapping(journey_suite.get("browser_suite"))
     execution = _mapping(payload.get("execution"))
     assurance = _mapping(payload.get("assurance"))
@@ -139,6 +140,31 @@ def render_html_report(
             f'<td>{_chips(evidence["observed_checks"], empty="无已记录检查")}</td>'
             "</tr>"
         )
+
+    strict_rows = []
+    for raw in _items(strict_recovery.get("workers")):
+        worker = _mapping(raw)
+        strict_rows.append(
+            '<tr>'
+            f'<td>{_text(worker.get("phase"))}</td>'
+            f'<td>{_text(worker.get("pid"))}</td>'
+            f'<td>{_text(worker.get("launcher_pid"))}</td>'
+            f'<td>{_text(worker.get("http_requests_matched"))} / {_text(worker.get("expected_requests"))}</td>'
+            f'<td>{_text(worker.get("violations"))}</td>'
+            f'<td>{_text(worker.get("status"))}</td></tr>'
+        )
+    strict_detail = (
+        '<section><h2>单 master 下载恢复：浏览器 → HTTP 服务 → CLI Worker</h2>'
+        '<p>此项只覆盖损坏下载后的恢复和脚本终审；无素材/锚点生成、真实识别或成片质量验收。'
+        'process_tree_verified=false；进程 PID 与 transport 记录不构成 OS 进程树隔离证明。</p>'
+        f'<p>状态：{_text(strict_recovery.get("status"), "unknown")}；'
+        f'源码指纹：<code>{_text(strict_recovery.get("source_fingerprint"))}</code></p>'
+        f'<p>HTTP POST：{_chips(_items(strict_recovery.get("posts")), empty="无已记录请求")}</p>'
+        '<div class="table-wrap"><table><thead><tr><th>阶段</th><th>Worker PID</th><th>Launcher PID</th>'
+        '<th>匹配 / 期望请求</th><th>违规</th><th>状态</th></tr></thead>'
+        f'<tbody>{"".join(strict_rows) or "<tr><td colspan=6>未记录 Worker 执行</td></tr>"}</tbody></table></div>'
+        f'<p>{_chips(_items(strict_recovery.get("errors")), empty="无记录错误")}</p></section>'
+    )
 
     scenario_count = _number(payload.get("scenario_count"))
     scenario_passed = _number(payload.get("passed"))
@@ -437,6 +463,7 @@ def render_html_report(
     <div class="meta">“可证明”是通过项的有限范围，不是失败或未执行项的成功结论。未知来源不自动升级；详细动作事实见原始 JSON 与下方证据矩阵。</div>
     <div class="table-wrap"><table><thead><tr><th>维度 / 层级</th><th>状态</th><th>来源类型</th><th>替换边界</th><th>可证明（仅通过项）</th><th>不能证明</th><th>已记录检查</th></tr></thead><tbody>{''.join(boundary_rows)}</tbody></table></div>
   </section>
+  {strict_detail}
 
   <div class="metrics">
     {_summary_card("有效路径", f"{scenario_passed} / {scenario_count}", f"唯一轨迹 {_number(payload.get('unique_trace_count'))} 条")}

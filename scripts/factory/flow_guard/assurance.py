@@ -16,6 +16,7 @@ from .mutations import run_historical_mutation_calibration
 from .perceptual_media import run_perceptual_media_golden
 from .shadow_audit import audit_production_shadow
 from .video_golden import run_video_performance_golden
+from .strict_recovery import run_strict_master_recovery, validate_runner_result
 
 
 _HANDLERS = (
@@ -24,6 +25,17 @@ _HANDLERS = (
     "不是仅替换 Seedance HTTP transport。"
 )
 _CATALOG = {
+    "strict_master_recovery": (
+        "strict_master_recovery", run_strict_master_recovery, "bounded_strict_master_recovery",
+        "browser_http_service_cli_with_transport_fixtures",
+        "浏览器 HTTP → 正式 ManagementService 队列 → 原生 CLI Worker；"
+        "仅单个旁白 master 的损坏下载恢复与脚本终审。替换 HTTP transport、固定时钟/UUID 并隔离存储；"
+        "保留生产 handler，本地 FFmpeg/ffprobe 按白名单执行。process_tree_verified=false，不是 OS 进程树隔离。",
+        ["两个独立 Worker 的损坏下载与恢复；恢复不重复提交生成请求",
+         "浏览器恢复与脚本终审动作经正式 HTTP 服务传播；当前源码指纹绑定"],
+        ["完整生产链严格 transport 回放", "素材生成与锚点生成", "OS 进程树/网络隔离",
+         "真实识别准确率", "真实成片质量或人工验收"],
+    ),
     "component_propagation": (
         "graph_scenarios", explore_scenario, "component_propagation",
         "synthetic_media_with_scripted_graph_outcomes",
@@ -105,6 +117,11 @@ def _empty_boundaries() -> dict:
 
 
 def _observed_checks(check_id: str, result: Mapping) -> list[str]:
+    if check_id == "strict_master_recovery":
+        if result.get("status") == "passed" and validate_runner_result(dict(result)):
+            return []
+        checks = result.get("observed_checks")
+        return [check for check in checks if isinstance(check, str) and check.strip()] if isinstance(checks, list) else []
     if check_id == "production_shadow_audit":
         count = result.get("audited_job_count")
         return [f"audited_job_count={count}"] if type(count) is int and count >= 0 else []

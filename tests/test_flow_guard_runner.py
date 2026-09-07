@@ -58,6 +58,7 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
                 explorer=fake_explorer,
                 include_journeys=True,
                 journey_runner=fake_journey_runner,
+                strict_recovery_runner=lambda _: {"status": "not_run"},
             )
 
         coverage = summary["coverage"]
@@ -104,6 +105,7 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
                 explorer=fake_explorer,
                 include_journeys=True,
                 journey_runner=fake_journey_runner,
+                strict_recovery_runner=lambda _: {"status": "not_run"},
             )
 
         self.assertEqual(summary["status"], "failed")
@@ -388,6 +390,7 @@ class FlowGuardRunnerTests(unittest.IsolatedAsyncioTestCase):
                 explorer=fake_explorer,
                 include_journeys=True,
                 journey_runner=fake_journey_runner,
+                strict_recovery_runner=lambda _: {"status": "not_run"},
             )
 
         self.assertEqual(summary["status"], "failed")
