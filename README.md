@@ -105,6 +105,10 @@ BigASR 台词与字幕校准 + 画面质检
 
 ### 7. 原生声线与可选固定声线
 
+Graph V2 编译器与复杂度分析共用出镜/声音判断：画外对白和旁白不会仅因发声增加出镜人数，也不会默认让第一个画面人物对口型。显式安排在画面中的人物仍保留；有台词才检查台词与字幕，只有入镜对白才要求口型。纯背景音使用保留画面演员的独立执行路径，不强制人物全程闭嘴；多人同一节拍声音模式或台词归属不明确时，会提示修正模式或拆为逐人话轮，不猜测归属。规则与验证边界见 [声音与出镜语义](docs/testing/speech-visibility-contract.md)。
+
+母片预检按冻结图中的实际依赖读取场景锚点，区分“场景身份”与“必须有参考资产”：合法单场景无锚点依赖时不会误拦；确有依赖但缺素材、生成器不匹配或未审核时仍阻断。该规则已纳入 R1 零费用门禁，见 [冻结场景依赖](docs/testing/frozen-scene-dependencies.md)。
+
 | 模式 | 说明 | 额外配置 |
 |---|---|---|
 | `seedance_native` | Seedance 2.5 直接合成人声、环境音与口型，默认模式 | 无需 TTS 配置 |
@@ -255,6 +259,8 @@ Full 套件还会执行 3 条“来源 → 简报 → 剧本 → 制作设置 �
 严格边界建设的第一步是 `tests.test_strict_provider_boundary`：在单进程中运行真实 Seedance、豆包和 ASR HTTPX 客户端，在 transport 层回放响应，并阻止原始 socket / DNS / 子进程外逃。它尚未接入 Full，不覆盖完整 Worker / 浏览器 / 进程树，也不验证真实识别或内容质量，因此不会把 Flow Guard 的 `strict_transport_replay` 改为通过。
 
 可独立运行 `python -m unittest tests.test_strict_provider_boundary -v`；固定请求契约、错误样本、隔离限制及后续接入门槛见 [严格传输回放说明](docs/testing/strict-transport-replay.md)。
+
+当前已完成的独立切片、真实执行边界发现的卡点及剩余接入工作，见 [稳定交付实施记录](docs/testing/stable-delivery-progress.md)。定向测试通过不等同于整个改进计划或真实视频质量已验收。
 
 执行当前 Full 技术套件（不是所有产品功能的严格 E2E）：
 
