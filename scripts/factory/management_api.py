@@ -8107,7 +8107,7 @@ class ManagementService:
         # candidate review (or a marker without this dependency) must not be
         # treated as permission to re-run a paid master.
         fallback_dependents = self.database.execute(
-            "SELECT n.node_id,a.identity_key,a.video_url,a.video_path "
+            "SELECT n.node_id,a.identity_key,a.video_url,a.video_path,a.cost_cents "
             "FROM production_nodes n JOIN production_edges e "
             "ON e.job_id=n.job_id AND e.to_node_id=n.node_id "
             "AND e.edge_type='identity_reference' "
@@ -8157,9 +8157,11 @@ class ManagementService:
             approved_fallbacks: dict[str, list[dict[str, str]]] = {}
             for fallback in fallback_dependents:
                 # Identity rows have no provider_task_id column. Bind the
-                # event to the stable artifact location, never to review time.
+                # event to location + cumulative billed cost, never review time.
+                # A newly paid task can overwrite the same object path; an
+                # idempotent replay has zero cost delta and stays the same event.
                 artifact = hashlib.sha256(json.dumps(
-                    [fallback["video_url"], fallback["video_path"]],
+                    [fallback["video_url"], fallback["video_path"], int(fallback["cost_cents"] or 0)],
                     ensure_ascii=False,
                 ).encode("utf-8")).hexdigest()
                 approved_fallbacks.setdefault(str(fallback["node_id"]), []).append({

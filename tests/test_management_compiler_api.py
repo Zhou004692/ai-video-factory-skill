@@ -424,9 +424,10 @@ class ManagementCompilerApiTests(unittest.TestCase):
         self.assertEqual(self.database.execute(
             "SELECT COUNT(*) FROM production_node_events WHERE event='resume_anchor_dependency'"
         ).fetchone()[0], 1)
-        # A different approved artifact needs its own event, not the previous event ID.
+        # A new paid artifact may overwrite the same object URL and local path.
+        # Its cumulative billed cost distinguishes it from the prior approval.
         self.database.execute("UPDATE character_identity_anchors SET approval_state='PENDING_REVIEW',"
-                              "video_url='https://example.invalid/fallback-2.mp4'")
+                              "cost_cents=cost_cents+272")
         self.database.execute("UPDATE production_nodes SET error_code='continuity_anchor_review_pending' "
                               "WHERE node_id='master:1'")
         self.database.execute("UPDATE jobs SET state='ANCHOR_REVIEW_REQUIRED'")
