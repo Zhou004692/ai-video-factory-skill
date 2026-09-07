@@ -38,6 +38,27 @@ def record_review(
     first_pass: bool | None = None,
     checks: dict[str, bool] | None = None,
 ) -> None:
+    with db:
+        record_review_in_transaction(
+            db, job_id, decision,
+            manual_minutes=manual_minutes,
+            notes=notes,
+            first_pass=first_pass,
+            checks=checks,
+        )
+
+
+def record_review_in_transaction(
+    db: sqlite3.Connection,
+    job_id: str,
+    decision: str,
+    *,
+    manual_minutes: float = 0,
+    notes: str | None = None,
+    first_pass: bool | None = None,
+    checks: dict[str, bool] | None = None,
+) -> None:
+    """Record a review without committing the caller's transaction."""
     if decision not in REVIEW_DECISIONS:
         raise ValueError(
             f"decision must be one of {sorted(REVIEW_DECISIONS)}, got {decision!r}"
@@ -58,7 +79,6 @@ def record_review(
             json.dumps(checks or {}, ensure_ascii=False),
         ),
     )
-    db.commit()
 
 
 def _ratio(numerator: float, denominator: float) -> float:

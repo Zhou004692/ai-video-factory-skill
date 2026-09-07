@@ -16,7 +16,7 @@ import json
 import os
 from pathlib import Path
 
-from .. import ASSETS_DIR, subtitles
+from .. import ASSETS_DIR, master_transcriptions, subtitles
 from ..db import conn
 from ..clients import bigasr, ffmpeg
 from ..review_candidates import finalize_accepted_candidates
@@ -300,14 +300,22 @@ async def _refresh_director_speech_timeline(
         asr_source = master_path.with_suffix(".wav")
         if not asr_source.exists():
             asr_source = master_path
+        transcription = master_transcriptions.load_matching(
+            database, job_id, master_idx, master_path
+        )
+        derived_artifact_missing = transcription is None
         try:
-            transcription = await asyncio.to_thread(
+            transcription = transcription or await asyncio.to_thread(
                 bigasr.transcribe_detailed, asr_source
             )
         except Exception as exc:
             raise RuntimeError(
                 f"母片 #{master_idx} 的 ASR 时间轴生成失败，已停止合成以避免字幕错位：{exc}"
             ) from exc
+        if derived_artifact_missing:
+            master_transcriptions.persist(
+                database, job_id, master_idx, master_path, transcription
+            )
 
         related = [
             edit for edit in (storyboard.get("shots") or [])

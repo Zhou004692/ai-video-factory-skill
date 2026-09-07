@@ -273,6 +273,11 @@ class StrictMasterComposeReplay(StrictHandlerReplay):
         ):
             target = self._local_path(tail[10], {".mp3"})
             return [str(self.ffmpeg), *base, *tail[:10], target]
+        # Formal native-master director cut with independently mapped picture
+        # and native audio. The authored journey has one exact four-second edit.
+        if tail[:1] == ["-ss"]:
+            self._validate_director_cut(tail)
+            return [str(self.ffmpeg), *base, *tail]
         # Legacy one-master normalization used by the frozen formal graph.
         if tail[:1] == ["-i"] and tail.count("-i") == 1 and "-vf" in tail:
             self._validate_normalize(tail)
@@ -290,6 +295,53 @@ class StrictMasterComposeReplay(StrictHandlerReplay):
                 tail[-1] = str(failure_target)
             return [str(self.ffmpeg), *base, *tail]
         self._fail("strict replay forbids unapproved ffmpeg arguments: " + repr(tail))
+
+    def _validate_director_cut(self, tail):
+        if len(tail) != 43:
+            self._fail("strict replay forbids altered director-cut arguments")
+        video = self._local_path(tail[3], {".mp4"})
+        audio = self._local_path(tail[7], {".mp4"})
+        target = self._local_path(tail[-1], {".mp4"})
+        vf = tail[15]
+        textfiles = re.findall(r"textfile='([^']+)'", vf)
+        if len(textfiles) != 2:
+            self._fail("strict replay requires the authored director subtitles")
+        for value in textfiles:
+            windows_path = value.replace("\\:", ":").replace("/", "\\")
+            self._local_path(windows_path, {".txt"})
+        drawtext = (
+            "drawtext=fontfile='C\\:/Windows/Fonts/msyhbd.ttc':"
+            "textfile='{path}':fontcolor=white:fontsize=51:borderw=4:"
+            "bordercolor=black@0.9:x=(w-text_w)/2:y=h*0.80{offset}:"
+            "line_spacing=10:enable='between(t,0.100,1.600)'"
+        )
+        expected_vf = ",".join((
+            "setpts=PTS-STARTPTS",
+            "scale=1080:1920:force_original_aspect_ratio=decrease",
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
+            "setsar=1",
+            "fps=24",
+            drawtext.format(path=textfiles[0], offset="-34"),
+            drawtext.format(path=textfiles[1], offset="+34"),
+        ))
+        audio_filter = (
+            "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,"
+            "apad,atrim=duration=4.000,asetpts=N/SR/TB"
+        )
+        expected = [
+            "-ss", "0.000", "-i", video,
+            "-ss", "0.000", "-i", audio,
+            "-t", "4.000", "-map", "0:v:0", "-map", "1:a:0",
+            "-vf", expected_vf, "-af", audio_filter,
+            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-r", "24", "-fps_mode", "cfr", "-pix_fmt", "yuv420p",
+            "-video_track_timescale", "12288", "-movflags", "+faststart",
+            target,
+        ]
+        if tail != expected:
+            self._fail("strict replay forbids altered director-cut arguments")
+        tail[3], tail[7], tail[-1] = video, audio, target
 
     def _validate_normalize(self, tail):
         if len(tail) != 21 or tail[0] != "-i" or tail[2] != "-vf":

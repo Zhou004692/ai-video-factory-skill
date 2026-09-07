@@ -18,7 +18,7 @@ import shutil
 from .. import (
     ASSETS_DIR, SKILL_ROOT, anchor_generation, asset_library,
     character_assets, character_voices, master_dependencies,
-    creative_ir,
+    creative_ir, master_transcriptions,
     production_config, provider_capacity, provider_health,
     provider_executor as provider_tasks,
     reference_attention, scene_assets, subtitles,
@@ -471,13 +471,15 @@ class SeedanceQualityError(RuntimeError):
                  provider_calls: tuple[dict, ...],
                  reasons: tuple[str, ...] = (),
                  candidate_path: Path | None = None,
-                 candidate_url: str | None = None):
+                 candidate_url: str | None = None,
+                 transcription: bigasr.Transcription | None = None):
         super().__init__(message)
         self.cost_cents = cost_cents
         self.provider_calls = provider_calls
         self.reasons = reasons
         self.candidate_path = candidate_path
         self.candidate_url = candidate_url
+        self.transcription = transcription or bigasr.Transcription("")
         if candidate_path is not None and Path(candidate_path).is_file():
             self.pause_state = "PRODUCTION_REVIEW_REQUIRED"
 
@@ -939,6 +941,10 @@ def _record_failed_generation(db, job_id: str, idx: int,
         except AttributeError:
             pass
     if isinstance(exc, SeedanceQualityError) and has_candidate:
+        if exc.transcription.text or exc.transcription.utterances:
+            master_transcriptions.persist(
+                db, job_id, idx, candidate_path, exc.transcription,
+            )
         qa_note = json.dumps({
             "status": "manual_review_required",
             "reason": str(exc),
@@ -1017,6 +1023,14 @@ def _commit_generated_shot(
             "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
             (cost, job_id),
         )
+        if (
+            result.video_path.is_file()
+            and (result.transcription.text or result.transcription.utterances)
+        ):
+            master_transcriptions.persist(
+                database, job_id, idx, result.video_path,
+                result.transcription,
+            )
         database.commit()
     except BaseException:
         database.rollback()
@@ -3294,6 +3308,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             reasons=decision.reasons,
             candidate_path=review_path,
             candidate_url=video_url,
+            transcription=transcription,
         )
 
     if decision.passed:
@@ -3314,6 +3329,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             reasons=decision.reasons,
             candidate_path=review_path,
             candidate_url=video_url,
+            transcription=transcription,
         )
 
     projected_retry_cost = (
@@ -3351,6 +3367,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             reasons=decision.reasons,
             candidate_path=review_path,
             candidate_url=video_url,
+            transcription=transcription,
         )
 
     preserve_retry_attempt()
@@ -3373,6 +3390,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 reasons=retry_decision.reasons,
                 candidate_path=review_path,
                 candidate_url=video_url,
+                transcription=retry_transcription,
             )
         discard_candidate()
         raise SeedanceQualityError(
@@ -3549,6 +3567,7 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                     reasons=("repair_candidate_ready",),
                     candidate_path=result.video_path,
                     candidate_url=result.video_url,
+                    transcription=result.transcription,
                 )
 
             _persist_master_transcription(
@@ -4330,6 +4349,7 @@ async def _gen_broll(job_id: str, shot: dict,
                     reasons=("repair_candidate_ready",),
                     candidate_path=result.video_path,
                     candidate_url=result.video_url,
+                    transcription=result.transcription,
                 )
 
             if scene_voiceover:

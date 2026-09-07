@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -737,6 +738,7 @@ class ManagementService:
             else ProductionReadModel(self.database)
         )
         self._production_workers: dict[str, subprocess.Popen] = {}
+        self._final_review_lock = threading.RLock()
         self._last_provider_sweep = {
             "last_sweep_at": None,
             "checked": 0,
@@ -5261,67 +5263,115 @@ class ManagementService:
             raise ValueError("验收通过前必须确认全部验收项")
         if decision != "approved" and not str(notes or "").strip():
             raise ValueError("验收不通过时必须填写问题说明")
-        if decision == "approved":
-            reviewed_at = time.strftime("%Y-%m-%d %H:%M:%S")
-            flagged = self.database.execute(
-                "SELECT idx,video_qa FROM shots WHERE job_id=?",
-                (job_id,),
-            ).fetchall()
-            for shot in flagged:
-                try:
-                    qa = json.loads(shot["video_qa"] or "{}")
-                except (json.JSONDecodeError, TypeError):
-                    qa = {}
-                if qa.get("status") != "manual_review_required":
-                    continue
-                qa["automated_status"] = "manual_review_required"
-                qa["status"] = "human_review_approved"
-                qa["human_decision"] = "final_approved"
-                qa["reviewed_at"] = reviewed_at
-                self.database.execute(
-                    "UPDATE shots SET video_qa=? WHERE job_id=? AND idx=?",
-                    (json.dumps(qa, ensure_ascii=False), job_id, shot["idx"]),
+        with self._final_review_lock:
+            self.database.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-read after acquiring the write lock. The earlier read is
+                # only a fast validation path and cannot authorize mutation.
+                locked_row = self.database.execute(
+                    "SELECT state,final_path,execution_engine FROM jobs "
+                    "WHERE job_id=?", (job_id,),
+                ).fetchone()
+                if locked_row is None or str(locked_row["state"]) != "COMPOSED":
+                    raise ValueError("final_review is stale: job is not COMPOSED")
+                if not locked_row["final_path"] or not Path(
+                    locked_row["final_path"]
+                ).is_file():
+                    raise ValueError("final_review media is missing")
+
+                is_graph = (
+                    str(locked_row["execution_engine"] or "legacy")
+                    == "graph_v2"
                 )
-        production_metrics.record_review(
-            self.database, job_id, str(decision or "").strip(),
-            manual_minutes=float(manual_minutes or 0),
-            notes=str(notes or "").strip() or None,
-            first_pass=first_pass,
-            checks=normalized_checks,
-        )
-        if str(row["execution_engine"] or "legacy") == "graph_v2":
-            final_review = self.database.execute(
-                "SELECT state FROM production_nodes WHERE job_id=? "
-                "AND node_id='final_review'",
-                (job_id,),
-            ).fetchone()
-            if final_review and str(final_review["state"]) == "REVIEW_REQUIRED":
-                node_state_machine.transition_node(
-                    self.database,
-                    job_id,
-                    "final_review",
-                    "approve" if decision == "approved" else "reject",
-                    event_id=(
-                        f"{job_id}:final-review:{str(decision).strip()}"
-                    ),
-                    payload={
-                        "decision": str(decision),
-                        "notes": str(notes or "").strip(),
-                    },
+                if is_graph:
+                    final_review = self.database.execute(
+                        "SELECT state FROM production_nodes WHERE job_id=? "
+                        "AND node_id='final_review'", (job_id,),
+                    ).fetchone()
+                    if (
+                        final_review is None
+                        or str(final_review["state"]) != "REVIEW_REQUIRED"
+                    ):
+                        raise ValueError(
+                            "final_review node is not awaiting review"
+                        )
+
+                if decision == "approved":
+                    reviewed_at = time.strftime("%Y-%m-%d %H:%M:%S")
+                    flagged = self.database.execute(
+                        "SELECT idx,video_qa FROM shots WHERE job_id=?",
+                        (job_id,),
+                    ).fetchall()
+                    for shot in flagged:
+                        try:
+                            qa = json.loads(shot["video_qa"] or "{}")
+                        except (json.JSONDecodeError, TypeError):
+                            qa = {}
+                        if qa.get("status") != "manual_review_required":
+                            continue
+                        qa["automated_status"] = "manual_review_required"
+                        qa["status"] = "human_review_approved"
+                        qa["human_decision"] = "final_approved"
+                        qa["reviewed_at"] = reviewed_at
+                        self.database.execute(
+                            "UPDATE shots SET video_qa=? WHERE job_id=? "
+                            "AND idx=?",
+                            (
+                                json.dumps(qa, ensure_ascii=False),
+                                job_id, shot["idx"],
+                            ),
+                        )
+
+                production_metrics.record_review_in_transaction(
+                    self.database, job_id, str(decision or "").strip(),
+                    manual_minutes=float(manual_minutes or 0),
+                    notes=str(notes or "").strip() or None,
+                    first_pass=first_pass,
+                    checks=normalized_checks,
                 )
-            projection = production_projection.reconcile(
-                self.database, job_id
-            )
-            if projection.projected_job_state != str(row["state"]):
-                self.database.execute(
+                if is_graph:
+                    node_state_machine.transition_node_in_transaction(
+                        self.database,
+                        job_id,
+                        "final_review",
+                        "approve" if decision == "approved" else "reject",
+                        event_id=(
+                            f"{job_id}:final-review:{str(decision).strip()}"
+                        ),
+                        payload={
+                            "decision": str(decision),
+                            "notes": str(notes or "").strip(),
+                        },
+                    )
+                    projected_state = production_projection.reconcile(
+                        self.database, job_id
+                    ).projected_job_state
+                else:
+                    projected_state = (
+                        "READY_TO_PUBLISH"
+                        if decision == "approved" else "COMPOSED"
+                    )
+                updated = self.database.execute(
                     "UPDATE jobs SET state=?,error=NULL,"
-                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-                    (projection.projected_job_state, job_id),
+                    "updated_at=CURRENT_TIMESTAMP WHERE job_id=? "
+                    "AND state='COMPOSED'",
+                    (projected_state, job_id),
                 )
+                if updated.rowcount != 1:
+                    raise ValueError("final_review lost its job-state compare-and-swap")
                 self.database.commit()
+            except Exception:
+                self.database.rollback()
+                raise
+            persisted = self.database.execute(
+                "SELECT state FROM jobs WHERE job_id=?", (job_id,),
+            ).fetchone()
         return {
             "job_id": job_id, "decision": decision,
-            "publish_unlocked": decision == "approved",
+            "publish_unlocked": (
+                persisted is not None
+                and str(persisted["state"]) == "READY_TO_PUBLISH"
+            ),
         }
 
     def delete_video(self, job_id: str) -> dict:

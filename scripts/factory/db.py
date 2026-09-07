@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS shots (
     UNIQUE(job_id, idx)
 );
 
+CREATE TABLE IF NOT EXISTS master_transcriptions (
+    job_id             TEXT NOT NULL,
+    master_idx         INTEGER NOT NULL,
+    media_sha256       TEXT NOT NULL,
+    transcription_json TEXT NOT NULL,
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(job_id, master_idx, media_sha256),
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id  TEXT,

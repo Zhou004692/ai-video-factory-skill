@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -842,6 +844,152 @@ class ManagementCompilerApiTests(unittest.TestCase):
         self.assertTrue(result["publish_unlocked"])
         self.assertEqual(node["state"], "SUCCEEDED")
         self.assertEqual(job["state"], "READY_TO_PUBLISH")
+
+    def test_graph_final_review_rejects_failed_or_stale_node_atomically(self):
+        checks = {
+            key: True for key in (
+                "identity", "lip_sync", "subtitle_sync",
+                "visual_integrity", "clean_frame", "editing_rhythm",
+            )
+        }
+        for node_state in ("FAILED", "SUCCEEDED"):
+            job_id = f"J-FINAL-{node_state}"
+            final = self.root / "data" / f"{node_state.lower()}.mp4"
+            final.write_bytes(b"video")
+            self.database.execute(
+                "INSERT INTO jobs(job_id,topic_id,title,state,final_path,"
+                "execution_engine) VALUES(?,?,?,?,?,'graph_v2')",
+                (job_id, "T-F", node_state, "COMPOSED", str(final)),
+            )
+            self.database.execute(
+                "INSERT INTO production_nodes(job_id,node_id,node_type,paid,"
+                "state,spec_hash,input_json,idempotency_key) "
+                "VALUES(?,'final_review','final_review',0,?,'spec','{}',?)",
+                (job_id, node_state, f"idem-{node_state}"),
+            )
+            self.database.execute(
+                "INSERT INTO shots(job_id,idx,state,video_qa) VALUES(?,1,'OK',?)",
+                (job_id, json.dumps({
+                    "status": "manual_review_required",
+                    "reasons": ["qa_error"],
+                })),
+            )
+        self.database.commit()
+
+        for node_state in ("FAILED", "SUCCEEDED"):
+            job_id = f"J-FINAL-{node_state}"
+            with self.subTest(node_state=node_state), self.assertRaisesRegex(
+                ValueError, "final_review"
+            ):
+                self.service.review_video(
+                    job_id, decision="approved", checks=checks,
+                )
+            self.assertEqual(self.database.execute(
+                "SELECT state FROM jobs WHERE job_id=?", (job_id,),
+            ).fetchone()[0], "COMPOSED")
+            self.assertEqual(self.database.execute(
+                "SELECT COUNT(*) FROM review_events WHERE job_id=?", (job_id,),
+            ).fetchone()[0], 0)
+            self.assertEqual(self.database.execute(
+                "SELECT COUNT(*) FROM production_node_events WHERE job_id=?",
+                (job_id,),
+            ).fetchone()[0], 0)
+            qa = json.loads(self.database.execute(
+                "SELECT video_qa FROM shots WHERE job_id=? AND idx=1",
+                (job_id,),
+            ).fetchone()[0])
+            self.assertEqual(qa["status"], "manual_review_required")
+            self.assertNotIn("human_decision", qa)
+
+    def test_opposite_graph_review_decisions_are_serialized_to_one_commit(self):
+        database_path = self.root / "review-race.db"
+        final = self.root / "data" / "review-race.mp4"
+        final.write_bytes(b"video")
+        database = sqlite3.connect(database_path)
+        database.row_factory = sqlite3.Row
+        database.executescript(factory_db.DDL)
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,final_path,"
+            "execution_engine) VALUES(?,?,?,?,?,'graph_v2')",
+            ("J-REVIEW-RACE", "T-R", "race", "COMPOSED", str(final)),
+        )
+        database.execute(
+            "INSERT INTO production_nodes(job_id,node_id,node_type,paid,state,"
+            "spec_hash,input_json,idempotency_key) VALUES(?,?,?,?,?,?,?,?)",
+            ("J-REVIEW-RACE", "final_review", "final_review", 0,
+             "REVIEW_REQUIRED", "spec", "{}", "idem-review-race"),
+        )
+        database.commit()
+        database.close()
+        barrier = threading.Barrier(2)
+        checks = {
+            key: True for key in (
+                "identity", "lip_sync", "subtitle_sync",
+                "visual_integrity", "clean_frame", "editing_rhythm",
+            )
+        }
+
+        contenders = []
+        for decision in ("approved", "local_recut"):
+            connection = sqlite3.connect(
+                database_path, timeout=30, check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            # Schema setup is intentionally outside the race. Only the review
+            # transaction itself is concurrent.
+            contenders.append((
+                ManagementService(connection, self.root), connection, decision,
+            ))
+
+        def decide(service, decision):
+            barrier.wait(timeout=10)
+            return service.review_video(
+                "J-REVIEW-RACE", decision=decision,
+                checks=checks, notes=("recut" if decision != "approved" else ""),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(decide, service, decision)
+                       for service, _connection, decision in contenders]
+            outcomes = []
+            for future in futures:
+                try:
+                    outcomes.append(future.result(timeout=30))
+                except ValueError as exc:
+                    outcomes.append(exc)
+        for _service, connection, _decision in contenders:
+            connection.close()
+
+        self.assertEqual(sum(isinstance(item, dict) for item in outcomes), 1)
+        self.assertEqual(sum(isinstance(item, ValueError) for item in outcomes), 1)
+        verify = sqlite3.connect(database_path)
+        verify.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(verify.execute(
+                "SELECT COUNT(*) FROM review_events WHERE job_id='J-REVIEW-RACE'"
+            ).fetchone()[0], 1)
+            self.assertEqual(verify.execute(
+                "SELECT COUNT(*) FROM production_node_events "
+                "WHERE job_id='J-REVIEW-RACE'"
+            ).fetchone()[0], 1)
+            node_state = verify.execute(
+                "SELECT state FROM production_nodes WHERE job_id='J-REVIEW-RACE' "
+                "AND node_id='final_review'"
+            ).fetchone()[0]
+            job_state = verify.execute(
+                "SELECT state FROM jobs WHERE job_id='J-REVIEW-RACE'"
+            ).fetchone()[0]
+            self.assertIn((node_state, job_state), {
+                ("SUCCEEDED", "READY_TO_PUBLISH"),
+                ("FAILED", "FAILED"),
+            })
+            committed = next(item for item in outcomes if isinstance(item, dict))
+            self.assertEqual(
+                committed["publish_unlocked"],
+                job_state == "READY_TO_PUBLISH",
+            )
+        finally:
+            verify.close()
 
     def test_video_detail_projects_graph_into_five_business_stages(self):
         self.database.execute(

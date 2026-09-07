@@ -63,6 +63,7 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
         source = {
             "title": "Strict master compose",
             "target_duration_sec": 4,
+            "production_mode": "native_master_local_director",
             "characters": [],
             "production_settings": {
                 "music_provider": "silent",
@@ -121,6 +122,30 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             JOB_ID,
             configured_limit=1,
             handlers=production_adapters.build_handlers(replay.database),
+        )
+
+    def assert_single_paid_master_submission(self, replay):
+        calls = replay.database.execute(
+            "SELECT task_id,cost_cents FROM provider_calls WHERE job_id=?",
+            (JOB_ID,),
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in calls], [("strict-master-task-1", 7)]
+        )
+        self.assertEqual(replay.database.execute(
+            "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,),
+        ).fetchone()[0], 7)
+        self.assertEqual(sum(
+            request["method"] == "POST"
+            and request["route"].endswith("/contents/generations/tasks")
+            for request in replay.requests
+        ), 1)
+
+    def asr_submit_count(self, replay):
+        return sum(
+            request["method"] == "POST"
+            and request["route"].endswith("/auc/bigmodel/submit")
+            for request in replay.requests
         )
 
     def frozen_graph_snapshot(self, database):
@@ -195,6 +220,11 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 qa["result"]["visual_comparison"]["alignment"], 0.98
             )
+            derived = replay.database.execute(
+                "SELECT media_sha256 FROM master_transcriptions "
+                "WHERE job_id=? AND master_idx=1", (JOB_ID,),
+            ).fetchone()
+            self.assertEqual(derived["media_sha256"], replay.media_sha256)
             self.assertEqual(replay.database.execute(
                 "SELECT COUNT(*) FROM character_identity_anchors WHERE job_id=?",
                 (JOB_ID,),
@@ -214,13 +244,18 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(s["codec_type"] == "video" for s in media["streams"]))
             self.assertTrue(any(s["codec_type"] == "audio" for s in media["streams"]))
 
-            calls = replay.database.execute(
-                "SELECT task_id,cost_cents FROM provider_calls WHERE job_id=?",
-                (JOB_ID,),
-            ).fetchall()
-            self.assertEqual([tuple(row) for row in calls], [("strict-master-task-1", 7)])
+            self.assert_single_paid_master_submission(replay)
             self.assertEqual(job["cost_cents"], 7)
             self.assertEqual(len(replay.requests), 11)
+            self.assertEqual(self.asr_submit_count(replay), 1)
+            director_processes = [
+                process for process in replay.processes
+                if process["executable"].lower().startswith("ffmpeg")
+                and process["argv"][4:5] == ["-ss"]
+            ]
+            self.assertEqual(len(director_processes), 1)
+            self.assertIn("0:v:0", director_processes[0]["argv"])
+            self.assertIn("1:a:0", director_processes[0]["argv"])
             self.assertEqual(
                 [request["method"] for request in replay.requests].count("POST"),
                 6,
@@ -286,6 +321,18 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(replay.database.execute(
                 "SELECT final_path FROM jobs WHERE job_id=?", (JOB_ID,)
             ).fetchone()[0])
+            self.assert_single_paid_master_submission(replay)
+            self.assertEqual(len(replay.requests), 7)
+            self.assertEqual(self.asr_submit_count(replay), 0)
+            before = (len(replay.requests), len(replay.processes), 7)
+            second = await self.run_job(replay)
+            self.assertEqual(second.started_nodes, ())
+            self.assertEqual((
+                len(replay.requests), len(replay.processes),
+                replay.database.execute(
+                    "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,),
+                ).fetchone()[0],
+            ), before)
 
     async def test_quality_candidate_acceptance_resumes_same_frozen_graph(self):
         contract = self.contract()
@@ -309,6 +356,12 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(shot["state"], "REVIEW_REQUIRED")
             candidate = Path(qa["candidate_path"])
             self.assertTrue(candidate.is_file())
+            candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            self.assertEqual(candidate_sha, replay.media_sha256)
+            self.assertEqual(replay.database.execute(
+                "SELECT media_sha256 FROM master_transcriptions "
+                "WHERE job_id=? AND master_idx=1", (JOB_ID,),
+            ).fetchone()[0], candidate_sha)
             request_count = len(replay.requests)
             cost = replay.database.execute(
                 "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,)
@@ -346,6 +399,18 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
                 ).fetchone()[0],
                 "SUCCEEDED",
             )
+            active_master = Path(replay.database.execute(
+                "SELECT video_path FROM shots WHERE job_id=? AND idx=1",
+                (JOB_ID,),
+            ).fetchone()[0])
+            self.assertEqual(
+                hashlib.sha256(active_master.read_bytes()).hexdigest(),
+                candidate_sha,
+            )
+            self.assertEqual(replay.database.execute(
+                "SELECT media_sha256 FROM master_transcriptions "
+                "WHERE job_id=? AND master_idx=1", (JOB_ID,),
+            ).fetchone()[0], candidate_sha)
             resumed = await self.run_job(replay)
             self.assertEqual(
                 resumed.started_nodes, ("bgm", "local_compose", "final_review")
@@ -355,6 +420,12 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
                 self.frozen_graph_snapshot(replay.database), before_accept
             )
             self.assertEqual(len(replay.requests), request_count)
+            self.assertEqual(self.asr_submit_count(replay), 1)
+            self.assertEqual(replay.database.execute(
+                "SELECT media_sha256 FROM master_transcriptions "
+                "WHERE job_id=? AND master_idx=1", (JOB_ID,),
+            ).fetchone()[0], replay.media_sha256)
+            self.assert_single_paid_master_submission(replay)
             self.assertEqual(replay.database.execute(
                 "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,)
             ).fetchone()[0], cost)
@@ -388,6 +459,18 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(replay.database.execute(
                 "SELECT final_path FROM jobs WHERE job_id=?", (JOB_ID,)
             ).fetchone()[0])
+            self.assert_single_paid_master_submission(replay)
+            self.assertEqual(len(replay.requests), 9)
+            self.assertEqual(self.asr_submit_count(replay), 1)
+            before = (len(replay.requests), len(replay.processes), 7)
+            second = await self.run_job(replay)
+            self.assertEqual(second.started_nodes, ())
+            self.assertEqual((
+                len(replay.requests), len(replay.processes),
+                replay.database.execute(
+                    "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,),
+                ).fetchone()[0],
+            ), before)
 
     async def test_corrupt_download_fails_after_accounting_without_repost(self):
         from tos.utils import Crc64
@@ -489,25 +572,28 @@ class StrictMasterComposeJourneyTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(attack=attack):
                 with self.assertRaisesRegex(
                     StrictReplayViolation,
-                    "media path|normalization",
+                    "media path|normalization|unapproved ffmpeg arguments",
                 ):
                     with StrictMasterComposeReplay() as replay:
-                        source = (
-                            "https://example.invalid/master.mp4"
-                            if attack == "remote"
-                            else str(replay.root / "input.mp4")
-                        )
-                        command = [
-                            str(replay.ffmpeg), "-y", "-hide_banner",
-                            "-loglevel", "error", "-i", source,
-                            "-vf", "not-an-authored-filter",
-                            "-c:v", "libx264", "-preset", "medium",
-                            "-crf", "20", "-c:a", "aac", "-b:a", "128k",
-                            "-ar", "44100", "-ac", "2", "-pix_fmt", "yuv420p",
-                            str(replay.root / "output.mp4"),
-                        ]
-                        if attack == "extra":
-                            command.extend(["-progress", str(replay.root / "progress")])
+                        if attack == "remote":
+                            command = [
+                                str(replay.ffmpeg), "-y", "-hide_banner",
+                                "-loglevel", "error", "-i",
+                                "https://example.invalid/master.mp4",
+                                "-vn", "-ac", "1", "-ar", "16000",
+                                str(replay.root / "output.wav"),
+                            ]
+                        else:
+                            # Exact approved silent-BGM command plus one extra
+                            # otherwise-valid FFmpeg progress option.
+                            command = [
+                                str(replay.ffmpeg), "-y", "-hide_banner",
+                                "-loglevel", "error", "-f", "lavfi", "-i",
+                                "anullsrc=r=44100:cl=stereo", "-t", "60",
+                                "-q:a", "9", "-acodec", "libmp3lame",
+                                "-progress", str(replay.root / "progress.txt"),
+                                str(replay.root / "output.mp3"),
+                            ]
                         try:
                             await asyncio.create_subprocess_exec(*command)
                         except StrictReplayViolation:
