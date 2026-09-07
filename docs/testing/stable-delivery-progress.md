@@ -8,8 +8,9 @@
 |---|---|---|
 | W0 报告口径 | 来源、替换层、能证明/不能证明的范围；旧报告、缺失/异常元数据与矛盾结果不再恢复绿色结论 | 证明报告处理正确，不新增生产全链路证据 |
 | W1 客户端传输切片 | 真实 Seedance/豆包/ASR 客户端执行，固定请求/响应契约，鉴权/资源/任务关联头校验，拒绝越界网络/进程入口 | 单进程客户端测试；不是完整 handler、Worker 或浏览器旅程 |
+| W2 母片与导演合成切片 | 正式母片 handler、QA、ASR 媒体绑定派生产物、本地导演合成和原子最终审核；覆盖候选、空识别和失败恢复 | 单进程固定 transport 回放；不证明真实识别或内容质量 |
 
-W0 提交：`50767f2`、`2a23e08`、`61522e4`。W1 客户端提交：`21658d4`。上述两个切片均完成独立需求和代码审查。
+W0 提交：`50767f2`、`2a23e08`、`61522e4`。W1 客户端提交：`21658d4`。W2 母片与导演合成提交：`c825edc`、`ea61ae7`、`7d27ca1`、`9ca049f`。上述切片均完成独立规格和代码审查。
 
 ## W3 声音与出镜规则：独立审查已通过
 
@@ -61,7 +62,19 @@ frozen scene anchor is not ready: scene:7ae4b7c7678e
 
 独立规格审查与代码质量审查均通过，未发现待合并的阻塞问题。根代理已在移除 Provider 凭证的环境运行关键组合 61 项及扩大组合 661 项，均通过。详细契约、缺陷和限制见 [人物锚点正式处理器回放](strict-character-anchor-journey.md)。
 
-这只是 W1/W2 的第一条 handler 旅程，不改变 Flow Guard Full 的整体 `strict_transport_replay=not_run`：母片候选、ASR/QA、完整本地合成、Worker 重启、浏览器确认和历史任务恢复尚未形成同等级严格旅程；真实识别准确率和真实内容质量仍为 `not_run`。损坏媒体基于既有供应商任务的无重复购买重新下载也仍待实现。不修改正式任务，不增加预算，不调用在线模型。
+人物锚点旅程本身不改变 Flow Guard Full 的整体 `strict_transport_replay=not_run`。当时尚未覆盖母片候选、ASR/QA 和完整本地合成；这些边界现由下一节的独立旅程补齐，但 Worker 重启、浏览器确认、跨进程历史任务恢复和真实视频质量仍未形成同等级证据。损坏媒体基于既有供应商任务的无重复购买重新下载也仍待实现。
+
+### W2 母片到导演合成正式处理器旅程
+
+`c825edc`、`ea61ae7`、`7d27ca1`、`9ca049f` 建立了第二条正式处理器回放：真实编译/冻结图、节点领取、正式母片 handler、Seedance 与 TOS、豆包视频 QA、BigASR、媒体 SHA 绑定派生产物、本地导演剪辑、无声 BGM 和最终审核。正常链路固定 11 个传输步骤、一次 Seedance 付费提交、一次 ASR 提交和 7 分模拟费用；实际在线请求与供应商费用为 0。
+
+独立审查在原本通过的旅程中继续发现并修复三类正式卡点：ASR 只保存在可变 storyboard 导致合成阶段二次识别；最终审核可在过期/失败节点上写出成功事件并返回解锁；ASR 合法空结果未持久化且残留估算字幕。现改为派生产物按媒体 SHA 绑定，合法空结果与缺失/损坏明确区分，最终审核的复核、事件、节点状态和任务投影在同一写事务中提交。
+
+回归还覆盖 QA/ASR transport 失败、候选接受、损坏下载、合成失败、重复进入、并发相反审核、派生产物多版本和损坏缓存隔离。独立规格审查与代码质量审查均通过；质量复审另运行关键 13 项与扩大组合 357 项，并将并发相反终审连续验证 5 次，未发现待合入的阻塞问题。详细契约与限制见 [母片到导演合成正式处理器回放](strict-master-compose-journey.md)。
+
+提交 `9ca049f` 上，根代理移除 Provider 凭证后运行母片旅程、派生产物与管理 API 定向组合 28 项，通过（72.614 秒）；R0 22 项、R1 68 项通过，记录 `paid_provider_calls=0`、`external_requests=0`、`invariant_issues=0`。随后全量 1615 项通过（805.742 秒，跳过 1 项）；内含零费用 Flow Guard 增量巡检通过并保持 `strict_transport_replay=not_run`、`recognition_accuracy=not_run`、`actual_content_quality=not_run` 的证据边界。
+
+这条旅程补齐了单进程母片/QA/ASR/本地合成的严格边界，但尚未接入 Flow Guard Full 的内置证据来源，也未覆盖浏览器、Supervisor/Worker 进程树、跨进程重启和真实 Provider。因此整体 `strict_transport_replay` 仍为 `not_run`，真实识别准确率和内容质量仍为 `not_run`。
 
 ### 后续需处理的既有证据口径
 
@@ -73,3 +86,4 @@ frozen scene anchor is not ready: scene:7ae4b7c7678e
 - [严格客户端传输回放](strict-transport-replay.md)
 - [声音与出镜语义](speech-visibility-contract.md)
 - [冻结场景依赖](frozen-scene-dependencies.md)
+- [母片到导演合成正式处理器回放](strict-master-compose-journey.md)
