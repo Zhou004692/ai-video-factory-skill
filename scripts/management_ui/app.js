@@ -1321,8 +1321,14 @@ async function openProductionSettings(job){
   const sceneAnchorGenerator=current.scene_anchor_generator||configValue('SCENE_ANCHOR_GENERATOR')||'seedance_2_5';
   const audioMode=current.audio_mode||configValue('DIALOGUE_AUDIO_MODE')||'seedance_native';
   const dialogueMasters=(job.masters||job.planned_masters||[]).filter(master=>(master.type||'dialogue')==='dialogue');
-  const speakers=[...new Set(dialogueMasters.flatMap(master=>[master.speaker,...(master.speakers||[]),...(master.performance_beats||[]).map(beat=>beat.speaker)]).filter(Boolean))];
-  const effectiveSpeakers=[...new Set([...(job.characters||[]).map(character=>character.id),...speakers].filter(Boolean))];
+  const onScreen=item=>item.speech_mode?item.speech_mode==='on_screen':!/旁白|narrator|narration|voiceover|voice_over|画外音|画外台词|背景台词/i.test(item.speaker||'');
+  const speakers=dialogueMasters.flatMap(master=>{
+    const beats=master.performance_beats||[];
+    return (beats.length?beats:[master]).filter(onScreen).flatMap(item=>[item.speaker,...(item.speakers||[])]);
+  });
+  // The backend character table already represents visible identities, including
+  // silent actors. Only legacy jobs without that table need speaker fallback.
+  const effectiveSpeakers=[...new Set(((job.characters||[]).length?(job.characters||[]).map(character=>character.id):speakers).filter(Boolean))];
   const currentMappings=current.character_mappings||Object.fromEntries(effectiveSpeakers.map(id=>[id,current.character_id||'']));
   const options=(selected='')=>`<option value="" ${selected?'':'selected'}>AI 按剧本人物自动生成（推荐）</option>${active.map(c=>`<option value="${esc(c.character_id)}" ${selected===c.character_id?'selected':''}>固定角色：${esc(c.display_name)} · ${characterTypeLabel(c.identity_type)}</option>`).join('')}`;
   const mappingRows=effectiveSpeakers.map(speaker=>{const scriptCharacter=(job.characters||[]).find(c=>c.id===speaker);const name=scriptCharacter?.script_character_name||scriptCharacter?.name||speaker;const look=scriptCharacter?.look||scriptCharacter?.background_description||'按剧本人物描述与场景自动设定形象';return `<label class="speaker-mapping-row"><span><b>剧本人物：${esc(name)}</b><small>${esc(look)}</small></span><select data-speaker-mapping="${esc(speaker)}">${options(currentMappings[speaker]||'')}</select></label>`}).join('');

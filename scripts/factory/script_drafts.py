@@ -133,7 +133,29 @@ def _is_valid_duration(value) -> bool:
     return math.isfinite(duration) and duration > 0
 
 
+def _validate_character_identities(characters: list) -> None:
+    """Require unambiguous identities without guessing merges from job titles."""
+    names: dict[str, str] = {}
+    ids: set[str] = set()
+    for item in characters:
+        if not isinstance(item, dict):
+            continue
+        identity = _text(item.get("id") or item.get("name"))
+        if not identity:
+            continue
+        name = _text(item.get("name")) or identity
+        key = "".join(name.split()).casefold()
+        if identity in ids or (key in names and names[key] != identity):
+            raise ValueError(
+                f"character_identity_ambiguous: 人物“{name}”存在重复或冲突的身份；"
+                "同一人物跨场景必须复用同一个ID和形象，确为不同人物时请使用可区分的姓名。"
+            )
+        ids.add(identity)
+        names[key] = identity
+
+
 def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
+    _validate_character_identities(raw.get("characters") or [])
     beats_raw = raw.get("beats") or []
     if not isinstance(beats_raw, list) or not beats_raw:
         raise ValueError("script variant requires at least 1 narrative beat")
@@ -550,6 +572,9 @@ def _prompt(
         "每版应覆盖 hook、conflict、evidence、reversal、solution、cta 等必要叙事功能；"
         "beat 数量和顺序由内容决定，可合并、拆分或省略不适用的模板段落，不得为凑六段重复内容。"
         "speaker 使用稳定的简短人物 ID；同一人物在所有 beat 中必须使用同一个 ID。"
+        "同一业务员对接不同客户或进入不同场景，仍是同一人物，不能按场景新建编号、改变性别年龄。"
+        "人物表中的显示名称必须可区分；不同ID同名时先明确是同一人还是不同人。"
+        "用户在原始要求中明确指定的总角色数与多轮对话是创作要求，不能降为可忽略的建议；旁白不计入出镜角色。"
         "多人共同说同一句台词时，speakers 填写已有角色 ID 数组，speaker 填第一个 ID；"
         "不得将逗号拼接的人物列表或‘三人同框’创建为新角色。同框但未说话的人只放入 characters；"
         "多人分别说不同台词时拆成独立 beat，分别标明说话人。"
@@ -976,6 +1001,7 @@ def _balanced_master_groups(
 
 
 def _storyboard(script: dict) -> dict:
+    _validate_character_identities(script.get("characters") or [])
     requested_beats = script["beats"]
     beats = deepcopy(requested_beats)
     # Older cached reconstruction drafts can retain relative descriptions
