@@ -1228,7 +1228,7 @@ class ManagementService:
             "publish_resume_state", "publish_kind",
         ):
             completed_usage.pop(key, None)
-        completed_usage["status"] = "completed"
+            completed_usage["status"] = "completed"
         try:
             self.database.execute("BEGIN IMMEDIATE")
             call_updated = self.database.execute(
@@ -1241,6 +1241,7 @@ class ManagementService:
             )
             if int(call_updated.rowcount or 0) != 1:
                 raise ValueError("远端核对任务已被并发处理")
+            production_executor.release_resolved_provider_gates(self.database, job_id)
             unresolved = provider_tasks.unresolved_task_ids(
                 self.database, job_id
             )
@@ -3976,7 +3977,8 @@ class ManagementService:
                         ),
                         "label": (
                             "继续生成剩余母片"
-                            if job["resumable"] else "查看账号处理指引"
+                            if job["resumable"] else "核对远端任务"
+                            if job["unresolved_provider_tasks"] else "查看账号处理指引"
                         ),
                     },
                 },

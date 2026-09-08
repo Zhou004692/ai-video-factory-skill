@@ -9,7 +9,7 @@ import sqlite3
 from typing import Awaitable, Callable, Mapping
 import uuid
 
-from . import node_state_machine, provider_capacity, provider_executor
+from . import node_state_machine, provider_capacity, provider_executor, provider_tasks
 from .testing import fault_injection
 
 
@@ -86,6 +86,43 @@ class WaveResult:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def release_resolved_provider_gates(database: sqlite3.Connection, job_id: str) -> list[str]:
+    """Release unpaid sibling pauses after all remote tasks reconcile.
+
+    Caller owns the transaction. This does not start production or approve media.
+    """
+    job = database.execute("SELECT state,execution_engine,production_spec_hash FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    if not job or job['execution_engine'] != 'graph_v2' or job['state'] not in {
+        'PROVIDER_ACTION_REQUIRED', 'PRODUCTION_REVIEW_REQUIRED', 'PRODUCTION_QUEUED',
+        'PRODUCTION_RUNNING', 'FAILED',
+    } or provider_tasks.unresolved_task_ids(database, job_id):
+        return []
+    released = []
+    rows = database.execute(
+        "SELECT n.node_id,s.idx FROM production_nodes n JOIN shots s ON s.job_id=n.job_id AND n.node_id='master:'||s.idx "
+        "WHERE n.job_id=? AND n.node_type='master' AND n.state='ACTION_REQUIRED' "
+        "AND n.error_code='ProviderTaskGateError' AND n.spec_hash=? "
+        "AND COALESCE(n.provider_task_id,'')='' AND n.actual_cost_cents=0 AND n.lease_id IS NULL "
+        "AND s.state='PENDING' AND s.cost_cents=0 AND COALESCE(s.video_path,'')='' "
+        "AND NOT EXISTS(SELECT 1 FROM provider_calls c WHERE c.job_id=s.job_id AND c.shot_idx=s.idx)",
+        (job_id, job['production_spec_hash']),
+    ).fetchall()
+    for row in rows:
+        if database.execute(
+            "SELECT 1 FROM production_edges e JOIN production_nodes n ON n.job_id=e.job_id AND n.node_id=e.from_node_id "
+            "WHERE e.job_id=? AND e.to_node_id=? AND n.state!='SUCCEEDED' LIMIT 1", (job_id, row['node_id']),
+        ).fetchone():
+            continue
+        node_state_machine.transition_node_in_transaction(
+            database, job_id, row['node_id'], 'resume',
+            event_id=f"{job_id}:{row['node_id']}:resolved-gate:{uuid.uuid4().hex}",
+            payload={'reason':'all_provider_tasks_reconciled','no_prior_submission':True},
+        )
+        database.execute("UPDATE production_nodes SET error_code=NULL,next_action=NULL,output_json='{}' WHERE job_id=? AND node_id=?", (job_id, row['node_id']))
+        released.append(str(row['node_id']))
+    return released
 
 
 def ready_nodes(

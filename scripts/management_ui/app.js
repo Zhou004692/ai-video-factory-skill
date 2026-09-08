@@ -931,6 +931,7 @@ const qualityDecisionLabel=decision=>({accept_candidate:'人工已接受候选',
 const masterStateLabel=state=>({PENDING:'等待生成',GENERATING:'生成中',OK:'生成完成',REVIEW_REQUIRED:'待人工复核',FAILED:'生成失败'})[state]||state||'等待生成';
 const remainingPendingMasterCount=(job,currentShot)=>(job?.shots||[]).filter(shot=>String(shot.idx)!==String(currentShot?.idx)&&(shot.state!=='OK'||shot.manual_review_required||shot.quality_status==='candidate_accepted_pending')).length;
 const masterQualityText=(shot,job={})=>{
+  if(shot.state==='FAILED'&&/下载结果未知/.test(shot.error||''))return '母片已生成，下载待恢复；请核对原任务';
   if(shot.quality_status==='candidate_accepted_pending'){
     const remaining=remainingPendingMasterCount(job,shot);
     return remaining?`已接受候选，等待其余母片（${remaining} 条）`:'已接受候选，正在生成成片';

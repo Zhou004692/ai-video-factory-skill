@@ -55,6 +55,8 @@ async def run_graph_job(
         raise production_invariants.ProductionInvariantError(invariant_report)
 
     recovered = production_executor.recover_expired_nodes(database, job_id)
+    with database:
+        production_executor.release_resolved_provider_gates(database, job_id)
     for node_id in production_executor.retry_repaired_contract_nodes(
         database, job_id,
     ):
