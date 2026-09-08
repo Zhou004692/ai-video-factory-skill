@@ -25,4 +25,21 @@ vm.runInContext(source.slice(start,end),context);
   context.confirmNetworkRetry({network_retry_indexes:[],network_retry_anchor_ids:[]});
   assert.match(notified,/当前没有可重试/);
   console.log('7 anchor retry UI assertions passed');
+  const job = {job_id:'J',state:'ANCHOR_REVIEW_REQUIRED',next_action:{id:'review_continuity_anchors',label:'审核人物与场景锚点'}};
+  const project = {project_id:'P',next_action:'view_progress',stage:'production'};
+  let opened;
+  Object.assign(context,{
+    state:{page:'overview',studioProjectId:'P',studioStage:'video'},
+    studioSelectedMaster:()=>({idx:1}), studioRelated:()=>({video:job}),
+    openProjectStudio:async()=>true,
+    openVideoDrawer:()=>opened='anchors',openVideoDrawerAt:()=>opened='master',
+  });
+  const labelStart=source.indexOf('function studioPrimaryActionLabel(');
+  vm.runInContext(source.slice(labelStart,source.indexOf('\nfunction renderStudioPrimaryAction(',labelStart)),context);
+  assert.equal(context.studioPrimaryActionLabel(project,{video:job}),'审核人物与场景锚点');
+  const routeStart=source.indexOf('async function routeProjectAction(');
+  vm.runInContext(source.slice(routeStart,source.indexOf('\nfunction ',routeStart)),context);
+  await context.routeProjectAction(project);
+  assert.equal(opened,'anchors');
+  console.log('2 anchor review entry assertions passed');
 })().catch(error=>{console.error(error);process.exitCode=1});

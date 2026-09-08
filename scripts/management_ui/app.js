@@ -382,6 +382,7 @@ function studioPrimaryActionLabel(project,r){
     return draft?`审核当前版本 V${Number(draft.variant_index||0)+1}`:'生成候选剧本';
   }
   if(project.next_action==='view_progress'){
+    if(r.video?.next_action?.id==='review_continuity_anchors')return r.video.next_action.label;
     const master=r.video?studioSelectedMaster(r.video):null;
     return master?`查看当前母片 M${String(master.idx).padStart(2,'0')}`:'查看生成进度';
   }
@@ -603,6 +604,7 @@ async function routeProjectAction(project){
     if(!job)return toast('对应视频任务已不存在',true);
     if(project.next_action==='configure_video')return runVideoNextAction(job);
     if(project.next_action==='view_progress'){
+      if(job.next_action?.id==='review_continuity_anchors')return openVideoDrawer(job);
       const master=studioSelectedMaster(job);
       return master?openVideoDrawerAt(job,master.idx):openVideoDrawer(job);
     }
