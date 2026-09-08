@@ -2476,8 +2476,9 @@ def production_reference_video_budget(snapshot: dict | None = None) -> int:
         raise ValueError(
             "SEEDANCE_PRODUCTION_REFERENCE_VIDEO_BUDGET must be positive"
         )
+    # A frozen job may use a newer model than the Worker's environment default.
     provider_limit = int(
-        seedance.capability_profile(seedance.DEFAULT_MODEL)[
+        seedance.capability_profile((snapshot or {}).get("model") or seedance.DEFAULT_MODEL)[
             "reference_limits"
         ]["reference_video"]
     )
