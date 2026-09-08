@@ -1041,7 +1041,7 @@ class ManagementService:
                 continue
             if phase != "committed":
                 continue
-            if decision in {"accept_candidate", "keep_prior"}:
+            if decision in {"accept_candidate", "keep_prior", "regenerate_master"}:
                 if self._sync_graph_master_review_decision(
                     job_id,
                     int(row["idx"]),
@@ -4530,6 +4530,28 @@ class ManagementService:
                 "WHERE job_id=? AND state='FAILED' AND cost_cents=0",
                 (job_id,),
             )
+        # A legacy shot reset cannot release a FAILED node in the frozen graph.
+        # Preserve its diagnostic instead of queueing a worker that has nothing
+        # runnable and immediately fails again.
+        graph_failure = self.database.execute(
+            "SELECT n.node_id,n.error_code,(SELECT e.payload_json "
+            "FROM production_node_events e WHERE e.job_id=n.job_id "
+            "AND e.node_id=n.node_id AND e.event='fail' "
+            "ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1) AS failure_json "
+            "FROM production_nodes n JOIN jobs j ON j.job_id=n.job_id "
+            "WHERE n.job_id=? AND j.execution_engine='graph_v2' "
+            "AND n.node_type='master' AND n.state='FAILED' LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        if graph_failure:
+            try:
+                detail = json.loads(graph_failure["failure_json"] or "{}").get("error")
+            except (ValueError, TypeError, AttributeError):
+                detail = None
+            raise ValueError(
+                f"母片 {graph_failure['node_id']} 的执行失败尚未修复："
+                f"{detail or graph_failure['error_code'] or '请查看错误详情'}"
+            )
         placeholders = ",".join("?" for _ in retry_indexes)
         self.database.execute(
             f"UPDATE shots SET state='PENDING',error=NULL,video_qa=NULL "
@@ -5789,17 +5811,27 @@ class ManagementService:
         ).fetchone()
         if not engine or str(engine["execution_engine"] or "legacy") != "graph_v2":
             return False
-        if decision not in {"accept_candidate", "keep_prior"}:
+        if decision not in {"accept_candidate", "keep_prior", "regenerate_master"}:
             return False
         node_id = f"master:{int(master_idx)}"
         node = self.database.execute(
-            "SELECT state FROM production_nodes WHERE job_id=? AND node_id=?",
+            "SELECT state,provider_task_id FROM production_nodes WHERE job_id=? AND node_id=?",
             (job_id, node_id),
         ).fetchone()
         if not node:
             return False
         current = str(node["state"])
-        if current == "SUCCEEDED":
+        regenerate = decision == "regenerate_master"
+        event_id = (
+            f"{job_id}:{node_id}:candidate-{decision}:"
+            f"{str(operation_id or 'committed')}"
+        )
+        if regenerate and self.database.execute(
+            "SELECT 1 FROM production_node_events WHERE job_id=? AND event_id=?",
+            (job_id, event_id),
+        ).fetchone():
+            return False
+        if current == "SUCCEEDED" and not regenerate:
             return False
         if current != "REVIEW_REQUIRED":
             raise ValueError(
@@ -5809,16 +5841,24 @@ class ManagementService:
             self.database,
             job_id,
             node_id,
-            "approve",
-            event_id=(
-                f"{job_id}:{node_id}:candidate-{decision}:"
-                f"{str(operation_id or 'committed')}"
-            ),
+            "regenerate" if regenerate else "approve",
+            event_id=event_id,
             payload={
                 "decision": decision,
                 "master_idx": int(master_idx),
+                "previous_provider_task_id": node["provider_task_id"],
             },
         )
+        if regenerate:
+            # The operator rejected this paid candidate. Keep its ledger and
+            # cumulative cost, but give the next attempt a new identity and no
+            # stale output/task pointer. Shot and graph commit atomically.
+            self.database.execute(
+                "UPDATE production_nodes SET provider_task_id=NULL,output_json='{}',"
+                "idempotency_key=?,lease_id=NULL,heartbeat_at=NULL "
+                "WHERE job_id=? AND node_id=?",
+                (f"{job_id}:{node_id}:regenerate:{operation_id}", job_id, node_id),
+            )
         self.database.execute(
             "UPDATE production_nodes SET error_code=NULL,next_action=NULL,"
             "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND node_id=?",

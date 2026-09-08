@@ -17,6 +17,7 @@ _TRANSITIONS = {
     ("RUNNING", "succeed"): "SUCCEEDED",
     ("RUNNING", "require_review"): "REVIEW_REQUIRED",
     ("REVIEW_REQUIRED", "approve"): "SUCCEEDED",
+    ("REVIEW_REQUIRED", "regenerate"): "READY",
     # Approving an unexpected replacement identity unblocks an unfinished
     # master; it does not approve a generated master candidate.
     ("REVIEW_REQUIRED", "resume_anchor_dependency"): "READY",

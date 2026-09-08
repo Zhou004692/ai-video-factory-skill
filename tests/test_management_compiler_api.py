@@ -526,6 +526,112 @@ class ManagementCompilerApiTests(unittest.TestCase):
             "to_state": "SUCCEEDED",
         })
 
+    def _seed_graph_regeneration(self, *, committed=False):
+        job_id = 'J-GRAPH-REGENERATE'
+        candidate = self.root / 'data' / 'assets' / job_id / 'shots' / 'review' / '01.mp4'
+        candidate.parent.mkdir(parents=True)
+        candidate.write_bytes(b'rejected-candidate')
+        qa = {'status': 'manual_review_required', 'candidate_path': str(candidate)}
+        if committed:
+            qa.update(status='regenerate_committed', review_operation={
+                'operation_id': 'committed-redo', 'decision': 'regenerate_master',
+                'phase': 'committed',
+            })
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,execution_engine,cost_cents) "
+            "VALUES(?,?,'redo','PRODUCTION_REVIEW_REQUIRED','{}','graph_v2',944)",
+            (job_id, 'T-REDO'),
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,state,cost_cents,video_qa) VALUES(?,1,?,944,?)",
+            (job_id, 'PENDING' if committed else 'REVIEW_REQUIRED', json.dumps(qa)),
+        )
+        self.database.executemany(
+            "INSERT INTO production_nodes(job_id,node_id,node_type,paid,state,spec_hash,"
+            "input_json,idempotency_key,provider_task_id,actual_cost_cents,output_json) "
+            "VALUES(?,?,'master',1,?,'frozen-redo','{}',?,?,?,?)",
+            [(job_id, 'master:1', 'REVIEW_REQUIRED', 'old-paid-attempt', 'old-task', 944,
+              json.dumps({'candidate_path': str(candidate)})),
+             (job_id, 'master:2', 'PENDING', 'downstream', None, 0, '{}')],
+        )
+        self.database.execute(
+            "INSERT INTO production_edges(job_id,from_node_id,to_node_id,edge_type) "
+            "VALUES(?,'master:1','master:2','master_sequence')", (job_id,),
+        )
+        self.database.execute(
+            "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,cost_cents) "
+            "VALUES('old-task',?,1,'seedance','master',944)", (job_id,),
+        )
+        self.database.commit()
+        return job_id
+
+    def _assert_graph_regeneration(self, job_id):
+        node = self.database.execute(
+            "SELECT * FROM production_nodes WHERE job_id=? AND node_id='master:1'", (job_id,),
+        ).fetchone()
+        self.assertEqual(node['state'], 'READY')
+        self.assertIsNone(node['provider_task_id'])
+        self.assertEqual(json.loads(node['output_json']), {})
+        self.assertNotEqual(node['idempotency_key'], 'old-paid-attempt')
+        self.assertEqual(node['actual_cost_cents'], 944)
+        self.assertEqual(self.database.execute(
+            "SELECT cost_cents FROM provider_calls WHERE task_id='old-task'"
+        ).fetchone()[0], 944)
+        self.assertEqual(self.database.execute(
+            "SELECT state FROM production_nodes WHERE job_id=? AND node_id='master:2'", (job_id,),
+        ).fetchone()[0], 'PENDING')
+        self.assertEqual(self.database.execute(
+            "SELECT COUNT(*) FROM production_node_events WHERE job_id=? AND event='regenerate'", (job_id,),
+        ).fetchone()[0], 1)
+
+    def test_regenerate_candidate_requeues_graph_and_keeps_paid_history(self):
+        job_id = self._seed_graph_regeneration()
+        with mock.patch.object(self.service, 'dispatch_production_queue', return_value={'dispatched_jobs': []}):
+            result = self.service.review_master_candidate(job_id, 1, decision='regenerate_master')
+        self.assertEqual(result['state'], 'PRODUCTION_QUEUED')
+        self._assert_graph_regeneration(job_id)
+
+    def test_startup_syncs_committed_regeneration_before_clearing_operation(self):
+        job_id = self._seed_graph_regeneration(committed=True)
+        self.service._recover_review_operations()
+        self.service._recover_review_operations()
+        self._assert_graph_regeneration(job_id)
+
+    def test_resume_reports_unrepaired_graph_failure_without_clearing_state(self):
+        job_id = self._seed_graph_regeneration(committed=True)
+        self.database.execute("UPDATE jobs SET state='FAILED' WHERE job_id=?", (job_id,))
+        self.database.execute(
+            "UPDATE production_nodes SET state='FAILED',provider_task_id=NULL,actual_cost_cents=0,"
+            "output_json='{}' WHERE job_id=? AND node_id='master:1'", (job_id,),
+        )
+        self.database.execute(
+            "INSERT INTO production_node_events(job_id,event_id,node_id,event,from_state,to_state,payload_json) "
+            "VALUES(?,'reference-failed','master:1','fail','RUNNING','FAILED',?)",
+            (job_id, json.dumps({'error': 'reference attention budget exceeded'})),
+        )
+        self.database.commit()
+        with self.assertRaisesRegex(ValueError, 'reference attention budget exceeded'):
+            self.service.resume_failed_video(job_id)
+        self.assertEqual(self.database.execute(
+            "SELECT state FROM jobs WHERE job_id=?", (job_id,),
+        ).fetchone()[0], 'FAILED')
+
+    def test_committed_regeneration_recovery_does_not_reset_a_new_running_attempt(self):
+        job_id = self._seed_graph_regeneration(committed=True)
+        self.service._sync_graph_master_review_decision(
+            job_id, 1, decision='regenerate_master', operation_id='committed-redo',
+        )
+        self.database.execute(
+            "UPDATE production_nodes SET state='RUNNING',lease_id='new-lease',provider_task_id='new-task' "
+            "WHERE job_id=? AND node_id='master:1'", (job_id,),
+        )
+        self.database.commit()
+        self.service._recover_review_operations()
+        row = self.database.execute(
+            "SELECT state,lease_id,provider_task_id FROM production_nodes WHERE job_id=? AND node_id='master:1'", (job_id,),
+        ).fetchone()
+        self.assertEqual(tuple(row), ('RUNNING', 'new-lease', 'new-task'))
+
     def test_startup_repairs_committed_candidate_with_stale_graph_review_state(self):
         job_id = "J-MASTER-REVIEW-RECOVERY"
         active = self.root / "data" / "assets" / job_id / "shots" / "01.mp4"
