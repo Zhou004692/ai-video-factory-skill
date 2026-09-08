@@ -3660,6 +3660,7 @@ def _cinematic_director_time_beats(
     if not raw_beats:
         raw_beats = [{
             "speaker": shot.get("speaker"),
+            "speakers": shot.get("speakers"),
             "duration": editorial_duration,
             "dialogue": shot.get("voiceover") or "",
             "visual_intent": shot.get("action") or shot.get("scene") or "",
@@ -3699,9 +3700,8 @@ def _cinematic_director_time_beats(
             beat.get("visual_intent") or beat.get("broll_hint")
             or shot.get("action") or ""
         ).strip(" ；;，,")
-        speaker = str(
-            beat.get("speaker") or shot.get("speaker") or "当前人物"
-        ).strip()
+        speakers = creative_ir.speaker_ids(beat) or creative_ir.speaker_ids(shot)
+        speaker = "、".join(speakers) or "当前人物"
         dialogue = str(beat.get("dialogue") or "").strip()
         speech_mode = creative_ir.normalize_speech_mode(
             beat.get("speech_mode"), speaker=speaker
@@ -3737,7 +3737,7 @@ def _cinematic_director_time_beats(
             ])
         elif dialogue:
             clauses.extend([
-                f"角色 {speaker} 说出 {{台词：{dialogue}}}",
+                f"角色 {speaker} {'共同' if len(speakers) > 1 else ''}说出 {{台词：{dialogue}}}",
                 "说话者面部与嘴部保持清晰可见，表演和运镜服务剧情，"
                 "不得在本句中途切离说话者或遮挡嘴部",
             ])

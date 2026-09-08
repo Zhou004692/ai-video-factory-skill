@@ -46,6 +46,30 @@ def _beat_speech_mode(beat: dict) -> str:
     )
 
 
+def _normalize_beat_speakers(beat: dict, characters: list) -> None:
+    speakers = list(creative_ir.speaker_ids(beat))
+    if len(speakers) > 1:
+        declared = characters or beat.get("characters") or beat.get("cast") or []
+        known = {
+            _text(value)
+            for character in declared
+            for value in (
+                (character.get("id"), character.get("name"))
+                if isinstance(character, dict) else (character,)
+            ) if _text(value)
+        }
+        unknown = [speaker for speaker in speakers if speaker not in known]
+        if unknown:
+            raise ValueError(f"unknown group speaker references: {unknown}; 请指定人物表中的说话人")
+        if not beat.get("speech_mode") and len({
+            normalize_speech_mode(None, speaker=speaker) for speaker in speakers
+        }) > 1:
+            raise ValueError("ambiguous group speech mode; 请按画内与画外声音拆分节拍")
+    beat["speaker"] = speakers[0] if speakers else ""
+    if len(speakers) > 1 or "speakers" in beat:
+        beat["speakers"] = speakers
+
+
 def normalize_generation_preferences(raw: dict | None) -> dict:
     """Return validated optional creative guidance, never hard output gates."""
     raw = raw or {}
@@ -115,7 +139,8 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
         raise ValueError("script variant requires at least 1 narrative beat")
     beats: list[dict] = []
     for index, beat in enumerate(beats_raw):
-        beat = beats_raw[index] or {}
+        beat = deepcopy(beats_raw[index] or {})
+        _normalize_beat_speakers(beat, raw.get("characters") or [])
         beat_type = _text(beat.get("beat")) or (
             BEAT_ORDER[index] if index < len(BEAT_ORDER)
             else f"segment_{index + 1}"
@@ -147,6 +172,8 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
                 beat.get("speech_mode"), speaker=_text(beat.get("speaker"))
             ),
         }
+        if "speakers" in beat:
+            normalized["speakers"] = beat["speakers"]
         for field in PERFORMANCE_TEXT_FIELDS:
             value = _text(beat.get(field))
             if value:
@@ -488,6 +515,7 @@ def _prompt(
             "beats": [{
                 "beat": "hook|conflict|evidence|reversal|solution|cta",
                 "speaker": "character_id",
+                "speakers": ["character_id"],
                 "dialogue": "口语化台词",
                 "duration_sec": 4,
                 "visual_intent": "画面意图",
@@ -522,6 +550,9 @@ def _prompt(
         "每版应覆盖 hook、conflict、evidence、reversal、solution、cta 等必要叙事功能；"
         "beat 数量和顺序由内容决定，可合并、拆分或省略不适用的模板段落，不得为凑六段重复内容。"
         "speaker 使用稳定的简短人物 ID；同一人物在所有 beat 中必须使用同一个 ID。"
+        "多人共同说同一句台词时，speakers 填写已有角色 ID 数组，speaker 填第一个 ID；"
+        "不得将逗号拼接的人物列表或‘三人同框’创建为新角色。同框但未说话的人只放入 characters；"
+        "多人分别说不同台词时拆成独立 beat，分别标明说话人。"
         "人物数量由选题、来源和叙事需要决定，不得因为口播形式默认只有一名 presenter。"
         "口播可以采用单人主讲、双人问答、多人接力或同场对谈；来源或 Brief 出现多个明确人物、"
         "观点或多轮对话时，必须使用不同且稳定的 speaker ID，不得合并为 presenter；"
@@ -953,6 +984,7 @@ def _storyboard(script: dict) -> dict:
     # masters, leaving the first one with an empty voiceover.
     previous_scene = ""
     for beat in beats:
+        _normalize_beat_speakers(beat, script.get("characters") or [])
         beat["speech_mode"] = normalize_speech_mode(
             beat.get("speech_mode"), speaker=_text(beat.get("speaker"))
         )
@@ -992,7 +1024,7 @@ def _storyboard(script: dict) -> dict:
             })
     timeline_units = _provider_timeline_units(beats)
     original_audio_speakers = list(dict.fromkeys(
-        _text(beat["speaker"]) for beat in beats
+        speaker for beat in beats for speaker in creative_ir.speaker_ids(beat)
     ))
     speaker_aliases: dict[str, str] = {}
     named_speakers = [
@@ -1008,8 +1040,14 @@ def _storyboard(script: dict) -> dict:
         speaker = _text(beat["speaker"])
         return speaker_aliases.get(speaker, speaker)
 
+    def effective_speakers(beat: dict) -> list[str]:
+        return list(dict.fromkeys(
+            speaker_aliases.get(speaker, speaker)
+            for speaker in creative_ir.speaker_ids(beat)
+        ))
+
     on_screen_speakers = list(dict.fromkeys(
-        effective_speaker(beat) for beat in beats
+        speaker for beat in beats for speaker in effective_speakers(beat)
         if _beat_speech_mode(beat) == "on_screen"
     ))
     declared_characters = list(dict.fromkeys(
@@ -1041,10 +1079,10 @@ def _storyboard(script: dict) -> dict:
         scene_anchor_description = _scene_description(group)
         site_anchor = _site_anchor_metadata(group)
         group_audio_speakers = list(dict.fromkeys(
-            effective_speaker(beat) for beat in group
+            speaker for beat in group for speaker in effective_speakers(beat)
         ))
         group_speakers = list(dict.fromkeys(
-            effective_speaker(beat) for beat in group
+            speaker for beat in group for speaker in effective_speakers(beat)
             if _beat_speech_mode(beat) == "on_screen"
         ))
         group_cast: list[str] = []
@@ -1053,7 +1091,7 @@ def _storyboard(script: dict) -> dict:
                 beat.get("characters") or beat.get("cast") or []
             )
             if _beat_speech_mode(beat) == "on_screen":
-                cast_candidates.append(effective_speaker(beat))
+                cast_candidates.extend(effective_speakers(beat))
             for character_id in cast_candidates:
                 normalized = _text(
                     character_id.get("id")
@@ -1078,6 +1116,7 @@ def _storyboard(script: dict) -> dict:
             performance_beats.append({
                 "beat": beat["beat"],
                 "speaker": effective_speaker(beat),
+                "speakers": effective_speakers(beat),
                 "speech_mode": _beat_speech_mode(beat),
                 "source_beat_index": beat["_source_beat_index"],
                 "fragment_index": beat["_fragment_index"],
@@ -1200,7 +1239,7 @@ def _storyboard(script: dict) -> dict:
                 )
                 for character_id in [
                     *(beat.get("characters") or beat.get("cast") or []),
-                    beat.get("speaker"),
+                    *effective_speakers(beat),
                 ]:
                     normalized = _text(
                         character_id.get("id")

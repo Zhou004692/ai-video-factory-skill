@@ -133,12 +133,13 @@ def lip_sync_required(beat: CreativeBeat) -> bool:
     return bool(beat.dialogue and on_screen_speakers(beat))
 
 
-def _speakers(beat: Mapping[str, object]) -> tuple[str, ...]:
-    explicit = _tuple_text(beat.get("speakers"))
-    if explicit:
-        return explicit
-    speaker = _text(beat.get("speaker"))
-    return (speaker,) if speaker else ()
+def speaker_ids(beat: Mapping[str, object]) -> tuple[str, ...]:
+    """Read plural references, including legacy comma-separated speaker IDs."""
+    values = _tuple_text(beat.get("speakers")) or _tuple_text(beat.get("speaker"))
+    return tuple(dict.fromkeys(
+        part.strip() for value in values for part in re.split(r"[,，、]", value)
+        if part.strip()
+    ))
 
 
 def _creative_beat(
@@ -155,7 +156,7 @@ def _creative_beat(
         beat_id=_text(beat.get("id") or beat.get("beat_id")) or f"beat-{index}",
         kind=_text(beat.get("kind") or beat.get("beat")) or "scene",
         scene=_text(beat.get("scene") or beat.get("location")),
-        speakers=_speakers(beat),
+        speakers=speaker_ids(beat),
         dialogue=_text(beat.get("dialogue") or beat.get("voiceover")),
         action=action,
         emotion=_text(
