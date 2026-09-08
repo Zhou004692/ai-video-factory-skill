@@ -97,13 +97,7 @@ async def run_graph_job(
             job_id=job_id,
         )
 
-    report = production_projection.reconcile(database, job_id)
-    database.execute(
-        "UPDATE jobs SET state=?,production_worker_pid=NULL,"
-        "updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-        (report.projected_job_state, job_id),
-    )
-    database.commit()
+    report = production_projection.persist(database, job_id)
     return GraphRunResult(
         job_id=job_id,
         job_state=report.projected_job_state,

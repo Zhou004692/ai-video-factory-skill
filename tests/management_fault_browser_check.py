@@ -783,6 +783,8 @@ def run_browser_gate() -> set[str]:
             run_provider_reconcile(browser, base_url, rejected=True)
             run_failed_details(browser, base_url)
             run_anchor_generation_waiting(browser, base_url)
+            run_shared_recovery_policy(browser, base_url, running=False)
+            run_shared_recovery_policy(browser, base_url, running=True)
             for action_id in (
                 "configure_music_provider",
                 "confirm_budget",
@@ -805,6 +807,34 @@ def run_browser_gate() -> set[str]:
         finally:
             browser.close()
     return observed_actions
+
+
+def run_shared_recovery_policy(browser, base_url: str, *, running: bool) -> None:
+    """UI contract only: API/media are intercepted, backend is tested separately."""
+    job = review_job()
+    job['state'] = 'PRODUCTION_RUNNING' if running else 'PROVIDER_ACTION_REQUIRED'
+    action = {'id': 'view_progress' if running else 'reconcile_provider_task', 'label': '查看进度' if running else '核对远端任务'}
+    job['recovery'] = {
+        'action_ids': [action['id']] + ([] if running else ['review_master_candidates']),
+        'candidate_decisions': [] if running else ['accept_candidate', 'reject_job'],
+        'next_action': action,
+    }
+    job['next_action'] = action
+    job['shots'][0]['candidate_review_eligible'] = not running
+    page, posts, errors, bad = scenario_page(browser, base_url, job)
+    page.locator(f'[data-video-id="{job["job_id"]}"]').click()
+    if running:
+        assert page.locator('[data-review-master]').count() == 0
+        page.locator('#drawer-next-action').click()
+        assert posts == []
+    else:
+        page.locator('[data-review-master]').click()
+        assert page.locator('[data-candidate-decision="regenerate_master"]').count() == 0
+        assert page.locator('[data-candidate-decision="accept_candidate"]').is_visible()
+        page.locator('[data-candidate-decision="accept_candidate"]').click()
+        wait_for_post(page, posts, '/candidate-review')
+        assert len(posts) == 1 and posts[0]['body'] == {'decision': 'accept_candidate'}
+    assert_clean(page, errors, bad)
 
 
 def run_unit_gate() -> None:
@@ -832,7 +862,7 @@ def main() -> None:
         "source_types": [],
         "provider_response_types": ["stubbed_api"],
     }, sort_keys=True))
-    print("management production-fault browser check: PASS (26 scenarios)")
+    print("management production-fault browser check: PASS (28 scenarios)")
 
 
 if __name__ == "__main__":

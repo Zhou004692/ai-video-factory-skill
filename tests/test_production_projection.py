@@ -155,6 +155,13 @@ class ProductionProjectionTests(unittest.TestCase):
         self.assertEqual(report.next_action, "view_publication")
         self.assertEqual(report.differences, ())
 
+    def test_pending_graph_without_runnable_work_does_not_project_a_queue(self):
+        self.database.execute("UPDATE production_nodes SET state='PENDING'")
+        self.database.commit()
+        report = production_projection.persist(self.database, 'J-E2E')
+        self.assertEqual(report.projected_job_state, 'RECOVERY_REQUIRED')
+        self.assertEqual(report.next_action, 'preserve_and_diagnose')
+
 
 if __name__ == "__main__":
     unittest.main()

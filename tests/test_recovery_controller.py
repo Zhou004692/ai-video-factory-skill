@@ -135,6 +135,28 @@ class RecoveryControllerTests(unittest.TestCase):
             "PRODUCTION_RUNNING",
         )
 
+    def seed_graph(self, state, output=None):
+        self.seed_job()
+        self.database.execute("UPDATE jobs SET execution_engine='graph_v2'")
+        self.database.execute("INSERT INTO production_nodes(job_id,node_id,node_type,state,spec_hash,input_json,idempotency_key,lease_id,output_json) VALUES('J-1','master:1','master',?,'s','{}','i','old',?)", (state, json.dumps(output or {})))
+        self.database.commit()
+
+    def test_graph_failure_is_not_requeued_by_dead_worker_recovery(self):
+        self.seed_graph('FAILED')
+        outcome = reconcile_job(self.database, 'J-1', now=self.now)
+        self.assertEqual(outcome.state, 'FAILED')
+        self.assertNotEqual(outcome.action, 'requeue')
+
+    def test_completed_checkpoint_projects_review_after_restart(self):
+        self.seed_graph('RUNNING', {'candidate_path': 'paid.mp4', '_executor_checkpoint': {'event': 'require_review', 'event_id': 'completed'}})
+        outcome = reconcile_job(self.database, 'J-1', now=self.now)
+        self.assertEqual(outcome.state, 'PRODUCTION_REVIEW_REQUIRED')
+        self.assertEqual(self.database.execute('SELECT state FROM production_nodes').fetchone()[0], 'REVIEW_REQUIRED')
+
+    def test_stranded_pending_graph_requires_diagnosis(self):
+        self.seed_graph('PENDING')
+        self.assertEqual(reconcile_job(self.database, 'J-1', now=self.now).state, 'RECOVERY_REQUIRED')
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,8 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import sqlite3
+import json
+import uuid
 
-from . import provider_tasks
+from . import node_state_machine, provider_tasks
+
+TERMINAL_STATES = frozenset({'PUBLISHED', 'REJECTED', 'REJECTED_PENDING_RECONCILIATION'})
 
 
 PRIORITY = (
@@ -114,8 +118,8 @@ def _projected_state(
         "RUNNING": ("PRODUCTION_RUNNING", "view_progress"),
         "READY": ("PRODUCTION_QUEUED", "view_progress"),
         "FAILED": ("FAILED", "preserve_and_diagnose"),
-        "PENDING": ("PRODUCTION_QUEUED", "view_progress"),
-        "SUCCEEDED": ("PRODUCTION_QUEUED", "view_progress"),
+        "PENDING": ("RECOVERY_REQUIRED", "preserve_and_diagnose"),
+        "SUCCEEDED": ("RECOVERY_REQUIRED", "preserve_and_diagnose"),
     }[selected]
 
 
@@ -126,12 +130,13 @@ def reconcile(database: sqlite3.Connection, job_id: str) -> ProjectionReport:
     if job is None:
         raise ValueError(f"video job not found: {job_id}")
     current_state = str(job["state"])
-    if current_state == "PUBLISHED":
+    if current_state in TERMINAL_STATES:
         return ProjectionReport(
             job_id=job_id,
             current_job_state=current_state,
-            projected_job_state="PUBLISHED",
-            next_action="view_publication",
+            projected_job_state=current_state,
+            next_action=("view_publication" if current_state == "PUBLISHED" else
+                         "reconcile_rejected_provider_cost" if current_state == "REJECTED_PENDING_RECONCILIATION" else "none"),
             differences=(),
         )
     nodes = database.execute(
@@ -164,6 +169,27 @@ def reconcile(database: sqlite3.Connection, job_id: str) -> ProjectionReport:
         next_action=action,
         differences=tuple(differences),
     )
+
+
+def persist(database: sqlite3.Connection, job_id: str) -> ProjectionReport:
+    """Commit the graph-derived job projection without reviving termination."""
+    with node_state_machine.atomic(database):
+        report = reconcile(database, job_id)
+        if report.current_job_state not in TERMINAL_STATES:
+            database.execute(
+                "UPDATE jobs SET state=?,production_worker_pid=CASE WHEN ?='PRODUCTION_RUNNING' "
+                "THEN production_worker_pid ELSE NULL END,updated_at=CURRENT_TIMESTAMP "
+                "WHERE job_id=? AND state=?",
+                (report.projected_job_state, report.projected_job_state, job_id, report.current_job_state),
+            )
+            if report.current_job_state != report.projected_job_state:
+                database.execute(
+                    "INSERT INTO job_transitions(event_id,job_id,event,from_state,to_state,payload_json) VALUES(?,?,?,?,?,?)",
+                    (f"{job_id}:graph-projection:{uuid.uuid4().hex}", job_id, "graph_projected",
+                     report.current_job_state, report.projected_job_state,
+                     json.dumps({"next_action": report.next_action, "differences": report.differences})),
+                )
+        return report
 
 
 def mirror_legacy_execution(database: sqlite3.Connection, job_id: str) -> None:

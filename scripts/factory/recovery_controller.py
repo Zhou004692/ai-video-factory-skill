@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import sqlite3
 from typing import Callable
 
-from . import provider_tasks
+from . import node_state_machine, production_executor, production_projection, provider_tasks
 from .state_machine import InvalidTransitionError, transition
 
 
@@ -68,10 +68,16 @@ def reconcile_job(
     lease_timeout_sec: int = 60,
 ) -> RecoveryOutcome:
     """Recover one expired job without performing any provider POST."""
+    with node_state_machine.atomic(database):
+        return _reconcile_job(database, job_id, now=now, worker_alive=worker_alive,
+                              lease_timeout_sec=lease_timeout_sec)
+
+
+def _reconcile_job(database, job_id, *, now, worker_alive, lease_timeout_sec):
     current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     row = database.execute(
         "SELECT state,failure_code,production_worker_pid,"
-        "production_heartbeat_at,recovery_attempts FROM jobs WHERE job_id=?",
+        "production_heartbeat_at,recovery_attempts,execution_engine FROM jobs WHERE job_id=?",
         (job_id,),
     ).fetchone()
     if row is None:
@@ -106,6 +112,34 @@ def reconcile_job(
             },
         )
         return RecoveryOutcome(job_id, "terminal_policy_failure", "FAILED")
+    if row['execution_engine'] == 'graph_v2' and database.execute(
+        'SELECT 1 FROM production_nodes WHERE job_id=? LIMIT 1', (job_id,),
+    ).fetchone():
+        production_executor.recover_expired_nodes(
+            database, job_id, now=current_time, lease_timeout_sec=lease_timeout_sec,
+        )
+        graph_states = {r[0] for r in database.execute(
+            'SELECT state FROM production_nodes WHERE job_id=?', (job_id,),
+        )}
+        # A node may have a newer heartbeat than the job lease. Do not clear it.
+        if 'RUNNING' in graph_states:
+            return RecoveryOutcome(job_id, 'none', state)
+        report = production_projection.reconcile(database, job_id)
+        if report.projected_job_state != 'PRODUCTION_QUEUED':
+            production_projection.persist(database, job_id)
+            database.execute(
+                'UPDATE jobs SET worker_lease_id=NULL,production_heartbeat_at=NULL,recovery_attempts=? WHERE job_id=?',
+                (attempts + 1, job_id),
+            )
+            action = {'PROVIDER_ACTION_REQUIRED': 'reconcile_provider',
+                      'PRODUCTION_REVIEW_REQUIRED': 'manual_review'}.get(report.projected_job_state, report.next_action)
+            return RecoveryOutcome(job_id, action, report.projected_job_state,
+                                   tuple(provider_tasks.unresolved_task_ids(database, job_id)))
+        if 'READY' not in graph_states:
+            transition(database, job_id, 'recovery_required',
+                       event_id=f'{job_id}:recovery-stranded:{event_suffix}',
+                       updates={**base_updates, 'error': '还有未完成工作，但没有可执行节点，请检查依赖状态'})
+            return RecoveryOutcome(job_id, 'manual_recovery', 'RECOVERY_REQUIRED')
     if attempts >= 3:
         transition(
             database, job_id, "recovery_required",

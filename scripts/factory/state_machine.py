@@ -87,10 +87,10 @@ _EVENT_RULES: dict[str, tuple[frozenset[str], str | None]] = {
         frozenset({"FAILED", "PROVIDER_ACTION_REQUIRED"}), "SHOTS_OK",
     ),
     "review_decided": (
-        frozenset({"FAILED", "PRODUCTION_REVIEW_REQUIRED"}), None,
+        frozenset({"FAILED", "PRODUCTION_REVIEW_REQUIRED", "PROVIDER_ACTION_REQUIRED", "BUDGET_CONFIRMATION_REQUIRED"}), None,
     ),
     "rejection_requested": (
-        frozenset({"FAILED", "PRODUCTION_REVIEW_REQUIRED"}), None,
+        frozenset({"FAILED", "PRODUCTION_REVIEW_REQUIRED", "PROVIDER_ACTION_REQUIRED", "BUDGET_CONFIRMATION_REQUIRED"}), None,
     ),
     "recovery_requeue": (
         frozenset({"PRODUCTION_RUNNING"}), "PRODUCTION_QUEUED",
@@ -118,6 +118,7 @@ _DYNAMIC_EVENT_TARGETS: dict[str, frozenset[str]] = {
         "SHOTS_OK", "FAILED", "REJECTED",
     }),
     "review_decided": frozenset({
+        "FAILED", "BUDGET_CONFIRMATION_REQUIRED", "RECOVERY_REQUIRED",
         "PROVIDER_ACTION_REQUIRED", "PRODUCTION_REVIEW_REQUIRED",
         "PRODUCTION_QUEUED", "SHOTS_OK", "COMPOSED",
     }),

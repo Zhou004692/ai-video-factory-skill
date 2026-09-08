@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import sqlite3
+from contextlib import contextmanager
 from typing import Mapping
 
 
@@ -35,6 +36,7 @@ _TRANSITIONS = {
     ("RUNNING", "reconcile_review"): "REVIEW_REQUIRED",
     ("READY", "reconcile_review"): "REVIEW_REQUIRED",
     ("RUNNING", "fail"): "FAILED",
+    ("RUNNING", "recover_unsubmitted"): "READY",
     ("READY", "skip"): "SKIPPED",
     ("FAILED", "retry"): "READY",
 }
@@ -44,6 +46,68 @@ _TRANSITIONS = {
 class TransitionResult:
     applied: bool
     state: str
+
+
+@contextmanager
+def atomic(database: sqlite3.Connection):
+    """Own a write transaction or compose without committing the caller."""
+    owns = not database.in_transaction
+    database.execute('BEGIN IMMEDIATE' if owns else 'SAVEPOINT node_command')
+    try:
+        yield
+        if owns:
+            database.commit()
+        else:
+            database.execute('RELEASE SAVEPOINT node_command')
+    except BaseException:
+        if owns:
+            database.rollback()
+        else:
+            database.execute('ROLLBACK TO SAVEPOINT node_command')
+            database.execute('RELEASE SAVEPOINT node_command')
+        raise
+
+
+def finish_attempt(database, job_id, node_id, event, *, lease_id, event_id,
+                   output, error_code=None):
+    """Publish a leased outcome once, including result, event and lease release.
+
+    The handler checkpoint remains durable until this whole command commits.
+    A worker whose lease has been replaced cannot publish into a new attempt.
+    """
+    with atomic(database):
+        prior = database.execute(
+            'SELECT node_id,event,to_state FROM production_node_events WHERE job_id=? AND event_id=?',
+            (job_id, event_id),
+        ).fetchone()
+        if prior:
+            if prior['node_id'] != node_id or prior['event'] != event:
+                raise ValueError('event_id belongs to another node outcome')
+            return TransitionResult(False, str(prior['to_state']))
+        row = database.execute(
+            'SELECT state,lease_id FROM production_nodes WHERE job_id=? AND node_id=?',
+            (job_id, node_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError('production node not found')
+        if row['state'] != 'RUNNING' or row['lease_id'] != lease_id:
+            return TransitionResult(False, str(row['state']))
+        result = transition_node_in_transaction(
+            database, job_id, node_id, event, event_id=event_id, payload=output,
+        )
+        next_action = {'require_review': 'review_candidate',
+                       'require_action': 'reconcile_provider_task',
+                       'require_budget': 'increase_job_budget',
+                       'fail': 'preserve_and_diagnose', 'recover_unsubmitted': 'retry_node'}.get(event)
+        task_id = output.get('provider_task_id') or output.get('task_id') or None
+        database.execute(
+            'UPDATE production_nodes SET output_json=?,error_code=?,next_action=?, '
+            'provider_task_id=COALESCE(?,provider_task_id),lease_id=NULL,heartbeat_at=NULL '
+            'WHERE job_id=? AND node_id=?',
+            (json.dumps(output, ensure_ascii=False, sort_keys=True), error_code,
+             next_action, task_id, job_id, node_id),
+        )
+        return result
 
 
 def _promote_dependents(database: sqlite3.Connection, job_id: str) -> None:
@@ -86,7 +150,7 @@ def transition_node(
     payload: Mapping[str, object] | None = None,
 ) -> TransitionResult:
     """Apply an event once and promote newly unblocked downstream nodes."""
-    with database:
+    with atomic(database):
         return transition_node_in_transaction(
             database,
             job_id,

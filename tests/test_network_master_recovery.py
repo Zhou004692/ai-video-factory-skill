@@ -58,6 +58,65 @@ class NetworkMasterRecoveryTests(unittest.TestCase):
         self.assertFalse(job['shots'][0]['regeneration_eligible'])
         self.assertTrue(job['shots'][2]['candidate_preview_url'])
 
+    def test_provider_pause_accepts_candidate_without_reposting_or_losing_ledger(self):
+        self.database.execute("UPDATE jobs SET state='PROVIDER_ACTION_REQUIRED'")
+        self.database.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) VALUES('unknown','J-NET',1,'seedance','master','{\"status\":\"unknown\"}')")
+        self.database.commit()
+        job = self.service.videos()['jobs'][0]
+        self.assertEqual(job['next_action']['id'], 'reconcile_provider_task')
+        self.assertTrue(job['shots'][2]['candidate_review_eligible'])
+        self.assertNotIn('regenerate_master', job['recovery']['candidate_decisions'])
+        with self.assertRaises(ValueError):
+            self.service.review_master_candidate('J-NET', 3, decision='regenerate_master')
+        with mock.patch.object(self.service, 'dispatch_production_queue') as dispatch:
+            result = self.service.review_master_candidate('J-NET', 3, decision='accept_candidate')
+        self.assertEqual(result['state'], 'PROVIDER_ACTION_REQUIRED')
+        dispatch.assert_not_called()
+        self.assertEqual(self.database.execute('SELECT COUNT(*) FROM provider_calls').fetchone()[0], 1)
+
+    def test_budget_pause_preserves_sibling_budget_after_acceptance(self):
+        self.database.execute("UPDATE jobs SET state='BUDGET_CONFIRMATION_REQUIRED'")
+        self.database.execute("UPDATE production_nodes SET state='BUDGET_REQUIRED' WHERE node_id='master:1'")
+        self.database.execute("UPDATE shots SET state='BUDGET_REQUIRED',error=NULL WHERE idx=1")
+        self.database.commit()
+        with mock.patch.object(self.service, 'dispatch_production_queue') as dispatch:
+            result = self.service.review_master_candidate('J-NET', 3, decision='accept_candidate')
+        self.assertEqual(result['state'], 'BUDGET_CONFIRMATION_REQUIRED')
+        dispatch.assert_not_called()
+        self.assertEqual(self.service.videos()['jobs'][0]['next_action']['id'], 'increase_job_budget')
+
+    def test_graph_ready_after_provider_reconciliation_can_use_advertised_resume(self):
+        self.database.execute("UPDATE jobs SET state='PROVIDER_ACTION_REQUIRED',failure_code=NULL")
+        self.database.execute("UPDATE production_nodes SET state='READY',error_code=NULL WHERE node_id='master:1'")
+        self.database.execute("UPDATE production_nodes SET state='SUCCEEDED' WHERE node_id='master:3'")
+        self.database.execute("UPDATE shots SET state='OK',video_qa=NULL WHERE idx=3")
+        self.database.execute("UPDATE shots SET video_qa=NULL WHERE idx=1")
+        self.database.commit()
+        self.assertEqual(self.service.videos()['jobs'][0]['next_action']['id'], 'resume_failed_video')
+        from factory import state_machine
+        before = tuple(self.database.execute("SELECT state,error FROM shots WHERE idx=1").fetchone())
+        with mock.patch.object(state_machine, 'transition', side_effect=RuntimeError('commit interrupted')):
+            with self.assertRaisesRegex(RuntimeError, 'commit interrupted'):
+                self.service.resume_failed_video('J-NET')
+        self.assertEqual(tuple(self.database.execute("SELECT state,error FROM shots WHERE idx=1").fetchone()), before)
+        result = self.service.resume_failed_video('J-NET')
+        self.assertEqual(result['state'], 'STORYBOARDED')
+        self.assertEqual(self.database.execute("SELECT state FROM production_nodes WHERE node_id='master:1'").fetchone()[0], 'READY')
+        self.assertEqual(self.database.execute('SELECT cost_cents FROM jobs').fetchone()[0], 944)
+
+    def test_accepting_candidate_preserves_sibling_failure_and_retry_route(self):
+        before = tuple(self.database.execute("SELECT state,error,video_qa FROM shots WHERE idx=1").fetchone())
+        with mock.patch.object(self.service, 'dispatch_production_queue', return_value={'dispatched_jobs': []}) as dispatch:
+            result = self.service.review_master_candidate('J-NET', 3, decision='accept_candidate')
+        dispatch.assert_not_called()
+        self.assertEqual(result['state'], 'FAILED')
+        self.assertEqual(tuple(self.database.execute("SELECT state,error,video_qa FROM shots WHERE idx=1").fetchone()),before)
+        job = self.service.videos()['jobs'][0]
+        self.assertEqual(job['next_action']['id'],'retry_network_failures')
+        with mock.patch.object(self.service, 'dispatch_production_queue', return_value={'dispatched_jobs': []}):
+            self.service.retry_network_failures('J-NET', confirmed=True)
+        self.assertEqual(self.database.execute("SELECT state FROM production_nodes WHERE node_id='master:1'").fetchone()[0],'READY')
+
     def test_confirmed_retry_requeues_graph_without_recompiling_or_touching_candidate(self):
         before=dict(self.database.execute("SELECT * FROM production_nodes WHERE node_id='master:3'").fetchone())
         with mock.patch.object(self.service,'dispatch_production_queue',return_value={'dispatched_jobs':[]}) as dispatch:

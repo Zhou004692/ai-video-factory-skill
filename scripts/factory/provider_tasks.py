@@ -173,6 +173,9 @@ def reserve_paid_submit(
     reservation_id = f"local-submit:{provider}:{job_id}:{int(shot_idx)}:{intent}"
     try:
         database.execute("BEGIN IMMEDIATE")
+        job_state = database.execute('SELECT state FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+        if job_state and job_state[0] in {'REJECTED', 'REJECTED_PENDING_RECONCILIATION', 'PUBLISHED'}:
+            raise ProviderTaskGateError('任务已终止或发布，禁止新的付费提交')
         assert_no_unresolved(
             database,
             job_id,

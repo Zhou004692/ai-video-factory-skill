@@ -145,7 +145,9 @@ def ready_nodes(
         return ()
     return tuple(database.execute(
         "SELECT * FROM production_nodes WHERE job_id=? AND state='READY' "
-        "AND lease_id IS NULL ORDER BY paid DESC,node_type,node_id LIMIT ?",
+        "AND lease_id IS NULL AND EXISTS(SELECT 1 FROM jobs j WHERE j.job_id=production_nodes.job_id "
+        "AND j.state NOT IN ('REJECTED','REJECTED_PENDING_RECONCILIATION','PUBLISHED')) "
+        "ORDER BY paid DESC,node_type,node_id LIMIT ?",
         (job_id, available),
     ).fetchall())
 
@@ -159,11 +161,13 @@ def acquire_lease(
 ) -> str | None:
     lease = lease_id or uuid.uuid4().hex
     timestamp = _now()
-    with database:
+    with node_state_machine.atomic(database):
         updated = database.execute(
             "UPDATE production_nodes SET state='RUNNING',lease_id=?,heartbeat_at=?,"
             "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND node_id=? "
-            "AND state='READY' AND lease_id IS NULL",
+            "AND state='READY' AND lease_id IS NULL "
+            "AND EXISTS(SELECT 1 FROM jobs j WHERE j.job_id=production_nodes.job_id "
+            "AND j.state NOT IN ('REJECTED','REJECTED_PENDING_RECONCILIATION','PUBLISHED'))",
             (lease, timestamp, job_id, node_id),
         )
         if int(updated.rowcount or 0) == 1:
@@ -217,12 +221,13 @@ async def run_ready_wave(
         node_id = str(row["node_id"])
         handler = handlers.get(str(row["node_type"]))
         if handler is None:
-            failed.append(node_id)
-            node_state_machine.transition_node(
-                database, job_id, node_id, "fail",
+            result = node_state_machine.finish_attempt(
+                database, job_id, node_id, "fail", lease_id=lease,
                 event_id=f"{job_id}:{node_id}:{lease}:missing-handler",
-                payload={"error": "missing node handler"},
+                output={"error": "missing node handler"}, error_code="MissingHandler",
             )
+            if result.applied:
+                failed.append(node_id)
             return
         if str(row["node_type"]) == "local_compose":
             fault_injection.hit(
@@ -231,6 +236,7 @@ async def run_ready_wave(
                 job_id=job_id,
                 node_id=node_id,
             )
+        handler_completed = False
         try:
             with provider_executor.paid_task_owner_context(
                 job_id=job_id, node_id=node_id,
@@ -242,6 +248,7 @@ async def run_ready_wave(
                 if isinstance(raw_outcome, NodeOutcome)
                 else NodeOutcome.succeed(raw_outcome)
             )
+            handler_completed = True
             output = dict(outcome.output)
             checkpoint = {
                 "event": outcome.event,
@@ -255,9 +262,9 @@ async def run_ready_wave(
             # node state. If the process dies in this narrow window, restart
             # recovery can apply the recorded transition without re-running a
             # provider or local handler.
-            database.execute(
+            checkpoint_write = database.execute(
                 "UPDATE production_nodes SET output_json=? "
-                "WHERE job_id=? AND node_id=? AND lease_id=?",
+                "WHERE job_id=? AND node_id=? AND lease_id=? AND state='RUNNING'",
                 (
                     json.dumps(
                         checkpointed_output,
@@ -270,23 +277,20 @@ async def run_ready_wave(
                 ),
             )
             database.commit()
+            if checkpoint_write.rowcount != 1:
+                return
             fault_injection.hit(
                 database,
                 "after_handler_completion_before_node_update",
                 job_id=job_id,
                 node_id=node_id,
             )
-            database.execute(
-                "UPDATE production_nodes SET output_json=?,lease_id=NULL,"
-                "heartbeat_at=NULL WHERE job_id=? AND node_id=? AND lease_id=?",
-                (json.dumps(output, ensure_ascii=False, sort_keys=True),
-                 job_id, node_id, lease),
+            committed = node_state_machine.finish_attempt(
+                database, job_id, node_id, outcome.event, lease_id=lease,
+                event_id=f"{job_id}:{node_id}:{lease}:{outcome.event}", output=output,
             )
-            database.commit()
-            node_state_machine.transition_node(
-                database, job_id, node_id, outcome.event,
-                event_id=f"{job_id}:{node_id}:{lease}:{outcome.event}",
-            )
+            if not committed.applied:
+                return
             if outcome.event == "succeed":
                 succeeded.append(node_id)
             elif outcome.event == "require_review":
@@ -296,39 +300,19 @@ async def run_ready_wave(
             elif outcome.event == "require_budget":
                 budget_required.append(node_id)
         except Exception as exc:
+            if handler_completed:
+                raise  # Keep the durable checkpoint for restart recovery.
             pause_outcome = _pause_outcome_from_exception(exc)
             if pause_outcome is not None:
                 output = dict(pause_outcome.output)
-                next_action = (
-                    "reconcile_provider_task"
-                    if pause_outcome.event == "require_action"
-                    else "increase_job_budget"
-                    if pause_outcome.event == "require_budget"
-                    else "review_candidate"
+                committed = node_state_machine.finish_attempt(
+                    database, job_id, node_id, pause_outcome.event, lease_id=lease,
+                    event_id=f"{job_id}:{node_id}:{lease}:{pause_outcome.event}",
+                    output=output,
+                    error_code=str(output.get("stable_code") or type(exc).__name__),
                 )
-                provider_task_id = str(
-                    output.get("provider_task_id")
-                    or output.get("task_id") or ""
-                ).strip() or None
-                database.execute(
-                    "UPDATE production_nodes SET error_code=?,output_json=?,"
-                    "provider_task_id=COALESCE(?,provider_task_id),next_action=?,"
-                    "lease_id=NULL,heartbeat_at=NULL WHERE job_id=? "
-                    "AND node_id=? AND lease_id=?",
-                    (
-                        str(output.get("stable_code") or type(exc).__name__),
-                        json.dumps(output, ensure_ascii=False, sort_keys=True),
-                        provider_task_id, next_action, job_id, node_id, lease,
-                    ),
-                )
-                database.commit()
-                node_state_machine.transition_node(
-                    database, job_id, node_id, pause_outcome.event,
-                    event_id=(
-                        f"{job_id}:{node_id}:{lease}:{pause_outcome.event}"
-                    ),
-                    payload=output,
-                )
+                if not committed.applied:
+                    return
                 if pause_outcome.event == "require_action":
                     action_required.append(node_id)
                 elif pause_outcome.event == "require_budget":
@@ -336,18 +320,13 @@ async def run_ready_wave(
                 else:
                     review_required.append(node_id)
                 return
-            database.execute(
-                "UPDATE production_nodes SET error_code=?,lease_id=NULL,"
-                "heartbeat_at=NULL WHERE job_id=? AND node_id=? AND lease_id=?",
-                (type(exc).__name__, job_id, node_id, lease),
-            )
-            database.commit()
-            node_state_machine.transition_node(
-                database, job_id, node_id, "fail",
+            committed = node_state_machine.finish_attempt(
+                database, job_id, node_id, "fail", lease_id=lease,
                 event_id=f"{job_id}:{node_id}:{lease}:failed",
-                payload={"error": str(exc)},
+                output={"error": str(exc)}, error_code=type(exc).__name__,
             )
-            failed.append(node_id)
+            if committed.applied:
+                failed.append(node_id)
 
     await asyncio.gather(*(run_one(row, lease) for row, lease in claimed))
     return WaveResult(
@@ -368,12 +347,17 @@ def recover_expired_nodes(
     lease_timeout_sec: int = 60,
 ) -> dict[str, str]:
     """Recover expired leases without issuing provider work."""
+    with node_state_machine.atomic(database):
+        return _recover_expired_nodes(database, job_id, now=now, lease_timeout_sec=lease_timeout_sec)
+
+
+def _recover_expired_nodes(database, job_id, *, now, lease_timeout_sec):
     cutoff = (now or datetime.now(timezone.utc)) - timedelta(
         seconds=max(1, int(lease_timeout_sec))
     )
     recovered: dict[str, str] = {}
     rows = database.execute(
-        "SELECT node_id,heartbeat_at,provider_task_id,output_json "
+        "SELECT node_id,heartbeat_at,provider_task_id,output_json,lease_id,paid,actual_cost_cents "
         "FROM production_nodes WHERE job_id=? AND state='RUNNING'",
         (job_id,),
     ).fetchall()
@@ -391,7 +375,9 @@ def recover_expired_nodes(
         try:
             output = json.loads(row["output_json"] or "{}")
         except (TypeError, json.JSONDecodeError):
-            output = {}
+            output = {"recovery_error": "invalid output", "raw_output": row["output_json"]}
+        if not isinstance(output, dict):
+            output = {"recovery_error": "invalid output", "raw_output": row["output_json"]}
         checkpoint = (
             output.get("_executor_checkpoint")
             if isinstance(output, dict) else None
@@ -402,63 +388,44 @@ def recover_expired_nodes(
             if event in {
                 "succeed", "require_review", "require_action", "require_budget",
             } and event_id:
-                database.execute(
-                    "UPDATE production_nodes SET lease_id=NULL,heartbeat_at=NULL "
-                    "WHERE job_id=? AND node_id=? AND state='RUNNING'",
-                    (job_id, row["node_id"]),
-                )
-                database.commit()
-                result = node_state_machine.transition_node(
-                    database,
-                    job_id,
-                    str(row["node_id"]),
-                    event,
-                    event_id=event_id,
-                )
                 clean_output = dict(output)
                 clean_output.pop("_executor_checkpoint", None)
-                next_action = {
-                    "require_review": "review_candidate",
-                    "require_action": "reconcile_provider_task",
-                    "require_budget": "increase_job_budget",
-                }.get(event)
-                database.execute(
-                    "UPDATE production_nodes SET output_json=?,next_action=? "
-                    "WHERE job_id=? AND node_id=?",
-                    (
-                        json.dumps(
-                            clean_output, ensure_ascii=False, sort_keys=True,
-                        ),
-                        next_action,
-                        job_id,
-                        row["node_id"],
-                    ),
+                result = node_state_machine.finish_attempt(
+                    database, job_id, str(row["node_id"]), event,
+                    lease_id=row["lease_id"], event_id=event_id, output=clean_output,
+                    error_code=clean_output.get("stable_code"),
                 )
-                database.commit()
-                recovered[str(row["node_id"])] = result.state
+                if result.applied:
+                    recovered[str(row["node_id"])] = result.state
                 continue
-        if str(row["provider_task_id"] or "").strip():
-            state, action = "ACTION_REQUIRED", "reconcile_provider_task"
-        elif isinstance(output, dict) and (
-            output.get("candidate_path") or output.get("candidate_url")
-        ):
-            state, action = "REVIEW_REQUIRED", "review_candidate"
+        unresolved = provider_tasks.unresolved_task_ids(database, job_id)
+        if str(row["provider_task_id"] or "").strip() or (row["paid"] and unresolved):
+            event = "require_action"
+        elif isinstance(output, dict) and (output.get("candidate_path") or output.get("candidate_url")):
+            event = "require_review"
+        elif output or row["actual_cost_cents"]:
+            event = "require_action"
         else:
-            state, action = "READY", "retry_node"
-        database.execute(
-            "UPDATE production_nodes SET state=?,next_action=?,lease_id=NULL,"
-            "heartbeat_at=NULL,updated_at=CURRENT_TIMESTAMP "
-            "WHERE job_id=? AND node_id=? AND state='RUNNING'",
-            (state, action, job_id, row["node_id"]),
+            event = "recover_unsubmitted"
+        result = node_state_machine.finish_attempt(
+            database, job_id, str(row["node_id"]), event,
+            lease_id=row["lease_id"],
+            event_id=f"{job_id}:{row['node_id']}:{row['lease_id']}:expired:{event}",
+            output=output if isinstance(output, dict) else {"recovery_error": "invalid output"},
         )
-        recovered[str(row["node_id"])] = state
-    database.commit()
+        if result.applied:
+            recovered[str(row["node_id"])] = result.state
     return recovered
 
 
 def retry_repaired_contract_nodes(
     database: sqlite3.Connection, job_id: str,
 ) -> tuple[str, ...]:
+    with node_state_machine.atomic(database):
+        return _retry_repaired_contract_nodes(database, job_id)
+
+
+def _retry_repaired_contract_nodes(database, job_id):
     """Retry known local contract failures after the implementation is fixed.
 
     This is deliberately narrower than a generic retry. It only requeues a
@@ -487,7 +454,7 @@ def retry_repaired_contract_nodes(
             output = json.loads(row["output_json"] or "{}")
         except (TypeError, json.JSONDecodeError):
             output = {"invalid": True}
-        if output:
+        if not isinstance(output, dict) or set(output) - {"error"}:
             continue
 
         failure = database.execute(
@@ -550,5 +517,4 @@ def retry_repaired_contract_nodes(
             (job_id, node_id),
         )
         recovered.append(node_id)
-    database.commit()
     return tuple(recovered)

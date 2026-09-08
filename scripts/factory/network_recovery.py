@@ -65,6 +65,8 @@ def queue_retry(database, job_id, *, confirmed):
     owns_transaction = not database.in_transaction
     database.execute('BEGIN IMMEDIATE' if owns_transaction else 'SAVEPOINT network_recovery')
     try:
+        from .recovery_plan import require_action
+        require_action(database, job_id, "retry_network_failures")
         indexes = retry_indexes(database, job_id)
         if not indexes:
             raise ValueError('当前没有可安全重试的提交前连接失败母片，请刷新任务状态')

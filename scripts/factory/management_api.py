@@ -22,7 +22,7 @@ import httpx
 
 from . import (
     anchor_generation, character_assets, character_voices, error_registry, master_dependencies, media_sources, performance_feedback, production_metrics, production_planner, quality_canary,
-    network_recovery, node_state_machine, production_config, production_executor,
+    network_recovery, node_state_machine, production_config, production_executor, recovery_plan,
     production_invariants, production_projection, provider_capacity,
     provider_health, provider_tasks, recovery_controller, scene_assets,
     script_drafts, script_sources, source_analysis, source_scheduler,
@@ -4065,6 +4065,17 @@ class ManagementService:
                 "code": failure_code or str(job["state"]).lower(),
                 "message": status_message,
             }
+            plan = recovery_plan.resolve(self.database, job["job_id"])
+            if plan is not None:
+                job["recovery"] = plan
+                job["next_action"] = plan["next_action"]
+                job["allowed_actions"] = plan["allowed_actions"]
+                job["status_reason"] = {"code": "recovery_plan", "message": plan["reason"]}
+                job["resumable"] = "resume_failed_video" in plan["action_ids"]
+                for shot in shots:
+                    shot["candidate_review_eligible"] = bool(
+                        shot.get("candidate_preview_url") and "review_master_candidates" in plan["action_ids"]
+                    )
         return {"jobs": jobs}
 
     def upgrade_director_plan(self, job_id: str) -> dict:
@@ -4257,6 +4268,11 @@ class ManagementService:
             "FAILED", "PROVIDER_ACTION_REQUIRED", "BGM_OK",
         }:
             raise ValueError("只有失败或账号处理完成的视频任务可以继续生成")
+        plan = recovery_plan.resolve(self.database, job_id)
+        if plan is not None and "resume_failed_video" in plan["action_ids"]:
+            return recovery_plan.resume_ready_graph(self.database, job_id)
+        if plan is not None and "review_master_candidates" not in plan["action_ids"]:
+            recovery_plan.require_action(self.database, job_id, "resume_failed_video")
         shots = self.database.execute(
             "SELECT idx,state,video_qa FROM shots WHERE job_id=? ORDER BY idx",
             (job_id,),
@@ -4529,28 +4545,6 @@ class ManagementService:
                 "review_note='',updated_at=CURRENT_TIMESTAMP "
                 "WHERE job_id=? AND state='FAILED' AND cost_cents=0",
                 (job_id,),
-            )
-        # A legacy shot reset cannot release a FAILED node in the frozen graph.
-        # Preserve its diagnostic instead of queueing a worker that has nothing
-        # runnable and immediately fails again.
-        graph_failure = self.database.execute(
-            "SELECT n.node_id,n.error_code,(SELECT e.payload_json "
-            "FROM production_node_events e WHERE e.job_id=n.job_id "
-            "AND e.node_id=n.node_id AND e.event='fail' "
-            "ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1) AS failure_json "
-            "FROM production_nodes n JOIN jobs j ON j.job_id=n.job_id "
-            "WHERE n.job_id=? AND j.execution_engine='graph_v2' "
-            "AND n.node_type='master' AND n.state='FAILED' LIMIT 1",
-            (job_id,),
-        ).fetchone()
-        if graph_failure:
-            try:
-                detail = json.loads(graph_failure["failure_json"] or "{}").get("error")
-            except (ValueError, TypeError, AttributeError):
-                detail = None
-            raise ValueError(
-                f"母片 {graph_failure['node_id']} 的执行失败尚未修复："
-                f"{detail or graph_failure['error_code'] or '请查看错误详情'}"
             )
         placeholders = ",".join("?" for _ in retry_indexes)
         self.database.execute(
@@ -5916,7 +5910,7 @@ class ManagementService:
             and qa.get("status") == "manual_review_required"
         )
         active_review = bool(
-            job["state"] == "PRODUCTION_REVIEW_REQUIRED"
+            job["state"] in {"PRODUCTION_REVIEW_REQUIRED", "FAILED", "PROVIDER_ACTION_REQUIRED", "BUDGET_CONFIRMATION_REQUIRED"}
             and shot["state"] in {"REVIEW_REQUIRED", "FAILED"}
             and qa.get("status") == "manual_review_required"
         )
@@ -6030,6 +6024,8 @@ class ManagementService:
         claimed_qa["review_operation"] = operation
         try:
             self.database.execute("BEGIN IMMEDIATE")
+            if normalized != "reject_job":
+                recovery_plan.require_review_decision(self.database, job_id, normalized)
             claimed = self.database.execute(
                 "UPDATE shots SET state='REVIEW_DECIDING',video_qa=? "
                 "WHERE job_id=? AND idx=? AND state=? "
@@ -6294,11 +6290,18 @@ class ManagementService:
                         error_message = str(exc)
                     else:
                         next_state = "PRODUCTION_QUEUED"
-                        self.database.execute(
-                            "UPDATE shots SET state='PENDING',error=NULL,video_qa=NULL "
-                            "WHERE job_id=? AND state='FAILED'",
-                            (job_id,),
-                        )
+                        if str(job["execution_engine"] or "legacy") == "graph_v2":
+                            projection = production_projection.reconcile(self.database, job_id)
+                            next_state = projection.projected_job_state
+                            if next_state in {"FAILED", "RECOVERY_REQUIRED"}:
+                                plan = recovery_plan.resolve(self.database, job_id)
+                                error_message = plan["reason"] if plan else "Production graph requires diagnosis"
+                        else:
+                            self.database.execute(
+                                "UPDATE shots SET state='PENDING',error=NULL,video_qa=NULL "
+                                "WHERE job_id=? AND state='FAILED'",
+                                (job_id,),
+                            )
                 elif str(job["execution_engine"] or "legacy") == "graph_v2":
                     next_state = "PRODUCTION_QUEUED"
                 else:
@@ -6622,6 +6625,7 @@ class ManagementService:
             return result
         if next_state in {
             "PRODUCTION_REVIEW_REQUIRED", "PROVIDER_ACTION_REQUIRED", "COMPOSED",
+            "FAILED", "BUDGET_CONFIRMATION_REQUIRED", "RECOVERY_REQUIRED",
         }:
             return result
 
