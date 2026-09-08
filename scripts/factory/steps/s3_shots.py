@@ -979,6 +979,8 @@ def _record_failed_generation(db, job_id: str, idx: int,
         failure_note = (
             json.dumps({
                 "status": "generation_failed", "failure_code": stable_code,
+                **({"submit_result_unknown": exc.submit_result_unknown}
+                   if isinstance(getattr(exc, "submit_result_unknown", None), bool) else {}),
             }, ensure_ascii=False)
             if stable_code else None
         )

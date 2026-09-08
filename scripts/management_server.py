@@ -938,6 +938,10 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                         if isinstance(requested_actions, list) else None
                     ),
                 )
+            elif request_path.startswith("/api/videos/") and request_path.endswith("/retry-network-failures"):
+                result = self.service.retry_network_failures(
+                    request_path.split("/")[3], confirmed=payload.get("confirmed") is True,
+                )
             elif self.path.endswith("/resume") and self.path.startswith("/api/videos/"):
                 job_id = self.path.split("/")[3]
                 result = self.service.resume_failed_video(job_id)

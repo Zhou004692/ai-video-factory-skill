@@ -22,7 +22,7 @@ import httpx
 
 from . import (
     anchor_generation, character_assets, character_voices, error_registry, master_dependencies, media_sources, performance_feedback, production_metrics, production_planner, quality_canary,
-    node_state_machine, production_config, production_executor,
+    network_recovery, node_state_machine, production_config, production_executor,
     production_invariants, production_projection, provider_capacity,
     provider_health, provider_tasks, recovery_controller, scene_assets,
     script_drafts, script_sources, source_analysis, source_scheduler,
@@ -3529,6 +3529,7 @@ class ManagementService:
                 shot["regeneration_eligible"] = bool(
                     job["state"] in {"COMPOSED", "FAILED", "BLOCKED"}
                     and shot.get("state") in {"OK", "FAILED"}
+                    and all(other.get("state") == "OK" for other in shots if int(other["idx"]) != idx)
                 )
                 shot["lip_sync_repair_eligible"] = bool(
                     job["state"] in {
@@ -3677,6 +3678,7 @@ class ManagementService:
                 )
             )
             job["identity_anchor_retry_ready"] = identity_anchor_retry_ready
+            job["network_retry_indexes"] = network_recovery.retry_indexes(self.database, job["job_id"])
             provider_recovery_ready = bool(
                 job["state"] in {"FAILED", "PROVIDER_ACTION_REQUIRED"}
                 and not job["unresolved_provider_tasks"]
@@ -4008,6 +4010,8 @@ class ManagementService:
             elif pause_presentation:
                 job["display_state_label"] = pause_presentation["label"]
                 job["next_action"] = pause_presentation["next_action"]
+            elif job["network_retry_indexes"]:
+                job["next_action"] = {"id": "retry_network_failures", "label": "重试连接失败的母片"}
             elif job["state"] == "FAILED" and job["resumable"]:
                 job["next_action"] = (
                     {
@@ -4549,6 +4553,12 @@ class ManagementService:
             "remaining_masters": remaining,
             "manual_review_masters": len(review_indexes),
         }
+
+    def retry_network_failures(self, job_id: str, *, confirmed: bool = False) -> dict:
+        indexes = network_recovery.queue_retry(self.database, job_id, confirmed=confirmed)
+        dispatch = self.dispatch_production_queue()
+        return {"job_id": job_id, "retried_master_indexes": indexes,
+                "state": "PRODUCTION_RUNNING" if job_id in dispatch["dispatched_jobs"] else "PRODUCTION_QUEUED"}
 
     def prepare_master_regeneration(
         self, job_id: str, master_idx: int, *, reason: str = ""
