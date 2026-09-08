@@ -374,7 +374,7 @@ function studioReviewIssues(video){
 function studioPreferredDraftIndex(r){const drafts=r.drafts||[];const approvedIndex=drafts.findIndex(item=>item.draft_id===r.selected?.draft_id||item.status==='approved');const recommendedIndex=drafts.findIndex((item,index)=>Number(item.variant_index??index)===Number(item.recommended_index));return approvedIndex>=0?approvedIndex:recommendedIndex>=0?recommendedIndex:0}
 function studioDefaultPublishIndex(project,r){const ready=(state.publishing?.ready||[]).find(item=>item.job_id===project.video?.job_id);const candidates=project.next_action==='record_performance'?(r.publications||[]).map(item=>item.platform):(ready?.remaining_platforms||studioPublishPlatforms.filter(platform=>!(r.publications||[]).some(item=>item.platform===platform)));const index=studioPublishPlatforms.indexOf(candidates[0]);return index>=0?index:0}
 function studioPrimaryActionLabel(project,r){
-  if(r.video?.network_retry_indexes?.length)return r.video.next_action.label;
+  if(r.video?.network_retry_indexes?.length||r.video?.network_retry_anchor_ids?.length)return r.video.next_action.label;
   if(project.next_action==='generate_scripts')return state.studioStage==='brief'?'使用当前角度生成剧本':'使用推荐角度生成剧本';
   if(project.next_action==='review_script'){
     const draftIndex=state.studioStage==='script'?state.studioOutlineIndex:studioPreferredDraftIndex(r);
@@ -581,7 +581,7 @@ async function routeProjectAction(project){
   if(!await openProjectStudio(project,actionStage,focus))return;
   const activeProject=(state.projects?.projects||[]).find(item=>item.project_id===project.project_id)||project;
   const related=studioRelated(activeProject);
-  if(related.video?.network_retry_indexes?.length)return confirmNetworkRetry(related.video);
+  if(related.video?.network_retry_indexes?.length||related.video?.network_retry_anchor_ids?.length)return confirmNetworkRetry(related.video);
   if(project.next_action==='generate_brief'){
     const source=related.source;
     if(source)return openSourceDrawer(source);
@@ -896,9 +896,11 @@ function openBriefDrawer(brief,options={}){
 }
 function confirmNetworkRetry(job){
   const indexes=job.network_retry_indexes||[];
-  if(!indexes.length)return toast('当前没有可重试的连接失败母片，请刷新任务',true);
+  const anchors=job.network_retry_anchor_ids||[];
+  if(!indexes.length&&!anchors.length)return toast('当前没有可重试的连接失败生成项，请刷新任务',true);
   const candidates=(job.shots||[]).filter(shot=>shot.candidate_preview_url).map(shot=>`#${shot.idx}`);
-  openModal('RETRY GENERATION','重试连接失败的母片',`<div class="review-callout"><strong>重新排队 ${indexes.map(idx=>`#${idx}`).join('、')}</strong><p>这些母片在提交前连接失败。重试成功后会产生生成费用，继续遵守本任务原预算和重试限制。</p><p>累计已发生 ${money(job.cost_cents)}；${candidates.length?`${candidates.join('、')} 的候选视频保留，仍需人工复核。`:'已有完成母片保留。'}前置母片通过后，等待中的后续母片会继续生成。</p></div><div class="modal-actions"><button class="mini-action" id="cancel-network-retry">取消</button><button class="primary-action" id="confirm-network-retry">确认重试并继续</button></div>`);
+  const targets=[...(anchors.length?[`${anchors.length} 个未提交锚点`]:[]),...indexes.map(idx=>`母片 #${idx}`)].join('、');
+  openModal('RETRY GENERATION','重试未提交的生成项',`<div class="review-callout"><strong>重新排队 ${targets}</strong><p>这些生成项在提交前连接失败。重试成功后会产生生成费用，继续遵守本任务原预算和重试限制。</p><p>累计已发生 ${money(job.cost_cents)}；${candidates.length?`${candidates.join('、')} 的候选视频保留，仍需人工复核。`:'已有锚点和完成母片保留。'}锚点完成后仍需人工审核。</p></div><div class="modal-actions"><button class="mini-action" id="cancel-network-retry">取消</button><button class="primary-action" id="confirm-network-retry">确认重试并继续</button></div>`);
   $('#cancel-network-retry').onclick=closeModal;
   $('#confirm-network-retry').onclick=async()=>{const button=$('#confirm-network-retry');button.disabled=true;try{const result=await api(`/api/videos/${encodeURIComponent(job.job_id)}/retry-network-failures`,{method:'POST',body:JSON.stringify({confirmed:true})});closeModal();closeDrawer();toast(result.state==='PRODUCTION_RUNNING'?'失败母片已恢复生成':'失败母片已进入生成队列');await loadPage('videos')}catch(error){button.disabled=false;toast(error.message,true)}};
 }

@@ -59,6 +59,37 @@ def retry_indexes(database, job_id):
     return eligible
 
 
+def retry_anchor_ids(database, job_id):
+    from .anchor_recovery import anchor_row
+    job = database.execute('SELECT * FROM jobs WHERE job_id=?',(job_id,)).fetchone()
+    if not job or job['state'] != 'FAILED' or job['execution_engine'] != 'graph_v2' or job['production_worker_pid']:
+        return []
+    if provider_tasks.unresolved_task_ids(database,job_id) or provider_health.get_status(database,'seedance')['status'] != provider_health.AVAILABLE:
+        return []
+    if database.execute("SELECT 1 FROM production_nodes WHERE job_id=? AND state='RUNNING'",(job_id,)).fetchone() or production_invariants.audit(database,job_id).blockers:
+        return []
+    eligible = []
+    for node in database.execute("SELECT * FROM production_nodes WHERE job_id=? AND node_type IN ('scene_anchor','character_anchor') AND state='FAILED' ORDER BY node_id",(job_id,)):
+        if node['provider_task_id'] or node['actual_cost_cents'] or node['lease_id']:
+            continue
+        try:
+            output = json.loads(node['output_json'] or '{}')
+            legacy = node['error_code'] == 'SeedanceSubmissionUnknownError' and str(output.get('error','')).startswith('Seedance 提交前连接失败；')
+            proven = output.get('submit_result_unknown') is False and output.get('stable_code') == 'transient_network'
+            if not proven and not ('submit_result_unknown' not in output and legacy):
+                continue
+            production_adapters._frozen_spec(database,node)
+            anchor = anchor_row(database,node)[3]
+        except (ValueError,KeyError,TypeError,production_adapters.FrozenSpecMismatchError):
+            continue
+        if anchor['cost_cents'] or anchor['video_path'] or anchor['image_path'] or anchor['state'] != 'FAILED':
+            continue
+        if database.execute("SELECT 1 FROM production_edges e JOIN production_nodes n ON n.job_id=e.job_id AND n.node_id=e.from_node_id WHERE e.job_id=? AND e.to_node_id=? AND n.state!='SUCCEEDED'",(job_id,node['node_id'])).fetchone():
+            continue
+        eligible.append(node['node_id'])
+    return eligible
+
+
 def queue_retry(database, job_id, *, confirmed):
     if confirmed is not True:
         raise ValueError('请确认重试失败母片；成功提交后会按原任务预算计费')
@@ -68,9 +99,14 @@ def queue_retry(database, job_id, *, confirmed):
         from .recovery_plan import require_action
         require_action(database, job_id, "retry_network_failures")
         indexes = retry_indexes(database, job_id)
-        if not indexes:
+        anchors = retry_anchor_ids(database, job_id)
+        if not indexes and not anchors:
             raise ValueError('当前没有可安全重试的提交前连接失败母片，请刷新任务状态')
         operation = secrets.token_hex(12)
+        for node_id in anchors:
+            node_state_machine.transition_node_in_transaction(database,job_id,node_id,'retry',
+                event_id=f'{job_id}:network-retry:{operation}:{node_id}',payload={'reason':'confirmed_pre_submit_connection_retry'})
+            database.execute('UPDATE production_nodes SET error_code=NULL,next_action=NULL WHERE job_id=? AND node_id=?',(job_id,node_id))
         for idx in indexes:
             node_state_machine.transition_node_in_transaction(
                 database, job_id, f'master:{idx}', 'retry',
@@ -82,7 +118,7 @@ def queue_retry(database, job_id, *, confirmed):
         state_machine.transition(
             database, job_id, 'queued', event_id=f'{job_id}:network-retry:{operation}',
             updates={'error':None, 'failure_code':None, 'retries':0},
-            payload={'retried_master_indexes':indexes, 'preserve_candidates':True},
+            payload={'retried_master_indexes':indexes, 'retried_anchor_ids':anchors, 'preserve_candidates':True},
         )
         if owns_transaction:
             database.commit()

@@ -1369,7 +1369,7 @@ class ManagementService:
             return self._resume_reconcile_publish(
                 job_id, str(task_id), existing_usage
             )
-        if provider == "seedance":
+        if provider in {"seedance", "seedance_scene", "seedance_identity"}:
             inspected = asyncio.run(seedance.inspect_task(str(task_id)))
         elif provider == "suno":
             inspected = asyncio.run(
@@ -1377,6 +1377,9 @@ class ManagementService:
             )
         else:
             raise ValueError(f"provider {provider} 不支持远端任务核对")
+        if provider in {"seedance_scene", "seedance_identity"} and not terminal_reconciliation:
+            from . import anchor_recovery
+            return anchor_recovery.reconcile(self.database, self.root, job_id, str(task_id), inspected)
         status = str(inspected.get("status") or "unknown").strip().casefold()
         if status not in {"completed", "failed"}:
             provider_tasks.mark_action_required(
@@ -3680,6 +3683,7 @@ class ManagementService:
             )
             job["identity_anchor_retry_ready"] = identity_anchor_retry_ready
             job["network_retry_indexes"] = network_recovery.retry_indexes(self.database, job["job_id"])
+            job["network_retry_anchor_ids"] = network_recovery.retry_anchor_ids(self.database, job["job_id"])
             provider_recovery_ready = bool(
                 job["state"] in {"FAILED", "PROVIDER_ACTION_REQUIRED"}
                 and not job["unresolved_provider_tasks"]

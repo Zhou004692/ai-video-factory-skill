@@ -25,6 +25,7 @@ _TRANSITIONS = {
     ("REVIEW_REQUIRED", "reject"): "FAILED",
     ("RUNNING", "require_action"): "ACTION_REQUIRED",
     ("ACTION_REQUIRED", "resume"): "READY",
+    ("ACTION_REQUIRED", "reconcile_failed"): "FAILED",
     ("RUNNING", "require_budget"): "BUDGET_REQUIRED",
     ("BUDGET_REQUIRED", "resume"): "READY",
     # A provider result can arrive after a local pause was persisted. The paid

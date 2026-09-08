@@ -14,7 +14,7 @@ LABELS = {
     'reconcile_rejected_provider_cost': '核对终止任务成本',
     'review_master_candidates': '预览并处理候选母片',
     'review_continuity_anchors': '审核人物与场景锚点',
-    'retry_network_failures': '重试连接失败的母片',
+    'retry_network_failures': '重试未提交的生成项',
     'increase_job_budget': '确认剩余生成预算',
     'preserve_and_diagnose': '查看阻塞原因与修复建议',
     'view_progress': '查看生成进度',
@@ -74,8 +74,9 @@ def _resolve(database, job_id):
     if unresolved:
         return result(['reconcile_provider_task', *review_actions], '远端提交或产物尚未核对，保留已有候选，禁止重复生成', task_ids=unresolved)
     retry = network_recovery.retry_indexes(database, job_id)
-    if retry:
-        return result(['retry_network_failures', *review_actions], '仅重试已确认未提交的连接失败，保留其他母片', retry_indexes=retry)
+    anchors = network_recovery.retry_anchor_ids(database, job_id)
+    if retry or anchors:
+        return result(['retry_network_failures', *review_actions], '仅重试已确认未提交的连接失败，保留已有锚点与母片', retry_indexes=retry, retry_anchor_ids=anchors)
     if candidate_reviews:
         return result(review_actions, '已有母片等待人工判断；接受或重做后重新判定剩余工作')
     if state == 'ANCHOR_REVIEW_REQUIRED':

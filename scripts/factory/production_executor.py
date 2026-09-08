@@ -323,7 +323,11 @@ async def run_ready_wave(
             committed = node_state_machine.finish_attempt(
                 database, job_id, node_id, "fail", lease_id=lease,
                 event_id=f"{job_id}:{node_id}:{lease}:failed",
-                output={"error": str(exc)}, error_code=type(exc).__name__,
+                output={"error": str(exc), **({
+                    "submit_result_unknown": exc.submit_result_unknown,
+                    "stable_code": getattr(exc, "stable_code", None),
+                } if isinstance(getattr(exc, "submit_result_unknown", None), bool) else {})},
+                error_code=type(exc).__name__,
             )
             if committed.applied:
                 failed.append(node_id)
