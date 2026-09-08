@@ -1,0 +1,22 @@
+// Run with node tests/test_studio_resolved_review.js. No network or task writes.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const source = fs.readFileSync(path.join(__dirname, '../scripts/management_ui/app.js'), 'utf8');
+const start = source.indexOf('function studioReviewIssues(');
+const end = source.indexOf('function studioPreferredDraftIndex(', start);
+const context = vm.createContext({});
+vm.runInContext(source.slice(start, end), context);
+const issues = shots => JSON.parse(JSON.stringify(context.studioReviewIssues({shots})));
+const accepted = {idx: 1, state: 'OK', quality_status: 'candidate_accepted', manual_review_required: false, quality_reasons: ['qa_error'], human_decision: 'accept_candidate'};
+assert.deepEqual(issues([accepted]), [], 'accepted historical QA must not remain an actionable review issue');
+assert.deepEqual(issues([{...accepted, quality_status: 'human_review_approved'}]), []);
+assert.deepEqual(issues([{...accepted, quality_status: 'candidate_rejected', human_decision: 'keep_prior'}]), []);
+assert.equal(issues([{...accepted, manual_review_required: true}]).length, 1, 'a new review overrides an old acceptance');
+assert.equal(issues([{...accepted, state: 'FAILED'}]).length, 1, 'a new failure overrides an old acceptance');
+assert.equal(issues([{...accepted, quality_status: 'failed', human_decision: ''}]).length, 1);
+assert.equal(issues([{...accepted, quality_status: 'candidate_accepted_pending'}]).length, 1, 'acceptance still pending must remain visible');
+assert.deepEqual(issues([accepted, {...accepted, idx: 2, state: 'FAILED'}]), [{masterIndex: 2, reason: 'qa_error'}]);
+assert.deepEqual(accepted.quality_reasons, ['qa_error'], 'historical evidence must remain intact');
+console.log('9 resolved-review routing assertions passed');
