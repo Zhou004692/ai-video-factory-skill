@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -242,7 +243,14 @@ def reserve_paid_submit(database: sqlite3.Connection, **kwargs) -> str:
             owner_id=owner_id,
             spec_hash=spec_hash,
         )
-    return provider_tasks.reserve_paid_submit(database, **kwargs)
+    reservation = provider_tasks.reserve_paid_submit(database, **kwargs)
+    if owner_id:
+        row = database.execute('SELECT usage_json FROM provider_calls WHERE task_id=?',(reservation,)).fetchone()
+        usage = json.loads(row[0])
+        usage.update({'owner_node_id':owner_id,'owner_spec_hash':spec_hash})
+        database.execute('UPDATE provider_calls SET usage_json=? WHERE task_id=?',(json.dumps(usage),reservation))
+        database.commit()
+    return reservation
 
 
 def begin_paid_submit_batch(database: sqlite3.Connection, job_id: str) -> str:
@@ -297,6 +305,26 @@ def _bind_frozen_node_task(
     owner: FrozenNodeOwner,
     task_id: str,
 ) -> None:
+    from . import node_state_machine
+    with node_state_machine.atomic(database):
+        current = database.execute('SELECT provider_task_id FROM production_nodes WHERE job_id=? AND node_id=? AND spec_hash=? AND state=\'RUNNING\'',(owner.job_id,owner.node_id,owner.spec_hash)).fetchone()
+        previous = str(current[0] or '') if current else ''
+        if previous and previous != task_id:
+            prior = database.execute('SELECT * FROM provider_calls WHERE task_id=? AND job_id=?',(previous,owner.job_id)).fetchone()
+            reservations = database.execute("SELECT * FROM provider_calls WHERE job_id=? AND task_id LIKE 'local-submit:%'",(owner.job_id,)).fetchall()
+            successors = []
+            for reservation in reservations:
+                usage = json.loads(reservation['usage_json'] or '{}')
+                if (usage.get('remote_task_id') == task_id and usage.get('owner_node_id') == owner.node_id
+                        and usage.get('owner_spec_hash') == owner.spec_hash and not reservation['cost_cents']):
+                    successors.append(reservation)
+            if (not prior or provider_tasks._status(prior['usage_json']) not in {'completed','failed'} or len(successors) != 1
+                    or tuple(prior[k] for k in ('shot_idx','provider','intent')) != tuple(successors[0][k] for k in ('shot_idx','provider','intent'))):
+                raise ProductionContractRequiredError('prior provider task is unresolved or retry ownership differs')
+            database.execute('UPDATE production_nodes SET provider_task_id=? WHERE job_id=? AND node_id=? AND spec_hash=? AND state=\'RUNNING\' AND provider_task_id=?',
+                             (task_id,owner.job_id,owner.node_id,owner.spec_hash,previous))
+            database.execute('INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)',
+                             (owner.job_id,'provider_retry_binding','info',json.dumps({'node_id':owner.node_id,'previous_task_id':previous,'task_id':task_id})))
     updated = database.execute(
         "UPDATE production_nodes SET provider_task_id=?,"
         "updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND node_id=? "

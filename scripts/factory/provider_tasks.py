@@ -254,7 +254,7 @@ def promote_reservation(
     try:
         database.execute("BEGIN IMMEDIATE")
         reservation = database.execute(
-            "SELECT usage_json FROM provider_calls WHERE task_id=? "
+            "SELECT usage_json,job_id,shot_idx,provider,intent,cost_cents FROM provider_calls WHERE task_id=? "
             "AND task_id LIKE 'local-submit:%'",
             (reservation_id,),
         ).fetchone()
@@ -266,9 +266,13 @@ def promote_reservation(
             reservation_usage = json.loads(reservation[0] or "{}")
         except (json.JSONDecodeError, TypeError):
             reservation_usage = {}
+        if (tuple(reservation[1:5]) != (job_id,int(shot_idx),provider,intent)
+                or reservation[5] or not isinstance(reservation_usage,dict)
+                or reservation_usage.get('remote_task_id',task_id) != task_id):
+            raise ProviderTaskGateError('Local reservation ownership or remote task binding conflicts')
         pending_usage = {"status": "pending"}
         if isinstance(reservation_usage, dict):
-            for key in ("batch_id", "reserved_cost_cents"):
+            for key in ("batch_id", "reserved_cost_cents", "owner_node_id", "owner_spec_hash"):
                 if reservation_usage.get(key):
                     pending_usage[key] = reservation_usage[key]
         existing = database.execute(
@@ -379,7 +383,7 @@ def upsert_final_call(
             except (json.JSONDecodeError, TypeError):
                 existing_payload = {}
             if isinstance(existing_payload, dict):
-                for key in ("batch_id", "reserved_cost_cents"):
+                for key in ("batch_id", "reserved_cost_cents", "owner_node_id", "owner_spec_hash"):
                     if existing_payload.get(key):
                         payload[key] = existing_payload[key]
         if existing is not None and str(status).strip().casefold() == "pending":

@@ -1365,10 +1365,24 @@ class ManagementService:
                 (job_id, remote_task_id),
             ).fetchone()
             existing_usage = json.loads(call["usage_json"] or "{}")
+        # A partially promoted task can have both a real row and a local alias.
+        # Retire matching aliases even when lookup found the real row first.
+        for alias in self.database.execute("SELECT * FROM provider_calls WHERE job_id=? AND task_id LIKE 'local-submit:%'",(job_id,)).fetchall():
+            if provider_tasks.effective_task_id(alias['task_id'],alias['usage_json']) == str(task_id):
+                provider_tasks.promote_reservation(self.database,alias['task_id'],task_id=str(task_id),
+                    job_id=job_id,shot_idx=int(call['shot_idx'] or 0),provider=call['provider'],intent=call['intent'])
+        if not terminal_reconciliation:
+            from . import accepted_task_recovery
+            accepted = accepted_task_recovery.recover(self.database,self.root / 'data' / 'assets',job_id,str(task_id))
+            if accepted is not None:
+                return accepted
         if existing_usage.get("publish_staging_path"):
             return self._resume_reconcile_publish(
                 job_id, str(task_id), existing_usage
             )
+        if not terminal_reconciliation and existing_usage.get('status') in {'completed','failed'}:
+            return {'job_id':job_id,'task_id':str(task_id),'remote_status':existing_usage['status'],
+                    'state':job['state'],'cost_delta_cents':0}
         if provider in {"seedance", "seedance_scene", "seedance_identity"}:
             inspected = asyncio.run(seedance.inspect_task(str(task_id)))
         elif provider == "suno":
