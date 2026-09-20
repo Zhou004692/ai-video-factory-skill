@@ -4,7 +4,7 @@
 
 当前版本：`3.2.0.0`
 
-当前正式支持：Windows 个人 PC 单机版
+当前交付方式：直接分发 Skill 文件夹或压缩包，由使用方的 Skill 更新机制同步版本。
 
 > 产品默认通过本地管理台使用。普通用户不需要执行命令、编辑数据库或理解内部任务 ID。
 
@@ -146,16 +146,13 @@ Graph V2 编译器与复杂度分析共用出镜/声音判断：画外对白和�
 
 ## 普通用户使用方式
 
-### 首次安装
+### Skill 分发与首次使用
 
-1. 下载或克隆本仓库。
-2. Windows 用户双击根目录的 **`安装 AI 视频工厂.cmd`**。
-3. 安装器会自动准备 Python 隔离环境、依赖、FFmpeg、SQLite，并在 Windows 桌面放置可见的 **`AI Video Factory.cmd`** 启动脚本。
-4. 安装完成后直接双击桌面启动脚本；也可以运行 Skill 根目录的 **`打开 AI 视频工厂.cmd`**，或对已安装本 Skill 的 Agent 说：**“打开 AI 视频工厂”**。
-5. 浏览器打开本地管理台：`http://127.0.0.1:8765`。
-
-已有 `.env`、数据库、角色资产和业务数据不会被初始化过程覆盖。
-启动脚本只是一个可查看、可复制、可删除的普通文件，不注册计划任务、不安装 Windows 服务、不写注册表。它会先检查服务状态：服务已运行时只打开管理台；未运行时在后台静默启动，等待就绪后再打开浏览器，重复点击不会启动多个服务。启动日志位于 `%LOCALAPPDATA%\AI Video Factory\logs`。
+1. 通过 Skill 文件夹或压缩包分发本仓库，保留 `SKILL.md`、`scripts/`、`references/` 和 `templates/`。
+2. 使用方安装或更新 Skill 后，由 Agent 按 `SKILL.md` 调用 `scripts/bootstrap.py --profile script --json` 完成本地运行环境、占位配置和数据库初始化。
+3. 需要管理台时，由 Agent 按宿主系统启动本地服务；Windows 使用 `scripts/open_management.ps1`，其他系统使用 Python 运行时启动 `scripts/management_server.py`。
+4. Skill 更新由使用方的 Skill 更新机制完成，业务数据和运行时数据保存在本地 `data/` 与 `.env`，不会随 Skill 更新包分发。
+5. 管理台地址：`http://127.0.0.1:8765`。
 
 ### 完整生产流程
 
@@ -192,14 +189,14 @@ Graph V2 编译器与复杂度分析共用出镜/声音判断：画外对白和�
 
 完整字段和默认值见 [templates/env.example](templates/env.example)。普通用户应优先在管理台“配置中心”填写，不需要手工编辑 `.env`。
 
-## 管理员 / 开发者安装
+## 管理员 / 开发者验证
 
 ```powershell
 git clone https://github.com/Zhou004692/ai-video-factory-skill `
   $env:USERPROFILE\.claude\skills\ai-video-factory
 
 cd $env:USERPROFILE\.claude\skills\ai-video-factory
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+python scripts\bootstrap.py --profile script --json
 powershell -ExecutionPolicy Bypass -File scripts\open_management.ps1
 ```
 
@@ -209,8 +206,6 @@ powershell -ExecutionPolicy Bypass -File scripts\open_management.ps1
 .\.venv\Scripts\python.exe scripts\cli.py status
 .\.venv\Scripts\python.exe -m unittest discover -s tests -q
 ```
-
-详细部署说明见 [SETUP_NEW_MACHINE.md](SETUP_NEW_MACHINE.md)。
 
 ## 零费用技术链路回归与证据边界
 
@@ -303,7 +298,7 @@ Full 套件还会执行 3 条“来源 → 简报 → 剧本 → 制作设置 �
 - 视频生成、自动重试和渠道投稿都需要明确的预算或发布确认。
 - 本地超时不等于远端失败；系统优先核对原 Provider Task ID，禁止不确定状态下重复付费提交。
 - 自动抓取只支持已授权内容源，不提供账号爬虫、浏览器模拟登录或未授权全网抓取。
-- 当前正式验收范围为 Windows 个人 PC；服务器部署尚未纳入当前发布范围。
+- 当前交付边界是 Skill 文件夹/压缩包及其 Agent 初始化流程；Windows 安装包、桌面启动器和系统级安装注册不属于发布内容。
 
 ## 项目结构
 
@@ -315,14 +310,12 @@ ai-video-factory/
 │  ├─ factory/                # 来源、剧本、生产、质检、发布核心逻辑
 │  │  └─ flow_guard/          # R4 分支遍历、诊断和零费用修复
 │  ├─ flow_guard.py           # 单次/持续流程巡检入口
-│  ├─ install.ps1             # Windows 安装器
 │  └─ cli.py                  # 管理员与自动化接口
 ├─ references/                # Provider、流程、提示词与排障说明
 ├─ templates/                 # 环境变量与业务模板
 ├─ tests/                     # 单元、集成、媒体与故障回归测试
 ├─ data/                      # 本地运行数据（默认不提交 Git）
 ├─ SKILL.md                   # Agent 使用契约
-└─ SETUP_NEW_MACHINE.md       # 新机器部署说明
 ```
 
 ## 延伸文档

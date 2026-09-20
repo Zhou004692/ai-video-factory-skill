@@ -101,7 +101,7 @@ try {
         }
     }
 
-    & $python (Join-Path $PSScriptRoot "install.py") --root $root --no-venv --no-deps --no-desktop-launcher *> $null
+    & $python (Join-Path $PSScriptRoot "install.py") --root $root --no-venv --no-deps *> $null
     if ($LASTEXITCODE -ne 0) {
         throw "AI Video Factory local state validation failed."
     }

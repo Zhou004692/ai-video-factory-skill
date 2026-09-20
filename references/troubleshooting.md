@@ -101,15 +101,15 @@
 - 先用 `publication-map` 绑定准确平台作品 ID，再导入 24/72/168 小时绩效快照
 - 通过 `learning-report` 和预注册实验报告对比成本、完播率与线索；样本不完整时不得输出胜出结论
 
-## 六、Windows 安装与升级恢复
+## 六、Skill 更新与运行时恢复
 
-### 双击安装后仍提示缺少 FFmpeg
-- 再次双击安装入口；安装器会通过 Windows Package Manager 安装 `Gyan.FFmpeg`。
-- 如果公司电脑禁用了 winget，请让管理员安装 FFmpeg，并在配置中填写 `FFMPEG_PATH` 与 `FFPROBE_PATH` 的绝对路径。
+### 更新 Skill 后仍提示缺少 FFmpeg
+- 先让 Agent 重新运行 `scripts/bootstrap.py --profile video --json`，确认 Skill 更新后的运行时检查结果。
+- 如果公司电脑禁用了自动依赖安装，请让管理员安装 FFmpeg，并在配置中填写 `FFMPEG_PATH` 与 `FFPROBE_PATH` 的绝对路径。
 - 在管理台运行环境检查中确认 FFmpeg、FFprobe 与中文字幕字体都显示可用，再开始视频生产。
 
 ### 升级失败后如何恢复
 - 每次已有安装升级前，系统会在数据目录的 `backups/upgrade-<UTC时间>/` 保存 `.env`、SQLite 与角色资产快照。
-- 数据库迁移或初始化失败时，安装器会自动恢复该快照，不需要手工复制文件。
+- 数据库迁移或初始化失败时，Skill 初始化流程会自动恢复该快照，不需要手工复制文件。
 - 成功升级后快照仍保留，可根据安装报告中的 `upgrade_backup` 路径进行人工核验；确认新版本稳定后再按磁盘策略清理旧快照。
-- 使用外置 `FACTORY_DATA_DIR` 时，快照与数据库都保存在外置目录，重新安装程序目录不会覆盖业务数据。
+- 使用外置 `FACTORY_DATA_DIR` 时，快照与数据库都保存在外置目录，更新 Skill 文件不会覆盖业务数据。

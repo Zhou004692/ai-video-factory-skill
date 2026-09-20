@@ -1,4 +1,4 @@
-"""Cross-platform installer for the AI Video Factory skill runtime."""
+"""Initialize the local runtime used by the AI Video Factory Skill."""
 from __future__ import annotations
 
 import argparse
@@ -15,34 +15,6 @@ from factory.runtime_profile import resolve_runtime_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-WINDOWS_LAUNCHER = """@echo off
-start "" /min powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0scripts\\open_management.ps1"
-exit /b 0
-"""
-
-PORTABLE_LAUNCHER = """#!/usr/bin/env sh
-set -eu
-ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-if [ -x "$ROOT_DIR/.venv/bin/python" ]; then
-  PYTHON="$ROOT_DIR/.venv/bin/python"
-else
-  PYTHON="$(command -v python3 || command -v python || true)"
-  if [ -z "$PYTHON" ]; then
-    echo "AI Video Factory requires Python 3.11 or newer." >&2
-    exit 1
-  fi
-  "$PYTHON" "$ROOT_DIR/scripts/install.py" --root "$ROOT_DIR" >/dev/null
-  PYTHON="$ROOT_DIR/.venv/bin/python"
-fi
-"$PYTHON" "$ROOT_DIR/scripts/install.py" --root "$ROOT_DIR" --no-venv --no-deps >/dev/null
-START_PAGE=overview
-if [ ! -f "$ROOT_DIR/.env" ] || grep -q '=<required>' "$ROOT_DIR/.env"; then
-  START_PAGE=config
-fi
-exec "$PYTHON" "$ROOT_DIR/scripts/management_server.py" --start-page "$START_PAGE"
-"""
 
 
 def _venv_python(root: Path) -> Path:
@@ -85,51 +57,6 @@ def _initialize_database(root: Path) -> bool:
     return database.is_file()
 
 
-def _write_launchers(root: Path) -> list[str]:
-    launchers = {
-        root / "打开 AI 视频工厂.cmd": WINDOWS_LAUNCHER,
-        root / "open-ai-video-factory.sh": PORTABLE_LAUNCHER,
-    }
-    for path, content in launchers.items():
-        existing = path.read_text(encoding="utf-8") if path.exists() else None
-        if existing != content:
-            path.write_text(content, encoding="utf-8", newline="\n")
-        if path.suffix == ".sh":
-            path.chmod(path.stat().st_mode | 0o111)
-    return [str(path) for path in launchers]
-
-
-def install_windows_desktop_launcher(
-    root: Path = ROOT, *, desktop_directory: Path | None = None
-) -> str | None:
-    """Install the idempotent Windows desktop entry and return its path."""
-    if sys.platform != "win32":
-        return None
-    script = root.resolve() / "scripts" / "install_desktop_launcher.ps1"
-    command = [
-        "powershell.exe",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(script),
-        "-SkillRoot",
-        str(root.resolve()),
-    ]
-    if desktop_directory is not None:
-        command.extend(("-DesktopDirectory", str(desktop_directory.resolve())))
-    completed = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-    return lines[-1] if lines else None
-
-
 def _configuration_required(env_file: Path) -> bool:
     if not env_file.is_file():
         return True
@@ -167,8 +94,7 @@ def _write_runtime_metadata(metadata_file: Path, version: str) -> None:
 
 
 def install(root: Path = ROOT, *, create_venv: bool = True,
-            install_dependencies: bool = True,
-            create_desktop_launcher: bool | None = None) -> dict:
+            install_dependencies: bool = True) -> dict:
     if sys.version_info < (3, 11):
         raise RuntimeError("Python 3.11 or newer is required")
     root = root.resolve()
@@ -220,16 +146,6 @@ def install(root: Path = ROOT, *, create_venv: bool = True,
             )
 
         database_initialized = _initialize_database(root)
-        launchers = _write_launchers(root)
-        if create_desktop_launcher is None:
-            create_desktop_launcher = (
-                sys.platform == "win32" and root == ROOT.resolve()
-            )
-        desktop_launcher = (
-            install_windows_desktop_launcher(root)
-            if create_desktop_launcher
-            else None
-        )
         configuration_required = _configuration_required(env_file)
         _write_runtime_metadata(runtime_metadata, current_version)
     except BaseException:
@@ -248,8 +164,6 @@ def install(root: Path = ROOT, *, create_venv: bool = True,
         "runtime": profile.as_public_dict(),
         "upgrade_backup": str(upgrade_backup) if upgrade_backup else None,
         "database_initialized": database_initialized,
-        "launchers": launchers,
-        "desktop_launcher": desktop_launcher,
         "status": "configuration_required" if configuration_required else "ready",
         "start_page": "config" if configuration_required else "overview",
         "paid_provider_calls": 0,
@@ -261,18 +175,11 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--no-venv", action="store_true")
     parser.add_argument("--no-deps", action="store_true")
-    parser.add_argument("--no-desktop-launcher", action="store_true")
     args = parser.parse_args()
     result = install(
         args.root,
         create_venv=not args.no_venv,
         install_dependencies=not args.no_deps,
-        create_desktop_launcher=False,
-    )
-    result["desktop_launcher"] = (
-        install_windows_desktop_launcher(args.root)
-        if not args.no_desktop_launcher
-        else None
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

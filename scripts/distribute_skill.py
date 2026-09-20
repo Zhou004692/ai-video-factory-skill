@@ -17,8 +17,6 @@ ROOT_FILES = (
     "CHANGELOG.md",
     "SKILL.md",
     "VERSION",
-    "安装 AI 视频工厂.cmd",
-    "打开 AI 视频工厂.cmd",
 )
 
 DIRECTORY_RULES = {
@@ -31,8 +29,6 @@ SCRIPT_ROOT_FILES = {
     "scripts/cli.py",
     "scripts/doctor.py",
     "scripts/install.py",
-    "scripts/install.ps1",
-    "scripts/install_desktop_launcher.ps1",
     "scripts/management_server.py",
     "scripts/open_management.ps1",
     "scripts/requirements.txt",
@@ -47,6 +43,7 @@ REFERENCE_FILES = {
     "references/prompts/storyboard.md",
     "references/prompts/topic_score.md",
     "references/prompts/voiceover_polish.md",
+    "references/quality_canary_scripts.json",
 }
 
 EXCLUDED_PARTS = {

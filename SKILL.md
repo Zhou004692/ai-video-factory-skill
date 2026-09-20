@@ -9,8 +9,8 @@ description: 用自然语言完成可追溯短视频剧本与标准成片。自�
 
 当用户说“打开 AI 视频工厂”或首次使用管理后台时，Agent 必须在后台完成初始化，普通用户不执行任何命令：
 
-1. 优先运行 Skill 内的 `scripts/bootstrap.py --profile script --json`；该动作只创建本地运行环境、占位配置和数据库，Windows 首次安装同时生成普通 `.cmd` 桌面启动脚本，不注册计划任务或系统服务，`paid_provider_calls` 必须为 `0`。
-2. Windows 后台调用 `scripts/open_management.ps1`；macOS/Linux 后台调用安装后生成的 `open-ai-video-factory.sh`。Windows 启动器负责健康检查、单实例后台启动和就绪后打开浏览器，不要直接另起 `management_server.py`。
+1. 优先运行 Skill 内的 `scripts/bootstrap.py --profile script --json`；该动作只创建本地运行环境、占位配置和数据库，不安装桌面启动器、不注册计划任务或系统服务，`paid_provider_calls` 必须为 `0`。
+2. 根据宿主系统调用 Skill 内的管理台启动脚本；Windows 使用 `scripts/open_management.ps1`，其他系统直接使用对应 Python 运行时启动管理服务。不要把 Skill 当作 Windows 安装包，也不要创建桌面快捷方式。
 3. 配置不完整时，管理台直接打开“配置中心”；配置已完成时打开工作台。
 4. 只在页面中引导用户填写缺少的凭证，不让用户复制命令、数据库路径或内部任务 ID。
 5. 初始化必须保留已有 `.env`、数据库、角色和业务数据，不覆盖已有配置。

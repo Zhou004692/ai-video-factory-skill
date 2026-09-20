@@ -41,38 +41,22 @@ class SkillDistributionTests(unittest.TestCase):
                 "VERSION",
                 "CHANGELOG.md",
                 "SKILL.md",
-                "安装 AI 视频工厂.cmd",
-                "打开 AI 视频工厂.cmd",
                 "agents/openai.yaml",
                 "scripts/cli.py",
                 "scripts/bootstrap.py",
                 "scripts/management_server.py",
                 "scripts/open_management.ps1",
-                "scripts/install_desktop_launcher.ps1",
                 "scripts/management_ui/index.html",
                 "scripts/management_ui/styles.css",
                 "scripts/management_ui/app.js",
-                "scripts/install.ps1",
                 "scripts/doctor.py",
                 "scripts/install.py",
                 "scripts/factory/script_drafts.py",
                 "templates/env.example",
                 "references/characters/roster.yaml",
+                "references/quality_canary_scripts.json",
             ):
                 self.assertTrue((package / relative).is_file(), relative)
-
-            bootstrap_launcher = (package / "安装 AI 视频工厂.cmd").read_text(
-                encoding="utf-8"
-            )
-            self.assertIn("scripts\\install.ps1", bootstrap_launcher)
-            self.assertNotIn("C:\\Users\\", bootstrap_launcher)
-
-            runtime_launcher = (package / "打开 AI 视频工厂.cmd").read_text(
-                encoding="utf-8"
-            )
-            self.assertIn("scripts\\open_management.ps1", runtime_launcher)
-            self.assertIn("-WindowStyle Hidden", runtime_launcher)
-            self.assertNotIn("C:\\Users\\", runtime_launcher)
 
             for relative in (
                 ".env",
@@ -84,6 +68,10 @@ class SkillDistributionTests(unittest.TestCase):
                 "tests",
                 "references/characters/sales_xiaoneng",
                 "SETUP_NEW_MACHINE.md",
+                "安装 AI 视频工厂.cmd",
+                "打开 AI 视频工厂.cmd",
+                "scripts/install.ps1",
+                "scripts/install_desktop_launcher.ps1",
                 "scripts/broll_demo_test.py",
                 "scripts/smoke_check.py",
                 "scripts/factory/experiments",
@@ -302,7 +290,7 @@ class SkillDistributionTests(unittest.TestCase):
         self.assertTrue(report["ready"], report)
         self.assertNotIn("VOLC_TTS_APPID", report["missing_fields"])
 
-    def test_installer_preserves_existing_env_and_initializes_runtime(self):
+    def test_skill_runtime_initializer_preserves_existing_env_and_initializes_runtime(self):
         from install import install
 
         with tempfile.TemporaryDirectory() as tmp:

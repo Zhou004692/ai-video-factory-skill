@@ -16,30 +16,6 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 class FreshInstallTests(unittest.TestCase):
-    @unittest.skipUnless(sys.platform == "win32", "Windows shortcut integration")
-    def test_skill_root_install_creates_desktop_script_automatically(self):
-        from distribute_skill import build_distribution
-        import install as installer
-
-        with tempfile.TemporaryDirectory() as tmp:
-            package = build_distribution(ROOT, Path(tmp) / "dist")
-            with (
-                patch.object(installer, "ROOT", package),
-                patch.object(
-                    installer,
-                    "install_windows_desktop_launcher",
-                    return_value="C:\\Desktop\\AI Video Factory.cmd",
-                ) as create_launcher,
-            ):
-                report = installer.install(
-                    package, create_venv=False, install_dependencies=False
-                )
-
-            create_launcher.assert_called_once_with(package)
-            self.assertEqual(
-                report["desktop_launcher"], "C:\\Desktop\\AI Video Factory.cmd"
-            )
-
     def test_upgrade_failure_restores_env_database_and_character_assets(self):
         from distribute_skill import build_distribution
         from install import install
@@ -100,7 +76,7 @@ class FreshInstallTests(unittest.TestCase):
             self.assertIsNone(first["upgrade_backup"])
             self.assertIsNone(second["upgrade_backup"])
 
-    def test_installer_honors_external_runtime_data_directory(self):
+    def test_runtime_initializer_honors_external_runtime_data_directory(self):
         from distribute_skill import build_distribution
         from install import install
 
@@ -137,7 +113,7 @@ class FreshInstallTests(unittest.TestCase):
                 Path(result.stdout.strip()), (external_data / "factory.db").resolve()
             )
 
-    def test_installer_rejects_unsupported_python_before_writing_files(self):
+    def test_runtime_initializer_rejects_unsupported_python_before_writing_files(self):
         from install import install
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,23 +157,12 @@ class FreshInstallTests(unittest.TestCase):
             self.assertIn("jobs", tables)
             self.assertIn("script_sources", tables)
 
-            windows_launcher = package / "打开 AI 视频工厂.cmd"
-            portable_launcher = package / "open-ai-video-factory.sh"
-            self.assertTrue(windows_launcher.is_file())
-            self.assertTrue(portable_launcher.is_file())
-            launcher_text = windows_launcher.read_text(encoding="utf-8")
-            portable_text = portable_launcher.read_text(encoding="utf-8")
-            self.assertIn("scripts\\open_management.ps1", launcher_text)
-            self.assertNotIn("C:\\Users\\", launcher_text)
-            self.assertIn("python3", portable_text)
-            self.assertNotIn("powershell", portable_text.lower())
-
             self.assertEqual(report["status"], "configuration_required")
             self.assertEqual(report["start_page"], "config")
             self.assertEqual(report["paid_provider_calls"], 0)
             self.assertTrue(report["database_initialized"])
 
-    def test_open_management_script_self_installs_then_routes_configuration(self):
+    def test_open_management_script_self_initializes_then_routes_configuration(self):
         script = (ROOT / "scripts" / "open_management.ps1").read_text(
             encoding="utf-8"
         )
@@ -212,63 +177,11 @@ class FreshInstallTests(unittest.TestCase):
         self.assertIn("NoBrowser", script)
         self.assertNotIn("Write-Host", script)
 
-        installer = (ROOT / "scripts" / "install.ps1").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("Gyan.FFmpeg", installer)
-        self.assertIn("install_desktop_launcher.ps1", installer)
-
-        desktop_installer = (
-            ROOT / "scripts" / "install_desktop_launcher.ps1"
-        ).read_text(encoding="utf-8")
-        self.assertIn("WriteAllText", desktop_installer)
-        self.assertIn("open_management.ps1", desktop_installer)
-        self.assertIn("-WindowStyle Hidden", desktop_installer)
-        self.assertIn("AI Video Factory.cmd", desktop_installer)
-        self.assertNotIn("CreateShortcut", desktop_installer)
-        self.assertNotIn("Register-ScheduledTask", desktop_installer)
-
         app = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"
         )
         self.assertIn("location.hash", app)
         self.assertIn("navigate(initialPage)", app)
-
-    @unittest.skipUnless(sys.platform == "win32", "Windows shortcut integration")
-    def test_desktop_script_targets_hidden_idempotent_launcher(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            desktop = Path(tmp) / "Desktop"
-            desktop.mkdir()
-            script = ROOT / "scripts" / "install_desktop_launcher.ps1"
-            command = [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(script),
-                "-SkillRoot",
-                str(ROOT),
-                "-DesktopDirectory",
-                str(desktop),
-            ]
-            first = subprocess.run(
-                command, check=True, capture_output=True, text=True, encoding="utf-8"
-            )
-            second = subprocess.run(
-                command, check=True, capture_output=True, text=True, encoding="utf-8"
-            )
-
-            launcher = desktop / "AI Video Factory.cmd"
-            self.assertTrue(launcher.is_file())
-            self.assertIn("AI Video Factory.cmd", first.stdout)
-            self.assertIn("AI Video Factory.cmd", second.stdout)
-            launcher_text = launcher.read_text(encoding="utf-8")
-            self.assertIn("start \"\" /min powershell.exe", launcher_text)
-            self.assertIn("-WindowStyle Hidden", launcher_text)
-            self.assertIn("open_management.ps1", launcher_text)
-            self.assertNotIn("schtasks", launcher_text.casefold())
-            self.assertFalse((desktop / "AI Video Factory.lnk").exists())
 
 
 if __name__ == "__main__":
