@@ -2,6 +2,18 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.2.0.2] - 2026-09-23
+
+### Changed
+
+- Separated mutable runtime state from the replaceable Skill directory, with automatic one-time migration of legacy `.env`, SQLite data and media assets.
+- Changed upgrade snapshots to use SQLite's online backup API so committed WAL transactions are included consistently.
+
+### Fixed
+
+- Restored failed upgrades without leaving stale SQLite WAL/SHM sidecars that could override the recovered database.
+- Preserved legacy state when an interrupted first run had already created an empty external data directory.
+
 ## [3.2.0.1] - 2026-09-20
 
 ### Changed

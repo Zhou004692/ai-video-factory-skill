@@ -709,12 +709,19 @@ class ManagementService:
         root: Path,
         *,
         worker_mode: str = "child_process",
+        data_dir: Path | None = None,
+        env_path: Path | None = None,
         production_service=None,
         production_read_model=None,
     ):
         self.database = database
         self.root = Path(root).resolve()
-        self.env_path = self.root / ".env"
+        self.data_dir = (
+            Path(data_dir).resolve() if data_dir is not None else self.root / "data"
+        )
+        self.env_path = (
+            Path(env_path).resolve() if env_path is not None else self.root / ".env"
+        )
         if worker_mode not in {"child_process", "external"}:
             raise ValueError("worker_mode must be child_process or external")
         self.worker_mode = worker_mode
@@ -726,6 +733,7 @@ class ManagementService:
             else ProductionService(
                 self.database,
                 self.root,
+                env_path=self.env_path,
                 start_handler=self._start_video_job_impl,
                 resume_handler=self._resume_failed_video_impl,
                 review_handler=self._review_video_impl,
@@ -953,7 +961,7 @@ class ManagementService:
 
             def controlled(key: str, *, require_file: bool = False) -> Path | None:
                 return controlled_job_asset_path(
-                    self.root / "data" / "assets", job_id,
+                    self.data_dir / "assets", job_id,
                     operation.get(key), require_file=require_file,
                 )
 
@@ -1373,7 +1381,7 @@ class ManagementService:
                     job_id=job_id,shot_idx=int(call['shot_idx'] or 0),provider=call['provider'],intent=call['intent'])
         if not terminal_reconciliation:
             from . import accepted_task_recovery
-            accepted = accepted_task_recovery.recover(self.database,self.root / 'data' / 'assets',job_id,str(task_id))
+            accepted = accepted_task_recovery.recover(self.database,self.data_dir / 'assets',job_id,str(task_id))
             if accepted is not None:
                 return accepted
         if existing_usage.get("publish_staging_path"):
@@ -1485,7 +1493,7 @@ class ManagementService:
                     "state": "PROVIDER_ACTION_REQUIRED",
                 }
             candidate_path = (
-                self.root / "data" / "assets" / job_id / "shots" / "review"
+                self.data_dir / "assets" / job_id / "shots" / "review"
                 / f"{shot_idx:02d}-reconciled-{str(task_id)[-12:]}.mp4"
             ).resolve()
             staging_dir = candidate_path.parent / "staging"
@@ -1510,7 +1518,7 @@ class ManagementService:
                     "state": "PROVIDER_ACTION_REQUIRED",
                 }
             bgm_path = (
-                self.root / "data" / "assets" / job_id / "bgm.mp3"
+                self.data_dir / "assets" / job_id / "bgm.mp3"
             ).resolve()
             staging_dir = bgm_path.parent / "review" / "staging"
             staging_dir.mkdir(parents=True, exist_ok=True)
@@ -3602,7 +3610,7 @@ class ManagementService:
                     and shot.get("candidate_preview_url")
                 ):
                     source = controlled_job_asset_path(
-                        self.root / "data" / "assets",
+                        self.data_dir / "assets",
                         job["job_id"],
                         master.get("repair_source_path"),
                         require_file=True,
@@ -4312,7 +4320,7 @@ class ManagementService:
                     asyncio.run(s5_bgm.run(job_id, provider=music_provider))
                 asyncio.run(s6_compose.run(job_id))
                 finalize_accepted_candidates(
-                    self.database, self.root / "data" / "assets", job_id
+                    self.database, self.data_dir / "assets", job_id
                 )
             except Exception as exc:
                 self.database.execute(
@@ -4423,7 +4431,7 @@ class ManagementService:
             except (json.JSONDecodeError, TypeError):
                 qa = {}
             has_review_artifact = bool(controlled_candidate_path(
-                self.root / "data" / "assets", job_id,
+                self.data_dir / "assets", job_id,
                 qa.get("candidate_path"),
             ))
             if (
@@ -4521,7 +4529,7 @@ class ManagementService:
                 self.database.commit()
                 asyncio.run(s6_compose.run(job_id))
                 finalize_accepted_candidates(
-                    self.database, self.root / "data" / "assets", job_id
+                    self.database, self.data_dir / "assets", job_id
                 )
             except Exception as exc:
                 outcome = error_registry.describe_failure(
@@ -4774,7 +4782,7 @@ class ManagementService:
             raise ValueError("只有包含人物对白的母片可以执行口型局部修复")
 
         source = controlled_job_asset_path(
-            self.root / "data" / "assets", job_id, target["video_path"],
+            self.data_dir / "assets", job_id, target["video_path"],
             require_file=True,
         )
         source_kind = "active_master"
@@ -4785,7 +4793,7 @@ class ManagementService:
             except (json.JSONDecodeError, TypeError):
                 qa = {}
             source = controlled_candidate_path(
-                self.root / "data" / "assets", job_id,
+                self.data_dir / "assets", job_id,
                 qa.get("candidate_path"),
             )
             source_kind = "review_candidate"
@@ -4796,7 +4804,7 @@ class ManagementService:
             == "seedance_lip_sync_edit"
         ):
             source = controlled_job_asset_path(
-                self.root / "data" / "assets", job_id,
+                self.data_dir / "assets", job_id,
                 master.get("repair_source_path"), require_file=True,
             )
             source_kind = "persisted_repair_source"
@@ -4938,7 +4946,7 @@ class ManagementService:
         if master is None:
             raise ValueError("导演计划中不存在该母片")
         source = controlled_job_asset_path(
-            self.root / "data" / "assets", job_id, target["video_path"],
+            self.data_dir / "assets", job_id, target["video_path"],
             require_file=True,
         )
         if source is None:
@@ -5728,7 +5736,7 @@ class ManagementService:
         """Return the cover extracted from the final timeline's first frame."""
         final_path = self.video_file(job_id)
         cover = final_path.parent / "thumbnail.jpg"
-        allowed_root = (self.root / "data" / "assets" / str(job_id)).resolve()
+        allowed_root = (self.data_dir / "assets" / str(job_id)).resolve()
         resolved = cover.resolve()
         if not resolved.is_relative_to(allowed_root) or not resolved.is_file():
             raise ValueError("成片首帧封面不存在")
@@ -5749,7 +5757,7 @@ class ManagementService:
         if not raw_path:
             raise ValueError("待复核候选母片不存在")
         path = controlled_candidate_path(
-            self.root / "data" / "assets", job_id, raw_path
+            self.data_dir / "assets", job_id, raw_path
         )
         if path is None:
             raise ValueError("待复核候选母片不存在")
@@ -5779,7 +5787,7 @@ class ManagementService:
         ):
             raise ValueError("原始修复母片不存在")
         path = controlled_job_asset_path(
-            self.root / "data" / "assets",
+            self.data_dir / "assets",
             job_id,
             master.get("repair_source_path"),
             require_file=True,
@@ -5800,7 +5808,7 @@ class ManagementService:
         if not value:
             return None
         path = controlled_job_asset_path(
-            self.root / "data" / "assets",
+            self.data_dir / "assets",
             job_id,
             value,
             require_file=require_file,
@@ -5945,7 +5953,7 @@ class ManagementService:
             self.master_candidate_file(job_id, master_idx)
             if normalized in {"accept_candidate", "regenerate_master"}
             else controlled_candidate_path(
-                self.root / "data" / "assets", job_id,
+                self.data_dir / "assets", job_id,
                 qa.get("candidate_path"),
             )
         )
@@ -5995,7 +6003,7 @@ class ManagementService:
         original_video_qa = str(shot["video_qa"] or "") or None
         operation_id = secrets.token_hex(12)
         operation_staging = (
-            self.root / "data" / "assets" / job_id / "review" / "staging"
+            self.data_dir / "assets" / job_id / "review" / "staging"
         ).resolve()
         candidate_path_value = str(candidate) if candidate else str(
             qa.get("candidate_path") or ""
@@ -6403,7 +6411,7 @@ class ManagementService:
             active = self._controlled_job_asset(job_id, active, label="当前母片")
             active.parent.mkdir(parents=True, exist_ok=True)
             staging_dir = (
-                self.root / "data" / "assets" / job_id / "review" / "staging"
+                self.data_dir / "assets" / job_id / "review" / "staging"
             ).resolve()
             staging_dir.mkdir(parents=True, exist_ok=True)
             prior_backup = None
@@ -6506,7 +6514,7 @@ class ManagementService:
                 raise
         elif normalized == "regenerate_master":
             staging_dir = (
-                self.root / "data" / "assets" / job_id / "review" / "staging"
+                self.data_dir / "assets" / job_id / "review" / "staging"
             ).resolve()
             staging_dir.mkdir(parents=True, exist_ok=True)
             staged_candidate = self._controlled_job_asset(
@@ -6612,7 +6620,7 @@ class ManagementService:
         next_state = decision_commit["state"]
         if regeneration_storyboard is not None:
             storyboard_path = (
-                self.root / "data" / "assets" / job_id / "storyboard.json"
+                self.data_dir / "assets" / job_id / "storyboard.json"
             )
             try:
                 storyboard_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6653,7 +6661,7 @@ class ManagementService:
         final_backup = None
         if final:
             staging_dir = (
-                self.root / "data" / "assets" / job_id / "review" / "staging"
+                self.data_dir / "assets" / job_id / "review" / "staging"
             ).resolve()
             staging_dir.mkdir(parents=True, exist_ok=True)
             final_backup = self._controlled_job_asset(
@@ -6676,7 +6684,7 @@ class ManagementService:
             )
             asyncio.run(s6_compose.run(job_id))
             finalize_accepted_candidates(
-                self.database, self.root / "data" / "assets", job_id
+                self.database, self.data_dir / "assets", job_id
             )
         except Exception as exc:
             if final:
@@ -7397,7 +7405,19 @@ class ManagementService:
             "WHERE character_id=? ORDER BY sort_order,created_at,image_id",
             (character_id,),
         ).fetchall()
-        return [(self.root / row["relative_path"]).resolve() for row in rows]
+        return [self._character_image_path(row["relative_path"]) for row in rows]
+
+    def _character_image_path(self, relative_path: str) -> Path:
+        relative = Path(str(relative_path or ""))
+        if relative.is_absolute():
+            raise ValueError("角色图片路径无效")
+        if relative.parts and relative.parts[0].casefold() == "data":
+            relative = Path(*relative.parts[1:])
+        path = (self.data_dir / relative).resolve()
+        asset_root = (self.data_dir / "character_assets").resolve()
+        if not path.is_relative_to(asset_root):
+            raise ValueError("角色图片路径无效")
+        return path
 
     def create_custom_character(
         self, *, character_id: str, display_name: str,
@@ -7470,8 +7490,8 @@ class ManagementService:
             character_id.encode("utf-8") + source.read_bytes()
         ).hexdigest()[:16]
         image_id = f"IMG-{digest}"
-        relative = Path("data") / "character_assets" / character_id / f"{image_id}{suffix}"
-        target = self.root / relative
+        relative = Path("character_assets") / character_id / f"{image_id}{suffix}"
+        target = self.data_dir / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists():
             shutil.copyfile(source, target)
@@ -7500,9 +7520,8 @@ class ManagementService:
         ).fetchone()
         if not row:
             raise ValueError("角色图片不存在")
-        path = (self.root / row["relative_path"]).resolve()
-        asset_root = (self.root / "data" / "character_assets").resolve()
-        if asset_root not in path.parents or not path.is_file():
+        path = self._character_image_path(row["relative_path"])
+        if not path.is_file():
             raise ValueError("角色图片不存在")
         return path
 
@@ -7599,7 +7618,7 @@ class ManagementService:
         response.raise_for_status()
         content_type = str(response.headers.get("content-type") or "").lower()
         suffix = ".png" if "png" in content_type else ".jpg"
-        preview_root = self.root / "data" / "character_previews"
+        preview_root = self.data_dir / "character_previews"
         preview_root.mkdir(parents=True, exist_ok=True)
         preview_key = hashlib.sha256(character_id.encode("utf-8")).hexdigest()
         for old in preview_root.glob(f"{preview_key}.*"):
@@ -7612,7 +7631,7 @@ class ManagementService:
         custom_paths = self._character_image_paths(character_id)
         if custom_paths:
             return custom_paths[0]
-        preview_root = self.root / "data" / "character_previews"
+        preview_root = self.data_dir / "character_previews"
         preview_key = hashlib.sha256(character_id.encode("utf-8")).hexdigest()
         matches = list(preview_root.glob(f"{preview_key}.*")) if preview_root.exists() else []
         if not matches:
@@ -7782,7 +7801,7 @@ class ManagementService:
         self.database.commit()
         for path in image_paths:
             path.unlink(missing_ok=True)
-        custom_root = self.root / "data" / "character_assets" / character_id
+        custom_root = self.data_dir / "character_assets" / character_id
         if custom_root.exists():
             shutil.rmtree(custom_root)
         return {"character_id": character_id, "deleted": True}

@@ -25,8 +25,9 @@ if sys.platform == "win32":
 
 # 加载 skill 根目录的 .env
 from dotenv import load_dotenv
+from runtime_paths import environment_file, resolve_data_dir
 SKILL_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(SKILL_ROOT / ".env")
+load_dotenv(environment_file(SKILL_ROOT, os.environ))
 
 # 把 scripts/ 加进 sys.path,确保 factory 包可被导入
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1056,9 +1057,12 @@ def assign_execution_engine(job_id, engine):
     """Internal: assign one unpaid storyboarded job to a gray engine."""
     database = conn()
     try:
-        result = ManagementService(database, SKILL_ROOT).assign_execution_engine(
-            job_id, engine
-        )
+        result = ManagementService(
+            database,
+            SKILL_ROOT,
+            data_dir=resolve_data_dir(SKILL_ROOT, os.environ),
+            env_path=environment_file(SKILL_ROOT, os.environ),
+        ).assign_execution_engine(job_id, engine)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     finally:

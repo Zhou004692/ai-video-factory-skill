@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 from pathlib import Path
 import sys
 import tempfile
@@ -13,15 +14,20 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 class RuntimeProfileTests(unittest.TestCase):
-    def test_desktop_defaults_to_private_local_runtime(self):
+    def test_desktop_defaults_to_state_outside_replaceable_skill_directory(self):
         from factory.runtime_profile import resolve_runtime_profile
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            profile = resolve_runtime_profile(root=root, environ={})
+            root = Path(tmp) / "skills" / "ai-video-factory"
+            runtime_home = Path(tmp) / "runtime-home"
+            profile = resolve_runtime_profile(
+                root=root,
+                environ={"FACTORY_RUNTIME_HOME": str(runtime_home)},
+            )
 
         self.assertEqual(profile.mode, "desktop")
-        self.assertEqual(profile.data_dir, (root / "data").resolve())
+        self.assertEqual(profile.data_dir, (runtime_home / "data").resolve())
+        self.assertFalse(profile.data_dir.is_relative_to(root.resolve()))
         self.assertIsNone(profile.public_base_url)
         self.assertEqual(profile.worker_mode, "child_process")
         self.assertEqual(profile.bind_host, "127.0.0.1")
@@ -134,6 +140,82 @@ class RuntimeProfileTests(unittest.TestCase):
                 clear=False,
             ):
                 self.assertEqual(db.database_path(), explicit.resolve())
+
+    def test_management_service_uses_external_data_and_environment_paths(self):
+        from factory.db import conn
+        from factory.management_api import ManagementService
+
+        parameters = inspect.signature(ManagementService).parameters
+        self.assertIn("data_dir", parameters)
+        self.assertIn("env_path", parameters)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "replaceable-skill"
+            root.mkdir()
+            runtime_home = Path(tmp) / "runtime-home"
+            data_dir = runtime_home / "data"
+            env_file = runtime_home / ".env"
+            env_file.parent.mkdir(parents=True)
+            env_file.write_text("ARK_API_KEY=<required>\n", encoding="utf-8")
+            database_path = data_dir / "factory.db"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "FACTORY_DB_PATH": str(database_path),
+                    "FACTORY_DATA_DIR": str(data_dir),
+                },
+                clear=False,
+            ):
+                database = conn()
+            try:
+                service = ManagementService(
+                    database,
+                    root,
+                    worker_mode="external",
+                    data_dir=data_dir,
+                    env_path=env_file,
+                )
+                self.assertEqual(service.data_dir, data_dir.resolve())
+                self.assertEqual(service.env_path, env_file.resolve())
+                self.assertEqual(
+                    service.production_service.env_path,
+                    env_file.resolve(),
+                )
+                service.create_custom_character(
+                    character_id="runtime-hero",
+                    display_name="Runtime Hero",
+                    background_description="External runtime state fixture",
+                    gender="female",
+                )
+                source_image = Path(tmp) / "source.png"
+                source_image.write_bytes(b"runtime-image")
+                created = service.add_custom_character_image(
+                    "runtime-hero", source_image
+                )
+                stored = service.character_image_file(
+                    "runtime-hero", created["image_id"]
+                )
+                self.assertTrue(stored.is_relative_to(data_dir.resolve()))
+                self.assertFalse(stored.is_relative_to(root.resolve()))
+                relative = database.execute(
+                    "SELECT relative_path FROM character_reference_images "
+                    "WHERE image_id=?",
+                    (created["image_id"],),
+                ).fetchone()[0]
+                database.execute(
+                    "UPDATE character_reference_images SET relative_path=? "
+                    "WHERE image_id=?",
+                    (f"data/{relative}", created["image_id"]),
+                )
+                database.commit()
+                self.assertEqual(
+                    service.character_image_file(
+                        "runtime-hero", created["image_id"]
+                    ),
+                    stored,
+                )
+            finally:
+                database.close()
 
 
 if __name__ == "__main__":

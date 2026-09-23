@@ -17,9 +17,10 @@ from urllib.parse import parse_qs, urlparse
 import webbrowser
 
 from dotenv import load_dotenv
+from runtime_paths import environment_file
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(SERVER_ROOT / ".env")
+load_dotenv(environment_file(SERVER_ROOT, os.environ))
 
 from factory import SKILL_ROOT
 from factory.db import conn
@@ -1106,7 +1107,11 @@ def serve(
     ConsoleHandler.auth_manager = auth_manager
     database = conn()
     ConsoleHandler.service = ManagementService(
-        database, SKILL_ROOT, worker_mode=profile.worker_mode
+        database,
+        SKILL_ROOT,
+        worker_mode=profile.worker_mode,
+        data_dir=profile.data_dir,
+        env_path=environment_file(SKILL_ROOT, os.environ),
     )
     stop_event = threading.Event()
     supervisor = None

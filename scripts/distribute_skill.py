@@ -32,6 +32,7 @@ SCRIPT_ROOT_FILES = {
     "scripts/management_server.py",
     "scripts/open_management.ps1",
     "scripts/requirements.txt",
+    "scripts/runtime_paths.py",
 }
 
 REFERENCE_FILES = {

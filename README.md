@@ -2,7 +2,7 @@
 
 面向短视频团队的一站式 AI 内容生产工作台：从人工选题或自动抓取开始，完成来源归档、选题简报、剧本审核、角色与场景一致性控制、Seedance 2.5 原生母片生成、本地导演剪辑、成片验收、渠道发布与效果回流。
 
-当前版本：`3.2.0.0`
+当前版本：`3.2.0.2`
 
 当前交付方式：直接分发 Skill 文件夹或压缩包，由使用方的 Skill 更新机制同步版本。
 
@@ -151,8 +151,15 @@ Graph V2 编译器与复杂度分析共用出镜/声音判断：画外对白和�
 1. 通过 Skill 文件夹或压缩包分发本仓库，保留 `SKILL.md`、`scripts/`、`references/` 和 `templates/`。
 2. 使用方安装或更新 Skill 后，由 Agent 按 `SKILL.md` 调用 `scripts/bootstrap.py --profile script --json` 完成本地运行环境、占位配置和数据库初始化。
 3. 需要管理台时，由 Agent 按宿主系统启动本地服务；Windows 使用 `scripts/open_management.ps1`，其他系统使用 Python 运行时启动 `scripts/management_server.py`。
-4. Skill 更新由使用方的 Skill 更新机制完成，业务数据和运行时数据保存在本地 `data/` 与 `.env`，不会随 Skill 更新包分发。
+4. Skill 更新由使用方的 Skill 更新机制完成。可替换的 Skill 目录只保存代码；`.env`、数据库、角色素材和成片保存在独立运行目录，不会被覆盖式更新删除。
 5. 管理台地址：`http://127.0.0.1:8765`。
+
+默认运行目录为 Windows 的 `%LOCALAPPDATA%\AI Video Factory`、macOS 的
+`~/Library/Application Support/AI Video Factory`、Linux 的
+`~/.local/state/ai-video-factory`。首次运行新版时，系统会将旧 Skill 目录内的
+`.env` 与 `data/` 一次性复制到运行目录，并保留旧文件作为回退副本。可用
+`FACTORY_RUNTIME_HOME` 覆盖整个运行目录，或用 `FACTORY_ENV_FILE`、
+`FACTORY_DATA_DIR` 分别覆盖配置和数据路径。
 
 ### 完整生产流程
 
@@ -204,8 +211,12 @@ powershell -ExecutionPolicy Bypass -File scripts\open_management.ps1
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\cli.py status
+.\.venv\Scripts\python.exe tests\skill_update_release_gate.py
 .\.venv\Scripts\python.exe -m unittest discover -s tests -q
 ```
+
+Skill 更新门禁会回归“旧版状态迁移、覆盖式替换、WAL 一致性备份、失败回滚”，
+并在通过时输出 `SKILL_UPDATE_RELEASE_GATE_OK paid_provider_calls=0`。
 
 ## 零费用技术链路回归与证据边界
 
@@ -294,7 +305,7 @@ Full 套件还会执行 3 条“来源 → 简报 → 剧本 → 制作设置 �
 
 - 管理台默认只绑定本机回环地址，不对公网开放。
 - 凭证保存在本地，页面只展示配置状态，不回显密钥明文。
-- 来源、配置、任务、角色和媒体索引默认保存在本地 `data/`。
+- 来源、配置、任务、角色和媒体索引默认保存在独立的本地运行目录。
 - 视频生成、自动重试和渠道投稿都需要明确的预算或发布确认。
 - 本地超时不等于远端失败；系统优先核对原 Provider Task ID，禁止不确定状态下重复付费提交。
 - 自动抓取只支持已授权内容源，不提供账号爬虫、浏览器模拟登录或未授权全网抓取。
@@ -314,9 +325,11 @@ ai-video-factory/
 ├─ references/                # Provider、流程、提示词与排障说明
 ├─ templates/                 # 环境变量与业务模板
 ├─ tests/                     # 单元、集成、媒体与故障回归测试
-├─ data/                      # 本地运行数据（默认不提交 Git）
 ├─ SKILL.md                   # Agent 使用契约
 ```
+
+旧版 Skill 目录中的 `data/` 只作为首次迁移来源；新版不会在可替换的 Skill
+目录中创建业务数据库。
 
 ## 延伸文档
 

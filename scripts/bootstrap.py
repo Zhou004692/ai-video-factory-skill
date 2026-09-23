@@ -12,6 +12,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from runtime_paths import environment_file, existing_environment_file
+
 
 ROOT = Path(__file__).resolve().parents[1]
 VIDEO_KEYS = (
@@ -87,7 +89,7 @@ def bootstrap(
 ) -> dict:
     """Prepare the runtime and return an agent-readable readiness report."""
     root = root.resolve()
-    env_path = root / ".env"
+    env_path = existing_environment_file(root, os.environ)
     config = {**_read_env(env_path), **{k: v for k, v in os.environ.items() if v}}
     missing = [key for key in _required_fields(profile, config) if not _configured(config.get(key))]
 
@@ -102,14 +104,14 @@ def bootstrap(
 
     runtime = _venv_python(root)
     install_needed = not runtime.is_file()
-    if install_needed or not env_path.is_file() or not (root / "data").is_dir():
-        from install import install
+    from install import install
 
-        install(
-            root,
-            create_venv=install_needed,
-            install_dependencies=install_needed,
-        )
+    install(
+        root,
+        create_venv=install_needed,
+        install_dependencies=install_needed,
+    )
+    env_path = environment_file(root, os.environ)
 
     runtime = runtime if runtime.is_file() else (python_executable or Path(sys.executable))
     report = _run_doctor(root, runtime, profile)
@@ -121,6 +123,7 @@ def bootstrap(
         runtime = _venv_python(root)
         report = _run_doctor(root, runtime, profile)
 
+    env_path = environment_file(root, os.environ)
     config = {**_read_env(env_path), **{k: v for k, v in os.environ.items() if v}}
     missing = [key for key in _required_fields(profile, config) if not _configured(config.get(key))]
     failed_checks = [

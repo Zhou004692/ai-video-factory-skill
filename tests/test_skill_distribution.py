@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -162,8 +163,13 @@ class SkillDistributionTests(unittest.TestCase):
             (root / "data").mkdir()
             (root / ".env").write_text("ARK_API_KEY=configured\n", encoding="utf-8")
 
-            script = diagnose(root, profile="script")
-            video = diagnose(root, profile="video")
+            with patch.dict(
+                os.environ,
+                {"FACTORY_RUNTIME_HOME": str(root / "runtime-home")},
+                clear=False,
+            ):
+                script = diagnose(root, profile="script")
+                video = diagnose(root, profile="video")
 
             self.assertTrue(script["ready"], script)
             self.assertEqual(script["paid_provider_calls"], 0)
@@ -183,7 +189,11 @@ class SkillDistributionTests(unittest.TestCase):
 
             with patch.dict(
                 "os.environ",
-                {"DEFAULT_LLM_PROVIDER": "claude", "ANTHROPIC_API_KEY": "configured"},
+                {
+                    "DEFAULT_LLM_PROVIDER": "claude",
+                    "ANTHROPIC_API_KEY": "configured",
+                    "FACTORY_RUNTIME_HOME": str(root / "runtime-home"),
+                },
                 clear=False,
             ):
                 report = diagnose(root, profile="script")
@@ -206,7 +216,11 @@ class SkillDistributionTests(unittest.TestCase):
                 "VOLC_AK=ak\nVOLC_SK=sk\nTOS_BUCKET=bucket\n",
                 encoding="utf-8",
             )
-            with patch("doctor.shutil.which", return_value="binary"):
+            with patch.dict(
+                os.environ,
+                {"FACTORY_RUNTIME_HOME": str(root / "runtime-home")},
+                clear=False,
+            ), patch("doctor.shutil.which", return_value="binary"):
                 report = diagnose(root, profile="video")
 
         self.assertTrue(report["checks"]["credentials"]["ok"])
@@ -222,7 +236,11 @@ class SkillDistributionTests(unittest.TestCase):
                 "ARK_API_KEY=ark\nVOLC_AK=ak\nVOLC_SK=sk\nTOS_BUCKET=bucket\n",
                 encoding="utf-8",
             )
-            with patch("doctor.shutil.which", return_value="binary"):
+            with patch.dict(
+                os.environ,
+                {"FACTORY_RUNTIME_HOME": str(root / "runtime-home")},
+                clear=False,
+            ), patch("doctor.shutil.which", return_value="binary"):
                 report = diagnose(root, profile="video")
 
         self.assertTrue(report["checks"]["credentials"]["ok"], report)
@@ -238,7 +256,12 @@ class SkillDistributionTests(unittest.TestCase):
             (root / "data").mkdir()
             (root / ".env").write_text("PUBLISH_MODE=manual\n", encoding="utf-8")
 
-            report = diagnose(root, profile="learning")
+            with patch.dict(
+                os.environ,
+                {"FACTORY_RUNTIME_HOME": str(root / "runtime-home")},
+                clear=False,
+            ):
+                report = diagnose(root, profile="learning")
 
             self.assertTrue(report["ready"], report)
             self.assertEqual(report["paid_provider_calls"], 0)
@@ -293,7 +316,11 @@ class SkillDistributionTests(unittest.TestCase):
     def test_skill_runtime_initializer_preserves_existing_env_and_initializes_runtime(self):
         from install import install
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home")},
+            clear=False,
+        ):
             package = Path(tmp) / "ai-video-factory"
             (package / "templates").mkdir(parents=True)
             (package / "scripts" / "factory").mkdir(parents=True)
@@ -308,8 +335,10 @@ class SkillDistributionTests(unittest.TestCase):
             first = install(package, create_venv=False, install_dependencies=False)
             second = install(package, create_venv=False, install_dependencies=False)
 
-            self.assertEqual((package / ".env").read_text(encoding="utf-8"), "KEEP=1\n")
-            self.assertTrue((package / "data").is_dir())
+            external_env = Path(first["env_file"])
+            self.assertEqual(external_env.read_text(encoding="utf-8"), "KEEP=1\n")
+            self.assertTrue(Path(first["data_dir"]).is_dir())
+            self.assertFalse((package / "data").exists())
             self.assertFalse(first["env_created"])
             self.assertFalse(second["env_created"])
 

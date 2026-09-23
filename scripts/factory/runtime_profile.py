@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Literal, Mapping
 from urllib.parse import urlsplit
 
+from runtime_paths import resolve_data_dir
+
 
 class RuntimeProfileError(RuntimeError):
     """The requested runtime configuration is unsafe or incomplete."""
@@ -70,9 +72,7 @@ def resolve_runtime_profile(
     if mode == "desktop":
         if not _is_loopback(bind_host):
             raise RuntimeProfileError("本地模式只允许回环地址，禁止直接暴露公网")
-        data_dir = Path(data_value).expanduser() if data_value else root / "data"
-        if not data_dir.is_absolute():
-            data_dir = root / data_dir
+        data_dir = resolve_data_dir(root, values)
         replay_without_workers = (
             str(values.get("FACTORY_PROVIDER_MODE") or "").strip().casefold()
             == "replay"

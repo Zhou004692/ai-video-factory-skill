@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import sqlite3
 from . import DATA_DIR, SKILL_ROOT
+from runtime_paths import resolve_data_dir
 
 DDL = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -703,10 +704,7 @@ def database_path() -> Path:
         return Path(override).expanduser().resolve()
     runtime_data = os.environ.get("FACTORY_DATA_DIR", "").strip()
     if runtime_data:
-        data_dir = Path(runtime_data).expanduser()
-        if not data_dir.is_absolute():
-            data_dir = SKILL_ROOT / data_dir
-        return (data_dir / "factory.db").resolve()
+        return (resolve_data_dir(SKILL_ROOT, os.environ) / "factory.db").resolve()
     return Path(_DB_PATH)
 
 

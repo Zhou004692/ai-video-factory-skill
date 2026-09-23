@@ -16,23 +16,244 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 class FreshInstallTests(unittest.TestCase):
+    def test_bootstrap_migrates_legacy_state_when_runtime_already_exists(self):
+        from bootstrap import _venv_python, bootstrap
+        from distribute_skill import build_distribution
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home"),
+                "FACTORY_DATA_DIR": "",
+            },
+            clear=False,
+        ):
+            package = build_distribution(ROOT, Path(tmp) / "distribution")
+            (package / ".env").write_text(
+                "ARK_API_KEY=legacy-secret\n", encoding="utf-8"
+            )
+            legacy_data = package / "data"
+            legacy_data.mkdir(exist_ok=True)
+            database = sqlite3.connect(legacy_data / "factory.db")
+            try:
+                database.execute("CREATE TABLE legacy_marker(value TEXT NOT NULL)")
+                database.execute(
+                    "INSERT INTO legacy_marker(value) VALUES ('copied')"
+                )
+                database.commit()
+            finally:
+                database.close()
+            runtime = _venv_python(package)
+            runtime.parent.mkdir(parents=True)
+            runtime.write_bytes(b"existing-runtime")
+
+            with patch(
+                "bootstrap._run_doctor",
+                return_value={"ready": True, "checks": {}, "paid_provider_calls": 0},
+            ):
+                report = bootstrap(package, profile="script")
+
+            external_data = Path(tmp) / "runtime-home" / "data"
+            copied = sqlite3.connect(external_data / "factory.db")
+            try:
+                value = copied.execute("SELECT value FROM legacy_marker").fetchone()[0]
+            finally:
+                copied.close()
+            self.assertEqual(value, "copied")
+            self.assertEqual(report["paid_provider_calls"], 0)
+
+    def test_existing_in_skill_state_is_copied_to_external_runtime_home(self):
+        from distribute_skill import build_distribution
+        from install import install
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home"),
+                "FACTORY_DATA_DIR": "",
+            },
+            clear=False,
+        ):
+            package = build_distribution(ROOT, Path(tmp) / "distribution")
+            legacy_env = package / ".env"
+            legacy_env.write_text("ARK_API_KEY=legacy-secret\n", encoding="utf-8")
+            legacy_data = package / "data"
+            legacy_data.mkdir(exist_ok=True)
+            legacy_database = legacy_data / "factory.db"
+            connection = sqlite3.connect(legacy_database)
+            try:
+                connection.execute("CREATE TABLE legacy_marker(value TEXT NOT NULL)")
+                connection.execute(
+                    "INSERT INTO legacy_marker(value) VALUES ('copied')"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            legacy_character = legacy_data / "character_assets" / "hero" / "01.png"
+            legacy_character.parent.mkdir(parents=True)
+            legacy_character.write_bytes(b"legacy-character")
+
+            report = install(package, create_venv=False, install_dependencies=False)
+
+            runtime_home = Path(tmp) / "runtime-home"
+            external_env = runtime_home / ".env"
+            external_data = runtime_home / "data"
+            self.assertIn("env_file", report)
+            self.assertEqual(Path(report["env_file"]), external_env.resolve())
+            self.assertEqual(Path(report["data_dir"]), external_data.resolve())
+            self.assertEqual(
+                external_env.read_text(encoding="utf-8"),
+                "ARK_API_KEY=legacy-secret\n",
+            )
+            self.assertEqual(
+                (external_data / "character_assets" / "hero" / "01.png").read_bytes(),
+                b"legacy-character",
+            )
+            copied = sqlite3.connect(external_data / "factory.db")
+            try:
+                value = copied.execute("SELECT value FROM legacy_marker").fetchone()[0]
+            finally:
+                copied.close()
+            self.assertEqual(value, "copied")
+            self.assertTrue(legacy_env.is_file())
+            self.assertTrue(legacy_database.is_file())
+
+    def test_legacy_state_migrates_when_external_data_directory_is_empty(self):
+        from distribute_skill import build_distribution
+        from install import install
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home"),
+                "FACTORY_DATA_DIR": "",
+            },
+            clear=False,
+        ):
+            package = build_distribution(ROOT, Path(tmp) / "distribution")
+            legacy_data = package / "data"
+            legacy_data.mkdir(exist_ok=True)
+            legacy_database = legacy_data / "factory.db"
+            connection = sqlite3.connect(legacy_database)
+            try:
+                connection.execute("CREATE TABLE legacy_marker(value TEXT NOT NULL)")
+                connection.execute(
+                    "INSERT INTO legacy_marker(value) VALUES ('copied')"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            external_data = Path(tmp) / "runtime-home" / "data"
+            external_data.mkdir(parents=True)
+
+            report = install(package, create_venv=False, install_dependencies=False)
+
+            copied = sqlite3.connect(external_data / "factory.db")
+            try:
+                value = copied.execute("SELECT value FROM legacy_marker").fetchone()[0]
+            finally:
+                copied.close()
+            self.assertEqual(value, "copied")
+            self.assertTrue(report["legacy_state_migrated"]["data"])
+
+    def test_skill_replacement_preserves_external_runtime_state(self):
+        from distribute_skill import build_distribution
+        from install import install
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home"),
+                "FACTORY_DATA_DIR": "",
+            },
+            clear=False,
+        ):
+            temp_root = Path(tmp)
+            output_root = temp_root / "distribution"
+            package = build_distribution(ROOT, output_root)
+            (package / "VERSION").write_text("3.2.0.0", encoding="utf-8")
+            first = install(package, create_venv=False, install_dependencies=False)
+
+            runtime_home = temp_root / "runtime-home"
+            self.assertTrue(runtime_home.is_dir())
+            env_file = runtime_home / ".env"
+            data_dir = runtime_home / "data"
+            database = data_dir / "factory.db"
+            env_file.write_text("ARK_API_KEY=preserved-secret\n", encoding="utf-8")
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("CREATE TABLE update_marker(value TEXT NOT NULL)")
+                connection.execute(
+                    "INSERT INTO update_marker(value) VALUES ('preserved')"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            character = data_dir / "character_assets" / "hero" / "01.png"
+            character.parent.mkdir(parents=True)
+            character.write_bytes(b"preserved-character")
+
+            replacement = build_distribution(ROOT, output_root)
+            second = install(
+                replacement,
+                create_venv=False,
+                install_dependencies=False,
+            )
+
+            self.assertEqual(Path(first["data_dir"]), data_dir.resolve())
+            self.assertEqual(Path(second["data_dir"]), data_dir.resolve())
+            self.assertEqual(Path(second["env_file"]), env_file.resolve())
+            self.assertFalse((replacement / ".env").exists())
+            self.assertFalse((replacement / "data" / "factory.db").exists())
+            self.assertEqual(
+                env_file.read_text(encoding="utf-8"),
+                "ARK_API_KEY=preserved-secret\n",
+            )
+            self.assertEqual(character.read_bytes(), b"preserved-character")
+            recovered = sqlite3.connect(database)
+            try:
+                marker = recovered.execute(
+                    "SELECT value FROM update_marker"
+                ).fetchone()[0]
+            finally:
+                recovered.close()
+            self.assertEqual(marker, "preserved")
+            self.assertIsNotNone(second["upgrade_backup"])
+            self.assertEqual(second["paid_provider_calls"], 0)
+
     def test_upgrade_failure_restores_env_database_and_character_assets(self):
         from distribute_skill import build_distribution
         from install import install
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home")},
+            clear=False,
+        ):
             package = build_distribution(ROOT, Path(tmp) / "dist")
-            install(package, create_venv=False, install_dependencies=False)
+            initial = install(package, create_venv=False, install_dependencies=False)
             (package / "VERSION").write_text("9.9.9-test", encoding="utf-8")
-            env_file = package / ".env"
-            database = package / "data" / "factory.db"
-            character = package / "data" / "character_assets" / "hero" / "01.png"
+            env_file = Path(initial["env_file"])
+            data_dir = Path(initial["data_dir"])
+            database = data_dir / "factory.db"
+            character = data_dir / "character_assets" / "hero" / "01.png"
             character.parent.mkdir(parents=True)
             character.write_bytes(b"original-character")
             env_file.write_text("ARK_API_KEY=original\n", encoding="utf-8")
-            original_database = database.read_bytes()
+            original = sqlite3.connect(database)
+            try:
+                original.execute(
+                    "CREATE TABLE upgrade_restore_marker(value TEXT NOT NULL)"
+                )
+                original.execute(
+                    "INSERT INTO upgrade_restore_marker(value) VALUES ('original')"
+                )
+                original.commit()
+            finally:
+                original.close()
 
-            def corrupt_then_fail(root):
+            def corrupt_then_fail(root, **_kwargs):
                 env_file.write_text("ARK_API_KEY=corrupted\n", encoding="utf-8")
                 database.write_bytes(b"corrupted-db")
                 character.write_bytes(b"corrupted-character")
@@ -45,14 +266,27 @@ class FreshInstallTests(unittest.TestCase):
             self.assertEqual(
                 env_file.read_text(encoding="utf-8"), "ARK_API_KEY=original\n"
             )
-            self.assertEqual(database.read_bytes(), original_database)
+            restored = sqlite3.connect(database)
+            try:
+                marker = restored.execute(
+                    "SELECT value FROM upgrade_restore_marker"
+                ).fetchone()[0]
+                integrity = restored.execute("PRAGMA integrity_check").fetchone()[0]
+            finally:
+                restored.close()
+            self.assertEqual(marker, "original")
+            self.assertEqual(integrity, "ok")
             self.assertEqual(character.read_bytes(), b"original-character")
 
     def test_successful_upgrade_reports_a_recoverable_snapshot(self):
         from distribute_skill import build_distribution
         from install import install
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home")},
+            clear=False,
+        ):
             package = build_distribution(ROOT, Path(tmp) / "dist")
             install(package, create_venv=False, install_dependencies=False)
             (package / "VERSION").write_text("9.9.9-test", encoding="utf-8")
@@ -68,7 +302,11 @@ class FreshInstallTests(unittest.TestCase):
         from distribute_skill import build_distribution
         from install import install
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home")},
+            clear=False,
+        ):
             package = build_distribution(ROOT, Path(tmp) / "dist")
             first = install(package, create_venv=False, install_dependencies=False)
             second = install(package, create_venv=False, install_dependencies=False)
@@ -80,7 +318,11 @@ class FreshInstallTests(unittest.TestCase):
         from distribute_skill import build_distribution
         from install import install
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home")},
+            clear=False,
+        ):
             temp_root = Path(tmp)
             package = build_distribution(ROOT, temp_root / "dist")
             external_data = temp_root / "persistent-data"
@@ -116,7 +358,11 @@ class FreshInstallTests(unittest.TestCase):
     def test_runtime_initializer_rejects_unsupported_python_before_writing_files(self):
         from install import install
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home")},
+            clear=False,
+        ):
             root = Path(tmp) / "ai-video-factory"
             with patch("install.sys.version_info", (3, 10, 14)):
                 with self.assertRaisesRegex(RuntimeError, "Python 3.11"):
@@ -127,7 +373,11 @@ class FreshInstallTests(unittest.TestCase):
         from distribute_skill import build_distribution
         from install import install
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home")},
+            clear=False,
+        ):
             temp_root = Path(tmp)
             package = build_distribution(ROOT, temp_root / "dist")
 
@@ -137,13 +387,16 @@ class FreshInstallTests(unittest.TestCase):
                 install_dependencies=False,
             )
 
-            self.assertTrue((package / ".env").is_file())
-            env_text = (package / ".env").read_text(encoding="utf-8")
+            env_file = Path(report["env_file"])
+            self.assertTrue(env_file.is_file())
+            env_text = env_file.read_text(encoding="utf-8")
             self.assertIn("ARK_API_KEY=<required>", env_text)
             self.assertNotIn("secret-value", env_text)
 
-            database = package / "data" / "factory.db"
+            database = Path(report["data_dir"]) / "factory.db"
             self.assertTrue(database.is_file())
+            self.assertFalse((package / ".env").exists())
+            self.assertFalse((package / "data" / "factory.db").exists())
             db = sqlite3.connect(database)
             try:
                 tables = {

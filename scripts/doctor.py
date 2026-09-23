@@ -18,6 +18,7 @@ from factory.media_runtime import (
     resolve_subtitle_font,
 )
 from factory.runtime_profile import RuntimeProfileError, resolve_runtime_profile
+from runtime_paths import existing_environment_file
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,13 +40,13 @@ def diagnose(
     profile: str = "script",
     environ: Mapping[str, str] | None = None,
 ) -> dict:
-    env_path = root / ".env"
+    runtime_environ = os.environ if environ is None else environ
+    env_path = existing_environment_file(root, runtime_environ)
     config = {
         key: str(value or "") for key, value in dotenv_values(env_path).items()
     }
-    if environ is not None:
-        for key, value in environ.items():
-            config.setdefault(key, value)
+    for key, value in runtime_environ.items():
+        config.setdefault(key, value)
     provider = str(config.get("DEFAULT_LLM_PROVIDER") or "doubao").strip().lower()
     if profile == "learning":
         required = ()

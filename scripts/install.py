@@ -12,6 +12,7 @@ import venv
 
 from factory.runtime_backup import create_upgrade_snapshot, restore_upgrade_snapshot
 from factory.runtime_profile import resolve_runtime_profile
+from runtime_paths import prepare_runtime_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,11 +34,20 @@ def _read_environment(env_file: Path) -> dict[str, str]:
     return values
 
 
-def _initialize_database(root: Path) -> bool:
+def _initialize_database(
+    root: Path,
+    *,
+    env_file: Path,
+    runtime_home: Path,
+    data_dir: Path,
+) -> bool:
     db_module = root / "scripts" / "factory" / "db.py"
     if not db_module.is_file():
         return False
-    env = _read_environment(root / ".env")
+    env = _read_environment(env_file)
+    env["FACTORY_ENV_FILE"] = str(env_file)
+    env["FACTORY_RUNTIME_HOME"] = str(runtime_home)
+    env["FACTORY_DATA_DIR"] = str(data_dir)
     profile = resolve_runtime_profile(root=root, environ=env)
     database = profile.data_dir / "factory.db"
     env["FACTORY_DB_PATH"] = str(database)
@@ -98,8 +108,13 @@ def install(root: Path = ROOT, *, create_venv: bool = True,
     if sys.version_info < (3, 11):
         raise RuntimeError("Python 3.11 or newer is required")
     root = root.resolve()
-    env_file = root / ".env"
+    runtime_state = prepare_runtime_state(root, os.environ)
+    runtime_home = Path(runtime_state["runtime_home"])
+    env_file = Path(runtime_state["env_file"])
     initial_values = _read_environment(env_file)
+    initial_values["FACTORY_RUNTIME_HOME"] = str(runtime_home)
+    initial_values["FACTORY_ENV_FILE"] = str(env_file)
+    initial_values["FACTORY_DATA_DIR"] = str(runtime_state["data_dir"])
     profile = resolve_runtime_profile(root=root, environ=initial_values)
     data_dir = profile.data_dir
     version_file = root / "VERSION"
@@ -145,7 +160,12 @@ def install(root: Path = ROOT, *, create_venv: bool = True,
                 check=True,
             )
 
-        database_initialized = _initialize_database(root)
+        database_initialized = _initialize_database(
+            root,
+            env_file=env_file,
+            runtime_home=runtime_home,
+            data_dir=data_dir,
+        )
         configuration_required = _configuration_required(env_file)
         _write_runtime_metadata(runtime_metadata, current_version)
     except BaseException:
@@ -161,6 +181,12 @@ def install(root: Path = ROOT, *, create_venv: bool = True,
         "env_created": env_created,
         "venv_created": venv_created,
         "data_dir": str(data_dir),
+        "env_file": str(env_file),
+        "runtime_home": str(runtime_home),
+        "legacy_state_migrated": {
+            "environment": bool(runtime_state["env_migrated"]),
+            "data": bool(runtime_state["data_migrated"]),
+        },
         "runtime": profile.as_public_dict(),
         "upgrade_backup": str(upgrade_backup) if upgrade_backup else None,
         "database_initialized": database_initialized,

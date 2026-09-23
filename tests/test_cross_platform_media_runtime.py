@@ -101,7 +101,11 @@ class CrossPlatformMediaRuntimeTests(unittest.TestCase):
             with mock.patch("doctor.resolve_binary", return_value=binary), mock.patch(
                 "doctor.resolve_subtitle_font", return_value=font
             ):
-                report = diagnose(root, profile="video")
+                report = diagnose(
+                    root,
+                    profile="video",
+                    environ={"FACTORY_RUNTIME_HOME": str(root)},
+                )
 
             self.assertEqual(report["runtime"]["mode"], "desktop")
             self.assertEqual(report["runtime"]["data_dir"], str(data_dir.resolve()))

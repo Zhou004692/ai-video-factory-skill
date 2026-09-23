@@ -36,13 +36,32 @@ function Show-StartupError([string]$message) {
     }
 }
 
-$envFile = Join-Path $root ".env"
-$startPage = "overview"
-if (-not (Test-Path -LiteralPath $envFile)) {
-    $startPage = "config"
-} elseif (Select-String -LiteralPath $envFile -Pattern "=<required>" -Quiet) {
-    $startPage = "config"
+function Get-RuntimeEnvFile {
+    if ($env:FACTORY_ENV_FILE) {
+        return [System.IO.Path]::GetFullPath($env:FACTORY_ENV_FILE)
+    }
+    $runtimeHome = if ($env:FACTORY_RUNTIME_HOME) {
+        $env:FACTORY_RUNTIME_HOME
+    } elseif ($env:LOCALAPPDATA) {
+        Join-Path $env:LOCALAPPDATA "AI Video Factory"
+    } else {
+        Join-Path $env:USERPROFILE "AppData\Local\AI Video Factory"
+    }
+    return Join-Path $runtimeHome ".env"
 }
+
+function Get-StartPage {
+    $runtimeEnv = Get-RuntimeEnvFile
+    if (-not (Test-Path -LiteralPath $runtimeEnv)) {
+        return "config"
+    }
+    if (Select-String -LiteralPath $runtimeEnv -Pattern "=<required>" -Quiet) {
+        return "config"
+    }
+    return "overview"
+}
+
+$startPage = Get-StartPage
 
 if (Test-ManagementReady) {
     Open-ManagementPage $startPage
@@ -105,6 +124,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "AI Video Factory local state validation failed."
     }
+    $startPage = Get-StartPage
 
     $processOptions = @{
         FilePath = $python

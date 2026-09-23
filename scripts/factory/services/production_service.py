@@ -35,6 +35,7 @@ class ProductionService:
         database: sqlite3.Connection,
         root: Path,
         *,
+        env_path: Path | None = None,
         start_handler: Callable[..., dict] | None = None,
         resume_handler: Callable[..., dict] | None = None,
         review_handler: Callable[..., dict] | None = None,
@@ -42,7 +43,9 @@ class ProductionService:
     ):
         self.database = database
         self.root = Path(root).resolve()
-        self.env_path = self.root / ".env"
+        self.env_path = (
+            Path(env_path).resolve() if env_path is not None else self.root / ".env"
+        )
         self._start_handler = start_handler
         self._resume_handler = resume_handler
         self._review_handler = review_handler

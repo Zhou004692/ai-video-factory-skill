@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 
 
 def _file_digest(path: Path) -> str:
@@ -14,6 +15,17 @@ def _file_digest(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _snapshot_sqlite(source: Path, destination: Path) -> None:
+    """Create a transactionally consistent standalone SQLite snapshot."""
+    source_connection = sqlite3.connect(source, timeout=30)
+    destination_connection = sqlite3.connect(destination)
+    try:
+        source_connection.backup(destination_connection)
+    finally:
+        destination_connection.close()
+        source_connection.close()
 
 
 def create_upgrade_snapshot(
@@ -44,7 +56,10 @@ def create_upgrade_snapshot(
         if source.is_dir():
             shutil.copytree(source, backup / relative)
         elif source.is_file():
-            shutil.copy2(source, backup / relative)
+            if name == "database":
+                _snapshot_sqlite(source, backup / relative)
+            else:
+                shutil.copy2(source, backup / relative)
             item["sha256"] = _file_digest(backup / relative)
         items.append(item)
     manifest["items"] = items
@@ -71,4 +86,7 @@ def restore_upgrade_snapshot(backup: Path) -> None:
                 shutil.rmtree(target)
             shutil.copytree(snapshot, target)
         else:
+            if item["name"] == "database":
+                Path(f"{target}-wal").unlink(missing_ok=True)
+                Path(f"{target}-shm").unlink(missing_ok=True)
             shutil.copy2(snapshot, target)
