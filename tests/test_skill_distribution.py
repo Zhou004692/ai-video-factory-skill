@@ -45,6 +45,7 @@ class SkillDistributionTests(unittest.TestCase):
                 "agents/openai.yaml",
                 "scripts/cli.py",
                 "scripts/bootstrap.py",
+                "scripts/distribute_skill.py",
                 "scripts/management_server.py",
                 "scripts/open_management.ps1",
                 "scripts/management_ui/index.html",

@@ -13,6 +13,14 @@ import uuid
 
 
 APP_DIRECTORY = "ai-video-factory"
+LEGACY_MIGRATION_MARKER = ".legacy-migration.json"
+LEGACY_AUXILIARY_SUBTREES = (
+    "assets",
+    "character_assets",
+    "character_previews",
+    "acceptance",
+    "management_uploads",
+)
 
 
 def runtime_home(
@@ -220,6 +228,58 @@ def _same_file_content(left: Path, right: Path) -> bool:
     return digests[0] == digests[1]
 
 
+def _legacy_state_signature(
+    source: Path,
+    auxiliary_data: Path | None,
+) -> str:
+    digest = hashlib.sha256()
+    roots: list[tuple[str, Path]] = [("primary", source)]
+    if auxiliary_data is not None:
+        roots.extend(
+            (f"auxiliary/{name}", auxiliary_data / name)
+            for name in LEGACY_AUXILIARY_SUBTREES
+        )
+    for label, root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(
+            (item for item in root.rglob("*") if item.is_file()),
+            key=lambda item: item.relative_to(root).as_posix(),
+        ):
+            if path.name in {".gitkeep", "factory.db-shm"}:
+                continue
+            digest.update(label.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _legacy_migration_matches(
+    destination: Path,
+    source: Path,
+    auxiliary_data: Path | None,
+) -> bool:
+    marker = destination / LEGACY_MIGRATION_MARKER
+    if not marker.is_file():
+        return False
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    expected_auxiliary = str(auxiliary_data.resolve()) if auxiliary_data else None
+    return (
+        payload.get("source") == str(source.resolve())
+        and payload.get("auxiliary") == expected_auxiliary
+        and payload.get("signature")
+        == _legacy_state_signature(source, auxiliary_data)
+    )
+
+
 def _merge_legacy_subtree(source: Path, destination: Path) -> None:
     if not source.is_dir():
         return
@@ -254,12 +314,7 @@ def _copy_legacy_data(
         else:
             staging.mkdir(parents=True)
         if auxiliary_data is not None and auxiliary_data.is_dir():
-            for name in (
-                "assets",
-                "character_assets",
-                "acceptance",
-                "management_uploads",
-            ):
+            for name in LEGACY_AUXILIARY_SUBTREES:
                 _merge_legacy_subtree(
                     auxiliary_data / name,
                     staging / name,
@@ -272,6 +327,20 @@ def _copy_legacy_data(
             _rebase_database_paths(target_database, source, destination)
             if auxiliary_data is not None:
                 _rebase_database_paths(target_database, auxiliary_data, destination)
+        (staging / LEGACY_MIGRATION_MARKER).write_text(
+            json.dumps(
+                {
+                    "source": str(source.resolve()),
+                    "auxiliary": (
+                        str(auxiliary_data.resolve()) if auxiliary_data else None
+                    ),
+                    "signature": _legacy_state_signature(source, auxiliary_data),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         staging.replace(destination)
     except BaseException:
         if staging.exists():
@@ -336,24 +405,28 @@ def prepare_runtime_state(
         auxiliary_data
         and any(
             _has_substantive_state(auxiliary_data / name)
-            for name in (
-                "assets",
-                "character_assets",
-                "acceptance",
-                "management_uploads",
-            )
+            for name in LEGACY_AUXILIARY_SUBTREES
         )
     )
     legacy_state_present = (
         _has_substantive_state(legacy_data) or auxiliary_state_present
     )
     completed_external_state = (data_dir / "runtime.json").is_file()
+    migrated_legacy_unchanged = (
+        completed_external_state
+        and legacy_state_present
+        and _legacy_migration_matches(
+            data_dir,
+            legacy_data,
+            auxiliary_data if auxiliary_state_present else None,
+        )
+    )
     if (
         data_dir != legacy_data
         and legacy_state_present
         and data_dir.exists()
         and not empty_external_data
-        and not completed_external_state
+        and not migrated_legacy_unchanged
     ):
         raise RuntimeError(
             "旧 Skill 数据与未完成的外部运行数据同时存在；已停止升级，"

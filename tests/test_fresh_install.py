@@ -26,6 +26,127 @@ class FreshInstallTests(unittest.TestCase):
         self.assertLess(local, roaming)
         self.assertLess(roaming, portable)
         self.assertNotIn("$env:USERPROFILE \"AppData\\Local", launcher)
+        self.assertIn('$logRoot = Join-Path (Get-RuntimeHome) "logs"', launcher)
+        self.assertNotIn('Join-Path $root "data\\logs"', launcher)
+
+    def test_distributed_updater_migrates_before_destructive_replacement(self):
+        from distribute_skill import build_distribution
+
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            staged = build_distribution(ROOT, temp_root / "staged")
+            installed_parent = temp_root / "installed"
+            legacy = installed_parent / "ai-video-factory"
+            legacy_data = legacy / "data"
+            legacy_data.mkdir(parents=True)
+            (legacy / ".env").write_text(
+                "ARK_API_KEY=legacy-secret\n", encoding="utf-8"
+            )
+            (legacy_data / "assets").mkdir()
+            (legacy_data / "assets" / "paid.mp4").write_bytes(b"paid")
+            database = sqlite3.connect(legacy_data / "factory.db")
+            database.execute("CREATE TABLE markers(value TEXT NOT NULL)")
+            database.execute("INSERT INTO markers(value) VALUES ('legacy')")
+            database.commit()
+            database.close()
+            runtime_home = temp_root / "runtime-home"
+            environment = {
+                **os.environ,
+                "FACTORY_RUNTIME_HOME": str(runtime_home),
+                "FACTORY_DATA_DIR": "",
+                "FACTORY_ENV_FILE": "",
+                "FACTORY_DB_PATH": "",
+            }
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(staged / "scripts" / "distribute_skill.py"),
+                    "--source",
+                    str(staged),
+                    "--output",
+                    str(installed_parent),
+                ],
+                cwd=staged,
+                env=environment,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            self.assertTrue((legacy / "scripts" / "distribute_skill.py").is_file())
+            self.assertEqual(
+                (runtime_home / "data" / "assets" / "paid.mp4").read_bytes(),
+                b"paid",
+            )
+            migrated = sqlite3.connect(runtime_home / "data" / "factory.db")
+            try:
+                self.assertEqual(
+                    migrated.execute("SELECT value FROM markers").fetchone()[0],
+                    "legacy",
+                )
+            finally:
+                migrated.close()
+
+    def test_process_configured_in_skill_data_fails_closed_before_delete(self):
+        from distribute_skill import build_distribution
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "distribution"
+            legacy = output_root / "ai-video-factory"
+            custom_data = legacy / "custom-state"
+            custom_data.mkdir(parents=True)
+            sentinel = custom_data / "paid.mp4"
+            sentinel.write_bytes(b"preserve-me")
+            with patch.dict(
+                os.environ,
+                {
+                    "FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home"),
+                    "FACTORY_DATA_DIR": str(custom_data.resolve()),
+                    "FACTORY_ENV_FILE": "",
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Skill 目录"):
+                    build_distribution(ROOT, output_root)
+
+            self.assertEqual(sentinel.read_bytes(), b"preserve-me")
+            self.assertTrue(legacy.is_dir())
+
+    def test_completed_external_runtime_rejects_untracked_newer_legacy_state(self):
+        from distribute_skill import build_distribution
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home"),
+                "FACTORY_DATA_DIR": "",
+            },
+            clear=False,
+        ):
+            output_root = Path(tmp) / "distribution"
+            legacy = output_root / "ai-video-factory"
+            legacy_data = legacy / "data"
+            legacy_data.mkdir(parents=True)
+            newer = legacy_data / "newer.txt"
+            newer.write_text("newer", encoding="utf-8")
+            external_data = Path(tmp) / "runtime-home" / "data"
+            external_data.mkdir(parents=True)
+            (external_data / "runtime.json").write_text(
+                '{"installed_version":"3.2.0.2"}', encoding="utf-8"
+            )
+            older = external_data / "older.txt"
+            older.write_text("older", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "同时存在"):
+                build_distribution(ROOT, output_root)
+
+            self.assertEqual(newer.read_text(encoding="utf-8"), "newer")
+            self.assertEqual(older.read_text(encoding="utf-8"), "older")
 
     def test_distribution_replacement_preserves_genuine_legacy_tree_before_delete(self):
         from distribute_skill import build_distribution
@@ -394,6 +515,11 @@ class FreshInstallTests(unittest.TestCase):
             )
             hardcoded_character.parent.mkdir(parents=True, exist_ok=True)
             hardcoded_character.write_bytes(b"legacy-character")
+            hardcoded_preview = (
+                package / "data" / "character_previews" / "hero.png"
+            )
+            hardcoded_preview.parent.mkdir(parents=True, exist_ok=True)
+            hardcoded_preview.write_bytes(b"legacy-preview")
             database = sqlite3.connect(legacy_data / "factory.db")
             try:
                 database.execute("CREATE TABLE legacy_marker(value TEXT NOT NULL)")
@@ -430,6 +556,10 @@ class FreshInstallTests(unittest.TestCase):
                 )
             )
             self.assertEqual(Path(character_path).read_bytes(), b"legacy-character")
+            self.assertEqual(
+                (external_data / "character_previews" / "hero.png").read_bytes(),
+                b"legacy-preview",
+            )
             self.assertTrue(report["legacy_state_migrated"]["data"])
 
     def test_skill_replacement_preserves_external_runtime_state(self):

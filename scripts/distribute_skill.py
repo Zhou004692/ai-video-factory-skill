@@ -11,7 +11,12 @@ import tempfile
 import zipfile
 
 from runtime_lock import exclusive_runtime_lock
-from runtime_paths import prepare_runtime_state, runtime_home
+from runtime_paths import (
+    environment_file,
+    prepare_runtime_state,
+    read_environment_file,
+    runtime_home,
+)
 
 
 SKILL_NAME = "ai-video-factory"
@@ -31,6 +36,7 @@ DIRECTORY_RULES = {
 SCRIPT_ROOT_FILES = {
     "scripts/bootstrap.py",
     "scripts/cli.py",
+    "scripts/distribute_skill.py",
     "scripts/doctor.py",
     "scripts/install.py",
     "scripts/management_server.py",
@@ -101,8 +107,6 @@ def _allowed(path: Path, root: Path) -> bool:
     relative = path.relative_to(root)
     if any(part in EXCLUDED_PARTS for part in relative.parts):
         return False
-    if relative.as_posix() == "scripts/distribute_skill.py":
-        return False
     if relative.as_posix() in SCRIPT_ROOT_FILES | REFERENCE_FILES:
         return True
     if relative.parts[:2] == ("scripts", "factory") and path.suffix == ".py":
@@ -135,6 +139,33 @@ host_demo:
 """
 
 
+def _has_substantive_files(directory: Path) -> bool:
+    return directory.is_dir() and any(
+        path.is_file() and path.name != ".gitkeep"
+        for path in directory.rglob("*")
+    )
+
+
+def _configured_in_skill_state(target: Path) -> bool:
+    values = read_environment_file(environment_file(target, os.environ))
+    configured = str(
+        os.environ.get("FACTORY_DATA_DIR")
+        or values.get("FACTORY_DATA_DIR")
+        or ""
+    ).strip()
+    if not configured:
+        return False
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        candidate = target / candidate
+    candidate = candidate.resolve()
+    try:
+        candidate.relative_to(target.resolve())
+    except ValueError:
+        return False
+    return _has_substantive_files(candidate)
+
+
 def build_distribution(source_root: Path, output_root: Path) -> Path:
     source_root = source_root.resolve()
     output_root = output_root.resolve()
@@ -143,10 +174,8 @@ def build_distribution(source_root: Path, output_root: Path) -> Path:
         data_dir = target / "data"
         has_legacy_state = (target / ".env").is_file()
         if data_dir.is_dir():
-            has_legacy_state = has_legacy_state or any(
-                path.is_file() and path.name != ".gitkeep"
-                for path in data_dir.rglob("*")
-            )
+            has_legacy_state = has_legacy_state or _has_substantive_files(data_dir)
+        has_legacy_state = has_legacy_state or _configured_in_skill_state(target)
         if has_legacy_state:
             with exclusive_runtime_lock(
                 runtime_home(target, os.environ),
@@ -186,6 +215,8 @@ def audit_distribution(package_root: Path) -> dict:
         if suffix in {".db", ".sqlite", ".sqlite3"}:
             findings.append({"rule": "local-database", "path": relative})
         if suffix not in TEXT_EXTENSIONS:
+            continue
+        if relative == "scripts/distribute_skill.py":
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for rule, pattern in AUDIT_RULES.items():

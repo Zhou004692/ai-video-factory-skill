@@ -36,20 +36,23 @@ function Show-StartupError([string]$message) {
     }
 }
 
+function Get-RuntimeHome {
+    if ($env:FACTORY_RUNTIME_HOME) {
+        return [System.IO.Path]::GetFullPath($env:FACTORY_RUNTIME_HOME)
+    } elseif ($env:LOCALAPPDATA) {
+        return Join-Path $env:LOCALAPPDATA "AI Video Factory"
+    } elseif ($env:APPDATA) {
+        return Join-Path $env:APPDATA "AI Video Factory"
+    } else {
+        return Join-Path (Split-Path -Parent $root) "AI Video Factory"
+    }
+}
+
 function Get-RuntimeEnvFile {
     if ($env:FACTORY_ENV_FILE) {
         return [System.IO.Path]::GetFullPath($env:FACTORY_ENV_FILE)
     }
-    $runtimeHome = if ($env:FACTORY_RUNTIME_HOME) {
-        $env:FACTORY_RUNTIME_HOME
-    } elseif ($env:LOCALAPPDATA) {
-        Join-Path $env:LOCALAPPDATA "AI Video Factory"
-    } elseif ($env:APPDATA) {
-        Join-Path $env:APPDATA "AI Video Factory"
-    } else {
-        Join-Path (Split-Path -Parent $root) "AI Video Factory"
-    }
-    return Join-Path $runtimeHome ".env"
+    return Join-Path (Get-RuntimeHome) ".env"
 }
 
 function Get-StartPage {
@@ -70,11 +73,7 @@ if (Test-ManagementReady) {
     exit 0
 }
 
-$logRoot = if ($env:LOCALAPPDATA) {
-    Join-Path $env:LOCALAPPDATA "AI Video Factory\logs"
-} else {
-    Join-Path $root "data\logs"
-}
+$logRoot = Join-Path (Get-RuntimeHome) "logs"
 New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
 $stdoutLog = Join-Path $logRoot "management-server.log"
 $stderrLog = Join-Path $logRoot "management-server-error.log"

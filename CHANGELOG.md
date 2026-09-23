@@ -10,6 +10,7 @@ All notable changes to AI Video Factory are documented here.
 - Changed upgrade snapshots to use SQLite's online backup API so committed WAL transactions are included consistently.
 - Added a shared runtime lock so Skill upgrades fail closed while the management service is using mutable state.
 - Isolated the Skill update release gate from real runtime paths and blocked all non-local network connections.
+- Included the sanitized distribution updater in every Skill package so destructive replacements can migrate state before deleting the old tree.
 
 ### Fixed
 
@@ -19,7 +20,9 @@ All notable changes to AI Video Factory are documented here.
 - Rebased database paths that pointed into the legacy Skill data tree while leaving external paths unchanged.
 - Migrated legacy relative custom data directories and hardcoded media subtrees into the stable runtime directory.
 - Failed closed when legacy state conflicts with a populated, incomplete external runtime directory.
+- Added signed legacy-migration evidence so a completed runtime cannot hide newer state that reappeared in an old Skill tree.
 - Routed anchor recovery, management uploads and quality-canary evidence to the external runtime directory.
+- Migrated legacy character previews and moved launcher logs and startup locks into the stable runtime home.
 
 ## [3.2.0.1] - 2026-09-20
 
