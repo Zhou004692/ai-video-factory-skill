@@ -16,6 +16,21 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 class FreshInstallTests(unittest.TestCase):
+    def test_migration_directory_promotion_retries_transient_permission_errors(self):
+        import runtime_paths
+
+        staging = Path("staging")
+        destination = Path("destination")
+        permission_error = PermissionError(5, "temporarily scanned")
+        with patch(
+            "runtime_paths.os.replace",
+            side_effect=(permission_error, permission_error, None),
+        ) as replace, patch("runtime_paths.time.sleep") as sleep:
+            runtime_paths._promote_staging_directory(staging, destination)
+
+        self.assertEqual(replace.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_windows_launcher_runtime_path_precedence_matches_python(self):
         launcher = (ROOT / "scripts" / "open_management.ps1").read_text(
             encoding="utf-8"

@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import time
 from typing import Mapping
 import uuid
 
@@ -297,6 +298,18 @@ def _merge_legacy_subtree(source: Path, destination: Path) -> None:
         shutil.copy2(path, target)
 
 
+def _promote_staging_directory(staging: Path, destination: Path) -> None:
+    """Atomically promote a migration tree, tolerating transient Windows scans."""
+    for attempt in range(8):
+        try:
+            os.replace(staging, destination)
+            return
+        except PermissionError:
+            if destination.exists() or attempt == 7:
+                raise
+            time.sleep(min(0.05 * (2 ** attempt), 0.4))
+
+
 def _copy_legacy_data(
     source: Path,
     destination: Path,
@@ -341,7 +354,7 @@ def _copy_legacy_data(
             ),
             encoding="utf-8",
         )
-        staging.replace(destination)
+        _promote_staging_directory(staging, destination)
     except BaseException:
         if staging.exists():
             shutil.rmtree(staging)
