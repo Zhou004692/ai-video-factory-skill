@@ -1401,7 +1401,9 @@ class ManagementService:
             raise ValueError(f"provider {provider} 不支持远端任务核对")
         if provider in {"seedance_scene", "seedance_identity"} and not terminal_reconciliation:
             from . import anchor_recovery
-            return anchor_recovery.reconcile(self.database, self.root, job_id, str(task_id), inspected)
+            return anchor_recovery.reconcile(
+                self.database, self.data_dir, job_id, str(task_id), inspected
+            )
         status = str(inspected.get("status") or "unknown").strip().casefold()
         if status not in {"completed", "failed"}:
             provider_tasks.mark_action_required(
@@ -2123,7 +2125,9 @@ class ManagementService:
             ),
         }
         canary_scorecard = quality_canary.summarize_acceptance_records(
-            quality_canary.load_acceptance_records(self.root)
+            quality_canary.load_acceptance_records(
+                self.root, data_dir=self.data_dir
+            )
         )
         production_compiler_v2 = production_metrics.production_v2_summary(
             self.database

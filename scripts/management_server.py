@@ -17,7 +17,8 @@ from urllib.parse import parse_qs, urlparse
 import webbrowser
 
 from dotenv import load_dotenv
-from runtime_paths import environment_file
+from runtime_lock import exclusive_runtime_lock
+from runtime_paths import environment_file, runtime_home
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(environment_file(SERVER_ROOT, os.environ))
@@ -312,7 +313,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
             raise ValueError("请选择需要上传的音视频文件")
         if length > MEDIA_UPLOAD_MAX_BYTES:
             raise OverflowError("上传文件过大，单个文件不能超过 512 MB")
-        upload_root = self.service.root / "data" / "management_uploads"
+        upload_root = self.service.data_dir / "management_uploads"
         upload_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="source-", dir=upload_root) as tmp:
             target = Path(tmp) / filename
@@ -338,7 +339,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
             raise ValueError("请选择需要上传的角色图片")
         if length > CUSTOM_CHARACTER_IMAGE_MAX_BYTES:
             raise OverflowError("单张角色图片不能超过 20 MB")
-        upload_root = self.service.root / "data" / "management_uploads"
+        upload_root = self.service.data_dir / "management_uploads"
         upload_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="character-", dir=upload_root) as tmp:
             target = Path(tmp) / filename
@@ -1088,6 +1089,25 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
 
 
 def serve(
+    host: str | None = None,
+    port: int = 8765,
+    *,
+    open_browser: bool = True,
+    start_page: str = "overview",
+) -> None:
+    with exclusive_runtime_lock(
+        runtime_home(SKILL_ROOT, os.environ),
+        purpose="启动管理服务",
+    ):
+        _serve_locked(
+            host,
+            port,
+            open_browser=open_browser,
+            start_page=start_page,
+        )
+
+
+def _serve_locked(
     host: str | None = None,
     port: int = 8765,
     *,

@@ -3922,14 +3922,28 @@ class RealQualityCanaryContractTests(unittest.TestCase):
     def test_write_acceptance_record_is_atomic_and_runtime_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            runtime_data = root / "external-runtime-data"
             record = {"schema_version": 1, "run_id": "run-001"}
-            path = quality_canary.write_acceptance_record(root, record)
+            path = quality_canary.write_acceptance_record(
+                root, record, data_dir=runtime_data
+            )
 
             self.assertEqual(
-                path, root / "data" / "acceptance" / "run-001" / "acceptance.json"
+                path,
+                runtime_data.resolve()
+                / "acceptance"
+                / "run-001"
+                / "acceptance.json",
             )
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), record)
             self.assertFalse(path.with_suffix(".json.tmp").exists())
+            self.assertEqual(
+                quality_canary.load_acceptance_records(
+                    root, data_dir=runtime_data
+                ),
+                [record],
+            )
+            self.assertFalse((root / "data").exists())
 
 
 if __name__ == "__main__":

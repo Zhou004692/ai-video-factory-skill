@@ -11247,6 +11247,7 @@ class ManagementMediaServerTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             service.root = Path(tmp)
+            service.data_dir = Path(tmp) / "external-runtime-data"
             ConsoleHandler.service = service
             server = ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHandler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11318,6 +11319,7 @@ class ManagementMediaServerTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             service.root = Path(tmp)
+            service.data_dir = Path(tmp) / "external-runtime-data"
             ConsoleHandler.service = service
             server = ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHandler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11851,6 +11853,7 @@ class ManagementMediaServerTests(unittest.TestCase):
         service.add_media_source.side_effect = add_media_source
         with tempfile.TemporaryDirectory() as tmp:
             service.root = Path(tmp)
+            service.data_dir = Path(tmp) / "external-runtime-data"
             ConsoleHandler.service = service
             server = ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHandler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -11875,6 +11878,10 @@ class ManagementMediaServerTests(unittest.TestCase):
         self.assertEqual(captured["title"], "客户访谈")
         self.assertNotIn("..", captured["path"].name)
         self.assertEqual(captured["path"].suffix, ".mp4")
+        self.assertIn(
+            service.data_dir / "management_uploads",
+            captured["path"].parents,
+        )
         self.assertFalse(captured["path"].exists())
 
     def test_media_upload_endpoint_rejects_declared_oversize_before_reading(self):

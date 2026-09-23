@@ -18,7 +18,8 @@ class AnchorNetworkRecoveryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        (self.root / 'data').mkdir()
+        self.runtime_data = self.root / 'external-runtime-data'
+        self.runtime_data.mkdir()
         self.c = sqlite3.connect(':memory:')
         self.c.row_factory = sqlite3.Row
         self.c.executescript(db.DDL)
@@ -40,7 +41,12 @@ class AnchorNetworkRecoveryTests(unittest.TestCase):
         self.c.execute("INSERT INTO scene_visual_anchors(job_id,anchor_key,description,master_indexes,state,generator,model,error) VALUES('J-ANCHOR',?,'Office','[1,2]','FAILED','seedance_2_5','doubao-seedance-2-5-260628','download unknown')", (self.key,))
         self.c.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,cost_cents,usage_json) VALUES('remote-anchor','J-ANCHOR',-2001,'seedance_scene','generate',272,?)", (json.dumps({'status':'action_required'}),))
         self.c.commit()
-        self.service = ManagementService(self.c, self.root, worker_mode='external')
+        self.service = ManagementService(
+            self.c,
+            self.root,
+            worker_mode='external',
+            data_dir=self.runtime_data,
+        )
 
     def anchor(self):
         return self.c.execute("SELECT * FROM scene_visual_anchors").fetchone()
@@ -72,7 +78,10 @@ class AnchorNetworkRecoveryTests(unittest.TestCase):
         self.assertEqual(self.c.execute('SELECT cost_cents FROM jobs').fetchone()[0],272)
         self.assertEqual(self.c.execute('SELECT state FROM production_nodes WHERE node_id=?',(self.node['node_id'],)).fetchone()[0],'REVIEW_REQUIRED')
         self.assertEqual(provider_tasks.unresolved_task_ids(self.c,'J-ANCHOR'),[])
-        self.assertEqual(Path(self.anchor()['video_path']).read_bytes(),b'paid-media')
+        recovered_path = Path(self.anchor()['video_path'])
+        self.assertEqual(recovered_path.read_bytes(),b'paid-media')
+        self.assertTrue(recovered_path.is_relative_to(self.runtime_data.resolve()))
+        self.assertFalse((self.root / 'data').exists())
         with self.assertRaises(ValueError):
             self.reconcile()
         self.assertEqual(self.c.execute('SELECT cost_cents FROM jobs').fetchone()[0],272)

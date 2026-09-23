@@ -152,6 +152,8 @@ Graph V2 编译器与复杂度分析共用出镜/声音判断：画外对白和�
 2. 使用方安装或更新 Skill 后，由 Agent 按 `SKILL.md` 调用 `scripts/bootstrap.py --profile script --json` 完成本地运行环境、占位配置和数据库初始化。
 3. 需要管理台时，由 Agent 按宿主系统启动本地服务；Windows 使用 `scripts/open_management.ps1`，其他系统使用 Python 运行时启动 `scripts/management_server.py`。
 4. Skill 更新由使用方的 Skill 更新机制完成。可替换的 Skill 目录只保存代码；`.env`、数据库、角色素材和成片保存在独立运行目录，不会被覆盖式更新删除。
+
+更新前先关闭正在运行的管理服务，再同步新 Skill 并执行自举。升级与管理服务共用运行时互斥锁；若仍有进程占用数据，升级会停止并提示关闭服务，不会并发修改或回滚 SQLite。
 5. 管理台地址：`http://127.0.0.1:8765`。
 
 默认运行目录为 Windows 的 `%LOCALAPPDATA%\AI Video Factory`、macOS 的
@@ -216,7 +218,7 @@ powershell -ExecutionPolicy Bypass -File scripts\open_management.ps1
 ```
 
 Skill 更新门禁会回归“旧版状态迁移、覆盖式替换、WAL 一致性备份、失败回滚”，
-并在通过时输出 `SKILL_UPDATE_RELEASE_GATE_OK paid_provider_calls=0`。
+并在通过时输出 `SKILL_UPDATE_RELEASE_GATE_OK paid_provider_calls=0 external_requests=0`。
 
 ## 零费用技术链路回归与证据边界
 

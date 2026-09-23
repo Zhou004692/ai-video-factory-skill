@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from runtime_paths import resolve_data_dir
+
 from . import SKILL_ROOT, production_config
 from .clients import video_qa
 
@@ -34,9 +36,14 @@ def load_frozen_profiles(path: Path = PROFILE_PATH) -> list[dict[str, Any]]:
     return deepcopy(profiles)
 
 
-def load_acceptance_records(root: Path) -> list[dict[str, Any]]:
+def load_acceptance_records(
+    root: Path, *, data_dir: Path | None = None
+) -> list[dict[str, Any]]:
     """Load portable local acceptance records; malformed files stay non-fatal."""
-    acceptance_root = Path(root) / "data" / "acceptance"
+    runtime_data = Path(data_dir).resolve() if data_dir else resolve_data_dir(
+        Path(root), os.environ
+    )
+    acceptance_root = runtime_data / "acceptance"
     if not acceptance_root.is_dir():
         return []
     records: list[dict[str, Any]] = []
@@ -594,11 +601,19 @@ def build_acceptance_record(
     }
 
 
-def write_acceptance_record(root: Path, record: Mapping[str, Any]) -> Path:
+def write_acceptance_record(
+    root: Path,
+    record: Mapping[str, Any],
+    *,
+    data_dir: Path | None = None,
+) -> Path:
     run_id = str(record.get("run_id") or "").strip()
     if not run_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in run_id):
         raise ValueError("run_id must contain only letters, numbers, dash or underscore")
-    target = root / "data" / "acceptance" / run_id / "acceptance.json"
+    runtime_data = Path(data_dir).resolve() if data_dir else resolve_data_dir(
+        Path(root), os.environ
+    )
+    target = runtime_data / "acceptance" / run_id / "acceptance.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".json.tmp")
     temporary.write_text(

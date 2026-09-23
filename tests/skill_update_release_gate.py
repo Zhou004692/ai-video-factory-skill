@@ -1,25 +1,24 @@
-"""Zero-provider-cost regression gate for Skill replacement and state upgrades."""
+"""Zero-cost, state-isolated regression gate for Skill replacement upgrades."""
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
-import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scripts"))
 
-PROVIDER_CREDENTIALS = (
-    "ANTHROPIC_API_KEY",
-    "ARK_API_KEY",
-    "VOLC_ASR_API_KEY",
-    "VOLC_AK",
-    "VOLC_SK",
-    "VOLC_TTS_API_KEY",
-    "SUNO_API_KEY",
+from tests.zero_cost_release_gate import _SECRET_MARKERS, _guard_source
+
+
+RUNTIME_OVERRIDES = (
+    "FACTORY_RUNTIME_HOME",
+    "FACTORY_DATA_DIR",
+    "FACTORY_ENV_FILE",
+    "FACTORY_DB_PATH",
 )
 
 TEST_MODULES = (
@@ -30,27 +29,81 @@ TEST_MODULES = (
 )
 
 
+def _isolated_environment(
+    guard_root: Path,
+    runtime_home: Path,
+    telemetry_path: Path,
+) -> dict[str, str]:
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not any(marker in key.upper() for marker in _SECRET_MARKERS)
+        and key not in RUNTIME_OVERRIDES
+    }
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    pythonpath = [str(guard_root), str(ROOT), str(ROOT / "scripts")]
+    if existing_pythonpath:
+        pythonpath.append(existing_pythonpath)
+    environment.update({
+        "PYTHONPATH": os.pathsep.join(pythonpath),
+        "PYTHONUTF8": "1",
+        "FACTORY_RUNTIME_HOME": str(runtime_home),
+        "FACTORY_PROVIDER_MODE": "replay",
+        "FACTORY_REPLAY_DISABLE_WORKERS": "1",
+        "FACTORY_ZERO_COST_SOCKET_TELEMETRY": str(telemetry_path),
+    })
+    return environment
+
+
 def main() -> int:
-    previous = {name: os.environ.get(name) for name in PROVIDER_CREDENTIALS}
-    previous_runtime_home = os.environ.get("FACTORY_RUNTIME_HOME")
-    with tempfile.TemporaryDirectory(prefix="ai-video-factory-update-gate-") as tmp:
-        os.environ["FACTORY_RUNTIME_HOME"] = str(Path(tmp) / "runtime-home")
-        for name in PROVIDER_CREDENTIALS:
-            os.environ.pop(name, None)
-        try:
-            suite = unittest.defaultTestLoader.loadTestsFromNames(TEST_MODULES)
-            result = unittest.TextTestRunner(verbosity=1).run(suite)
-        finally:
-            if previous_runtime_home is None:
-                os.environ.pop("FACTORY_RUNTIME_HOME", None)
-            else:
-                os.environ["FACTORY_RUNTIME_HOME"] = previous_runtime_home
-            for name, value in previous.items():
-                if value is not None:
-                    os.environ[name] = value
-    if not result.wasSuccessful():
-        return 1
-    print("SKILL_UPDATE_RELEASE_GATE_OK paid_provider_calls=0")
+    with tempfile.TemporaryDirectory(
+        prefix="ai-video-factory-update-gate-"
+    ) as directory:
+        guard_root = Path(directory).resolve()
+        runtime_home = guard_root / "runtime-home"
+        telemetry_path = guard_root / "external-requests.jsonl"
+        (guard_root / "sitecustomize.py").write_text(
+            _guard_source(), encoding="utf-8"
+        )
+        environment = _isolated_environment(
+            guard_root,
+            runtime_home,
+            telemetry_path,
+        )
+        completed = subprocess.run(
+            [sys.executable, "-m", "unittest", *TEST_MODULES],
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if completed.stdout:
+            print(completed.stdout.rstrip(), flush=True)
+        external_requests = 0
+        if telemetry_path.is_file():
+            external_requests = sum(
+                1 for line in telemetry_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines() if line.strip()
+            )
+        if completed.returncode or external_requests:
+            if external_requests:
+                print(
+                    f"Skill update gate blocked {external_requests} external request(s)",
+                    file=sys.stderr,
+                )
+            return 1
+        resolved_home = Path(environment["FACTORY_RUNTIME_HOME"]).resolve()
+        if resolved_home != runtime_home or not resolved_home.is_relative_to(guard_root):
+            print("Skill update gate runtime isolation failed", file=sys.stderr)
+            return 1
+    print(
+        "SKILL_UPDATE_RELEASE_GATE_OK "
+        "paid_provider_calls=0 external_requests=0"
+    )
     return 0
 
 

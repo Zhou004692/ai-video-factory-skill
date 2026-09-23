@@ -12,7 +12,8 @@ import venv
 
 from factory.runtime_backup import create_upgrade_snapshot, restore_upgrade_snapshot
 from factory.runtime_profile import resolve_runtime_profile
-from runtime_paths import prepare_runtime_state
+from runtime_lock import exclusive_runtime_lock
+from runtime_paths import prepare_runtime_state, runtime_home
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,8 +104,8 @@ def _write_runtime_metadata(metadata_file: Path, version: str) -> None:
     temporary.replace(metadata_file)
 
 
-def install(root: Path = ROOT, *, create_venv: bool = True,
-            install_dependencies: bool = True) -> dict:
+def _install_unlocked(root: Path, *, create_venv: bool,
+                      install_dependencies: bool) -> dict:
     if sys.version_info < (3, 11):
         raise RuntimeError("Python 3.11 or newer is required")
     root = root.resolve()
@@ -194,6 +195,20 @@ def install(root: Path = ROOT, *, create_venv: bool = True,
         "start_page": "config" if configuration_required else "overview",
         "paid_provider_calls": 0,
     }
+
+
+def install(root: Path = ROOT, *, create_venv: bool = True,
+            install_dependencies: bool = True) -> dict:
+    if sys.version_info < (3, 11):
+        raise RuntimeError("Python 3.11 or newer is required")
+    root = root.resolve()
+    home = runtime_home(root, os.environ)
+    with exclusive_runtime_lock(home, purpose="安装或升级"):
+        return _install_unlocked(
+            root,
+            create_venv=create_venv,
+            install_dependencies=install_dependencies,
+        )
 
 
 def main() -> int:

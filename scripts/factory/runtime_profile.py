@@ -104,7 +104,7 @@ def resolve_runtime_profile(
         raise RuntimeProfileError("server 模式必须配置 FACTORY_ADMIN_PASSWORD_HASH")
     data_dir = Path(data_value).expanduser()
     if not data_dir.is_absolute():
-        data_dir = root / data_dir
+        raise RuntimeProfileError("server 模式的 FACTORY_DATA_DIR 必须使用绝对路径")
     origin = f"{parsed.scheme}://{parsed.netloc}"
     return RuntimeProfile(
         mode="server",

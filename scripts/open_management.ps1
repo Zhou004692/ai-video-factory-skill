@@ -44,8 +44,10 @@ function Get-RuntimeEnvFile {
         $env:FACTORY_RUNTIME_HOME
     } elseif ($env:LOCALAPPDATA) {
         Join-Path $env:LOCALAPPDATA "AI Video Factory"
+    } elseif ($env:APPDATA) {
+        Join-Path $env:APPDATA "AI Video Factory"
     } else {
-        Join-Path $env:USERPROFILE "AppData\Local\AI Video Factory"
+        Join-Path (Split-Path -Parent $root) "AI Video Factory"
     }
     return Join-Path $runtimeHome ".env"
 }

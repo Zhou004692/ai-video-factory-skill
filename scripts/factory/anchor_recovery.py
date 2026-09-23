@@ -24,7 +24,7 @@ def anchor_row(database, node):
     return table, column, key, rows[0]
 
 
-def reconcile(database, root, job_id, task_id, inspected):
+def reconcile(database, data_dir, job_id, task_id, inspected):
     rows = database.execute('SELECT * FROM production_nodes WHERE job_id=? AND provider_task_id=?',
                             (job_id, task_id)).fetchall()
     if len(rows) != 1:
@@ -56,7 +56,7 @@ def reconcile(database, root, job_id, task_id, inspected):
             raise ValueError('Invalid downloaded anchor bytes')
         # Unique immutable paths: a crash or losing concurrent request leaves
         # unreferenced media, never overwrites the currently approved artifact.
-        asset_root = (Path(root) / 'data' / 'assets').resolve()
+        asset_root = (Path(data_dir) / 'assets').resolve()
         directory = (asset_root / job_id / 'anchor_recovery' / uuid.uuid4().hex).resolve()
         if not directory.is_relative_to(asset_root):
             raise ValueError('Invalid anchor asset location')

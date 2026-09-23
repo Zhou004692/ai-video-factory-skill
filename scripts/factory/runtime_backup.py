@@ -28,6 +28,32 @@ def _snapshot_sqlite(source: Path, destination: Path) -> None:
         source_connection.close()
 
 
+def _restore_sqlite(snapshot: Path, target: Path) -> None:
+    """Restore through SQLite so open WAL readers never see a replaced DB file."""
+    source_connection = sqlite3.connect(
+        f"file:{snapshot.as_posix()}?mode=ro", uri=True, timeout=30
+    )
+    target_connection = sqlite3.connect(target, timeout=30)
+    try:
+        source_connection.backup(target_connection)
+        target_connection.commit()
+    except sqlite3.DatabaseError as exc:
+        message = str(exc).casefold()
+        if "not a database" not in message and "malformed" not in message:
+            raise
+        target_connection.close()
+        source_connection.close()
+        Path(f"{target}-wal").unlink(missing_ok=True)
+        Path(f"{target}-shm").unlink(missing_ok=True)
+        shutil.copy2(snapshot, target)
+        return
+    finally:
+        try:
+            target_connection.close()
+        finally:
+            source_connection.close()
+
+
 def create_upgrade_snapshot(
     *, root: Path, data_dir: Path, env_file: Path
 ) -> Path | None:
@@ -87,6 +113,6 @@ def restore_upgrade_snapshot(backup: Path) -> None:
             shutil.copytree(snapshot, target)
         else:
             if item["name"] == "database":
-                Path(f"{target}-wal").unlink(missing_ok=True)
-                Path(f"{target}-shm").unlink(missing_ok=True)
-            shutil.copy2(snapshot, target)
+                _restore_sqlite(snapshot, target)
+            else:
+                shutil.copy2(snapshot, target)

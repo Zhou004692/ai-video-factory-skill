@@ -116,6 +116,22 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertNotIn("secret", repr(public).lower())
         self.assertNotIn("s" * 32, repr(profile))
 
+    def test_server_rejects_relative_data_directory(self):
+        from factory.runtime_profile import RuntimeProfileError, resolve_runtime_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeProfileError, "绝对路径"):
+                resolve_runtime_profile(
+                    root=Path(tmp),
+                    environ={
+                        "FACTORY_RUNTIME": "server",
+                        "FACTORY_PUBLIC_BASE_URL": "https://video.example.com",
+                        "FACTORY_DATA_DIR": "relative-data",
+                        "FACTORY_SESSION_SECRET": "x" * 32,
+                        "FACTORY_ADMIN_PASSWORD_HASH": "hash",
+                    },
+                )
+
     def test_database_path_uses_runtime_data_dir_unless_explicitly_overridden(self):
         from factory import db
 

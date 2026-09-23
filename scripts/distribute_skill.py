@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import tempfile
 import zipfile
+
+from runtime_lock import exclusive_runtime_lock
+from runtime_paths import prepare_runtime_state, runtime_home
 
 
 SKILL_NAME = "ai-video-factory"
@@ -32,6 +36,7 @@ SCRIPT_ROOT_FILES = {
     "scripts/management_server.py",
     "scripts/open_management.ps1",
     "scripts/requirements.txt",
+    "scripts/runtime_lock.py",
     "scripts/runtime_paths.py",
 }
 
@@ -135,7 +140,22 @@ def build_distribution(source_root: Path, output_root: Path) -> Path:
     output_root = output_root.resolve()
     target = output_root / SKILL_NAME
     if target.exists():
-        shutil.rmtree(target)
+        data_dir = target / "data"
+        has_legacy_state = (target / ".env").is_file()
+        if data_dir.is_dir():
+            has_legacy_state = has_legacy_state or any(
+                path.is_file() and path.name != ".gitkeep"
+                for path in data_dir.rglob("*")
+            )
+        if has_legacy_state:
+            with exclusive_runtime_lock(
+                runtime_home(target, os.environ),
+                purpose="替换 Skill",
+            ):
+                prepare_runtime_state(target, os.environ)
+                shutil.rmtree(target)
+        else:
+            shutil.rmtree(target)
     target.mkdir(parents=True)
 
     for path in source_root.rglob("*"):
