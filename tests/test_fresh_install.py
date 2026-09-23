@@ -157,6 +157,44 @@ class FreshInstallTests(unittest.TestCase):
             self.assertEqual(value, "copied")
             self.assertTrue(report["legacy_state_migrated"]["data"])
 
+    def test_legacy_relative_custom_data_directory_migrates_with_new_semantics(self):
+        from distribute_skill import build_distribution
+        from install import install
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"FACTORY_RUNTIME_HOME": str(Path(tmp) / "runtime-home")},
+            clear=False,
+        ):
+            package = build_distribution(ROOT, Path(tmp) / "distribution")
+            (package / ".env").write_text(
+                "FACTORY_DATA_DIR=custom-runtime\nARK_API_KEY=legacy-secret\n",
+                encoding="utf-8",
+            )
+            legacy_data = package / "custom-runtime"
+            legacy_data.mkdir()
+            database = sqlite3.connect(legacy_data / "factory.db")
+            try:
+                database.execute("CREATE TABLE legacy_marker(value TEXT NOT NULL)")
+                database.execute(
+                    "INSERT INTO legacy_marker(value) VALUES ('custom-copied')"
+                )
+                database.commit()
+            finally:
+                database.close()
+
+            report = install(package, create_venv=False, install_dependencies=False)
+
+            external_data = Path(tmp) / "runtime-home" / "custom-runtime"
+            self.assertEqual(Path(report["data_dir"]), external_data.resolve())
+            copied = sqlite3.connect(external_data / "factory.db")
+            try:
+                value = copied.execute("SELECT value FROM legacy_marker").fetchone()[0]
+            finally:
+                copied.close()
+            self.assertEqual(value, "custom-copied")
+            self.assertTrue(report["legacy_state_migrated"]["data"])
+
     def test_skill_replacement_preserves_external_runtime_state(self):
         from distribute_skill import build_distribution
         from install import install

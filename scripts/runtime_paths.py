@@ -127,9 +127,16 @@ def prepare_runtime_state(
         shutil.copy2(legacy_env, env_file)
         env_migrated = True
 
-    combined = {**read_environment_file(env_file), **values}
+    combined = {
+        **read_environment_file(env_file),
+        **{key: value for key, value in values.items() if str(value).strip()},
+    }
     data_dir = resolve_data_dir(root, combined)
-    legacy_data = root / "data"
+    configured_data = str(combined.get("FACTORY_DATA_DIR") or "").strip()
+    legacy_data = Path(configured_data).expanduser() if configured_data else root / "data"
+    if not legacy_data.is_absolute():
+        legacy_data = root / legacy_data
+    legacy_data = legacy_data.resolve()
     data_migrated = False
     empty_external_data = data_dir.is_dir() and not any(data_dir.iterdir())
     if (
