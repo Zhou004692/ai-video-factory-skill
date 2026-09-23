@@ -2,6 +2,24 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.2.0.3] - 2026-09-23
+
+### Added
+
+- Added a zero-cost transport preflight for the model API, media upload and provider download paths, with separate DNS, TCP, TLS, read-only HTTP and application-route evidence.
+- Added management-console transport diagnostics and persisted the latest sanitized report in the external runtime directory.
+
+### Changed
+
+- Changed the smoke check to use read-only transport probes instead of LLM, invalid video-generation or credentialed storage requests.
+- Changed paid production start and budget-resume entry points to fail before worker dispatch when the transport preflight is unavailable.
+- Preserved sanitized transport phase evidence for Seedance submit, poll, download, reconciliation and video-QA failures.
+
+### Fixed
+
+- Preserved the generated candidate and actionable network evidence when automatic video QA cannot connect.
+- Kept non-reconcilable unknown submissions on the account guide instead of showing a misleading remote-task action label.
+
 ## [3.2.0.2] - 2026-09-23
 
 ### Changed

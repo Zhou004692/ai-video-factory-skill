@@ -63,6 +63,9 @@ def _pause_outcome_from_exception(exc: Exception) -> NodeOutcome | None:
                 int(value)
                 if attribute.endswith("_cents") else str(value)
             )
+    diagnostic = getattr(exc, "transport_diagnostic", None)
+    if isinstance(diagnostic, dict):
+        output["transport"] = dict(diagnostic)
     if pause_state == "PROVIDER_ACTION_REQUIRED":
         return NodeOutcome.require_action(output)
     if pause_state == "BUDGET_CONFIRMATION_REQUIRED":
@@ -326,6 +329,10 @@ async def run_ready_wave(
                 output={"error": str(exc), **({
                     "submit_result_unknown": exc.submit_result_unknown,
                     "stable_code": getattr(exc, "stable_code", None),
+                    **({"transport": dict(exc.transport_diagnostic)}
+                       if isinstance(
+                           getattr(exc, "transport_diagnostic", None), dict
+                       ) else {}),
                 } if isinstance(getattr(exc, "submit_result_unknown", None), bool) else {})},
                 error_code=type(exc).__name__,
             )

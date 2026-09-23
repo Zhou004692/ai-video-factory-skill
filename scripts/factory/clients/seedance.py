@@ -30,7 +30,7 @@ import re
 
 import httpx
 
-from .. import provider_runtime
+from .. import provider_runtime, transport_diagnostics
 from . import provider_downloads
 
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
@@ -255,14 +255,28 @@ def _provider_error(
 
 
 def _submission_transport_error(exc: BaseException) -> RuntimeError:
+    endpoint = f"{ARK_BASE}/contents/generations/tasks"
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
         error = SeedanceSubmissionUnknownError(
             "Seedance 提交前连接失败；本次错误归类为 transient_network，"
             "可按重试策略处理。"
         )
         error.submit_result_unknown = False
+        error.transport_diagnostic = transport_diagnostics.exception_diagnostic(
+            exc,
+            stage="submit_connect",
+            endpoint=endpoint,
+            submit_result_unknown=False,
+        )
         return error
-    return _ambiguous_provider_error(stage="submit")
+    error = _ambiguous_provider_error(stage="submit")
+    error.transport_diagnostic = transport_diagnostics.exception_diagnostic(
+        exc,
+        stage="submit_response",
+        endpoint=endpoint,
+        submit_result_unknown=True,
+    )
+    return error
 
 
 def _ambiguous_provider_error(
@@ -733,15 +747,23 @@ async def text_to_video(
                 ) from None
 
         # 2. 轮询
+        last_poll_diagnostic = None
         for _ in range(max(1, timeout // 5)):
             await asyncio.sleep(5)
             try:
                 s = await cli.get(
                     f"{ARK_BASE}/contents/generations/tasks/{task_id}"
                 )
-            except httpx.TransportError:
+            except httpx.TransportError as exc:
                 # The paid task id is known. Continue polling that same task;
                 # never create a second task because a status request failed.
+                last_poll_diagnostic = transport_diagnostics.exception_diagnostic(
+                    exc,
+                    stage="poll",
+                    endpoint=f"{ARK_BASE}/contents/generations/tasks/{task_id}",
+                    submit_result_unknown=False,
+                    submit_state="submitted_known",
+                )
                 continue
             if s.status_code >= 500:
                 continue
@@ -793,14 +815,24 @@ async def text_to_video(
                     video, _ = await provider_downloads.download_bytes(
                         video_url, timeout=120
                     )
-                except httpx.TransportError:
+                except httpx.TransportError as exc:
                     notify_task_updated("action_required", {
                         "status": "action_required",
                         "usage": data.get("usage") or {},
                     })
-                    raise _ambiguous_provider_error(
+                    error = _ambiguous_provider_error(
                         stage="下载", task_id=task_id
-                    ) from None
+                    )
+                    error.transport_diagnostic = (
+                        transport_diagnostics.exception_diagnostic(
+                            exc,
+                            stage="download",
+                            endpoint=video_url,
+                            submit_result_unknown=False,
+                            submit_state="submitted_known",
+                        )
+                    )
+                    raise error from None
                 except httpx.HTTPStatusError as exc:
                     notify_task_updated("action_required", {
                         "status": "action_required",
@@ -821,7 +853,10 @@ async def text_to_video(
                 notify_task_updated("failed", data)
                 raise _task_failure_error(task_id, data)
         notify_task_updated("action_required", {"status": "action_required"})
-        raise _ambiguous_provider_error(stage="轮询", task_id=task_id)
+        error = _ambiguous_provider_error(stage="轮询", task_id=task_id)
+        if last_poll_diagnostic is not None:
+            error.transport_diagnostic = last_poll_diagnostic
+        raise error
 
 
 async def inspect_task(task_id: str) -> dict:
@@ -864,8 +899,18 @@ async def inspect_task(task_id: str) -> dict:
             response = await cli.get(
                 f"{ARK_BASE}/contents/generations/tasks/{normalized_id}"
             )
-        except httpx.TransportError:
-            return {"status": "unknown", "task_id": normalized_id}
+        except httpx.TransportError as exc:
+            return {
+                "status": "unknown",
+                "task_id": normalized_id,
+                "transport_diagnostic": transport_diagnostics.exception_diagnostic(
+                    exc,
+                    stage="reconcile",
+                    endpoint=f"{ARK_BASE}/contents/generations/tasks/{normalized_id}",
+                    submit_result_unknown=False,
+                    submit_state="submitted_known",
+                ),
+            }
         if response.status_code >= 500:
             return {"status": "unknown", "task_id": normalized_id}
         if response.status_code >= 400:
@@ -897,8 +942,19 @@ async def inspect_task(task_id: str) -> dict:
             video, final_url = await provider_downloads.download_bytes(
                 video_url.strip(), timeout=120
             )
-        except httpx.HTTPError:
-            return {**result, "status": "unknown", "video_url": video_url}
+        except httpx.HTTPError as exc:
+            return {
+                **result,
+                "status": "unknown",
+                "video_url": video_url,
+                "transport_diagnostic": transport_diagnostics.exception_diagnostic(
+                    exc,
+                    stage="download",
+                    endpoint=video_url,
+                    submit_result_unknown=False,
+                    submit_state="submitted_known",
+                ),
+            }
         return {**result, "video_url": final_url, "video": video}
 
 

@@ -474,7 +474,8 @@ class SeedanceQualityError(RuntimeError):
                  candidate_path: Path | None = None,
                  candidate_url: str | None = None,
                  transcription: bigasr.Transcription | None = None,
-                 transcription_available: bool = False):
+                 transcription_available: bool = False,
+                 qa_evidence: dict | None = None):
         super().__init__(message)
         self.cost_cents = cost_cents
         self.provider_calls = provider_calls
@@ -483,6 +484,7 @@ class SeedanceQualityError(RuntimeError):
         self.candidate_url = candidate_url
         self.transcription = transcription or bigasr.Transcription("")
         self.transcription_available = bool(transcription_available)
+        self.qa_evidence = dict(qa_evidence or {})
         if candidate_path is not None and Path(candidate_path).is_file():
             self.pause_state = "PRODUCTION_REVIEW_REQUIRED"
 
@@ -950,13 +952,17 @@ def _record_failed_generation(db, job_id: str, idx: int,
             )
         qa_note = json.dumps({
             "status": "manual_review_required",
-            "reason": str(exc),
+            "reason": (
+                "自动质检不可用，候选母片已保留并转人工复核"
+                if exc.qa_evidence else str(exc)
+            ),
             "reasons": exc.reasons,
             "candidate_path": (
                 str(candidate_path) if candidate_path else None
             ),
             "candidate_url": candidate_url or None,
             "provider_calls": exc.provider_calls,
+            "diagnostic": exc.qa_evidence or None,
         }, ensure_ascii=False)
         db.execute(
             "UPDATE shots SET state='REVIEW_REQUIRED', error=?, provider='seedance', "
@@ -981,6 +987,10 @@ def _record_failed_generation(db, job_id: str, idx: int,
                 "status": "generation_failed", "failure_code": stable_code,
                 **({"submit_result_unknown": exc.submit_result_unknown}
                    if isinstance(getattr(exc, "submit_result_unknown", None), bool) else {}),
+                **({"transport": dict(exc.transport_diagnostic)}
+                   if isinstance(
+                       getattr(exc, "transport_diagnostic", None), dict
+                   ) else {}),
             }, ensure_ascii=False)
             if stable_code else None
         )
@@ -3272,8 +3282,18 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                     )
             return raw, decision, transcription, transcription_available
         except Exception as exc:
+            diagnostic = getattr(exc, "transport_diagnostic", None)
             return (
-                {"notes": f"qa_error: {exc}"},
+                {
+                    "status": "qa_error",
+                    "failure_code": str(
+                        getattr(exc, "stable_code", "") or "qa_unavailable"
+                    ),
+                    "transport": (
+                        dict(diagnostic) if isinstance(diagnostic, dict) else None
+                    ),
+                    "notes": "自动质检不可用，候选母片需人工复核",
+                },
                 video_qa.QADecision(False, ("qa_error",)),
                 transcription,
                 transcription_available,
@@ -3319,6 +3339,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             candidate_url=video_url,
             transcription=transcription,
             transcription_available=transcription_available,
+            qa_evidence=raw,
         )
 
     if decision.passed:

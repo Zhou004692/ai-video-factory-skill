@@ -7759,6 +7759,7 @@ class ManagementServiceTests(unittest.TestCase):
                 "last_error",
                 "master_capacity",
                 "provider_recovery",
+                "transport_preflight",
             },
         )
         self.assertFalse(payload["supervisor_alive"])
@@ -10607,6 +10608,17 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("充值后继续生成剩余母片", script)
         self.assertIn("母片已生成，自动质检未完成，需人工复核", script)
 
+    def test_ui_exposes_zero_cost_transport_preflight_and_phase_results(self):
+        script = (
+            ROOT / "scripts" / "management_ui" / "app.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("runTransportPreflight", script)
+        self.assertIn("/api/providers/seedance/transport-preflight", script)
+        self.assertIn("DNS 解析", script)
+        self.assertIn("TLS 握手", script)
+        self.assertIn("付费调用 0 次", script)
+
     def test_replay_fixture_miss_is_explained_as_a_safe_local_recovery(self):
         script = (
             ROOT / "scripts" / "management_ui" / "app.js"
@@ -11605,6 +11617,37 @@ class ManagementMediaServerTests(unittest.TestCase):
 
         self.assertEqual(payload["checked"], 4)
         service.reconcile_provider_tasks.assert_called_once_with(limit=4)
+
+    def test_transport_preflight_endpoint_is_read_only_service_call(self):
+        service = mock.Mock()
+        service.run_transport_preflight.return_value = {
+            "diagnostic_id": "transport-test",
+            "ready": False,
+            "paid_provider_calls": 0,
+            "provider_task_created": False,
+            "targets": [],
+        }
+        ConsoleHandler.service = service
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ConsoleHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            response = request.urlopen(request.Request(
+                f"http://127.0.0.1:{server.server_port}"
+                "/api/providers/seedance/transport-preflight",
+                data=b"{}",
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            ))
+            payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(payload["paid_provider_calls"], 0)
+        self.assertFalse(payload["provider_task_created"])
+        service.run_transport_preflight.assert_called_once_with()
 
     def test_performance_snapshot_endpoint_delegates_to_publication_service(self):
         service = mock.Mock()

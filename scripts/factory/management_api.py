@@ -26,7 +26,7 @@ from . import (
     production_invariants, production_projection, provider_capacity,
     provider_health, provider_tasks, recovery_controller, scene_assets,
     script_drafts, script_sources, source_analysis, source_scheduler,
-    state_machine, task_doctor, topic_briefs,
+    state_machine, task_doctor, topic_briefs, transport_diagnostics,
 )
 from .clients import douyin, music, seedance, video_qa, volc_assets, volc_tts
 from .video_routing import AUDIO_MODE_FIXED_TTS, normalize_audio_mode
@@ -713,6 +713,7 @@ class ManagementService:
         env_path: Path | None = None,
         production_service=None,
         production_read_model=None,
+        transport_preflight_enabled: bool = False,
     ):
         self.database = database
         self.root = Path(root).resolve()
@@ -725,6 +726,10 @@ class ManagementService:
         if worker_mode not in {"child_process", "external"}:
             raise ValueError("worker_mode must be child_process or external")
         self.worker_mode = worker_mode
+        self.transport_preflight_enabled = bool(transport_preflight_enabled)
+        self.transport_diagnostic_path = (
+            self.data_dir / "runtime" / "transport-preflight.json"
+        )
         if production_service is None or production_read_model is None:
             from .services import ProductionReadModel, ProductionService
         self.production_service = (
@@ -1866,7 +1871,35 @@ class ManagementService:
                 configured_limit=configured_master_limit,
             ),
             "provider_recovery": dict(self._last_provider_sweep),
+            "transport_preflight": transport_diagnostics.load_report(
+                self.transport_diagnostic_path
+            ),
         }
+
+    def run_transport_preflight(self) -> dict:
+        """Run read-only network checks and persist only sanitized evidence."""
+        environment = dict(os.environ)
+        environment.update(_read_env(self.env_path))
+        try:
+            timeout = float(
+                environment.get("PROVIDER_PREFLIGHT_TIMEOUT_SEC") or 4.0
+            )
+        except (TypeError, ValueError):
+            timeout = 4.0
+        timeout = max(1.0, min(timeout, 10.0))
+        return transport_diagnostics.run_preflight(
+            timeout=timeout,
+            environment=environment,
+            report_path=self.transport_diagnostic_path,
+        )
+
+    def _require_transport_preflight(self) -> dict | None:
+        if not self.transport_preflight_enabled:
+            return None
+        report = self.run_transport_preflight()
+        if not report.get("ready"):
+            raise transport_diagnostics.TransportPreflightError(report)
+        return report
 
     def production_consistency(self, *, limit: int = 100) -> dict:
         from . import production_projection
@@ -4008,7 +4041,10 @@ class ManagementService:
                         "label": (
                             "继续生成剩余母片"
                             if job["resumable"] else "核对远端任务"
-                            if job["unresolved_provider_tasks"] else "查看账号处理指引"
+                            if any(
+                                task.get("reconcilable") is not False
+                                for task in job["unresolved_provider_tasks"]
+                            ) else "查看账号处理指引"
                         ),
                     },
                 },
@@ -7815,6 +7851,8 @@ class ManagementService:
         approved_budget_cents: int | None = None,
         high_risk_confirmed: bool = False,
     ) -> dict:
+        if confirmed:
+            self._require_transport_preflight()
         return self.production_service.start(
             job_id,
             confirmed=confirmed,
@@ -7912,6 +7950,7 @@ class ManagementService:
                 int(confirmed_cost.get("projected_total_cost_cents") or 0),
                 required_total,
             )
+        self._require_transport_preflight()
         with self.database:
             for row in nodes:
                 node_id = str(row["node_id"])

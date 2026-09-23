@@ -7,11 +7,37 @@ import re
 
 import httpx
 
+from .. import transport_diagnostics
 from .claude import _extract_json
 from . import doubao_llm
 
 
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
+
+
+class VideoQATransportError(RuntimeError):
+    """Sanitized QA transport failure with submit certainty evidence."""
+
+    stable_code = "transient_network"
+    code = stable_code
+    error_code = stable_code
+
+
+def _transport_error(exc: BaseException, *, stage: str) -> VideoQATransportError:
+    submit_unknown = not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+    error = VideoQATransportError(
+        "视频自动质检网络不可用；候选母片已保留并转人工复核。"
+    )
+    error.submit_result_unknown = submit_unknown
+    error.retryable = False
+    error.non_retryable = True
+    error.transport_diagnostic = transport_diagnostics.exception_diagnostic(
+        exc,
+        stage=stage,
+        endpoint=f"{ARK_BASE}/chat/completions",
+        submit_result_unknown=submit_unknown,
+    )
+    return error
 
 
 @dataclass(frozen=True)
@@ -340,11 +366,14 @@ def analyze_continuity(
         "messages": [{"role": "user", "content": content}],
     }
     with httpx.Client(timeout=timeout) as cli:
-        response = cli.post(
-            f"{ARK_BASE}/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {key}"},
-        )
+        try:
+            response = cli.post(
+                f"{ARK_BASE}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {key}"},
+            )
+        except httpx.TransportError as exc:
+            raise _transport_error(exc, stage="continuity_qa_submit") from exc
         if response.status_code >= 400:
             raise RuntimeError(
                 f"continuity_qa {response.status_code}: {response.text[:800]} | "
@@ -417,11 +446,14 @@ def analyze(video_url: str, *, expect_speech: bool,
         }],
     }
     with httpx.Client(timeout=timeout) as cli:
-        response = cli.post(
-            f"{ARK_BASE}/chat/completions",
-            json=payload,
-            headers={"Authorization": f"Bearer {key}"},
-        )
+        try:
+            response = cli.post(
+                f"{ARK_BASE}/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {key}"},
+            )
+        except httpx.TransportError as exc:
+            raise _transport_error(exc, stage="qa_submit") from exc
         if response.status_code >= 400:
             raise RuntimeError(
                 f"video_qa {response.status_code}: {response.text[:800]} | "

@@ -748,6 +748,8 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 result = self.service.create_quality_canary(payload)
             elif request_path == "/api/providers/seedance/clear-block":
                 result = self.service.clear_seedance_provider_block()
+            elif request_path == "/api/providers/seedance/transport-preflight":
+                result = self.service.run_transport_preflight()
             elif request_path == "/api/integrations/douyin/disconnect":
                 result = self.service.disconnect_douyin()
             elif (request_path.startswith("/api/videos/")
@@ -1132,6 +1134,7 @@ def _serve_locked(
         worker_mode=profile.worker_mode,
         data_dir=profile.data_dir,
         env_path=environment_file(SKILL_ROOT, os.environ),
+        transport_preflight_enabled=True,
     )
     stop_event = threading.Event()
     supervisor = None
