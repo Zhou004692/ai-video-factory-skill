@@ -27,6 +27,7 @@ from . import (
     provider_health, provider_tasks, recovery_controller, scene_assets,
     script_drafts, script_sources, source_analysis, source_scheduler,
     state_machine, task_doctor, topic_briefs, transport_diagnostics,
+    master_download_recovery,
 )
 from .clients import douyin, music, seedance, video_qa, volc_assets, volc_tts
 from .video_routing import AUDIO_MODE_FIXED_TTS, normalize_audio_mode
@@ -4333,61 +4334,31 @@ class ManagementService:
             return None
         with self.database:
             self.database.execute("BEGIN IMMEDIATE")
-            placeholders = ",".join("?" for _ in retry_indexes)
-            known_paid_master = self.database.execute(
-                "SELECT 1 FROM shots s WHERE s.job_id=? "
-                f"AND s.idx IN ({placeholders}) AND (s.cost_cents>0 OR EXISTS("
-                "SELECT 1 FROM production_nodes n WHERE n.job_id=s.job_id "
-                "AND n.node_id='master:' || s.idx "
-                "AND (COALESCE(n.provider_task_id,'')<>'' OR n.actual_cost_cents>0)) "
-                "OR EXISTS(SELECT 1 FROM provider_calls c WHERE c.job_id=s.job_id "
-                "AND c.shot_idx=s.idx)) LIMIT 1",
-                (job_id, *retry_indexes),
-            ).fetchone()
-            if known_paid_master is None:
+            assessment = master_download_recovery.assess(
+                self.database, job_id, retry_indexes
+            )
+            if assessment is None:
                 return None
-            recoverable = []
-            for idx in retry_indexes:
-                row = self.database.execute(
-                    "SELECT n.node_id,n.output_json,n.provider_task_id,c.usage_json "
-                    "FROM production_nodes n JOIN provider_calls c "
-                    "ON c.task_id=n.provider_task_id AND c.job_id=n.job_id "
-                    "JOIN jobs j ON j.job_id=n.job_id "
-                    "WHERE n.job_id=? AND n.node_id=? AND n.state='FAILED' "
-                    "AND n.node_type='master' AND n.spec_hash=j.production_spec_hash "
-                    "AND c.shot_idx=? AND c.provider='seedance' AND j.state='FAILED'",
-                    (job_id, f"master:{idx}", idx),
-                ).fetchone()
-                if row is None:
-                    raise ValueError(
-                        "任务包含已付费母片，但部分待恢复母片尚未生成或缺少匹配的完成任务；"
-                        "请先核对母片任务，不能重新提交"
-                    )
-                try:
-                    usage = json.loads(row["usage_json"] or "{}")
-                except (TypeError, json.JSONDecodeError) as exc:
-                    raise ValueError("已付费母片任务证据损坏，不能重新提交") from exc
-                if not isinstance(usage, dict) or usage.get("status") != "completed":
-                    raise ValueError("已付费母片任务未确认完成，不能重新提交")
-                recoverable.append((idx, row))
-            for idx, row in recoverable:
-                output = json.loads(row["output_json"] or "{}")
+            if not assessment.eligible:
+                raise ValueError(assessment.reason)
+            for candidate in assessment.candidates:
+                output = json.loads(candidate.output_json or "{}")
                 output.pop("_executor_checkpoint", None)
-                output["resume_provider_task_id"] = row["provider_task_id"]
+                output["resume_provider_task_id"] = candidate.task_id
                 node_state_machine.transition_node_in_transaction(
-                    self.database, job_id, row["node_id"], "retry",
+                    self.database, job_id, candidate.node_id, "retry",
                     event_id=f"{job_id}:download-recovery:{secrets.token_hex(12)}",
-                    payload={"provider_task_id": row["provider_task_id"]},
+                    payload={"provider_task_id": candidate.task_id},
                 )
                 self.database.execute(
                     "UPDATE production_nodes SET output_json=?,lease_id=NULL,"
                     "heartbeat_at=NULL,error_code=NULL,next_action=NULL "
                     "WHERE job_id=? AND node_id=?",
-                    (json.dumps(output, ensure_ascii=False), job_id, row["node_id"]),
+                    (json.dumps(output, ensure_ascii=False), job_id, candidate.node_id),
                 )
                 self.database.execute(
                     "UPDATE shots SET state='PENDING',error=NULL,video_qa=NULL "
-                    "WHERE job_id=? AND idx=?", (job_id, idx),
+                    "WHERE job_id=? AND idx=?", (job_id, candidate.index),
                 )
             state_machine.transition(
                 self.database, job_id, "queued",
@@ -4398,7 +4369,8 @@ class ManagementService:
         return {
             "job_id": job_id, "state": "PRODUCTION_QUEUED",
             "recovery_kind": "completed_master_download",
-            "preserved_masters": completed, "remaining_masters": len(retry_indexes),
+            "preserved_masters": completed,
+            "remaining_masters": len(assessment.candidates),
             "manual_review_masters": 0,
         }
 
@@ -4415,7 +4387,11 @@ class ManagementService:
         }:
             raise ValueError("只有失败或账号处理完成的视频任务可以继续生成")
         plan = recovery_plan.resolve(self.database, job_id)
-        if plan is not None and "resume_failed_video" in plan["action_ids"]:
+        if (
+            plan is not None
+            and "resume_failed_video" in plan["action_ids"]
+            and plan.get("recovery_kind") != "completed_master_download"
+        ):
             return recovery_plan.resume_ready_graph(self.database, job_id)
         if plan is not None and "review_master_candidates" not in plan["action_ids"]:
             recovery_plan.require_action(self.database, job_id, "resume_failed_video")
@@ -4484,14 +4460,6 @@ class ManagementService:
         structured_failure_codes = {
             str(job["failure_code"] or "").strip(), *shot_failure_codes,
         } - {""}
-        # A reaped Worker can leave a submitted task pending even though its
-        # process failure is internal_error. Reconcile that evidence before any
-        # generation decision; this exception never authorizes a new submit.
-        interrupted_provider_task = bool(
-            resume_from_state == "FAILED"
-            and structured_failure_codes == {"internal_error"}
-            and provider_tasks.unresolved_task_ids(self.database, job_id)
-        )
         music_configuration_retry_ready = bool(
             structured_failure_codes == {"music_configuration_invalid"}
             and shots
@@ -4510,15 +4478,12 @@ class ManagementService:
             and structured_failure_codes != {"account_unavailable"}
             and not identity_anchor_retry_ready
             and not music_configuration_retry_ready
-            and not interrupted_provider_task
         ):
             raise ValueError(
                 "该失败任务的稳定 failure code 不可恢复；"
                 "隐私、内容政策、版权及其他 Provider 拒绝禁止重新提交"
             )
-        if not interrupted_provider_task and (
-            resume_from_state == "PROVIDER_ACTION_REQUIRED" or structured_failure_codes
-        ):
+        if resume_from_state == "PROVIDER_ACTION_REQUIRED" or structured_failure_codes:
             unresolved = provider_tasks.unresolved_task_ids(self.database, job_id)
             if unresolved:
                 raise ValueError(

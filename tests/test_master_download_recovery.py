@@ -13,7 +13,7 @@ import unittest
 from tests import test_strict_master_compose_journey as journey
 from tests.strict_handler_support import StrictMasterComposeReplay
 from factory.management_api import ManagementService
-from factory import db as factory_db
+from factory import db as factory_db, recovery_plan
 
 JOB_ID = journey.JOB_ID
 
@@ -26,7 +26,10 @@ class MasterDownloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
         journey.StrictMasterComposeJourneyTests.assert_single_paid_master_submission
     )
 
-    async def _recover(self, *, missing=False, remote_status=None, corrupt_binding=False):
+    async def _recover(
+        self, *, missing=False, remote_status=None, corrupt_binding=False,
+        corrupt_output=False,
+    ):
         contract = self.contract()
         recovery_steps = self.contract()["steps"][2:]
         corrupt = b"authored corrupt master media"
@@ -40,7 +43,7 @@ class MasterDownloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
         if remote_status:
             recovery_steps[0]["response"]["json"]["status"] = remote_status
             contract["steps"] = contract["steps"][:5]
-        if corrupt_binding:
+        if corrupt_binding or corrupt_output:
             contract["steps"] = contract["steps"][:4]
         with StrictMasterComposeReplay(contract=contract) as replay:
             self.prepare(replay)
@@ -59,6 +62,18 @@ class MasterDownloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 )
                 replay.database.commit()
                 with self.assertRaisesRegex(ValueError, "不能重新提交"):
+                    service.resume_failed_video(JOB_ID)
+                self.assertEqual(replay.database.execute(
+                    "SELECT state FROM jobs WHERE job_id=?", (JOB_ID,),
+                ).fetchone()[0], "FAILED")
+                return
+            if corrupt_output:
+                replay.database.execute(
+                    "UPDATE production_nodes SET output_json='{broken' "
+                    "WHERE job_id=? AND node_id='master:1'", (JOB_ID,),
+                )
+                replay.database.commit()
+                with self.assertRaisesRegex(ValueError, "证据损坏"):
                     service.resume_failed_video(JOB_ID)
                 self.assertEqual(replay.database.execute(
                     "SELECT state FROM jobs WHERE job_id=?", (JOB_ID,),
@@ -108,6 +123,9 @@ class MasterDownloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_nonmatching_task_evidence_cannot_requeue_paid_master(self):
         await self._recover(corrupt_binding=True)
+
+    async def test_damaged_node_output_cannot_requeue_paid_master(self):
+        await self._recover(corrupt_output=True)
 
     def _assert_mixed_recovery_refused(self, *, paid_idx, mismatched_later=False):
         with tempfile.TemporaryDirectory() as directory, closing(sqlite3.connect(":memory:")) as database:
@@ -178,7 +196,7 @@ class MasterDownloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
     def test_later_mismatched_paid_binding_cannot_partially_requeue(self):
         self._assert_mixed_recovery_refused(paid_idx=1, mismatched_later=True)
 
-    def _assert_interrupted_provider_resume(self, *, failure_code, unresolved, allowed):
+    def _assert_interrupted_provider_resume(self, *, failure_code, unresolved):
         with tempfile.TemporaryDirectory() as directory, closing(sqlite3.connect(":memory:")) as database:
             database.row_factory = sqlite3.Row
             database.executescript(factory_db.DDL)
@@ -204,37 +222,39 @@ class MasterDownloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     (JOB_ID, '{"status":"pending"}'),
                 )
             database.commit()
-            if allowed:
-                result = service.resume_failed_video(JOB_ID)
-                self.assertEqual(result["state"], "PROVIDER_ACTION_REQUIRED")
-                self.assertEqual(result["unresolved_provider_tasks"], ["crashed-task"])
+            plan = recovery_plan.resolve(database, JOB_ID)
+            if unresolved:
+                self.assertEqual(plan["next_action"]["id"], "reconcile_provider_task")
+                self.assertEqual(plan["task_ids"], ["crashed-task"])
+                with self.assertRaises(ValueError):
+                    service.resume_failed_video(JOB_ID)
                 self.assertEqual(tuple(database.execute(
                     "SELECT state,provider_task_id FROM production_nodes "
                     "WHERE job_id=? AND node_id='master:1'", (JOB_ID,),
                 ).fetchone()), ("RUNNING", "crashed-task"))
             else:
-                with self.assertRaisesRegex(ValueError, "不可恢复"):
+                with self.assertRaises(ValueError):
                     service.resume_failed_video(JOB_ID)
-                self.assertEqual(database.execute(
-                    "SELECT state FROM jobs WHERE job_id=?", (JOB_ID,),
-                ).fetchone()[0], "FAILED")
+            self.assertEqual(database.execute(
+                "SELECT state FROM jobs WHERE job_id=?", (JOB_ID,),
+            ).fetchone()[0], "FAILED")
             self.assertEqual(database.execute(
                 "SELECT cost_cents FROM jobs WHERE job_id=?", (JOB_ID,),
             ).fetchone()[0], 0)
 
     def test_internal_worker_failure_with_pending_task_pauses_for_reconciliation(self):
         self._assert_interrupted_provider_resume(
-            failure_code="internal_error", unresolved=True, allowed=True,
+            failure_code="internal_error", unresolved=True,
         )
 
     def test_internal_worker_failure_without_task_stays_failed(self):
         self._assert_interrupted_provider_resume(
-            failure_code="internal_error", unresolved=False, allowed=False,
+            failure_code="internal_error", unresolved=False,
         )
 
     def test_policy_failure_with_pending_task_cannot_resume(self):
         self._assert_interrupted_provider_resume(
-            failure_code="output_policy_rejected", unresolved=True, allowed=False,
+            failure_code="output_policy_rejected", unresolved=True,
         )
 
 

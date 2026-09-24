@@ -8,6 +8,7 @@ from pathlib import Path
 import unittest
 
 from tests.strict_process_support import StrictProcessJourney, master_fixture
+from factory import recovery_plan
 
 
 class StrictProcessRecoveryTests(unittest.TestCase):
@@ -40,8 +41,14 @@ class StrictProcessRecoveryTests(unittest.TestCase):
             self.assertEqual(journey.database.execute("SELECT state FROM jobs").fetchone()[0], "FAILED")
             # A transport receipt is not a committed completed-provider record.
             # The existing reconciliation gate must retain ownership, not POST.
-            result = journey.service.resume_failed_video(master_fixture.JOB_ID)
-            self.assertEqual(result["state"], "PROVIDER_ACTION_REQUIRED")
+            plan = recovery_plan.resolve(journey.database, master_fixture.JOB_ID)
+            self.assertEqual(plan["next_action"]["id"], "reconcile_provider_task")
+            with self.assertRaises(ValueError):
+                journey.service.resume_failed_video(master_fixture.JOB_ID)
+            self.assertEqual(
+                journey.database.execute("SELECT state FROM jobs").fetchone()[0],
+                "FAILED",
+            )
             self.assertEqual(journey.service.dispatch_production_queue()["dispatched_jobs"], [])
             self.assertEqual(len(journey.records), 1)
             self.assertEqual(journey.database.execute("SELECT provider_task_id FROM production_nodes WHERE node_id='master:1'").fetchone()[0], "strict-master-task-1")

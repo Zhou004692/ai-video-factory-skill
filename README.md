@@ -2,7 +2,7 @@
 
 面向短视频团队的一站式 AI 内容生产工作台：从人工选题或自动抓取开始，完成来源归档、选题简报、剧本审核、角色与场景一致性控制、Seedance 2.5 原生母片生成、本地导演剪辑、成片验收、渠道发布与效果回流。
 
-当前版本：`3.2.0.3`
+当前版本：`3.2.0.4`
 
 当前交付方式：直接分发 Skill 文件夹或压缩包，由使用方的 Skill 更新机制同步版本。
 
@@ -267,7 +267,7 @@ Full 套件分别记录以下有限证据，不允许跨层替代：
 
 Full 套件还会执行 3 条“来源 → 简报 → 剧本 → 制作设置 → 锚点 → 母片 → 本地合成 → 待发布”服务旅程、管理台 Playwright 旅程、26 条管理台故障与处理交互场景，以及 7 组服务层动作契约。核心服务旅程关闭 ASR；最终审核中的身份、口型、字幕同步、画面完整性、干净画面和剪辑节奏检查由脚本提交 `True`，不是对产物进行真实质量验收。24 个管理台动作分别声明 UI、后端、Worker 必需证据；Full 缺少任一必需动作证据会失败。结构、语义、媒体可解码性和技术缺陷断言保留，但这些计数和 `READY_TO_PUBLISH` 状态不能证明内容质量。
 
-报告新增 `evidence_boundaries`，逐维度记录 `status`、`source_kind`、`replacement_boundary`、`proves`、`does_not_prove` 和 `observed_checks`。当前 Flow Guard 的严格生产 handler / transport 回放、真实识别准确率、真实成片内容质量均为 `not_run`，不会因 `--suite full` 或通过标志自动升级。已知内置执行器的实际结果才能附带对应来源；自定义执行器、旧报告或结果缺失时按 `unknown` 处理。详细定义与后续证据要求见 [测试证据边界](docs/testing/assurance-boundaries.md)。
+报告新增 `evidence_boundaries`，逐维度记录 `status`、`source_kind`、`replacement_boundary`、`proves`、`does_not_prove` 和 `observed_checks`。Flow Guard Full 现单列执行有边界的 `strict_master_recovery`，验证已完成母片的浏览器与跨 Worker 下载恢复；完整生产链严格 handler / transport 回放、真实识别准确率、真实成片内容质量仍为 `not_run`，不会由该切片或其他通过标志自动升级。已知内置执行器的实际结果才能附带对应来源；自定义执行器、旧报告或结果缺失时按 `unknown` 处理。详细定义与后续证据要求见 [测试证据边界](docs/testing/assurance-boundaries.md)。
 
 严格边界建设已包含客户端传输契约，以及人物锚点、母片到导演合成两条正式处理器旅程。`tests.test_strict_provider_boundary` 在单进程中运行真实 Seedance、豆包和 ASR HTTPX 客户端；`tests.test_strict_full_flow` 执行人物锚点链路；`tests.test_strict_master_compose_journey` 执行正式母片、视频 QA、BigASR、本地导演合成和最终审核链路。它们都只在最终 transport 回放固定响应，并阻止未登记的 socket、DNS 和子进程外逃。
 
@@ -275,7 +275,7 @@ Full 套件还会执行 3 条“来源 → 简报 → 剧本 → 制作设置 �
 
 母片旅程还验证：ASR 结果按媒体 SHA 持久化并由合成阶段复用；合法空识别不会触发第二次 ASR，且会清除估算字幕；质量候选接受后不重复请求或计费；最终审核的事件、节点状态和任务投影原子提交。损坏媒体、QA/ASR 异常、合成失败、过期审核和并发相反审核均有失败回归。
 
-可独立运行 `python -m unittest tests.test_strict_full_flow tests.test_strict_provider_boundary tests.test_strict_master_compose_journey tests.test_master_transcriptions -v`。当前尚未接入 Flow Guard Full，不覆盖 Worker 重启、浏览器或完整进程树，也不验证真实识别和内容质量，因此 Flow Guard 的整体 `strict_transport_replay` 仍保持 `not_run`。固定请求契约见 [严格传输回放说明](docs/testing/strict-transport-replay.md)，正式 handler 的状态、费用、恢复契约和未覆盖范围见 [人物锚点正式处理器回放](docs/testing/strict-character-anchor-journey.md)与[母片到导演合成正式处理器回放](docs/testing/strict-master-compose-journey.md)。
+可独立运行 `python -m unittest tests.test_strict_full_flow tests.test_strict_provider_boundary tests.test_strict_master_compose_journey tests.test_master_transcriptions -v`。这些单进程旅程本身不覆盖 Worker 重启、浏览器或完整进程树；Flow Guard Full 另行执行的 `strict_master_recovery` 只覆盖一条已完成旁白母片的跨进程恢复。两类证据都不验证真实识别和内容质量，因此整体 `strict_transport_replay` 仍保持 `not_run`。固定请求契约见 [严格传输回放说明](docs/testing/strict-transport-replay.md)，正式 handler 的状态、费用、恢复契约和未覆盖范围见 [人物锚点正式处理器回放](docs/testing/strict-character-anchor-journey.md)与[母片到导演合成正式处理器回放](docs/testing/strict-master-compose-journey.md)。
 
 当前已完成的独立切片、真实执行边界发现的卡点及剩余接入工作，见 [稳定交付实施记录](docs/testing/stable-delivery-progress.md)。定向测试通过不等同于整个改进计划或真实视频质量已验收。
 

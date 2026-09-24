@@ -2,6 +2,24 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.2.0.4] - 2026-09-24
+
+### Added
+
+- Added a fail-closed paid-master recovery assessment shared by the management action plan and the mutation boundary.
+- Added a bounded browser-to-service-to-CLI recovery replay to Flow Guard Full, with source fingerprints and explicit evidence limits.
+
+### Changed
+
+- Routed every stopped task with an unresolved provider submission to the existing reconciliation action before any resume decision.
+- Kept completed-master recovery on the frozen task, node and provider ledger binding across a new Worker process.
+
+### Fixed
+
+- Recovered missing or corrupt completed master media with GET and download only, without a second Seedance generation submission or charge.
+- Prevented mixed paid and ungenerated masters, damaged bindings and unconfirmed remote tasks from falling back to paid generation.
+- Kept the management console on recovery progress after queueing instead of reopening the paid-generation confirmation flow.
+
 ## [3.2.0.3] - 2026-09-23
 
 ### Added

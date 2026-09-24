@@ -6,7 +6,7 @@ cannot make a paid retry eligible on their own. Legacy jobs retain their path.
 import json
 from pathlib import Path
 
-from . import network_recovery, provider_tasks
+from . import master_download_recovery, network_recovery, provider_tasks
 
 TERMINAL = frozenset({'REJECTED', 'REJECTED_PENDING_RECONCILIATION', 'PUBLISHED'})
 LABELS = {
@@ -60,7 +60,7 @@ def _resolve(database, job_id):
 
     if state in TERMINAL:
         return result(['reconcile_rejected_provider_cost'] if state == 'REJECTED_PENDING_RECONCILIATION' else [], '任务已终止或发布')
-    if 'RUNNING' in states or state in {'PRODUCTION_RUNNING', 'PRODUCTION_QUEUED'}:
+    if state in {'PRODUCTION_RUNNING', 'PRODUCTION_QUEUED'}:
         return result(['view_progress'], '后台正在处理，请等待当前操作结束')
     review_nodes = [r for r in nodes if r['node_type'] == 'master' and r['state'] == 'REVIEW_REQUIRED']
     candidate_reviews = []
@@ -73,12 +73,24 @@ def _resolve(database, job_id):
     review_actions = ['review_master_candidates'] if candidate_reviews else []
     if unresolved:
         return result(['reconcile_provider_task', *review_actions], '远端提交或产物尚未核对，保留已有候选，禁止重复生成', task_ids=unresolved)
+    if 'RUNNING' in states:
+        return result(['view_progress'], '后台节点仍在运行；如进度未变化，请执行过期租约恢复扫描')
     retry = network_recovery.retry_indexes(database, job_id)
     anchors = network_recovery.retry_anchor_ids(database, job_id)
     if retry or anchors:
         return result(['retry_network_failures', *review_actions], '仅重试已确认未提交的连接失败，保留已有锚点与母片', retry_indexes=retry, retry_anchor_ids=anchors)
     if candidate_reviews:
         return result(review_actions, '已有母片等待人工判断；接受或重做后重新判定剩余工作')
+    download_recovery = master_download_recovery.assess(database, job_id)
+    if download_recovery is not None:
+        if download_recovery.eligible:
+            return result(
+                ['resume_failed_video'],
+                download_recovery.reason,
+                recovery_kind='completed_master_download',
+                retry_indexes=list(download_recovery.indexes),
+            )
+        return result(['preserve_and_diagnose'], download_recovery.reason)
     if state == 'ANCHOR_REVIEW_REQUIRED':
         return result(['review_continuity_anchors'], '人物或场景锚点等待审核')
     if 'BUDGET_REQUIRED' in states or state == 'BUDGET_CONFIRMATION_REQUIRED':
