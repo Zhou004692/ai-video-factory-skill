@@ -356,13 +356,15 @@ def recover_expired_nodes(
     *,
     now: datetime | None = None,
     lease_timeout_sec: int = 60,
+    force: bool = False,
 ) -> dict[str, str]:
-    """Recover expired leases without issuing provider work."""
+    """Recover leases without provider work; force only after proven Worker exit."""
     with node_state_machine.atomic(database):
-        return _recover_expired_nodes(database, job_id, now=now, lease_timeout_sec=lease_timeout_sec)
+        return _recover_expired_nodes(database, job_id, now=now,
+                                      lease_timeout_sec=lease_timeout_sec, force=force)
 
 
-def _recover_expired_nodes(database, job_id, *, now, lease_timeout_sec):
+def _recover_expired_nodes(database, job_id, *, now, lease_timeout_sec, force=False):
     cutoff = (now or datetime.now(timezone.utc)) - timedelta(
         seconds=max(1, int(lease_timeout_sec))
     )
@@ -381,7 +383,7 @@ def _recover_expired_nodes(database, job_id, *, now, lease_timeout_sec):
                 heartbeat = heartbeat.replace(tzinfo=timezone.utc)
         except ValueError:
             heartbeat = datetime.min.replace(tzinfo=timezone.utc)
-        if heartbeat > cutoff:
+        if not force and heartbeat > cutoff:
             continue
         try:
             output = json.loads(row["output_json"] or "{}")

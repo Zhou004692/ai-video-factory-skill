@@ -1,5 +1,6 @@
 """Cross-process strict replay: durable paid-task/media recovery, no live I/O."""
 import hashlib
+import json
 import os
 import socket
 import sqlite3
@@ -38,6 +39,7 @@ class StrictProcessRecoveryTests(unittest.TestCase):
             record = journey.dispatch("interrupted")
             self.assertTrue(record["interrupted"])
             self.assertEqual(record["http_requests_matched"], 4)
+            frozen = journey.fixture.frozen_graph_snapshot(journey.database)
             self.assertEqual(journey.database.execute("SELECT state FROM jobs").fetchone()[0], "FAILED")
             # A transport receipt is not a committed completed-provider record.
             # The existing reconciliation gate must retain ownership, not POST.
@@ -52,6 +54,29 @@ class StrictProcessRecoveryTests(unittest.TestCase):
             self.assertEqual(journey.service.dispatch_production_queue()["dispatched_jobs"], [])
             self.assertEqual(len(journey.records), 1)
             self.assertEqual(journey.database.execute("SELECT provider_task_id FROM production_nodes WHERE node_id='master:1'").fetchone()[0], "strict-master-task-1")
+            media = json.loads((Path(__file__).parent / "fixtures" / "strict_transport" /
+                                "master_av_media.json").read_text(encoding="utf-8"))
+            reconciled_process = journey.run_recovery_child("master")
+            self.assertNotEqual(reconciled_process["pid"], os.getpid())
+            self.assertNotEqual(reconciled_process["pid"], record["pid"])
+            reconciled = reconciled_process["result"]
+            self.assertEqual(reconciled["state"], "PRODUCTION_REVIEW_REQUIRED")
+            self.assertEqual(journey.database.execute("SELECT state FROM production_nodes WHERE node_id='master:1'").fetchone()[0], "REVIEW_REQUIRED")
+            self.assertEqual(hashlib.sha256(journey.service.master_candidate_file(
+                master_fixture.JOB_ID, 1).read_bytes()).hexdigest(), media["sha256"])
+            interrupted_review = journey.run_recovery_child(
+                "accept_candidate_crash", expected_exit=89,
+            )
+            self.assertEqual(interrupted_review["crash_phase"], "review_claimed")
+            self.assertEqual(journey.database.execute("SELECT state FROM shots").fetchone()[0], "REVIEW_DECIDING")
+            accepted = journey.run_recovery_child("accept_candidate")
+            self.assertNotEqual(accepted["pid"], os.getpid())
+            self.assertNotEqual(accepted["pid"], record["pid"])
+            self.assertNotEqual(accepted["pid"], interrupted_review["pid"])
+            self.assertEqual(accepted["result"]["decision"], "accept_candidate")
+            self.assertEqual(journey.database.execute("SELECT state FROM production_nodes WHERE node_id='master:1'").fetchone()[0], "SUCCEEDED")
+            self.assertEqual(journey.fixture.frozen_graph_snapshot(journey.database), frozen)
+            self.assert_paid_once(journey)
 
     def assert_paid_once(self, journey):
         calls = journey.database.execute(

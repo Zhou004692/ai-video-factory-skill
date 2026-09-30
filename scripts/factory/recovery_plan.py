@@ -72,6 +72,13 @@ def _resolve(database, job_id):
             candidate_reviews.append(node['node_id'])
     review_actions = ['review_master_candidates'] if candidate_reviews else []
     if unresolved:
+        if state == 'FAILED' and str(job['failure_code'] or '') in {
+            'input_privacy_rejected', 'output_policy_rejected',
+            'output_copyright_rejected',
+        }:
+            return result(['preserve_and_diagnose'],
+                          '内容政策失败需要人工诊断；远端费用记录仍须核查，不能自动恢复生成',
+                          task_ids=unresolved)
         return result(['reconcile_provider_task', *review_actions], '远端提交或产物尚未核对，保留已有候选，禁止重复生成', task_ids=unresolved)
     if 'RUNNING' in states:
         return result(['view_progress'], '后台节点仍在运行；如进度未变化，请执行过期租约恢复扫描')

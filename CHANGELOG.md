@@ -2,6 +2,18 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.2.0.5] - 2026-09-30
+
+### Fixed
+
+- Closed the stopped Worker recovery gap: a graph task marked `FAILED` with a known unresolved remote task can release its dead node lease and enter provider reconciliation without submitting generation again. Live Workers and policy failures remain protected.
+- Kept the management action plan aligned with the executable recovery path for policy failures.
+
+### Verified
+
+- Added separate-process replay for scene and character anchor reconciliation, and a master journey spanning Worker death, remote-task reconciliation, candidate-review process death, and a fresh-process review recovery.
+- The replay checks frozen task ownership, the existing provider ledger, media preservation, and a single simulated charge.
+
 ## [3.2.0.4] - 2026-09-24
 
 ### Added

@@ -35,6 +35,12 @@ class RecoveryPlanTests(unittest.TestCase):
         self.c.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) VALUES('remote','J',1,'seedance','master','{\"status\":\"unknown\"}')")
         self.assertEqual(self.plan()['next_action']['id'],'reconcile_provider_task')
 
+    def test_policy_failure_does_not_advertise_an_unavailable_reconcile_action(self):
+        self.c.execute("UPDATE jobs SET failure_code='output_policy_rejected'")
+        self.c.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) VALUES('remote','J',1,'seedance','master','{\"status\":\"unknown\"}')")
+        self.assertEqual(self.plan()['next_action']['id'], 'preserve_and_diagnose')
+        self.assertNotIn('reconcile_provider_task', self.plan()['action_ids'])
+
     def test_terminal_state_does_not_resume_from_remaining_nodes(self):
         self.c.execute("UPDATE jobs SET state='REJECTED'")
         self.assertEqual(self.plan()['action_ids'],[])

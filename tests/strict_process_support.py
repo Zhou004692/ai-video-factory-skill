@@ -68,7 +68,7 @@ class StrictProcessJourney:
             self.spec = self.fixture.prepare(SimpleNamespace(database=self.database))
             self.database.execute("UPDATE jobs SET state='PRODUCTION_QUEUED'")
             self.database.commit()
-            self.service = ManagementService(self.database, ROOT)
+            self.service = ManagementService(self.database, ROOT, data_dir=self.root)
             self.service.env_path = self.root / "isolated.env"
             self.service.production_service.env_path = self.service.env_path
             connect = sqlite3.connect
@@ -98,10 +98,20 @@ class StrictProcessJourney:
             self.stack.enter_context(mock.patch.object(socket.socket, "connect", side_effect=AssertionError("supervisor external socket denied")))
             self.stack.enter_context(mock.patch.object(socket, "getaddrinfo", side_effect=AssertionError("supervisor DNS denied")))
             original = subprocess.Popen.__init__
+            self._approved_recovery_child = None
             self.worker_pids = []
             self.taskkill = str(Path(os.environ.get("SYSTEMROOT", "C:/Windows")) / "System32" / "taskkill.exe")
 
             def launch(process, args, *positional, **kwargs):
+                if (self._approved_recovery_child is not None
+                        and list(args) == self._approved_recovery_child
+                        and not positional and not kwargs.get("shell")
+                        and kwargs.get("executable") is None
+                        and Path(kwargs.get("cwd", "")).resolve() == ROOT):
+                    child_env = kwargs.get("env") or {}
+                    if child_env.get("PYTHONPATH") != str(ROOT):
+                        raise AssertionError("recovery child must bypass Worker bootstrap")
+                    return original(process, args, **kwargs)
                 cleanup_commands = [[self.taskkill, "/PID", str(pid), "/T", "/F"] for pid in self.worker_pids]
                 if os.name == "nt" and list(args) in cleanup_commands and not positional and not kwargs.get("shell") and not kwargs.get("executable") and kwargs.get("env") is None:
                     return original(process, args, **kwargs)
@@ -160,6 +170,23 @@ class StrictProcessJourney:
         if result["dispatched_jobs"] != [master_fixture.JOB_ID]:
             raise AssertionError(result)
         return self.wait_worker()
+
+    def run_recovery_child(self, mode, task_id="strict-master-task-1", *, expected_exit=0):
+        report = self.root / f"recovery-{mode}.json"
+        command = [sys.executable, str(ROOT / "tests" / "process_recovery_child.py"),
+                   mode, str(self.root / "factory.db"), str(self.root),
+                   master_fixture.JOB_ID, task_id, str(report)]
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(ROOT)
+        self._approved_recovery_child = command
+        try:
+            child = subprocess.run(command, cwd=ROOT, env=environment,
+                                   capture_output=True, text=True, timeout=45)
+        finally:
+            self._approved_recovery_child = None
+        if child.returncode != expected_exit:
+            raise AssertionError(child.stdout + child.stderr)
+        return json.loads(report.read_text(encoding="utf-8"))
 
     def __exit__(self, *exc):
         for worker in self.service._production_workers.values():

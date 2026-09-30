@@ -46,6 +46,87 @@ def record_heartbeat(
     return int(updated.rowcount or 0) == 1
 
 
+def admit_stopped_provider_reconciliation(
+    database: sqlite3.Connection,
+    job_id: str,
+    task_id: str,
+    *,
+    worker_alive: Callable[[object], bool],
+) -> bool:
+    """Transfer a crashed graph Worker lease to the known-task GET path.
+
+    A supervisor may have recorded FAILED before its node lease expired. The
+    remote task remains unresolved, so waiting for the lease timeout or
+    resubmitting generation would both be wrong. This command only applies to
+    a stopped, non-policy graph failure with no live owner and never calls a
+    provider.
+    """
+    with node_state_machine.atomic(database):
+        row = database.execute(
+            "SELECT state,failure_code,production_worker_pid,execution_engine "
+            "FROM jobs WHERE job_id=?", (job_id,),
+        ).fetchone()
+        if not row or row["state"] != "FAILED" \
+                or str(row["failure_code"] or "") in POLICY_FAILURE_CODES \
+                or row["execution_engine"] != "graph_v2":
+            return False
+        if row["production_worker_pid"] and worker_alive(row["production_worker_pid"]):
+            raise ValueError("Production Worker is still running")
+        if task_id not in provider_tasks.unresolved_task_ids(database, job_id):
+            raise ValueError("Remote task is not pending reconciliation")
+        owners: set[str] = set()
+        for call in database.execute(
+            "SELECT task_id,shot_idx,provider,usage_json FROM provider_calls "
+            "WHERE job_id=?", (job_id,),
+        ).fetchall():
+            if provider_tasks.effective_task_id(call["task_id"], call["usage_json"]) != task_id:
+                continue
+            provider = str(call["provider"] or "").casefold()
+            if provider == "seedance" and int(call["shot_idx"] or 0) > 0:
+                node = database.execute(
+                    "SELECT node_id FROM production_nodes WHERE job_id=? "
+                    "AND node_id=? AND node_type='master'",
+                    (job_id, f"master:{int(call['shot_idx'])}"),
+                ).fetchone()
+                if node:
+                    owners.add(str(node["node_id"]))
+            else:
+                expected_type = {
+                    "seedance_scene": "scene_anchor",
+                    "seedance_identity": "character_anchor",
+                }.get(provider)
+                query = ("SELECT node_id FROM production_nodes WHERE job_id=? "
+                         "AND provider_task_id=?" +
+                         (" AND node_type=?" if expected_type else ""))
+                params = ((job_id, task_id, expected_type) if expected_type
+                          else (job_id, task_id))
+                owners.update(str(node["node_id"]) for node in database.execute(
+                    query, params,
+                ).fetchall())
+        if len(owners) != 1:
+            raise ValueError("Remote task has no unique graph node owner")
+        production_executor.recover_expired_nodes(database, job_id, force=True)
+        if database.execute(
+            "SELECT 1 FROM production_nodes WHERE job_id=? AND state='RUNNING' LIMIT 1",
+            (job_id,),
+        ).fetchone():
+            raise ValueError("Production node still owns a live lease")
+        transition(
+            database, job_id, "provider_paused",
+            event_id=f"{job_id}:stopped-provider:{task_id}",
+            updates={
+                "production_worker_pid": None,
+                "worker_lease_id": None,
+                "production_heartbeat_at": None,
+                "error": "本地生产进程已中断，远端任务待核对；不会重复提交生成",
+                "failure_code": None,
+            },
+            payload={"task_id": task_id, "reason": "worker_exit",
+                     "previous_failure_code": row["failure_code"]},
+        )
+        return True
+
+
 def _parse_time(value: object) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:

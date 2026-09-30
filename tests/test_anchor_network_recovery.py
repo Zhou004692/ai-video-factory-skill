@@ -1,7 +1,10 @@
 """Known paid anchors reconcile; proven unsubmitted anchors remain retryable."""
 import json
+from contextlib import closing
+import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -139,6 +142,54 @@ class AnchorNetworkRecoveryTests(unittest.TestCase):
         self.assertEqual(row['approval_state'],'PENDING_REVIEW')
         self.assertEqual(row['duration_sec'],4)
         self.assertEqual(row['cost_cents'],272)
+
+    def test_stopped_anchor_recovers_in_another_process_without_paid_submit(self):
+        for kind in ('scene', 'character'):
+            with self.subTest(kind=kind):
+                if kind == 'character':
+                    self.c.execute("UPDATE production_nodes SET state='REVIEW_REQUIRED',provider_task_id=NULL WHERE node_id=?", (self.node['node_id'],))
+                    node = self.c.execute("SELECT * FROM production_nodes WHERE node_type='character_anchor' LIMIT 1").fetchone()
+                    char_id = json.loads(node['input_json'])['character_id']
+                    self.c.execute("UPDATE provider_calls SET shot_idx=-1001,provider='seedance_identity'")
+                    self.c.execute("INSERT INTO character_identity_anchors(job_id,identity_key,character_id,display_name,source_type,state,generator) VALUES('J-ANCHOR','identity',?,'Actor','seedance_identity_anchor','FAILED','seedance_2_5')", (char_id,))
+                else:
+                    node = self.node
+                self.c.execute("UPDATE production_nodes SET state='RUNNING',lease_id='dead-worker-lease',heartbeat_at='2099-01-01T00:00:00+00:00',provider_task_id='remote-anchor' WHERE node_id=?", (node['node_id'],))
+                self.c.execute("UPDATE jobs SET state='FAILED',failure_code='internal_error',production_worker_pid=NULL")
+                self.c.commit()
+                persisted = self.root / f'{kind}.db'
+                with closing(sqlite3.connect(persisted)) as target:
+                    self.c.backup(target)
+                report = self.runtime_data / f'{kind}-recovery.json'
+                child = subprocess.run(
+                    [sys.executable, str(Path(__file__).parent / 'process_recovery_child.py'),
+                     'anchor', str(persisted), str(self.runtime_data), 'J-ANCHOR',
+                     'remote-anchor', str(report)],
+                    cwd=Path(__file__).resolve().parents[1],
+                    env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1])},
+                    capture_output=True, text=True, timeout=45,
+                )
+                self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+                evidence = json.loads(report.read_text(encoding='utf-8'))
+                self.assertNotEqual(evidence['pid'], os.getpid())
+                self.assertEqual(evidence['result']['state'], 'ANCHOR_REVIEW_REQUIRED')
+                with closing(sqlite3.connect(persisted)) as observed:
+                    observed.row_factory = sqlite3.Row
+                    table = ('scene_visual_anchors' if kind == 'scene'
+                             else 'character_identity_anchors')
+                    anchor = observed.execute(f'SELECT * FROM {table}').fetchone()
+                    self.assertEqual(anchor['state'], 'READY')
+                    self.assertEqual(anchor['approval_state'], 'PENDING_REVIEW')
+                    self.assertEqual(anchor['cost_cents'], 272)
+                    self.assertEqual(Path(anchor['video_path']).read_bytes(), b'paid-media')
+                    self.assertEqual(observed.execute('SELECT cost_cents FROM jobs').fetchone()[0], 272)
+                    self.assertEqual(observed.execute('SELECT state FROM production_nodes WHERE node_id=?', (node['node_id'],)).fetchone()[0], 'REVIEW_REQUIRED')
+                    self.assertEqual(provider_tasks.unresolved_task_ids(observed, 'J-ANCHOR'), [])
+                if kind == 'scene':
+                    # Reset only the in-memory source; the second child starts
+                    # from a separate frozen database snapshot.
+                    self.c.execute("UPDATE production_nodes SET state='REVIEW_REQUIRED',provider_task_id=NULL,lease_id=NULL,heartbeat_at=NULL WHERE node_id=?", (self.node['node_id'],))
+                    self.c.commit()
 
     def test_corrupt_media_never_becomes_reviewable(self):
         with mock.patch('factory.management_api.seedance.inspect_task',new=mock.AsyncMock(return_value=self.completed())), \

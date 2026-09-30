@@ -7837,6 +7837,42 @@ class ManagementServiceTests(unittest.TestCase):
             ["task-sweep-1", "task-sweep-2"],
         )
 
+    def test_provider_reconcile_sweep_admits_stopped_graph_with_known_task(self):
+        self.database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,failure_code,execution_engine) "
+            "VALUES('J-SWEEP-STOPPED','T-1','stopped','FAILED','internal_error','graph_v2')"
+        )
+        self.database.execute(
+            "INSERT INTO shots(job_id,idx,state) VALUES('J-SWEEP-STOPPED',1,'FAILED')"
+        )
+        self.database.execute(
+            "INSERT INTO production_nodes(job_id,node_id,node_type,state,spec_hash,input_json,"
+            "idempotency_key,lease_id,heartbeat_at,provider_task_id) VALUES("
+            "'J-SWEEP-STOPPED','master:1','master','RUNNING','frozen','{}','key',"
+            "'dead-lease','2099-01-01T00:00:00+00:00','known-task')"
+        )
+        self.database.execute(
+            "INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) "
+            "VALUES('known-task','J-SWEEP-STOPPED',1,'seedance','generate',?)",
+            (json.dumps({"status": "pending"}),),
+        )
+        self.database.commit()
+        with mock.patch.object(
+            seedance, "inspect_task", new=mock.AsyncMock(return_value={"status": "running"})
+        ) as inspect_task, mock.patch.object(
+            seedance, "text_to_video", new=mock.AsyncMock()
+        ) as submit:
+            report = self.service.reconcile_provider_tasks(limit=1)
+        self.assertEqual((report["checked"], report["pending"], report["failed"]), (1, 1, 0))
+        inspect_task.assert_awaited_once_with("known-task")
+        submit.assert_not_awaited()
+        self.assertEqual(self.database.execute(
+            "SELECT state FROM jobs WHERE job_id='J-SWEEP-STOPPED'"
+        ).fetchone()[0], "PROVIDER_ACTION_REQUIRED")
+        self.assertEqual(self.database.execute(
+            "SELECT state FROM production_nodes WHERE job_id='J-SWEEP-STOPPED'"
+        ).fetchone()[0], "ACTION_REQUIRED")
+
     def test_provider_reconcile_sweeper_thread_stops_cleanly(self):
         service = mock.Mock()
         stop = threading.Event()

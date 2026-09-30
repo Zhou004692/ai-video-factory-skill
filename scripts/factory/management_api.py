@@ -1340,6 +1340,13 @@ class ManagementService:
                     break
         if not job or not call:
             raise ValueError("待核对的远端任务不存在")
+        if job["state"] == "FAILED":
+            recovery_controller.admit_stopped_provider_reconciliation(
+                self.database, job_id, str(task_id), worker_alive=_process_is_alive,
+            )
+            job = self.database.execute(
+                "SELECT state,bgm_path FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
         terminal_reconciliation = (
             job["state"] == "REJECTED_PENDING_RECONCILIATION"
         )
@@ -1704,6 +1711,10 @@ class ManagementService:
             "FROM provider_calls p JOIN jobs j ON j.job_id=p.job_id "
             "WHERE j.state IN "
             "('PROVIDER_ACTION_REQUIRED','REJECTED_PENDING_RECONCILIATION') "
+            "OR (j.state='FAILED' AND j.execution_engine='graph_v2' "
+            "AND COALESCE(j.failure_code,'') NOT IN "
+            "('input_privacy_rejected','output_policy_rejected',"
+            "'output_copyright_rejected')) "
             "ORDER BY p.created_at,p.task_id"
         ).fetchall()
         report = {

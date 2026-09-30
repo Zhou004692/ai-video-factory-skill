@@ -36,6 +36,12 @@ Worker 通过测试专用临时 `sitecustomize` 安装传输回放，启动参�
 - 六项审核由测试脚本勾选。播放成功证明媒体传输与可解码性，不证明口型、身份、表演或剪辑效果。
 - Flow Guard Full 的 `strict_master_recovery` 单独记录本切片及源码指纹；失败或证据缺失会影响 Full 结果。整体 `strict_transport_replay`、`recognition_accuracy`、`actual_content_quality` 继续为 `not_run`。
 
+## P3 扩展：已停 Worker、锚点与候选审核
+
+`3.2.0.5` 补齐了已知远端任务的状态交接：Worker 硬退出后即使 Job 已是 `FAILED`、节点租约尚未过期，也能在确认 Worker 不存活、任务账本未核对且非政策失败后安全释放租约，进入原 task_id 的 GET 核对。人物与场景锚点在独立进程完成回收并进入人工审核。母片从正式 Worker 中断，到另一个进程核对并生成候选，再到审核进程硬退出和新进程启动恢复，均使用同一持久化 SQLite 与受控资产目录；模拟费用只出现一次。
+
+这些新增测试是独立进程和持久化状态证据，远端检查与媒体由测试替身提供；它们不替代 Flow Guard Full 报告，也不证明真实服务商产物或内容效果。
+
 ## 验证入口
 
 ```powershell
@@ -47,4 +53,4 @@ python scripts/flow_guard.py run --suite full --report <本机报告路径>
 
 阶段回归结果记录于 [稳定交付实施记录](stable-delivery-progress.md)。
 
-当前 `3.2.0.4` 集成在 P1 基线上完成定向回归和内置执行器复验。内置执行器绑定的源码指纹为 `8ba6261ae6547fa032a7b60716889b771fbdcf58e8a5d38cc296396a6d96ec97`，结果为 `READY_TO_PUBLISH`、真实付费调用 0、外部请求 0。该指纹只绑定 `scripts` 与 `tests` 中参与回放的源码，不替代 Git 提交身份。
+`3.2.0.4` 集成时在 P1 基线上完成定向回归和内置执行器复验。该次内置执行器绑定的源码指纹为 `8ba6261ae6547fa032a7b60716889b771fbdcf58e8a5d38cc296396a6d96ec97`，结果为 `READY_TO_PUBLISH`、真实付费调用 0、外部请求 0。该指纹只绑定当时 `scripts` 与 `tests` 中参与回放的源码，不替代 Git 提交身份，也不代表后续 `3.2.0.5` 的 Full 结果。

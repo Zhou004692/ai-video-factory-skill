@@ -6,7 +6,9 @@ import sqlite3
 import unittest
 
 from scripts.factory.db import DDL
-from scripts.factory.recovery_controller import reconcile_job
+from scripts.factory.recovery_controller import (
+    admit_stopped_provider_reconciliation, reconcile_job,
+)
 
 
 class RecoveryControllerTests(unittest.TestCase):
@@ -156,6 +158,54 @@ class RecoveryControllerTests(unittest.TestCase):
     def test_stranded_pending_graph_requires_diagnosis(self):
         self.seed_graph('PENDING')
         self.assertEqual(reconcile_job(self.database, 'J-1', now=self.now).state, 'RECOVERY_REQUIRED')
+
+    def test_stopped_graph_known_task_releases_fresh_lease_without_submit(self):
+        self.seed_graph('RUNNING')
+        self.database.execute("UPDATE jobs SET state='FAILED',failure_code='internal_error' WHERE job_id='J-1'")
+        self.database.execute("UPDATE production_nodes SET provider_task_id='remote-1',heartbeat_at='2099-01-01T00:00:00+00:00' WHERE job_id='J-1'")
+        self.database.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) VALUES('remote-1','J-1',1,'seedance','generate',?)", (json.dumps({'status':'action_required'}),))
+        self.database.commit()
+        self.assertTrue(admit_stopped_provider_reconciliation(
+            self.database, 'J-1', 'remote-1', worker_alive=lambda _pid: False,
+        ))
+        self.assertEqual(self.database.execute('SELECT state FROM jobs').fetchone()[0], 'PROVIDER_ACTION_REQUIRED')
+        node = self.database.execute('SELECT state,lease_id FROM production_nodes').fetchone()
+        self.assertEqual((node['state'], node['lease_id']), ('ACTION_REQUIRED', None))
+        self.assertFalse(admit_stopped_provider_reconciliation(
+            self.database, 'J-1', 'remote-1', worker_alive=lambda _pid: False,
+        ))
+
+    def test_stopped_graph_does_not_steal_live_worker_or_unknown_task(self):
+        self.seed_graph('RUNNING')
+        self.database.execute("UPDATE jobs SET state='FAILED',failure_code='internal_error' WHERE job_id='J-1'")
+        self.database.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) VALUES('remote-1','J-1',1,'seedance','generate',?)", (json.dumps({'status':'action_required'}),))
+        self.database.commit()
+        with self.assertRaisesRegex(ValueError, 'still running'):
+            admit_stopped_provider_reconciliation(
+                self.database, 'J-1', 'remote-1', worker_alive=lambda _pid: True,
+            )
+        with self.assertRaisesRegex(ValueError, 'not pending'):
+            admit_stopped_provider_reconciliation(
+                self.database, 'J-1', 'other-task', worker_alive=lambda _pid: False,
+            )
+        self.database.execute("UPDATE provider_calls SET shot_idx=-2001,provider='seedance_scene'")
+        self.database.commit()
+        with self.assertRaisesRegex(ValueError, 'no unique graph node owner'):
+            admit_stopped_provider_reconciliation(
+                self.database, 'J-1', 'remote-1', worker_alive=lambda _pid: False,
+            )
+        self.assertEqual(self.database.execute('SELECT state FROM jobs').fetchone()[0], 'FAILED')
+        self.assertEqual(self.database.execute('SELECT state FROM production_nodes').fetchone()[0], 'RUNNING')
+
+    def test_policy_failure_cannot_transfer_to_provider_recovery(self):
+        self.seed_graph('RUNNING')
+        self.database.execute("UPDATE jobs SET state='FAILED',failure_code='output_policy_rejected' WHERE job_id='J-1'")
+        self.database.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) VALUES('remote-1','J-1',1,'seedance','generate',?)", (json.dumps({'status':'action_required'}),))
+        self.database.commit()
+        self.assertFalse(admit_stopped_provider_reconciliation(
+            self.database, 'J-1', 'remote-1', worker_alive=lambda _pid: False,
+        ))
+        self.assertEqual(self.database.execute('SELECT state FROM jobs').fetchone()[0], 'FAILED')
 
 
 if __name__ == "__main__":
