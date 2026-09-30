@@ -164,13 +164,9 @@ class SkillDistributionTests(unittest.TestCase):
             (root / "data").mkdir()
             (root / ".env").write_text("ARK_API_KEY=configured\n", encoding="utf-8")
 
-            with patch.dict(
-                os.environ,
-                {"FACTORY_RUNTIME_HOME": str(root / "runtime-home")},
-                clear=False,
-            ):
-                script = diagnose(root, profile="script")
-                video = diagnose(root, profile="video")
+            isolated_environ = {"FACTORY_RUNTIME_HOME": str(root / "runtime-home")}
+            script = diagnose(root, profile="script", environ=isolated_environ)
+            video = diagnose(root, profile="video", environ=isolated_environ)
 
             self.assertTrue(script["ready"], script)
             self.assertEqual(script["paid_provider_calls"], 0)

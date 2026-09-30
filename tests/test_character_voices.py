@@ -438,7 +438,7 @@ class FixedVoiceGenerationTests(unittest.IsolatedAsyncioTestCase):
         database = sqlite3.connect(":memory:")
         database.row_factory = sqlite3.Row
         database.executescript(
-            "CREATE TABLE jobs(job_id TEXT PRIMARY KEY,cost_cents INTEGER DEFAULT 0);"
+            "CREATE TABLE jobs(job_id TEXT PRIMARY KEY,state TEXT DEFAULT 'STORYBOARDED',cost_cents INTEGER DEFAULT 0);"
             "CREATE TABLE shots(job_id TEXT,idx INTEGER,cost_cents INTEGER DEFAULT 0);"
             "CREATE TABLE provider_calls(task_id TEXT PRIMARY KEY,job_id TEXT,"
             "shot_idx INTEGER,provider TEXT,intent TEXT,usage_json TEXT,"
@@ -511,7 +511,7 @@ class FixedVoiceGenerationTests(unittest.IsolatedAsyncioTestCase):
         database = sqlite3.connect(":memory:")
         database.row_factory = sqlite3.Row
         database.executescript(
-            "CREATE TABLE jobs(job_id TEXT PRIMARY KEY,cost_cents INTEGER DEFAULT 0);"
+            "CREATE TABLE jobs(job_id TEXT PRIMARY KEY,state TEXT DEFAULT 'STORYBOARDED',cost_cents INTEGER DEFAULT 0);"
             "CREATE TABLE shots(job_id TEXT,idx INTEGER,cost_cents INTEGER DEFAULT 0);"
             "CREATE TABLE provider_calls(task_id TEXT PRIMARY KEY,job_id TEXT,"
             "shot_idx INTEGER,provider TEXT,intent TEXT,usage_json TEXT,"

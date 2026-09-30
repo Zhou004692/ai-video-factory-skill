@@ -610,7 +610,7 @@ class ManagementCompilerApiTests(unittest.TestCase):
             (job_id, json.dumps({'error': 'reference attention budget exceeded'})),
         )
         self.database.commit()
-        with self.assertRaisesRegex(ValueError, 'reference attention budget exceeded'):
+        with self.assertRaisesRegex(ValueError, '任务包含已付费母片'):
             self.service.resume_failed_video(job_id)
         self.assertEqual(self.database.execute(
             "SELECT state FROM jobs WHERE job_id=?", (job_id,),

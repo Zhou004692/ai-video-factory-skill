@@ -224,7 +224,11 @@ class MasterDownloadRecoveryTests(unittest.IsolatedAsyncioTestCase):
             database.commit()
             plan = recovery_plan.resolve(database, JOB_ID)
             if unresolved:
-                self.assertEqual(plan["next_action"]["id"], "reconcile_provider_task")
+                expected_action = (
+                    "preserve_and_diagnose" if failure_code == "output_policy_rejected"
+                    else "reconcile_provider_task"
+                )
+                self.assertEqual(plan["next_action"]["id"], expected_action)
                 self.assertEqual(plan["task_ids"], ["crashed-task"])
                 with self.assertRaises(ValueError):
                     service.resume_failed_video(JOB_ID)
