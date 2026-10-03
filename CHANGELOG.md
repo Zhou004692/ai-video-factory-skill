@@ -2,6 +2,19 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.2.0.6] - 2026-10-03
+
+### Fixed
+
+- Stage and audit a complete Skill before replacing the installed code; restore the previous directory when promotion fails, and retain it when rollback itself fails.
+- Recover the uniquely recorded previous Skill on the next updater run after a process exits between directory renames. Reject overlapping source/target directories and replacement while the external runtime is in use.
+- Build the distribution once and publish ZIP archives through a temporary file.
+- Reject process-level state path overrides inside the replaceable Skill before changing any files.
+
+### Added
+
+- Added an isolated shipped-entry-point delivery journey with a clean Python host, offline dependency installation, genuine historical Skill migration, local HTTP review continuation, failed-upgrade rollback, and updater process interruption.
+
 ## [3.2.0.5] - 2026-09-30
 
 ### Fixed

@@ -190,6 +190,16 @@ Flow Guard Full 新增独立 `strict_master_recovery` 维度，检查原始浏�
 
 `3.2.0.5` Skill ZIP 已通过脱敏审计，未包含 `.env`、本地数据库、正式素材或测试目录。交付继续采用 Skill 文件夹/ZIP 与使用方的 Skill 更新机制。
 
+## 2026-10-03：P4 Skill 分发更新验收
+
+`3.2.0.6` 继续以 Skill 文件夹/ZIP 交付。分发器先复制完整包、检查必需入口并脱敏审计，再在独立运行目录的互斥锁下迁移旧状态、保留旧代码并替换。复制、审计和切换失败保留或恢复旧包；回滚本身失败则保留唯一旧副本和事务记录，下次从原暂存包运行更新器恢复。多个恢复记录停止诊断，不自动选取。来源目标重叠、不完整来源、管理服务持锁，以及进程绝对状态路径指向目标 Skill 内部时均提前阻断。ZIP 通过临时文件替换，写入失败保留旧 ZIP。
+
+更新门禁 62 项通过（37.857 秒），包括新增 12 项替换故障回归，记录 `paid_provider_calls=0`、`external_requests=0`。完整交付旅程使用无项目依赖的干净 Python venv，实际解压包、自举安装依赖、启动包内管理服务，并从真实历史提交 `59556cf` 的 `3.2.0.1` 升级。配置、人物素材和成片哈希、944 分既有费用及路径绑定保持；本地 HTTP 能读取历史成片并执行六项脚本终审，另一个历史任务也能在回滚后继续终审。重复覆盖和更新器目录切换后硬退出再恢复均通过，账本仍只有一条既有记录。
+
+失败升级在包内已安装依赖的 Python 中运行；故障注入先修改费用、配置和人物素材、写入到达记录，再抛错，随后验证快照恢复数据库完整性和原数据。早期依赖缓存缺少源码构建所需 wheel、测试夹具未关闭 Windows SQLite 连接，以及故障报错被安装器子进程捕获而不可观测的批次均未计为最终通过；补齐 wheel、显式关闭连接并加强注入证据后，完整旅程报告为 `passed`，原始日志保留在 `.verification/p4-delivery-proof/`。
+
+本轮仅验证本机 Windows、一个真实历史版本与合成媒体的直接 Skill 更新；Python/FFmpeg 已存在，依赖来自预先准备的离线 wheelhouse。脚本终审不代表真实内容质量；Python socket 护栏也不构成操作系统级整个进程树网络隔离。本轮更新相关定向门禁通过，没有重新运行 P3 全量 Python 或 Flow Guard Full；上一轮全量结果保持各自源码边界。交付和恢复规则见 [Skill 分发更新验收](skill-delivery-acceptance.md)。
+
 ## 相关文档
 
 - [测试证据边界](assurance-boundaries.md)
@@ -198,3 +208,4 @@ Flow Guard Full 新增独立 `strict_master_recovery` 维度，检查原始浏�
 - [冻结场景依赖](frozen-scene-dependencies.md)
 - [母片到导演合成正式处理器回放](strict-master-compose-journey.md)
 - [跨进程素材恢复](strict-process-recovery.md)
+- [Skill 分发更新验收](skill-delivery-acceptance.md)

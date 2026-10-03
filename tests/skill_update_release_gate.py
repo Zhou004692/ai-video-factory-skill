@@ -26,6 +26,7 @@ TEST_MODULES = (
     "tests.test_runtime_profile",
     "tests.test_fresh_install",
     "tests.test_skill_distribution",
+    "tests.test_skill_replacement",
 )
 
 
