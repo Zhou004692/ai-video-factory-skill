@@ -206,6 +206,71 @@ class PublicationFeedbackVersionsTests(unittest.TestCase):
                 jobs.append(job)
         return experiment,jobs
 
+    def frozen_publication(self, job, item, tags):
+        final = Path(self.temp.name)/'assets'/job/'final.mp4'
+        final.parent.mkdir(parents=True,exist_ok=True)
+        final.write_bytes(item.encode())
+        frozen = {'title':item,'production_profile':'standard',
+                  'script_metadata':{'title':item,'creative_tags':tags}}
+        self.db.execute('UPDATE jobs SET final_path=?,production_spec_json=? WHERE job_id=?',
+            (str(final),json.dumps({'runtime_storyboard':frozen}),job))
+        self.db.commit()
+        return self.service().register_publication({'job_id':job,'platform':'douyin',
+            'item_id':item,'published_at':'2026-08-12T00:00:00Z'})['publication_id']
+
+    def test_experiment_rejects_unknown_or_conflicting_publication_tags(self):
+        from factory import creative_experiments
+        experiment,jobs = self.experiment_fixture()
+        tag_sets = [
+            {'hook_type':'question','narrative_pattern':'problem_solution','proof_type':'source_quote','cta_type':'consult'},
+            {},
+            {'hook_type':'contrarian','narrative_pattern':'comparison','proof_type':'source_quote','cta_type':'consult'},
+            {'hook_type':'contrarian'},
+        ]
+        for i,job in enumerate(jobs):
+            publication = self.frozen_publication(job,f'conflict-{job}',tag_sets[i])
+            feedback.record_snapshot(self.db,job,platform='douyin',publication_id=publication,
+                views=100,completion_rate=0.1 if i<2 else 0.9,captured_at='2026-08-12T22:00:00Z')
+        result = creative_experiments.experiment_report(self.db,experiment)
+        self.assertEqual(result['directional_assessment'],'insufficient_data')
+        self.assertEqual(result['arms']['control']['sample_count'],0)
+        self.assertEqual(result['arms']['treatment']['sample_count'],0)
+        reasons = {item['job_id']:item for item in result['excluded']}
+        self.assertEqual(reasons[jobs[0]]['reason'],'publication_creative_tags_mismatch')
+        self.assertEqual(reasons[jobs[1]]['reason'],'publication_creative_tags_unknown')
+        self.assertEqual(reasons[jobs[2]]['conflicting_dimensions'],['narrative_pattern'])
+        self.assertIn('proof_type',reasons[jobs[3]]['unknown_dimensions'])
+
+    def test_experiment_matching_frozen_tags_survive_mutable_tag_changes(self):
+        from factory import creative_experiments
+        experiment,jobs = self.experiment_fixture()
+        for i,job in enumerate(jobs):
+            tags = {'hook_type':'pain_point' if i<2 else 'contrarian',
+                'narrative_pattern':'problem_solution','proof_type':'source_quote','cta_type':'consult'}
+            publication = self.frozen_publication(job,f'matching-{job}',tags)
+            creative_learning.tag_angle(self.db,f'BRIEF-EXP-{"control" if i<2 else "treatment"}{i%2}',
+                angle_index=0,hook_type='question',narrative_pattern='comparison',proof_type='none',cta_type='none')
+            feedback.record_snapshot(self.db,job,platform='douyin',publication_id=publication,
+                views=100,completion_rate=0.1 if i<2 else 0.9,captured_at='2026-08-12T22:00:00Z')
+        result = creative_experiments.experiment_report(self.db,experiment)
+        self.assertEqual(result['directional_assessment'],'treatment_candidate')
+        self.assertEqual(result['arms']['control']['sample_count'],2)
+        self.assertEqual(result['arms']['treatment']['sample_count'],2)
+        self.assertEqual(result['excluded'],[])
+
+    def test_partial_frozen_tags_have_independent_dimension_coverage(self):
+        publication = self.frozen_publication('J','partial-tags',{'hook_type':'question'})
+        feedback.record_snapshot(self.db,'J',platform='douyin',publication_id=publication,
+            views=100,completion_rate=0.6,captured_at='2026-08-12T22:00:00Z')
+        result = creative_learning.strategy_report(self.db,platform='douyin',window_hours=24,min_samples=1)
+        dimensions = {row['dimension']:row for row in result['dimensions']}
+        self.assertEqual(dimensions['hook_type']['eligible'][0]['value'],'question')
+        self.assertEqual(dimensions['hook_type']['coverage']['known_samples'],1)
+        for dimension in ('narrative_pattern','proof_type','cta_type'):
+            self.assertEqual(dimensions[dimension]['eligible'],[])
+            self.assertEqual(dimensions[dimension]['coverage']['unknown_samples'],1)
+            self.assertEqual(dimensions[dimension]['unknown'][0]['publication_id'],publication)
+
     def test_experiment_missing_primary_metrics_never_selects_winner(self):
         from factory import creative_experiments
         experiment,jobs = self.experiment_fixture()

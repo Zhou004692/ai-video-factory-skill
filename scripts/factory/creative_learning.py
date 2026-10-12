@@ -35,6 +35,12 @@ def _controlled(field: str, value: str) -> str:
     return value
 
 
+def observed_tag(tags, dimension: str) -> str | None:
+    """A missing or invalid immutable tag is unknown for that dimension."""
+    value = tags.get(dimension) if isinstance(tags, dict) else None
+    return value if isinstance(value, str) and value in VOCABULARY[dimension] else None
+
+
 def tag_angle(
     db: sqlite3.Connection,
     brief_id: str,
@@ -107,20 +113,22 @@ def strategy_report(
         db, platform=platform, window_hours=window_hours,
         min_views=min_views, min_window_coverage=min_window_coverage,
     )
-    tagged: list[tuple[dict, sqlite3.Row]] = []
-    untagged: list[str] = []
-    for creative in base["creatives"]:
-        tag = creative.get('tags')
-        if tag:
-            tagged.append((creative, tag))
-        else:
-            untagged.append(creative["job_id"])
+    untagged = [creative["job_id"] for creative in base["creatives"]
+                if not any(observed_tag(creative.get("tags"), dimension)
+                           for dimension in VOCABULARY)]
 
     dimensions: list[dict] = []
     for dimension in VOCABULARY:
         groups: dict[str, list[dict]] = {}
-        for creative, tag in tagged:
-            groups.setdefault(tag[dimension], []).append(creative)
+        unknown: list[dict] = []
+        for creative in base["creatives"]:
+            value = observed_tag(creative.get("tags"), dimension)
+            if value is None:
+                unknown.append({"job_id": creative["job_id"],
+                                "publication_id": creative.get("publication_id"),
+                                "reason": "creative_tag_unknown"})
+            else:
+                groups.setdefault(value, []).append(creative)
         values = [
             {"value": value, **_aggregate_creatives(creatives)}
             for value, creatives in groups.items()
@@ -138,6 +146,9 @@ def strategy_report(
         dimensions.append({
             "dimension": dimension, "eligible": eligible,
             "insufficient": insufficient, "recommendation": recommendation,
+            "unknown": unknown,
+            "coverage": {"known_samples": sum(len(rows) for rows in groups.values()),
+                         "unknown_samples": len(unknown)},
         })
     return {
         "platform": base["platform"], "window_hours": base["window_hours"],

@@ -325,6 +325,26 @@ def assign_job(
     db.commit()
 
 
+def _publication_tag_exclusion(creative: dict, experiment, arm: str) -> dict | None:
+    """Assigned jobs do not authorize attribution of incompatible new versions."""
+    expected = json.loads(experiment["fixed_tags_json"] or "{}")
+    expected[experiment["variable_dimension"]] = (
+        experiment["control_value"] if arm == "control" else experiment["treatment_value"]
+    )
+    actual = {dimension: creative_learning.observed_tag(creative.get("tags"), dimension)
+              for dimension in expected}
+    unknown = sorted(dimension for dimension, value in actual.items() if value is None)
+    conflicting = sorted(dimension for dimension, value in actual.items()
+                         if value is not None and value != expected[dimension])
+    if not unknown and not conflicting:
+        return None
+    return {"job_id": creative["job_id"], "platform": experiment["platform"],
+            "publication_id": creative.get("publication_id"),
+            "reason": "publication_creative_tags_unknown" if unknown else "publication_creative_tags_mismatch",
+            "unknown_dimensions": unknown, "conflicting_dimensions": conflicting,
+            "expected_tags": expected, "observed_tags": actual}
+
+
 def experiment_report(db: sqlite3.Connection, experiment_id: str) -> dict:
     """Evaluate only the pre-registered metric and comparable time window."""
     experiment = db.execute(
@@ -351,6 +371,15 @@ def experiment_report(db: sqlite3.Connection, experiment_id: str) -> dict:
     current = {row['job_id']:row['publication_id'] for row in db.execute(
         'SELECT job_id,publication_id FROM platform_publications WHERE platform=? AND is_current=1',(experiment['platform'],))}
     base['creatives'] = [item for item in base['creatives'] if item.get('publication_id') == current.get(item['job_id'])]
+    compatible = []
+    for creative in base["creatives"]:
+        arm = assigned.get(creative["job_id"])
+        exclusion = _publication_tag_exclusion(creative, experiment, arm) if arm else None
+        if exclusion:
+            base["excluded"].append(exclusion)
+        else:
+            compatible.append(creative)
+    base["creatives"] = compatible
     by_arm: dict[str, list[dict]] = {"control": [], "treatment": []}
     eligible_ids: set[str] = set()
     for creative in base["creatives"]:
