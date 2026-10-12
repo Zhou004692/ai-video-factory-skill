@@ -1897,6 +1897,12 @@ class ManagementService:
         """Run read-only network checks and persist only sanitized evidence."""
         environment = dict(os.environ)
         environment.update(_read_env(self.env_path))
+        if str(environment.get("FACTORY_PROVIDER_MODE") or "").strip().casefold() == "replay":
+            # Replay has no provider transport. Request matching/media lookup
+            # still fail closed at ProviderRuntime; this is not live readiness.
+            return {"ready": True, "mode": "replay", "status": "replay_offline_transport",
+                    "paid_provider_calls": 0, "provider_task_created": False,
+                    "targets": [], "live_connectivity_verified": False}
         try:
             timeout = float(
                 environment.get("PROVIDER_PREFLIGHT_TIMEOUT_SEC") or 4.0

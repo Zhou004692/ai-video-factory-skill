@@ -1561,7 +1561,7 @@ def _approved_payload(row) -> dict:
 def approve_draft(db, draft_id: str) -> dict:
     row = db.execute(
         "SELECT d.*,b.approved_job_id AS brief_job_id,"
-        "b.approved_topic_id,b.recommended_title,b.brief_json "
+        "b.approved_topic_id,b.recommended_title,b.brief_json,b.approved_angle_index "
         "FROM script_drafts d JOIN topic_briefs b ON b.brief_id=d.brief_id "
         "WHERE d.draft_id=?", (_text(draft_id),),
     ).fetchone()
@@ -1610,6 +1610,36 @@ def approve_draft(db, draft_id: str) -> dict:
         )
     script = json.loads(row["script_json"])
     storyboard = _storyboard(script)
+    # Capture the actual controlled angle record at the new approval hand-off.
+    # These are authored intent labels, not assertions about generated pixels.
+    # Approved drafts return above; live tag changes cannot rebind old inputs.
+    brief = json.loads(row["brief_json"] or "{}")
+    angle_index = row["approved_angle_index"]
+    if angle_index is None:
+        angle_index = int(brief.get("recommended_index") or 0)
+    tag_row = db.execute(
+        "SELECT hook_type,narrative_pattern,proof_type,cta_type FROM creative_angle_tags "
+        "WHERE brief_id=? AND angle_index=?", (row["brief_id"], angle_index),
+    ).fetchone()
+    from . import creative_learning
+    tags = {
+        field: value for field in creative_learning.VOCABULARY
+        if (value := creative_learning.observed_tag(dict(tag_row) if tag_row else {}, field)) is not None
+    }
+    canonical_tags = json.dumps(tags, sort_keys=True, separators=(",", ":"))
+    canonical_script = json.dumps(script, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    storyboard["script_metadata"].update({
+        "brief_id": row["brief_id"], "selected_angle_index": angle_index,
+        "source_score": brief.get("source_score"),
+        "approved_draft_id": row["draft_id"],
+        "approved_script_sha256": hashlib.sha256(canonical_script.encode("utf-8")).hexdigest(),
+        "creative_tags": tags,
+        "creative_tag_snapshot": {
+            "authority": "approved_angle_intent_v1", "version": 1,
+            "provenance": "controlled_angle_record" if tags else "unknown",
+            "sha256": hashlib.sha256(canonical_tags.encode("utf-8")).hexdigest(),
+        },
+    })
     # Approval is the production hand-off boundary. Never persist a
     # Storyboard that the worker will reject after the job has been queued.
     from factory.steps import s1_storyboard

@@ -42,8 +42,9 @@ LEVEL_COMMANDS: dict[str, tuple[tuple[str, ...], ...]] = {
     "r2": (
         ("-m", "unittest", "tests.test_full_flow_regression"),
         ("tests/management_full_flow_browser_check.py",),
+        ("tests/creative_delivery_browser_check.py",),
     ),
-    "r3": (("-m", "unittest", "tests.test_full_flow_recovery"),),
+    "r3": (("-m", "unittest", "tests.test_full_flow_recovery", "tests.test_creative_delivery_journey"),),
     "r4": (
         (
             "-m", "unittest",

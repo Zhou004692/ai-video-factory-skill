@@ -11,11 +11,19 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from factory.flow_guard.management_actions import (  # noqa: E402
     BACKEND_VIDEO_ACTION_IDS,
+    evaluate_action_evidence,
     ui_video_action_ids,
 )
 
 
 class FlowGuardManagementActionTests(unittest.TestCase):
+    def test_visual_review_needs_actual_local_worker_evidence(self):
+        partial={'ui_dispatch_actions':['review_visual_content'],'integrated_backend_actions':['review_visual_content']}
+        item=next(i for i in evaluate_action_evidence(partial) if i['action_id']=='review_visual_content')
+        self.assertFalse(item['complete'])
+        self.assertEqual(item['missing'],['worker_action'])
+        partial['worker_actions']=['review_visual_content']
+        self.assertTrue(next(i for i in evaluate_action_evidence(partial) if i['action_id']=='review_visual_content')['complete'])
     def test_all_backend_actions_are_dispatched_by_the_console(self):
         source = (ROOT / "scripts" / "management_ui" / "app.js").read_text(
             encoding="utf-8"

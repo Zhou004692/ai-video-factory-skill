@@ -220,6 +220,8 @@ def main() -> int:
 
         environment = os.environ.copy()
         environment.update({
+            "FACTORY_RUNTIME_HOME": str(temp_root),
+            "FACTORY_ENV_FILE": str(temp_root / ".env"),
             "FACTORY_DB_PATH": str(target_db),
             "FACTORY_DATA_DIR": str(temp_root),
             "FACTORY_PROVIDER_MODE": "replay",
@@ -230,6 +232,9 @@ def main() -> int:
             "PRODUCTION_EXECUTION_ENGINE": "graph_v2",
             "PROVIDER_RECONCILE_ENABLED": "false",
         })
+        # The release gate disables generic replay workers; this journey
+        # explicitly owns safe child-process fixture handlers instead.
+        environment.pop("FACTORY_REPLAY_DISABLE_WORKERS", None)
         port = _free_port()
         base_url = f"http://127.0.0.1:{port}"
         server = subprocess.Popen(

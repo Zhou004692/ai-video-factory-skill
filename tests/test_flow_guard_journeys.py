@@ -23,7 +23,7 @@ class FlowGuardJourneyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("FACTORY_FLOW_GUARD_ZERO_COST_WORKER", source)
-        self.assertNotIn("FACTORY_REPLAY_DISABLE_WORKERS", source)
+        self.assertIn('environment.pop("FACTORY_REPLAY_DISABLE_WORKERS", None)', source)
         self.assertNotIn("def _run_graph", source)
         self.assertIn("production_worker_pid", source)
 
@@ -95,6 +95,7 @@ class FlowGuardJourneyTests(unittest.TestCase):
             ),
             SimpleNamespace(returncode=1, stdout="", stderr="fault failed"),
             SimpleNamespace(returncode=1, stdout="", stderr="backend failed"),
+            SimpleNamespace(returncode=1, stdout="", stderr="creative delivery failed"),
         ))
 
         def fake_command_runner(*args, **kwargs):
@@ -119,6 +120,7 @@ class FlowGuardJourneyTests(unittest.TestCase):
             SimpleNamespace(returncode=0, stdout="full passed", stderr=""),
             SimpleNamespace(returncode=1, stdout="", stderr="fault failed"),
             SimpleNamespace(returncode=1, stdout="", stderr="backend failed"),
+            SimpleNamespace(returncode=1, stdout="", stderr="creative delivery failed"),
         ))
 
         report = journeys.run_management_browser_suite(

@@ -22,6 +22,9 @@ from tests.management_workflow_browser_check import (  # noqa: E402
 
 
 class ZeroCostReleaseGateTests(unittest.TestCase):
+    def test_content_delivery_runs_actual_browser_and_restart_journey(self):
+        self.assertIn(('tests/creative_delivery_browser_check.py',), zero_cost_release_gate.LEVEL_COMMANDS['r2'])
+        self.assertIn('tests.test_creative_delivery_journey', ' '.join(part for cmd in zero_cost_release_gate.LEVEL_COMMANDS['r3'] for part in cmd))
     def test_unknown_replay_request_fails_before_socket_open(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture_root = Path(directory)

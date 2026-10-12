@@ -231,6 +231,12 @@ def run_management_browser_suite(
             7,
             (),
         ),
+        (
+            "creative_delivery_browser_restart",
+            PROJECT_ROOT / "tests" / "creative_delivery_browser_check.py",
+            1,
+            (),
+        ),
     )
     evidence = []
     coverage = CoverageEvidence()

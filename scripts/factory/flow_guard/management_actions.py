@@ -58,6 +58,7 @@ _BACKEND_EVIDENCE_ACTIONS = {
 }
 
 _WORKER_EVIDENCE_ACTIONS = {
+    "review_visual_content",
     "confirm_budget",
     "increase_job_budget",
     "repair_execution_contract",

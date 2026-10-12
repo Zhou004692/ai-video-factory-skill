@@ -47,10 +47,11 @@ def database(path):
 
 
 class DeliveryJourney:
-    def __init__(self, workspace, wheelhouse, legacy_ref):
+    def __init__(self, workspace, wheelhouse, legacy_ref, legacy_expected_version=None):
         self.workspace = workspace.resolve()
         self.wheelhouse = wheelhouse.resolve()
         self.legacy_ref = legacy_ref
+        self.legacy_expected_version = legacy_expected_version
         self.commands = []
         self.checks = []
         self.telemetry = self.workspace / "external-requests.jsonl"
@@ -238,10 +239,18 @@ class DeliveryJourney:
              self.workspace / "installed"], cwd=legacy_source, home=home))
         package = Path(legacy_report["package"])
         legacy_version = (package / "VERSION").read_text().strip()
-        self.run([self.host_python, package / "scripts/install.py", "--no-venv", "--no-deps"],
-                 cwd=package, home=home)
-        legacy_data = package / "data"
-        env_path = package / ".env"
+        old_source_sha = digest(package / 'scripts/factory/script_drafts.py')
+        if self.legacy_expected_version is None:
+            self.run([self.host_python, package / "scripts/install.py", "--no-venv", "--no-deps"],
+                     cwd=package, home=home)
+            legacy_data = package / "data"
+            env_path = package / ".env"
+        else:
+            # Current previous main has the real external-runtime bootstrap;
+            # exercise that old code, rather than pretend it writes in Skill.
+            self.bootstrap(package, home)
+            legacy_data = home / 'data'
+            env_path = home / '.env'
         env_path.write_text("ARK_API_KEY=<required>\nP4_KEEP=preserved\n", encoding="utf-8")
         media = legacy_data / "assets/J-P4/final.mp4"
         media.parent.mkdir(parents=True)
@@ -251,6 +260,11 @@ class DeliveryJourney:
         self.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
                   "color=c=blue:s=160x120:d=0.4", "-c:v", "libx264", "-pix_fmt", "yuv420p", media],
                  cwd=package, home=home)
+        archived_source = legacy_data / 'assets/J-P4/shots/review/repair_sources/historical.mp4'
+        archived_source.parent.mkdir(parents=True)
+        shutil.copyfile(media, archived_source)
+        opaque_proof = json.dumps({'fixture':'historical opaque proof; no generated business-action claim',
+                                   'source_sha256':digest(archived_source)},sort_keys=True)
         character = legacy_data / "character_assets/demo/anchor.png"
         character.parent.mkdir(parents=True)
         character.write_bytes(b"historical-character-artifact")
@@ -260,13 +274,29 @@ class DeliveryJourney:
             db.execute("INSERT INTO shots(job_id,idx,state,video_path) VALUES('J-P4',1,'OK',?)", (str(media),))
             db.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,cost_cents,usage_json) "
                        "VALUES('paid-before-update','J-P4',1,'seedance','generate',944,'{\"status\":\"completed\"}')")
+            db.execute("INSERT INTO events(job_id,step,level,message) VALUES('J-P4','historical_native_source_archive','info',?)",(opaque_proof,))
+            db.execute("INSERT INTO platform_publications(publication_id,job_id,platform,item_id,title,published_at,metadata_json) "
+                       "VALUES('PUB-P4','J-P4','douyin','old-offline-item','Historical publication','2026-10-01T00:00:00Z','{}')")
+            db.execute("INSERT INTO performance_snapshots(snapshot_id,job_id,platform,captured_at,views,likes,metadata_json) "
+                       "VALUES('SNAP-P4','J-P4','douyin','2026-10-02T00:00:00Z',7,0,'{}')")
         media_hash, character_hash, env_bytes = digest(media), digest(character), env_path.read_bytes()
         self.update(staged, package.parent, home)
         self.bootstrap(package, home)
         data = home / "data"
         migrated_media = data / "assets/J-P4/final.mp4"
         migrated_character = data / "character_assets/demo/anchor.png"
-        self.check("genuine_legacy_package_migrated", legacy_version == "3.2.0.1"
+        migrated_archive = data / 'assets/J-P4/shots/review/repair_sources/historical.mp4'
+        def historical_context_preserved(connection):
+            return (digest(migrated_archive)==media_hash
+                    and connection.execute("SELECT message FROM events WHERE step='historical_native_source_archive'").fetchone()[0]==opaque_proof
+                    and connection.execute("SELECT item_id FROM platform_publications WHERE publication_id='PUB-P4'").fetchone()[0]=='old-offline-item'
+                    and connection.execute("SELECT views,likes FROM performance_snapshots WHERE snapshot_id='SNAP-P4'").fetchone()==(7,0))
+        old_version_matches = (legacy_version == "3.2.0.1" if self.legacy_expected_version is None
+                               else legacy_version == self.legacy_expected_version)
+        new_source_sha = digest(package / 'scripts/factory/script_drafts.py')
+        self.check('actual_source_code_replaced', old_source_sha != new_source_sha
+                   and new_source_sha == digest(ROOT / 'scripts/factory/script_drafts.py'))
+        self.check("genuine_legacy_package_migrated", old_version_matches
                    and (home / ".env").read_bytes() == env_bytes
                    and digest(migrated_media) == media_hash
                    and digest(migrated_character) == character_hash)
@@ -274,6 +304,7 @@ class DeliveryJourney:
             row = db.execute("SELECT cost_cents,final_path FROM jobs WHERE job_id='J-P4'").fetchone()
             self.check("historical_cost_and_media_binding_preserved",
                        row == (944, str(migrated_media)) and db.execute("PRAGMA integrity_check").fetchone()[0] == 'ok')
+            self.check('source_archive_proof_and_feedback_preserved', historical_context_preserved(db))
         with self.server(package, home) as base:
             self.check("historical_task_loaded_by_new_service",
                        any(j['job_id'] == 'J-P4' and j['final_exists'] for j in self.http(base, '/api/videos')['jobs']))
@@ -286,6 +317,7 @@ class DeliveryJourney:
             self.check('external_runtime_survives_repeat_replacement',
                        db.execute("SELECT state,cost_cents FROM jobs WHERE job_id='J-P4'").fetchone()
                        == ('READY_TO_PUBLISH', 944))
+            self.check('repeat_keeps_source_archive_and_feedback', historical_context_preserved(db))
             db.execute("INSERT INTO jobs(job_id,topic_id,title,state,final_path) "
                        "VALUES('J-P4-ROLLBACK','T-P4','Rollback task','COMPOSED',?)", (str(migrated_media),))
         metadata = (data / 'runtime.json').read_bytes()
@@ -315,6 +347,7 @@ class DeliveryJourney:
                        and digest(migrated_character) == character_hash
                        and digest(migrated_media) == media_hash
                        and (data / 'runtime.json').read_bytes() == metadata)
+            self.check('rollback_keeps_source_archive_and_feedback', historical_context_preserved(db))
         (package / 'scripts/factory/db.py').write_bytes(original_db_code)
         (package / 'VERSION').write_bytes(original_version)
         self.bootstrap(package, home)
@@ -341,9 +374,11 @@ class DeliveryJourney:
                        db.execute("SELECT state,cost_cents FROM jobs WHERE job_id='J-P4'").fetchone()
                        == ('READY_TO_PUBLISH', 944)
                        and db.execute('SELECT COUNT(*) FROM provider_calls').fetchone()[0] == 1)
+            self.check('interrupted_replace_keeps_source_archive_and_feedback', historical_context_preserved(db))
         external = len(self.telemetry.read_text().splitlines()) if self.telemetry.exists() else 0
         self.check('no_guarded_external_requests', external == 0)
         return {"status": "passed", "legacy_ref": self.legacy_ref, "legacy_version": legacy_version,
+                "old_script_drafts_sha256": old_source_sha, "candidate_script_drafts_sha256": new_source_sha,
                 "skill_archive_sha256": digest(archive), "host_platform": sys.platform,
                 "version": original_version.decode().strip(), "checks": self.checks,
                 "commands": self.commands, "paid_provider_calls": 0, "external_requests": external,
@@ -358,13 +393,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wheelhouse', type=Path, required=True)
     parser.add_argument('--legacy-ref', default='59556cf')
+    parser.add_argument('--legacy-expected-version', default=None,
+                        help='Explicit previous-main version; default preserves genuine 3.2.0.1 migration proof')
     parser.add_argument('--work-root', type=Path, required=True)
     args = parser.parse_args()
     args.work_root.mkdir(parents=True, exist_ok=False)
     report_path = args.work_root / 'report.json'
     journey = None
     try:
-        journey = DeliveryJourney(args.work_root, args.wheelhouse, args.legacy_ref)
+        journey = DeliveryJourney(args.work_root, args.wheelhouse, args.legacy_ref, args.legacy_expected_version)
         report = journey.execute()
     except Exception as error:
         report = {"status": "failed", "error": f"{type(error).__name__}: {error}",
