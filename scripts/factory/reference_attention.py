@@ -7,6 +7,7 @@ numbering aligned with the actual request order.
 from __future__ import annotations
 
 from collections import Counter
+import math
 from typing import Iterable
 
 
@@ -37,7 +38,7 @@ def candidate(
     kind: str,
     duty: str,
     identity_key: str = "",
-    duration_sec: float = 0,
+    duration_sec: float | None = None,
     required: bool = True,
 ) -> dict:
     uri = str(uri or "").strip()
@@ -54,10 +55,53 @@ def candidate(
         "kind": kind,
         "duty": duty,
         "identity_key": str(identity_key or ""),
-        "duration_sec": max(0.0, float(duration_sec or 0)),
+        "duration_sec": known_duration(duration_sec),
         "required": bool(required),
         "priority": PRIORITY[duty],
     }
+
+
+def known_duration(value: object) -> float | None:
+    """Zero, malformed and nonfinite values are unavailable, never evidence."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+
+def validate_durations(
+    manifest: Iterable[dict], *, max_video_duration_sec: float | None = 30,
+    max_audio_duration_sec: float | None = 30, require_known: bool = False,
+) -> None:
+    items = list(manifest)
+    for kind, maximum in (("video", max_video_duration_sec),
+                          ("audio", max_audio_duration_sec)):
+        materials = [item for item in items if item.get("kind") == kind]
+        total = sum(known_duration(item.get("duration_sec")) or 0 for item in materials)
+        if maximum is not None and total > maximum:
+            raise ValueError(
+                f"reference {kind} aggregate duration {total:g}s exceeds max {maximum:g}s; "
+                "split the scene before paid generation"
+            )
+        if require_known:
+            for index, item in enumerate(materials, 1):
+                if known_duration(item.get("duration_sec")) is None:
+                    raise ValueError(
+                        f"reference duration unavailable for {kind} material {index}; "
+                        "provide verified duration metadata or a readable controlled local file "
+                        "before paid generation"
+                    )
+
+
+def sanitized_manifest(manifest: Iterable[dict]) -> list[dict]:
+    """Keep only bounded product labels and durations in provider audit."""
+    return [{
+        "kind": item.get("kind") if item.get("kind") in KIND_LABEL else "",
+        "duty": item.get("duty") if item.get("duty") in PRIORITY else "",
+        "material_index": int(item.get("material_index") or 0),
+        "duration_sec": known_duration(item.get("duration_sec")),
+    } for item in manifest if isinstance(item, dict)]
 
 
 def select_manifest(
@@ -65,6 +109,8 @@ def select_manifest(
     *,
     max_video_references: int,
     max_total_references: int = 8,
+    max_video_duration_sec: float = 30,
+    max_audio_duration_sec: float = 30,
 ) -> list[dict]:
     """Return an immutable request manifest ordered by product attention.
 
@@ -78,12 +124,18 @@ def select_manifest(
         key=lambda pair: (int(pair[1].get("priority") or 999), pair[0]),
     )
     deduped: list[dict] = []
-    seen: set[str] = set()
+    seen: dict[str, dict] = {}
     for _index, item in ordered:
         uri = str(item.get("uri") or "").strip()
-        if not uri or uri in seen:
+        if not uri:
             continue
-        seen.add(uri)
+        if uri in seen:
+            previous = seen[uri]
+            previous["required"] = previous.get("required", True) or item.get("required", True)
+            values = [known_duration(x.get("duration_sec")) for x in (previous, item)]
+            previous["duration_sec"] = max((x for x in values if x is not None), default=None)
+            continue
+        seen[uri] = item
         deduped.append(item)
     required_videos = sum(
         item.get("kind") == "video" and item.get("required", True)
@@ -116,6 +168,10 @@ def select_manifest(
     for item in selected:
         counters[item["kind"]] += 1
         item["material_index"] = counters[item["kind"]]
+    validate_durations(
+        selected, max_video_duration_sec=max_video_duration_sec,
+        max_audio_duration_sec=max_audio_duration_sec,
+    )
     return selected
 
 

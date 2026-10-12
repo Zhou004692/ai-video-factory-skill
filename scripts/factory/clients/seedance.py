@@ -30,7 +30,7 @@ import re
 
 import httpx
 
-from .. import provider_runtime, transport_diagnostics
+from .. import provider_runtime, reference_attention, transport_diagnostics
 from . import provider_downloads
 
 ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
@@ -44,6 +44,7 @@ SEEDANCE_25_CAPABILITIES = {
         "reference_audio": 10,
     },
     "task_types": frozenset({"auto", "edit", "extend"}),
+    "reference_duration_limits": {"video": 30, "audio": 30},
 }
 
 
@@ -59,6 +60,8 @@ def capability_profile(model: str) -> dict:
             "reference_audio": 3,
         },
         "task_types": frozenset({"auto"}),
+        # Preserve the existing legacy contract; no unverified duration caps.
+        "reference_duration_limits": {},
     }
 
 
@@ -487,6 +490,13 @@ def _video_task_payload(*, model: str, content: list, duration: float,
             "task_intent must be 'generate', 'edit', or 'extend'"
         )
     roles = {item.get("role") for item in content if item.get("role")}
+    is_25 = "seedance-2-5" in model.lower()
+    if is_25 and {"first_frame", "last_frame"} & roles and {
+        "reference_image", "reference_video", "reference_audio"
+    } & roles:
+        raise SeedanceParameterError(
+            "Seedance 2.5 strict first/last frames and multimodal references are mutually exclusive"
+        )
     if task_intent == "edit":
         if ratio != "adaptive":
             raise SeedanceParameterError(
@@ -494,9 +504,9 @@ def _video_task_payload(*, model: str, content: list, duration: float,
             )
         if duration != -1:
             raise SeedanceParameterError("Seedance edit tasks require duration=-1")
-        if not ({"reference_video", "reference_audio"} & roles):
+        if not (({"reference_video"} if is_25 else {"reference_video", "reference_audio"}) & roles):
             raise SeedanceParameterError(
-                "Seedance edit tasks require reference_video or reference_audio"
+                "Seedance edit tasks require reference_video"
             )
     profile = capability_profile(model)
     if "seedance-2-5" in model.lower():
@@ -552,6 +562,22 @@ def _video_task_payload(*, model: str, content: list, duration: float,
     return payload
 
 
+def _deduplicate_reference_inputs(materials: list[str] | None,
+                                  durations: list[float | None] | None,
+                                  kind: str) -> tuple[list[str], list[float | None] | None]:
+    materials = materials or []
+    if durations is not None and len(durations) != len(materials):
+        raise SeedanceParameterError(f"reference {kind} duration metadata must match material count")
+    unique = list(dict.fromkeys(materials))
+    if durations is None:
+        return unique, None
+    evidence = {}
+    for uri, value in zip(materials, durations):
+        seconds = reference_attention.known_duration(value)
+        evidence[uri] = max((x for x in (evidence.get(uri), seconds) if x is not None), default=None)
+    return unique, [evidence[uri] for uri in unique]
+
+
 def _validate_reference_limits(
     model: str,
     *,
@@ -586,6 +612,9 @@ async def text_to_video(
     references: list[str] | None = None,           # 2.5 最多 30 张
     reference_videos: list[str] | None = None,     # 2.5 最多 10 段
     reference_audios: list[str] | None = None,     # 2.5 最多 10 段
+    # Local preflight evidence only; these fields are never sent to the provider.
+    reference_video_durations: list[float | None] | None = None,
+    reference_audio_durations: list[float | None] | None = None,
     # 基本控制
     duration: float = 10.0,
     resolution: str = "720p",
@@ -628,12 +657,41 @@ async def text_to_video(
         )
 
     resolved_model = model or DEFAULT_MODEL
+    references = list(dict.fromkeys(references or []))
+    reference_videos, reference_video_durations = _deduplicate_reference_inputs(
+        reference_videos, reference_video_durations, "video",
+    )
+    reference_audios, reference_audio_durations = _deduplicate_reference_inputs(
+        reference_audios, reference_audio_durations, "audio",
+    )
     _validate_reference_limits(
         resolved_model,
         image_count=len(references or []),
         video_count=len(reference_videos or []),
         audio_count=len(reference_audios or []),
     )
+    duration_manifest = []
+    for kind, materials, durations in (
+        ("video", reference_videos or [], reference_video_durations),
+        ("audio", reference_audios or [], reference_audio_durations),
+    ):
+        if durations is None:
+            continue  # Legacy callers may not carry duration evidence.
+        if len(durations) != len(materials):
+            raise SeedanceParameterError(f"reference {kind} duration metadata must match material count")
+        duration_manifest.extend({"kind": kind, "duration_sec": seconds,
+                                  "material_index": index}
+                                 for index, seconds in enumerate(durations, 1))
+    limits = capability_profile(resolved_model)["reference_duration_limits"]
+    try:
+        reference_attention.validate_durations(
+            duration_manifest, max_video_duration_sec=limits.get("video"),
+            max_audio_duration_sec=limits.get("audio"), require_known=True,
+        )
+    except ValueError as exc:
+        raise SeedanceParameterError(str(exc)) from None
+    if metadata_out is not None and duration_manifest:
+        metadata_out["reference_manifest"] = reference_attention.sanitized_manifest(duration_manifest)
 
     # 兼容旧名
     if reference_image and not first_frame:

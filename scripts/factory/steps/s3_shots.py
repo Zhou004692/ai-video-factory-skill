@@ -2016,6 +2016,7 @@ def _apply_dialogue_reference_manifest(
     manifest = reference_attention.select_manifest(
         candidates,
         max_video_references=production_reference_video_budget(snapshot),
+        **_reference_duration_caps(snapshot.get("model") or seedance.DEFAULT_MODEL),
     )
     request["reference_manifest"] = manifest
     videos = [item for item in manifest if item["kind"] == "video"]
@@ -2446,6 +2447,28 @@ def _voice_anchor_from_completed_shot(
     return NativeVoiceAnchor(audio_path) if audio_path.exists() else None
 
 
+def _scene_voiceover_reference_mode(request: dict, prompt: str) -> str:
+    """Preserve an implicit scene image when voice needs multimodal mode.
+
+    Explicit end-frame locking stays strict and is rejected by the client if
+    combined with multimodal references; it must be routed deliberately.
+    """
+    first_frame = request.get("first_frame")
+    if not first_frame or not request.get("reference_audios") or request.get("last_frame"):
+        return prompt
+    images = list(dict.fromkeys([*(request.get("references") or []), first_frame]))
+    request["references"] = images
+    request["first_frame"] = None
+    index = images.index(first_frame) + 1
+    manifest = list(request.get("reference_manifest") or [])
+    if not any(item.get("kind") == "image" and item.get("uri") == first_frame for item in manifest):
+        image = reference_attention.candidate(first_frame, kind="image", duty="scene_continuity")
+        image["material_index"] = index
+        manifest.append(image)
+    request["reference_manifest"] = manifest
+    return prompt + f"\n图片{index}只负责首画面空间与景别的构图参考，非精确锁帧；动作与运镜按本镜提示词执行。"
+
+
 def _scene_voiceover_request_kwargs(
         shot: dict, anchor: NativeVoiceAnchor | None) -> dict:
     snapshot = production_config.snapshot_from_unit(shot) or {}
@@ -2592,7 +2615,8 @@ def _broll_request_kwargs(
                     identity_key=identity_key,
                 ))
     manifest = reference_attention.select_manifest(
-        candidates, max_video_references=reference_budget
+        candidates, max_video_references=reference_budget,
+        **_reference_duration_caps(snapshot.get("model") or seedance.DEFAULT_MODEL),
     )
     request["reference_manifest"] = manifest
     videos = [item for item in manifest if item["kind"] == "video"]
@@ -2738,6 +2762,59 @@ def _quality_retry_prompt(prompt: str, reasons: tuple[str, ...]) -> str:
         "水印与界面元素；相关区域改为纯色无字或符合场景的自然纹理，"
         "不要通过模糊、遮挡或变形文字规避。台词仅保留在音轨中。"
     )
+
+
+def _reference_duration_caps(model: str) -> dict:
+    limits = seedance.capability_profile(model)["reference_duration_limits"]
+    return {"max_video_duration_sec": limits.get("video"),
+            "max_audio_duration_sec": limits.get("audio")}
+
+
+async def _preflight_reference_manifest(request: dict, *, model: str) -> list[dict]:
+    """Validate all selected media; inspect only existing local files, never URLs.
+
+    Anchor records already carry video durations. Fixed/native voice WAVs can
+    use the existing local ffprobe path. Missing remote duration evidence is an
+    actionable error rather than a guessed zero or a network media probe.
+    """
+    existing = {(item.get("kind"), item.get("uri")): item
+                for item in request.get("reference_manifest") or [] if isinstance(item, dict)}
+    manifest = []
+    for kind, field, duty in (("video", "reference_videos", "scene_continuity"),
+                              ("audio", "reference_audios", "voice_continuity"),
+                              ("image", "references", "speaker_identity")):
+        materials = list(dict.fromkeys(request.get(field) or []))
+        for index, uri in enumerate(materials, 1):
+            item = dict(existing.get((kind, uri)) or reference_attention.candidate(
+                uri, kind=kind, duty=duty,
+            ))
+            item["material_index"] = index
+            item["duration_sec"] = reference_attention.known_duration(item.get("duration_sec"))
+            # A legacy aggregate is exact per-material evidence only for one input.
+            if kind in {"video", "audio"} and item["duration_sec"] is None and len(materials) == 1:
+                item["duration_sec"] = reference_attention.known_duration(
+                    request.get(f"reference_{kind}_duration_sec")
+                )
+            if kind in {"video", "audio"} and item["duration_sec"] is None:
+                text_uri = str(uri)
+                if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://|^data:", text_uri):
+                    local_path = Path(text_uri)
+                    if local_path.is_file():
+                        try:
+                            item["duration_sec"] = reference_attention.known_duration(
+                                await ffmpeg.probe_duration(local_path.resolve())
+                            )
+                        except Exception:
+                            # No decoder messages, paths, URLs or signatures in diagnostics.
+                            item["duration_sec"] = None
+            manifest.append(item)
+    try:
+        reference_attention.validate_durations(
+            manifest, require_known=True, **_reference_duration_caps(model),
+        )
+    except ValueError as exc:
+        raise seedance.SeedanceParameterError(str(exc)) from None
+    return manifest
 
 
 async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
@@ -2887,6 +2964,10 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         nonlocal spent_cost_cents, pre_recorded_cost_cents
         metadata: dict = {}
         call_kwargs = dict(generation_kwargs or request_kwargs)
+        if recovery_call is None:
+            call_kwargs["reference_manifest"] = await _preflight_reference_manifest(
+                call_kwargs, model=model,
+            )
         try:
             configured_capacity_limit = max(1, int(
                 (generation_snapshot or {}).get("max_concurrent_masters")
@@ -2908,15 +2989,17 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             )
         provider_kwargs = dict(call_kwargs)
         provider_kwargs.pop("reference_video_duration_sec", None)
-        reference_audit = [
-            {
-                "kind": str(item.get("kind") or ""),
-                "duty": str(item.get("duty") or ""),
-                "material_index": int(item.get("material_index") or 0),
-            }
-            for item in provider_kwargs.pop("reference_manifest", [])
-            if isinstance(item, dict)
-        ]
+        provider_kwargs.pop("reference_audio_duration_sec", None)
+        chosen_manifest = provider_kwargs.pop("reference_manifest", [])
+        reference_audit = reference_attention.sanitized_manifest(chosen_manifest)
+        if recovery_call is None:
+            for kind in ("video", "audio"):
+                durations = [item["duration_sec"] for item in chosen_manifest if item["kind"] == kind]
+                if durations:
+                    provider_kwargs[f"reference_{kind}s"] = list(dict.fromkeys(
+                        provider_kwargs.get(f"reference_{kind}s") or []
+                    ))
+                    provider_kwargs[f"reference_{kind}_durations"] = durations
         intent = call_kwargs.get("task_intent", "generate")
         deferred_completed: tuple[str, str, dict] | None = None
         attempt_task_ids: set[str] = {
@@ -4373,6 +4456,9 @@ async def _gen_broll(job_id: str, shot: dict,
                 "camera_fixed": bool(camera_fixed),
                 "motion_strength": float(motion_strength),
             })
+            if (scene_voiceover and not background_voiceover and not extend_mode
+                    and "seedance-2-5" in route.model.lower()):
+                prompt_full = _scene_voiceover_reference_mode(request_kwargs, prompt_full)
             result = await _generate_seedance_video(
                 prompt=prompt_full,
                 route=route,
