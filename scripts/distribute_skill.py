@@ -44,6 +44,7 @@ SCRIPT_ROOT_FILES = {
     "scripts/open_management.ps1",
     "scripts/requirements.txt",
     "scripts/runtime_lock.py",
+    "scripts/runtime_filesystem.py",
     "scripts/runtime_paths.py",
 }
 

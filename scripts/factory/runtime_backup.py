@@ -8,10 +8,12 @@ from pathlib import Path
 import shutil
 import sqlite3
 
+from runtime_filesystem import filesystem_path, sqlite_readonly_uri
+
 
 def _file_digest(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with filesystem_path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
@@ -19,8 +21,8 @@ def _file_digest(path: Path) -> str:
 
 def _snapshot_sqlite(source: Path, destination: Path) -> None:
     """Create a transactionally consistent standalone SQLite snapshot."""
-    source_connection = sqlite3.connect(source, timeout=30)
-    destination_connection = sqlite3.connect(destination)
+    source_connection = sqlite3.connect(filesystem_path(source), timeout=30)
+    destination_connection = sqlite3.connect(filesystem_path(destination))
     try:
         source_connection.backup(destination_connection)
     finally:
@@ -31,9 +33,9 @@ def _snapshot_sqlite(source: Path, destination: Path) -> None:
 def _restore_sqlite(snapshot: Path, target: Path) -> None:
     """Restore through SQLite so open WAL readers never see a replaced DB file."""
     source_connection = sqlite3.connect(
-        f"file:{snapshot.as_posix()}?mode=ro", uri=True, timeout=30
+        sqlite_readonly_uri(snapshot), uri=True, timeout=30
     )
-    target_connection = sqlite3.connect(target, timeout=30)
+    target_connection = sqlite3.connect(filesystem_path(target), timeout=30)
     try:
         source_connection.backup(target_connection)
         target_connection.commit()
@@ -43,9 +45,9 @@ def _restore_sqlite(snapshot: Path, target: Path) -> None:
             raise
         target_connection.close()
         source_connection.close()
-        Path(f"{target}-wal").unlink(missing_ok=True)
-        Path(f"{target}-shm").unlink(missing_ok=True)
-        shutil.copy2(snapshot, target)
+        filesystem_path(Path(f"{target}-wal")).unlink(missing_ok=True)
+        filesystem_path(Path(f"{target}-shm")).unlink(missing_ok=True)
+        shutil.copy2(filesystem_path(snapshot), filesystem_path(target))
         return
     finally:
         try:
@@ -63,12 +65,12 @@ def create_upgrade_snapshot(
         ("character_assets", data_dir / "character_assets", "character_assets"),
         ("assets", data_dir / "assets", "assets"),
     )
-    if not any(source.exists() for _, source, _ in targets):
+    if not any(filesystem_path(source).exists() for _, source, _ in targets):
         return None
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup = data_dir / "backups" / f"upgrade-{stamp}"
-    backup.mkdir(parents=True, exist_ok=False)
+    filesystem_path(backup).mkdir(parents=True, exist_ok=False)
     manifest: dict[str, object] = {"version": 1, "items": []}
     items: list[dict[str, object]] = []
     for name, source, relative in targets:
@@ -76,43 +78,43 @@ def create_upgrade_snapshot(
             "name": name,
             "source": str(source.resolve()),
             "snapshot": relative,
-            "existed": source.exists(),
-            "kind": "directory" if source.is_dir() else "file",
+            "existed": filesystem_path(source).exists(),
+            "kind": "directory" if filesystem_path(source).is_dir() else "file",
         }
-        if source.is_dir():
-            shutil.copytree(source, backup / relative)
-        elif source.is_file():
+        if filesystem_path(source).is_dir():
+            shutil.copytree(filesystem_path(source), filesystem_path(backup / relative))
+        elif filesystem_path(source).is_file():
             if name == "database":
                 _snapshot_sqlite(source, backup / relative)
             else:
-                shutil.copy2(source, backup / relative)
+                shutil.copy2(filesystem_path(source), filesystem_path(backup / relative))
             item["sha256"] = _file_digest(backup / relative)
         items.append(item)
     manifest["items"] = items
-    (backup / "manifest.json").write_text(
+    filesystem_path(backup / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return backup
 
 
 def restore_upgrade_snapshot(backup: Path) -> None:
-    manifest = json.loads((backup / "manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads(filesystem_path(backup / "manifest.json").read_text(encoding="utf-8"))
     for item in manifest["items"]:
         target = Path(item["source"])
         snapshot = backup / item["snapshot"]
         if not item["existed"]:
-            if target.is_dir():
-                shutil.rmtree(target)
+            if filesystem_path(target).is_dir():
+                shutil.rmtree(filesystem_path(target))
             else:
-                target.unlink(missing_ok=True)
+                filesystem_path(target).unlink(missing_ok=True)
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
+        filesystem_path(target.parent).mkdir(parents=True, exist_ok=True)
         if item["kind"] == "directory":
-            if target.exists():
-                shutil.rmtree(target)
-            shutil.copytree(snapshot, target)
+            if filesystem_path(target).exists():
+                shutil.rmtree(filesystem_path(target))
+            shutil.copytree(filesystem_path(snapshot), filesystem_path(target))
         else:
             if item["name"] == "database":
                 _restore_sqlite(snapshot, target)
             else:
-                shutil.copy2(snapshot, target)
+                shutil.copy2(filesystem_path(snapshot), filesystem_path(target))

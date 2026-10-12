@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sqlite3
 import sys
 import tempfile
@@ -12,6 +13,39 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 class RuntimeBackupTests(unittest.TestCase):
+    def test_snapshot_restore_preserves_paid_asset_beyond_windows_max_path(self):
+        from factory.runtime_backup import create_upgrade_snapshot, restore_upgrade_snapshot
+        from test_legacy_long_paths import disk, disposable_tree, long_asset, paid_database
+
+        with disposable_tree() as tmp:
+            root, data = tmp / "skill", tmp / "runtime"
+            root.mkdir()
+            asset = long_asset(data / "assets")
+            disk(asset.parent).mkdir(parents=True)
+            disk(asset).write_bytes(b"paid-original")
+            env_file = data / ".env"
+            env_file.write_text("KEEP=original\n", encoding="utf-8")
+            live = paid_database(data, asset)
+            try:
+                snapshot = create_upgrade_snapshot(root=root, data_dir=data, env_file=env_file)
+                manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+                self.assertTrue(all(not item["source"].startswith("\\\\?\\") for item in manifest["items"]))
+                self.assertEqual(disk(snapshot / "assets" / asset.relative_to(data / "assets")).read_bytes(), b"paid-original")
+                disk(asset).write_bytes(b"modified")
+                added = asset.parent / "unexpected.mp4"
+                disk(added).write_bytes(b"added-by-upgrade")
+                live.execute("UPDATE paid_tasks SET cost=99.25")
+                live.commit()
+                env_file.write_text("KEEP=changed\n", encoding="utf-8")
+                restore_upgrade_snapshot(snapshot)
+                self.assertEqual(disk(asset).read_bytes(), b"paid-original")
+                self.assertFalse(disk(added).exists())
+                self.assertEqual(live.execute("SELECT provider_id,cost,path FROM paid_tasks").fetchone(), ("paid-remote-task", 12.75, str(asset)))
+                self.assertEqual(env_file.read_text(encoding="utf-8"), "KEEP=original\n")
+                self.assertEqual(live.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            finally:
+                live.close()
+
     def test_runtime_lock_fails_closed_while_management_state_is_in_use(self):
         from runtime_lock import RuntimeStateBusy, RuntimeStateLock
 

@@ -12,6 +12,8 @@ import time
 from typing import Mapping
 import uuid
 
+from runtime_filesystem import filesystem_path, iter_tree, sqlite_readonly_uri
+
 
 APP_DIRECTORY = "ai-video-factory"
 LEGACY_MIGRATION_MARKER = ".legacy-migration.json"
@@ -113,8 +115,8 @@ def resolve_data_dir(
 
 
 def _copy_sqlite(source: Path, destination: Path) -> None:
-    source_connection = sqlite3.connect(source, timeout=30)
-    destination_connection = sqlite3.connect(destination)
+    source_connection = sqlite3.connect(filesystem_path(source), timeout=30)
+    destination_connection = sqlite3.connect(filesystem_path(destination))
     try:
         source_connection.backup(destination_connection)
     finally:
@@ -154,7 +156,7 @@ def _rebase_database_paths(
     """Rebase only absolute paths rooted in the replaceable legacy data tree."""
     source = source_data_dir.resolve()
     destination = destination_data_dir.resolve()
-    database = sqlite3.connect(database_path)
+    database = sqlite3.connect(filesystem_path(database_path))
     database.row_factory = sqlite3.Row
     try:
         tables = database.execute(
@@ -217,12 +219,12 @@ def _rebase_database_paths(
 
 
 def _same_file_content(left: Path, right: Path) -> bool:
-    if left.stat().st_size != right.stat().st_size:
+    if filesystem_path(left).stat().st_size != filesystem_path(right).stat().st_size:
         return False
     digests = []
     for path in (left, right):
         digest = hashlib.sha256()
-        with path.open("rb") as stream:
+        with filesystem_path(path).open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
         digests.append(digest.digest())
@@ -241,19 +243,21 @@ def _legacy_state_signature(
             for name in LEGACY_AUXILIARY_SUBTREES
         )
     for label, root in roots:
-        if not root.is_dir():
+        if not filesystem_path(root).is_dir():
             continue
         for path in sorted(
-            (item for item in root.rglob("*") if item.is_file()),
+            (item for item in iter_tree(root) if filesystem_path(item).is_file()),
             key=lambda item: item.relative_to(root).as_posix(),
         ):
-            if path.name in {".gitkeep", "factory.db-shm"}:
+            if path.name == ".gitkeep" or (
+                label == "primary" and path == source / "factory.db-shm"
+            ):
                 continue
             digest.update(label.encode("utf-8"))
             digest.update(b"\0")
             digest.update(path.relative_to(root).as_posix().encode("utf-8"))
             digest.update(b"\0")
-            with path.open("rb") as stream:
+            with filesystem_path(path).open("rb") as stream:
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(block)
             digest.update(b"\0")
@@ -266,10 +270,10 @@ def _legacy_migration_matches(
     auxiliary_data: Path | None,
 ) -> bool:
     marker = destination / LEGACY_MIGRATION_MARKER
-    if not marker.is_file():
+    if not filesystem_path(marker).is_file():
         return False
     try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload = json.loads(filesystem_path(marker).read_text(encoding="utf-8"))
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
     expected_auxiliary = str(auxiliary_data.resolve()) if auxiliary_data else None
@@ -282,30 +286,30 @@ def _legacy_migration_matches(
 
 
 def _merge_legacy_subtree(source: Path, destination: Path) -> None:
-    if not source.is_dir():
+    if not filesystem_path(source).is_dir():
         return
-    for path in source.rglob("*"):
+    for path in iter_tree(source):
         relative = path.relative_to(source)
         target = destination / relative
-        if path.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
+        if filesystem_path(path).is_dir():
+            filesystem_path(target).mkdir(parents=True, exist_ok=True)
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            if not target.is_file() or not _same_file_content(path, target):
+        filesystem_path(target.parent).mkdir(parents=True, exist_ok=True)
+        if filesystem_path(target).exists():
+            if not filesystem_path(target).is_file() or not _same_file_content(path, target):
                 raise RuntimeError(f"旧运行数据存在冲突文件：{relative}")
             continue
-        shutil.copy2(path, target)
+        shutil.copy2(filesystem_path(path), filesystem_path(target))
 
 
 def _promote_staging_directory(staging: Path, destination: Path) -> None:
     """Atomically promote a migration tree, tolerating transient Windows scans."""
     for attempt in range(8):
         try:
-            os.replace(staging, destination)
+            os.replace(filesystem_path(staging), filesystem_path(destination))
             return
         except PermissionError:
-            if destination.exists() or attempt == 7:
+            if filesystem_path(destination).exists() or attempt == 7:
                 raise
             time.sleep(min(0.05 * (2 ** attempt), 0.4))
 
@@ -317,30 +321,39 @@ def _copy_legacy_data(
     auxiliary_data: Path | None = None,
 ) -> None:
     staging = destination.with_name(f".{destination.name}.migrating-{uuid.uuid4().hex}")
+    physical_source = filesystem_path(source)
+
+    def ignore_primary_sidecars(directory: str, names: list[str]) -> set[str]:
+        # Preserve nested verification files verbatim; the primary DB alone
+        # receives a consistent online backup instead of copied WAL sidecars.
+        if Path(directory) != physical_source:
+            return set()
+        return set(names) & {"factory.db-wal", "factory.db-shm"}
+
     try:
-        if source.is_dir():
+        if filesystem_path(source).is_dir():
             shutil.copytree(
-                source,
-                staging,
-                ignore=shutil.ignore_patterns("factory.db-wal", "factory.db-shm"),
+                physical_source,
+                filesystem_path(staging),
+                ignore=ignore_primary_sidecars,
             )
         else:
-            staging.mkdir(parents=True)
-        if auxiliary_data is not None and auxiliary_data.is_dir():
+            filesystem_path(staging).mkdir(parents=True)
+        if auxiliary_data is not None and filesystem_path(auxiliary_data).is_dir():
             for name in LEGACY_AUXILIARY_SUBTREES:
                 _merge_legacy_subtree(
                     auxiliary_data / name,
                     staging / name,
                 )
         source_database = source / "factory.db"
-        if source_database.is_file():
+        if filesystem_path(source_database).is_file():
             target_database = staging / "factory.db"
-            target_database.unlink(missing_ok=True)
+            filesystem_path(target_database).unlink(missing_ok=True)
             _copy_sqlite(source_database, target_database)
             _rebase_database_paths(target_database, source, destination)
             if auxiliary_data is not None:
                 _rebase_database_paths(target_database, auxiliary_data, destination)
-        (staging / LEGACY_MIGRATION_MARKER).write_text(
+        filesystem_path(staging / LEGACY_MIGRATION_MARKER).write_text(
             json.dumps(
                 {
                     "source": str(source.resolve()),
@@ -356,17 +369,46 @@ def _copy_legacy_data(
         )
         _promote_staging_directory(staging, destination)
     except BaseException:
-        if staging.exists():
-            shutil.rmtree(staging)
+        # Only this invocation's generated sibling may be removed. Never follow
+        # an unexpectedly substituted symlink/junction into another state tree.
+        if filesystem_path(staging).exists():
+            if staging.is_symlink() or staging.resolve() != staging.absolute():
+                raise RuntimeError(f"迁移暂存目录发生变化，已保留供人工核对：{staging}")
+            shutil.rmtree(filesystem_path(staging))
         raise
 
 
 def _has_substantive_state(directory: Path) -> bool:
-    if not directory.is_dir():
+    if not filesystem_path(directory).is_dir():
         return False
     return any(
-        path.is_file() and path.name != ".gitkeep"
-        for path in directory.rglob("*")
+        filesystem_path(path).is_file() and path.name != ".gitkeep"
+        for path in iter_tree(directory)
+    )
+
+
+def _external_database_diagnostic(directory: Path) -> str:
+    """Describe observed empty schemas, without treating them as disposable."""
+    database_path = directory / "factory.db"
+    if not filesystem_path(database_path).is_file():
+        return ""
+    try:
+        database = sqlite3.connect(sqlite_readonly_uri(database_path), uri=True, timeout=5)
+        try:
+            tables = database.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            for (name,) in tables:
+                quoted = '"' + name.replace('"', '""') + '"'
+                if database.execute(f"SELECT 1 FROM {quoted} LIMIT 1").fetchone():
+                    return ""
+        finally:
+            database.close()
+    except sqlite3.Error:
+        return "外部 factory.db 无法只读核验，需人工检查数据库及其它文件。"
+    return (
+        "外部 factory.db 未发现业务行，可能仅有表结构（schema-only）；"
+        "未知表结构及其它文件仍需人工核对，不能据此判定目录可丢弃。"
     )
 
 
@@ -443,7 +485,11 @@ def prepare_runtime_state(
     ):
         raise RuntimeError(
             "旧 Skill 数据与未完成的外部运行数据同时存在；已停止升级，"
-            "请先核对两个目录，避免覆盖有效任务。"
+            f"避免覆盖有效任务。旧数据：{legacy_data}；外部数据：{data_dir}。"
+            + _external_database_diagnostic(data_dir)
+            + "两个目录均已保留；请先分别备份并人工核对任务、费用、资产及其它文件。"
+            "仅在确认外部目录可移出后，由人工将其完整移至其它备份目录，"
+            "保留旧数据原目录，再重试迁移；不要删除数据库或单独移除未知文件。"
         )
     if (
         data_dir != legacy_data
