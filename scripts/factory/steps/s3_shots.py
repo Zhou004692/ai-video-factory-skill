@@ -2777,8 +2777,18 @@ async def _preflight_reference_manifest(request: dict, *, model: str) -> list[di
     use the existing local ffprobe path. Missing remote duration evidence is an
     actionable error rather than a guessed zero or a network media probe.
     """
-    existing = {(item.get("kind"), item.get("uri")): item
-                for item in request.get("reference_manifest") or [] if isinstance(item, dict)}
+    existing: dict[tuple[str, str], dict] = {}
+    for item in request.get("reference_manifest") or []:
+        if not isinstance(item, dict):
+            continue
+        material_key = (item.get("kind"), item.get("uri"))
+        if material_key not in existing:
+            existing[material_key] = dict(item)
+            continue
+        previous = existing[material_key]
+        values = [reference_attention.known_duration(x.get("duration_sec")) for x in (previous, item)]
+        previous["duration_sec"] = max((x for x in values if x is not None), default=None)
+        previous["required"] = previous.get("required", True) or item.get("required", True)
     manifest = []
     for kind, field, duty in (("video", "reference_videos", "scene_continuity"),
                               ("audio", "reference_audios", "voice_continuity"),

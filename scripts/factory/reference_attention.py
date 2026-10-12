@@ -124,18 +124,19 @@ def select_manifest(
         key=lambda pair: (int(pair[1].get("priority") or 999), pair[0]),
     )
     deduped: list[dict] = []
-    seen: dict[str, dict] = {}
+    seen: dict[tuple[str, str], dict] = {}
     for _index, item in ordered:
         uri = str(item.get("uri") or "").strip()
         if not uri:
             continue
-        if uri in seen:
-            previous = seen[uri]
+        material_key = (str(item.get("kind") or ""), uri)
+        if material_key in seen:
+            previous = seen[material_key]
             previous["required"] = previous.get("required", True) or item.get("required", True)
             values = [known_duration(x.get("duration_sec")) for x in (previous, item)]
             previous["duration_sec"] = max((x for x in values if x is not None), default=None)
             continue
-        seen[uri] = item
+        seen[material_key] = item
         deduped.append(item)
     required_videos = sum(
         item.get("kind") == "video" and item.get("required", True)

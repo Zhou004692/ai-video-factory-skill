@@ -117,8 +117,29 @@ class DurationAttentionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "video.*31.*30"):
             reference_attention.select_manifest([first, later], max_video_references=3)
 
+    def test_same_uri_preserves_required_video_and_audio_roles(self):
+        video = media("video", 5)
+        audio = reference_attention.candidate(video["uri"], kind="audio", duty="voice_continuity", duration_sec=5)
+        manifest = reference_attention.select_manifest([video, audio], max_video_references=3)
+        self.assertEqual([item["kind"] for item in manifest], ["video", "audio"])
+        self.assertTrue(all(item["required"] for item in manifest))
+
 
 class SubmissionPreflightTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generation_wrapper_duplicate_metadata_cannot_hide_31_seconds(self):
+        long = media("video", 31)
+        short = media("video", 5)
+        request = {"duration": 8, "reference_videos": [long["uri"]],
+                   "reference_manifest": [long, short]}
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            seedance, "text_to_video", new=AsyncMock(return_value=b"mock")) as submit, patch.object(
+            s3_shots.tos, "upload", return_value="https://example.invalid/mock.mp4"):
+            with self.assertRaisesRegex(seedance.SeedanceParameterError, "video.*31.*30"):
+                await s3_shots._generate_seedance_video(
+                    prompt="test", route=VideoRoute(MODEL, "seedance25", False, False),
+                    request_kwargs=request, out_path=Path(temp) / "out.mp4", key_hint="offline")
+            submit.assert_not_awaited()
+
     async def test_legal_client_neighbors_reach_only_mock_transport(self):
         posted = []
         def handler(request):
