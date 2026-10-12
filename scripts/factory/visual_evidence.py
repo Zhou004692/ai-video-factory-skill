@@ -37,6 +37,16 @@ def _number(value):
     except (TypeError, ValueError):
         return None
 
+def _json_safe(value):
+    """Keep rejected provider values reviewable under strict JSON encoding."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
 def valid_interval(item, duration_sec):
     if not isinstance(item, dict):
         return False
@@ -71,6 +81,9 @@ def bind_observations(requirements, raw, *, asset_sha256, duration_sec):
     items = []
     for item in source if isinstance(source, list) else []:
         if not isinstance(item, dict):
+            # Retain a JSON-safe invalid marker: dropping malformed mappings
+            # could make a valid neighbouring entry falsely pass the bundle.
+            items.append({})
             continue
         copy = {"id": item.get("id"), "status": item.get("status"), "event_refs": deepcopy(item.get("event_refs")),
                 "provenance": "automatic"}
@@ -82,9 +95,9 @@ def bind_observations(requirements, raw, *, asset_sha256, duration_sec):
                 event = event_map[refs[0]]
                 copy.update({key: event[key] for key in ("start_sec", "end_sec", "observed_description", "confidence")})
         items.append(copy)
-    return {"version": 1, "asset_sha256": asset_sha256,
+    return _json_safe({"version": 1, "asset_sha256": asset_sha256,
             "requirement_set_hash": requirement_set_hash(requirements), "duration_sec": duration_sec,
-            "provenance": "automatic", "observed_visual_events": events, "items": items}
+            "provenance": "automatic", "observed_visual_events": events, "items": items})
 
 def evaluate(requirements, evidence, *, asset_sha256, duration_sec):
     """Validate automatic evidence. Payload provenance never authorizes review."""
@@ -146,8 +159,8 @@ def _evaluate(requirements, evidence, *, asset_sha256, duration_sec, human):
         for key in ("start_sec", "end_sec", "confidence"):
             item[key] = _number(item.get(key))
         output.append(item)
-    return {"version": 1, "passed": not reasons, "asset_sha256": asset_sha256,
-            "requirement_set_hash": wanted_hash, "items": output, "reasons": list(dict.fromkeys(reasons))}
+    return _json_safe({"version": 1, "passed": not reasons, "asset_sha256": asset_sha256,
+            "requirement_set_hash": wanted_hash, "items": output, "reasons": list(dict.fromkeys(reasons))})
 
 def retention_report(storyboard, masters, *, verified_human_master_ids=()):
     """Check full observed action intervals against the final picture edits."""
@@ -159,7 +172,7 @@ def retention_report(storyboard, masters, *, verified_human_master_ids=()):
         return report
     if storyboard.get("requirement_set_hash", report["requirement_set_hash"]) != report["requirement_set_hash"]:
         report["reasons"].append("content_stale_requirements")
-    intervals = {}
+    picture_runs = []
     for edit in storyboard.get("shots") or []:
         start, duration = _number(edit.get("video_start", 0)), _number(edit.get("duration"))
         idx = edit.get("video_master_idx")
@@ -168,7 +181,14 @@ def retention_report(storyboard, masters, *, verified_human_master_ids=()):
         if start is None or duration is None or actual is None or not 0 <= start < start + duration <= actual:
             report["reasons"].append("content_invalid_edit_interval")
             continue
-        intervals.setdefault(idx, []).append((start, start + duration))
+        # Preserve output order. An action may span cuts only if the same
+        # source continues immediately at its previous ending frame. Sorted
+        # unions lose reversals, intervening shots and repeated frames.
+        if (picture_runs and picture_runs[-1][0] == idx
+                and abs(start - picture_runs[-1][2]) <= .001):
+            picture_runs[-1] = (idx, picture_runs[-1][1], start + duration)
+        else:
+            picture_runs.append((idx, start, start + duration))
         report["kept_intervals"].append({"video_master_idx": idx, "edit_idx": edit.get("idx"), "start_sec": start, "end_sec": start + duration})
     proved = set()
     for master_plan in storyboard.get("masters") or []:
@@ -183,16 +203,11 @@ def retention_report(storyboard, masters, *, verified_human_master_ids=()):
             duration_sec=master.get("duration_sec"))
         report["master_hashes"][str(idx)] = master.get("asset_sha256")
         report["reasons"].extend(proof["reasons"])
-        merged = []
-        for start, end in sorted(intervals.get(idx, [])):
-            if merged and start <= merged[-1][1] + .001:
-                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
-            else:
-                merged.append((start, end))
         for item in proof["items"]:
             kept = item["status"] == "not_applicable" and proof["passed"]
             if item["status"] == "satisfied" and proof["passed"]:
-                kept = any(start <= item["start_sec"] and end >= item["end_sec"] for start, end in merged)
+                kept = any(source_idx == idx and start <= item["start_sec"] and end >= item["end_sec"]
+                           for source_idx, start, end in picture_runs)
                 if not kept:
                     report["reasons"].append("content_event_cropped")
             if kept:

@@ -56,6 +56,49 @@ class EvidenceTests(unittest.TestCase):
             raw = observation(); raw["visual_comparison"]["requirement_evidence"][0]["status"] = status
             self.assertFalse(self.report(raw)["passed"])
 
+    def test_malformed_mapping_cannot_disappear_beside_valid_mapping(self):
+        from factory import visual_evidence
+        for malformed in (None, "invalid", 7, float("nan")):
+            with self.subTest(malformed=malformed):
+                raw = observation(); raw["visual_comparison"]["requirement_evidence"].append(malformed)
+                proof = visual_evidence.bind_observations(REQS, raw, asset_sha256=SHA, duration_sec=4)
+                result = visual_evidence.evaluate(REQS, proof, asset_sha256=SHA, duration_sec=4)
+                self.assertFalse(result["passed"])
+                self.assertIn("content_invalid_evidence", result["reasons"])
+                json.dumps(proof, allow_nan=False)
+                json.dumps(result, allow_nan=False)
+
+    def test_nonfinite_mapping_refs_remain_rejected_and_json_safe(self):
+        from factory import visual_evidence
+        raw = observation()
+        raw["visual_comparison"]["requirement_evidence"][0]["event_refs"] = [float("nan")]
+        proof = visual_evidence.bind_observations(REQS, raw, asset_sha256=SHA, duration_sec=4)
+        result = visual_evidence.evaluate(REQS, proof, asset_sha256=SHA, duration_sec=4)
+        self.assertFalse(result["passed"])
+        json.dumps(proof, allow_nan=False)
+        json.dumps(result, allow_nan=False)
+
+    def test_action_retention_requires_output_adjacent_ascending_source(self):
+        from factory import visual_evidence
+        raw = observation(); raw["observed_visual_events"][0]["end_sec"] = 3
+        proof = visual_evidence.bind_observations(REQS, raw, asset_sha256=SHA, duration_sec=4)
+        board = {"visual_requirements": REQS, "masters": [{"idx": 1, "visual_requirements": REQS}]}
+        masters = {1: {"asset_sha256": SHA, "duration_sec": 4, "evidence": proof},
+                   2: {"asset_sha256": "other", "duration_sec": 4}}
+        def edit(master, start, duration=1):
+            return {"video_master_idx": master, "video_start": start, "duration": duration}
+        for shots, expected in (
+            ([edit(1, 1, 2)], True),
+            ([edit(1, 1), edit(1, 2)], True),
+            ([edit(1, 2), edit(1, 1)], False),
+            ([edit(1, 1), edit(2, 0), edit(1, 2)], False),
+            ([edit(1, 1), edit(1, 1.5, 1.5)], False),
+        ):
+            with self.subTest(shots=shots):
+                board["shots"] = shots
+                report = visual_evidence.retention_report(board, masters)
+                self.assertEqual(report["passed"], expected)
+
     def test_stale_and_forged_human_proof_are_rejected(self):
         from factory import visual_evidence
         proof = visual_evidence.bind_observations(REQS, observation(), asset_sha256=SHA, duration_sec=4)
