@@ -138,6 +138,32 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(projected[index]["video_fade_in_sec"], rendered[index]["video_fade_in_sec"])
                 self.assertEqual(projected[index]["video_fade_out_sec"], rendered[index]["video_fade_out_sec"])
 
+    def test_remote_edge_fades_do_not_block_unfaded_continuous_action(self):
+        from factory import visual_evidence
+        raw = observation(); raw["observed_visual_events"][0].update(start_sec=1.8, end_sec=2.2)
+        proof = visual_evidence.bind_observations(REQS, raw, asset_sha256=SHA, duration_sec=4)
+        masters = {1: {"asset_sha256": SHA, "duration_sec": 4, "evidence": proof},
+                   2: {"asset_sha256": "other", "duration_sec": 4}}
+        board = {"visual_requirements": REQS, "masters": [{"idx": 1, "visual_requirements": REQS}]}
+        # Entry fade finishes before the action; the later connection is clear.
+        board["shots"] = [{"idx": 1, "video_master_idx": 2, "video_start": 0, "duration": 1},
+            {"idx": 2, "video_master_idx": 1, "video_start": 1, "duration": 1,
+             "transition_type": "dip_to_black", "transition_duration_sec": .25},
+            {"idx": 3, "video_master_idx": 1, "video_start": 2, "duration": 1}]
+        report = visual_evidence.retention_report(board, masters)
+        with self.subTest(edge="entry"):
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["visible_intervals"][1]["start_sec"], 1.25)
+        # Exit fade starts after the action; it must still trim the outer end.
+        board["shots"] = [{"idx": 1, "video_master_idx": 1, "video_start": 1, "duration": 1},
+            {"idx": 2, "video_master_idx": 1, "video_start": 2, "duration": 1},
+            {"idx": 3, "video_master_idx": 2, "video_start": 0, "duration": 1,
+             "transition_type": "dip_to_black", "transition_duration_sec": .25}]
+        report = visual_evidence.retention_report(board, masters)
+        with self.subTest(edge="exit"):
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["visible_intervals"][1]["end_sec"], 2.75)
+
     def test_invalid_transition_duration_cannot_reach_renderer_or_pass_gate(self):
         from factory import visual_evidence
         proof = visual_evidence.bind_observations(REQS, observation(), asset_sha256=SHA, duration_sec=4)

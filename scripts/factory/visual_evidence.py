@@ -213,15 +213,14 @@ def retention_report(storyboard, masters, *, verified_human_master_ids=()):
             continue
         visible_start = start + transition["video_fade_in_sec"]
         visible_end = start + duration - transition["video_fade_out_sec"]
-        no_fade = not any(transition.values())
-        # Faded regions are conservatively excluded from content proof. Only
-        # unfaded adjacent cuts may join one uninterrupted observed action.
+        # Faded outer edges stay excluded, but do not block a later clear cut.
+        # Each run records its final clip's fade-out for the next connection.
         if (picture_runs and picture_runs[-1][0] == idx
-                and no_fade and picture_runs[-1][3]
+                and transition["video_fade_in_sec"] == 0 and picture_runs[-1][3] == 0
                 and abs(visible_start - picture_runs[-1][2]) <= .001):
-            picture_runs[-1] = (idx, picture_runs[-1][1], visible_end, True)
+            picture_runs[-1] = (idx, picture_runs[-1][1], visible_end, transition["video_fade_out_sec"])
         else:
-            picture_runs.append((idx, visible_start, visible_end, no_fade))
+            picture_runs.append((idx, visible_start, visible_end, transition["video_fade_out_sec"]))
         report["kept_intervals"].append({"video_master_idx": idx, "edit_idx": edit.get("idx"), "start_sec": start, "end_sec": start + duration})
         report["visible_intervals"].append({"video_master_idx": idx, "edit_idx": edit.get("idx"),
             "start_sec": visible_start, "end_sec": visible_end, **transition})
@@ -242,7 +241,7 @@ def retention_report(storyboard, masters, *, verified_human_master_ids=()):
             kept = item["status"] == "not_applicable" and proof["passed"]
             if item["status"] == "satisfied" and proof["passed"]:
                 kept = any(source_idx == idx and start <= item["start_sec"] and end >= item["end_sec"]
-                           for source_idx, start, end, _no_fade in picture_runs)
+                           for source_idx, start, end, _fade_out in picture_runs)
                 if not kept:
                     report["reasons"].append("content_event_cropped")
             if kept:
