@@ -8655,22 +8655,33 @@ class ManagementService:
         }
 
     def register_publication(self, payload: dict) -> dict:
+        with self._final_review_lock, node_state_machine.atomic(self.database):
+            return self._register_publication_in_transaction(payload)
+
+    def _publication_registration_snapshot(self, job_id: str) -> tuple[str, str | None]:
+        job = self.database.execute('SELECT state FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+        if not job:
+            raise ValueError('视频任务不存在')
+        if job['state'] not in {'READY_TO_PUBLISH', 'PUBLISHED'}:
+            raise ValueError('content: 只有待发布成片才能登记渠道发布结果；状态已变化，请刷新后重试')
+        report = content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+        revision = content_review.publication_revision(self.database, job_id, report) if report else None
+        return str(job['state']), revision
+
+    def _require_publication_registration_snapshot(self, job_id: str, expected: tuple[str, str | None]) -> None:
+        if self._publication_registration_snapshot(job_id) != expected:
+            raise ValueError('content publication registration state/report revision is stale')
+
+    def _register_publication_in_transaction(self, payload: dict) -> dict:
         required = ("job_id", "platform", "item_id")
         missing = [key for key in required if not str(payload.get(key) or "").strip()]
         if missing:
             raise ValueError("缺少发布字段：" + ", ".join(missing))
         job_id = str(payload["job_id"]).strip()
-        content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+        snapshot = self._publication_registration_snapshot(job_id)
         platform = str(payload["platform"]).strip()
         if platform not in {"douyin", "weixin_channels"}:
             raise ValueError("发布渠道仅支持抖音或微信视频号")
-        job = self.database.execute(
-            "SELECT state FROM jobs WHERE job_id=?", (job_id,)
-        ).fetchone()
-        if not job:
-            raise ValueError("视频任务不存在")
-        if job["state"] not in {"READY_TO_PUBLISH", "PUBLISHED"}:
-            raise ValueError("只有待发布成片才能登记渠道发布结果")
         publication_id = f"PUB-{payload['platform']}-{payload['item_id']}"
         metadata = payload.get("metadata") or {}
         if not isinstance(metadata, dict):
@@ -8706,7 +8717,7 @@ class ManagementService:
                     platform,
                 ),
             )
-        self.database.commit()
+        self._require_publication_registration_snapshot(job_id, snapshot)
         return {"publication_id": publication_id, "status": "saved"}
 
     def _douyin_publish_identity(self, job_id: str) -> dict:
@@ -8913,8 +8924,12 @@ class ManagementService:
         }
 
     def register_publications(self, payload: dict) -> dict:
+        with self._final_review_lock, node_state_machine.atomic(self.database):
+            return self._register_publications_in_transaction(payload)
+
+    def _register_publications_in_transaction(self, payload: dict) -> dict:
         job_id = str(payload.get("job_id") or "").strip()
-        content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+        snapshot = self._publication_registration_snapshot(job_id)
         channels = payload.get("channels") or []
         if not job_id or not isinstance(channels, list) or not channels:
             raise ValueError("请选择待发布成片和至少一个渠道")
@@ -8931,7 +8946,7 @@ class ManagementService:
             normalized.append({**channel, "platform": platform, "item_id": item_id})
         saved = []
         for channel in normalized:
-            saved.append(self.register_publication({**channel, "job_id": job_id}))
+            saved.append(self._register_publication_in_transaction({**channel, "job_id": job_id}))
         publication_rows = self.database.execute(
             "SELECT platform,metadata_json FROM platform_publications WHERE job_id=?",
             (job_id,),
@@ -8942,14 +8957,17 @@ class ManagementService:
         }
         target_state = (
             "PUBLISHED"
-            if {"douyin", "weixin_channels"}.issubset(published)
+            if snapshot[0] == 'PUBLISHED' or {"douyin", "weixin_channels"}.issubset(published)
             else "READY_TO_PUBLISH"
         )
-        self.database.execute(
-            "UPDATE jobs SET state=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-            (target_state, job_id),
+        self._require_publication_registration_snapshot(job_id, snapshot)
+        changed = self.database.execute(
+            "UPDATE jobs SET state=?,error=NULL,updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND state=?",
+            (target_state, job_id, snapshot[0]),
         )
-        self.database.commit()
+        if changed.rowcount != 1:
+            raise ValueError('content publication registration lost job-state compare-and-swap')
+        self._require_publication_registration_snapshot(job_id, (target_state, snapshot[1]))
         return {"job_id": job_id, "saved": len(saved), "state": target_state}
 
     def record_performance_snapshot(self, publication_id: str, payload: dict) -> dict:

@@ -364,15 +364,23 @@ async def _refresh_director_speech_timeline(
             try:
                 merged = content_review.persist_effective_storyboard(database, job_id, storyboard,
                     expected_local_fingerprint=local_fingerprint)
+                # The helper already persisted this merge. Re-read nonlocal
+                # metadata for JSON without replacing later operator changes.
+                live_row = database.execute('SELECT storyboard FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+                live = content_review.object_json(live_row['storyboard']) if live_row else {}
+                if content_review.edit_plan_fingerprint(live) != content_review.edit_plan_fingerprint(merged):
+                    raise ValueError('content local edit changed after ASR merge')
+                merged = content_review.effective_storyboard(live, merged)
             except ValueError as exc:
                 raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_effective_plan_changed']}) from exc
             storyboard.clear(); storyboard.update(merged)
-        encoded = json.dumps(storyboard, ensure_ascii=False)
-        database.execute(
-            "UPDATE jobs SET storyboard=? WHERE job_id=?",
-            (encoded, job_id),
-        )
-        database.commit()
+        else:
+            encoded = json.dumps(storyboard, ensure_ascii=False)
+            database.execute(
+                "UPDATE jobs SET storyboard=? WHERE job_id=?",
+                (encoded, job_id),
+            )
+            database.commit()
         storyboard_path = ASSETS_DIR / job_id / "storyboard.json"
         storyboard_path.parent.mkdir(parents=True, exist_ok=True)
         storyboard_path.write_text(

@@ -557,6 +557,135 @@ class ContentReviewTests(unittest.TestCase):
         self.assertEqual(client.upload_video.call_count,2)
         self.assertEqual(client.create_video.call_args.kwargs['video_id'],'upload-second')
 
+    def test_publication_batch_cannot_revive_job_after_real_content_review(self):
+        import factory.management_api as management_api
+        self.publish_fixture(); invoked=[]
+        original_pending=management_api._publication_is_pending
+        def change_content(raw):
+            if not invoked:
+                invoked.append(self.service.record_content_review('J',1,self.payload('active','conflicting')))
+            return original_pending(raw)
+        with patch.object(management_api,'_publication_is_pending',side_effect=change_content):
+            with self.assertRaisesRegex(ValueError,'content'):
+                self.service.register_publications({'job_id':'J','channels':[{'platform':'weixin_channels','item_id':'wx'}]})
+        self.assertEqual(len(invoked),1)
+        self.assertEqual(self.database.execute('SELECT COUNT(*) FROM platform_publications').fetchone()[0],0)
+
+    def test_asr_controlled_merge_does_not_overwrite_later_operator_controls(self):
+        from factory.steps import s6_compose
+        self.sb['production_settings']={'budget_cents':1000}
+        self.sb['shots'][0].update(duration=3,audio_master_idx=1,audio_start=.1,video_start=0,continuity_relation='same_master_continuous')
+        self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(self.sb),)); self.database.commit()
+        real_persist=content_review.persist_effective_storyboard
+        def persist_then_update(*args,**kwargs):
+            merged=real_persist(*args,**kwargs)
+            latest=json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0])
+            latest['production_settings']['budget_cents']=9999
+            latest['operator_note']='Preserve concurrent operator update'
+            self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(latest),)); self.database.commit()
+            return merged
+        rows=self.database.execute('SELECT * FROM shots').fetchall()
+        with patch.object(content_review,'persist_effective_storyboard',side_effect=persist_then_update),patch.object(s6_compose,'ASSETS_DIR',self.root/'data'/'assets'):
+            self.assertTrue(asyncio.run(s6_compose._refresh_director_speech_timeline('J',self.sb,rows,self.database)))
+        stored=json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0])
+        self.assertEqual(stored['production_settings']['budget_cents'],9999)
+        self.assertEqual(stored['operator_note'],'Preserve concurrent operator update')
+        self.assertEqual(stored['shots'][0]['video_start'],.1)
+        projected=json.loads((self.base/'storyboard.json').read_text(encoding='utf-8'))
+        self.assertEqual(projected['production_settings']['budget_cents'],9999)
+        self.assertEqual(projected['operator_note'],stored['operator_note'])
+
+    def test_publication_batch_rolls_back_all_channels_on_later_invalid_metadata(self):
+        self.publish_fixture()
+        with self.assertRaises(ValueError):
+            self.service.register_publications({'job_id':'J','channels':[
+                {'platform':'weixin_channels','item_id':'wx'},
+                {'platform':'douyin','item_id':'dy','metadata':'invalid-object'}]})
+        self.assertEqual(self.database.execute('SELECT COUNT(*) FROM platform_publications').fetchone()[0],0)
+        self.assertEqual(self.database.execute('SELECT state FROM jobs').fetchone()[0],'READY_TO_PUBLISH')
+
+    def test_single_and_batch_publication_leave_existing_transaction_to_caller(self):
+        self.publish_fixture()
+        for batch in [False,True]:
+            with self.subTest(batch=batch):
+                self.database.execute('BEGIN IMMEDIATE')
+                payload={'job_id':'J','platform':'weixin_channels','item_id':'wx'}
+                if batch: self.service.register_publications({'job_id':'J','channels':[payload]})
+                else: self.service.register_publication(payload)
+                self.assertTrue(self.database.in_transaction)
+                self.assertEqual(self.database.execute('SELECT COUNT(*) FROM platform_publications').fetchone()[0],1)
+                self.database.rollback()
+                self.assertEqual(self.database.execute('SELECT COUNT(*) FROM platform_publications').fetchone()[0],0)
+
+    def test_failed_batch_savepoint_preserves_prior_caller_changes(self):
+        self.publish_fixture(); self.database.execute('BEGIN IMMEDIATE')
+        self.database.execute("UPDATE jobs SET title='caller-owned-change'")
+        with self.assertRaises(ValueError):
+            self.service.register_publications({'job_id':'J','channels':[
+                {'platform':'weixin_channels','item_id':'wx'},
+                {'platform':'douyin','item_id':'dy','metadata':'invalid-object'}]})
+        self.assertTrue(self.database.in_transaction)
+        self.assertEqual(self.database.execute('SELECT title FROM jobs').fetchone()[0],'caller-owned-change')
+        self.assertEqual(self.database.execute('SELECT COUNT(*) FROM platform_publications').fetchone()[0],0)
+        self.database.rollback()
+        self.assertEqual(self.database.execute('SELECT title FROM jobs').fetchone()[0],'Test')
+
+    def test_publication_registration_waits_for_other_connection_review_and_cannot_revive_it(self):
+        from factory import node_state_machine
+        self.publish_fixture()
+        path=self.root/'registration-race.db'
+        registration_db=sqlite3.connect(path,check_same_thread=False,timeout=5)
+        self.database.backup(registration_db); registration_db.row_factory=sqlite3.Row
+        review_db=sqlite3.connect(path,check_same_thread=False,timeout=5); review_db.row_factory=sqlite3.Row
+        registration=ManagementService(registration_db,self.root); reviewer=ManagementService(review_db,self.root)
+        written=threading.Event(); release=threading.Event(); waiting=threading.Event(); finished=threading.Event(); errors=[]
+        def trace(sql):
+            if sql=='BEGIN IMMEDIATE' or sql.startswith('INSERT INTO platform_publications'): waiting.set()
+        registration_db.set_trace_callback(trace)
+        def review():
+            try:
+                with node_state_machine.atomic(review_db):
+                    reviewer.record_content_review('J',1,self.payload('active','conflicting'))
+                    written.set()
+                    if not release.wait(3): raise AssertionError('registration scheduling timed out')
+            except BaseException as exc: errors.append(('review',exc))
+        def register():
+            try: registration.register_publications({'job_id':'J','channels':[{'platform':'weixin_channels','item_id':'wx'}]})
+            except BaseException as exc: errors.append(('registration',exc))
+            finally: finished.set()
+        review_thread=threading.Thread(target=review); registration_thread=threading.Thread(target=register)
+        try:
+            review_thread.start(); self.assertTrue(written.wait(3))
+            registration_thread.start(); self.assertTrue(waiting.wait(3))
+            self.assertFalse(finished.is_set())
+        finally:
+            release.set(); review_thread.join(5)
+            if registration_thread.ident is not None: registration_thread.join(5)
+        try:
+            self.assertFalse(review_thread.is_alive()); self.assertFalse(registration_thread.is_alive())
+            self.assertEqual([name for name,_ in errors],['registration'])
+            self.assertIsInstance(errors[0][1],ValueError)
+            self.assertEqual(registration_db.execute('SELECT state FROM jobs').fetchone()[0],'BGM_OK')
+            self.assertEqual(registration_db.execute('SELECT COUNT(*) FROM platform_publications').fetchone()[0],0)
+        finally:
+            review_db.close(); registration_db.close()
+
+    def test_registration_failure_after_create_preserves_known_remote_item(self):
+        import factory.management_api as management_api
+        _,_,client=self.publish_fixture(); client.create_video.return_value={'item_id':'known-remote','video_id':'public'}
+        original_pending=management_api._publication_is_pending; invoked=[]
+        def change_content(raw):
+            if not invoked:
+                invoked.append(self.service.record_content_review('J',1,self.payload('active','conflicting')))
+            return original_pending(raw)
+        with patch.object(management_api,'_publication_is_pending',side_effect=change_content):
+            with self.assertRaisesRegex(ValueError,'content'): self.publish_with(client)
+        row=self.database.execute('SELECT state,item_id FROM platform_submissions').fetchone()
+        self.assertEqual(tuple(row),('submitted','known-remote'))
+        self.assertEqual(self.database.execute('SELECT COUNT(*) FROM platform_publications').fetchone()[0],0)
+        with self.assertRaisesRegex(ValueError,'reconcil'): self.publish_with(client)
+        self.assertEqual(client.create_video.call_count,1)
+
     def test_ui_save_and_local_resume_callbacks_keep_readable_unicode_toasts(self):
         source=(Path(__file__).resolve().parents[1]/'scripts'/'management_ui'/'app.js').read_text(encoding='utf-8')
         ui=source.split('async function openVisualContentReview',1)[1].split('const openCandidateWithContentBase',1)[0]
