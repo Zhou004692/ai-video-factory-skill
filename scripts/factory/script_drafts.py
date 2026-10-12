@@ -8,11 +8,11 @@ import re
 from copy import deepcopy
 from typing import Callable
 
-from . import creative_ir, production_config, script_sources
+from . import creative_ir, production_config, script_sources, visual_contract
 from .clients import doubao_llm
 
 
-PROMPT_VERSION = "complete-script-v12-voice-presence-performance-fidelity"
+PROMPT_VERSION = "complete-script-v13-visual-direction-contract"
 BEAT_ORDER = ("hook", "conflict", "evidence", "reversal", "solution", "cta")
 MAX_PROVIDER_MASTER_DURATION_SEC = 30.0
 RELATIVE_SCENE_PREFIXES = (
@@ -159,6 +159,7 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
     beats_raw = raw.get("beats") or []
     if not isinstance(beats_raw, list) or not beats_raw:
         raise ValueError("script variant requires at least 1 narrative beat")
+    visual_contract.validate_beats(beats_raw, allowed_source_ids=allowed_source_ids)
     beats: list[dict] = []
     for index, beat in enumerate(beats_raw):
         beat = deepcopy(beats_raw[index] or {})
@@ -183,6 +184,8 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
                 f"script beat {beat_label} references unknown source_id: {unknown}"
             )
         normalized = {
+            **deepcopy(beat),
+            "beat_id": _text(beat.get("beat_id") or beat.get("id")) or f"beat-{index + 1}",
             "beat": beat_type,
             "speaker": _text(beat.get("speaker")),
             "dialogue": dialogue,
@@ -234,6 +237,7 @@ def _normalize_variant(raw: dict, *, allowed_source_ids: set[str]) -> dict:
             if not normalized[field]:
                 raise ValueError(f"script beat {beat_label}.{field} is required")
         beats.append(normalized)
+    visual_contract.validate_beats(beats, allowed_source_ids=allowed_source_ids)
     title = _text(raw.get("title"))
     thesis = _text(raw.get("creative_thesis"))
     if not title:
@@ -535,12 +539,19 @@ def _prompt(
                 "background_description": "role, responsibility, personality and relationships",
             }],
             "beats": [{
+                "beat_id": "stable-authored-beat-id",
                 "beat": "hook|conflict|evidence|reversal|solution|cta",
                 "speaker": "character_id",
                 "speakers": ["character_id"],
                 "dialogue": "口语化台词",
                 "duration_sec": 4,
                 "visual_intent": "画面意图",
+                "camera_intent": "景别、运镜、主体与动作覆盖设计",
+                "speech_mode": "on_screen|off_screen|narration",
+                "must_preserve": [{"id": "critical-story-id", "description": "关键剧情或事实保留项"}],
+                "may_adapt": ["可调整的景别、节奏或非关键细节"],
+                "visual_requirements": [{"id": "visible-action-id", "description": "必须在画面可见的关键动作", "source_ids": ["SRC-..."]}],
+                "reference_control": {"choice": "text", "rationale": "导演选择与原因；仅计划，不生成额外素材"},
                 "source_ids": ["SRC-..."],
                 "continuity_id": "same-scene-stable-id",
                 "site_id": "same-project-site-id-or-empty",
@@ -588,6 +599,14 @@ def _prompt(
         "不得由 presenter 转述或代说；来源中的人物台词必须归属该人物。必要的事实串联可以使用旁白，"
         "但旁白不能抢走角色推动剧情的台词。"
         "每个 beat 必须有可直接朗读的中文台词、预计秒数、画面意图、来源 ID 和 B-roll 建议。"
+        "beat_id 使用稳定且唯一的 ID；camera_intent 描述本节拍主体、动作与镜头覆盖。"
+        "must_preserve 保留关键剧情与事实的人类可读说明，may_adapt 列出可调整内容。"
+        "visual_requirements 只列必须可见的关键动作，不把每条事实声明或细枝末节都变成视觉要求；"
+        "用稳定 id、description 和可选合法 source_ids 表达，事实来源与视觉要求分别记录。"
+        "speech_mode 默认为 on_screen；需要明确的画外对白或旁白时才写 off_screen/narration，"
+        "characters 可以包含正在无声反应的出镜人物；不得为规避口型质量把入镜对白改成画外音。"
+        "reference_control 的 choice 仅可为 text/multimodal/strict_frame/storyboard/motion_reference/native_edit/extend，"
+        "必须说明 rationale；只是导演计划，不授权增加参考素材、编辑、续拍或任何付费动作，实际预算走既有批准流程。"
         "每个有人物表演的 beat 必须保留或明确 emotion、tone、pace、volume、pause、"
         "facial_expression、gaze、gesture 与 body_action；本地视频来源已有这些字段时不得删减或泛化。"
         "speaker_review_required=true 表示说话人仍未核实，不得擅自把该台词改分给第一个出镜人物。"
@@ -601,7 +620,7 @@ def _prompt(
         "必须复用同一个 site_id，并用 site_description 描述这个项目现场；这些 beat 的 scene 和 continuity_id 仍保持各自独立。"
         "只有泛称相似但并非同一具体现场的工厂、办公室或仓库，不得复用 site_id；不存在上层现场关系时 site_id 留空。"
         "不要按说话人或固定秒数更换 continuity_id。broll_hint 只是本地导演剪辑建议，不会自动创建付费母片。"
-        "broll_required=true 等价于授权新增一条独立付费 B-roll 母片；仅当该画面提供台词之外不可缺少的证据、实物或流程信息，"
+        "broll_required=true 仅表示独立 B-roll 的生产建议，不构成付费授权，实际生成须走既有预算批准；仅当该画面提供台词之外不可缺少的证据、实物或流程信息，"
         "并且无法在对应对白母片的 visual_intent 中完成时才设为 true；只为补充景别、特写、环境空镜或重复对白母片已有动作时必须为 false。"
         "只允许引用提供的 source_id；不得编造事实、金额、客户、政策或产品能力；"
         "不得照抄竞品台词，只能借鉴抽象结构。目标为 Seedance 2.5 原生母片加本地导演剪辑。"
@@ -837,6 +856,11 @@ def _provider_timeline_units(beats: list[dict]) -> list[dict]:
             zip(durations, dialogues), 1
         ):
             fragment = deepcopy(beat)
+            source_id = _text(beat.get("beat_id") or beat.get("id")) or f"beat-{beat_index + 1}"
+            fragment["source_beat_id"] = source_id
+            fragment["beat_id"] = source_id if len(durations) == 1 else f"{source_id}~fragment-{fragment_index}"
+            if "id" in fragment:
+                fragment["id"] = fragment["beat_id"]
             fragment["duration_sec"] = duration
             fragment["dialogue"] = dialogue
             fragment["_source_beat_index"] = beat_index
@@ -1140,6 +1164,7 @@ def _storyboard(script: dict) -> dict:
         for beat in group:
             duration = float(beat["duration_sec"])
             performance_beats.append({
+                **{key: deepcopy(value) for key, value in beat.items() if not key.startswith("_")},
                 "beat": beat["beat"],
                 "speaker": effective_speaker(beat),
                 "speakers": effective_speakers(beat),
@@ -1194,6 +1219,18 @@ def _storyboard(script: dict) -> dict:
             )
             scene = "明亮现代的设备租赁办公室，背景整洁，无可读文字、数字、商标或水印"
             action = "主讲人面对镜头自然讲解，随钩子、反转和行动号召做克制手势与表情变化"
+            if any(any(field in beat for field in (
+                "camera_intent", "visual_requirements", "must_preserve", "may_adapt", "reference_control"
+            )) for beat in group):
+                # New authored direction must not be downgraded by the legacy
+                # single-presenter scaffold. Legacy drafts retain that default.
+                scene = "；".join(dict.fromkeys(
+                    _text(beat.get("scene") or beat.get("visual_intent")) for beat in group
+                ))
+                action = "；".join(dict.fromkeys(item["visual_intent"] for item in performance_beats))
+                camera = "；".join(dict.fromkeys(
+                    _text(beat.get("camera_intent")) for beat in group if _text(beat.get("camera_intent"))
+                )) or camera
         if not has_dialogue:
             render_mode = "broll"
             shot_type = "电影化无对白场景镜头"
@@ -1265,7 +1302,7 @@ def _storyboard(script: dict) -> dict:
                 )
                 for character_id in [
                     *(beat.get("characters") or beat.get("cast") or []),
-                    *effective_speakers(beat),
+                    *(effective_speakers(beat) if _beat_speech_mode(beat) == "on_screen" else []),
                 ]:
                     normalized = _text(
                         character_id.get("id")
@@ -1308,6 +1345,17 @@ def _storyboard(script: dict) -> dict:
                 "asset_tags": [
                     _text(beat.get("beat")) for _, beat in selected_group
                 ],
+                "performance_beats": [
+                    {**deepcopy(beat), "beat_id": f"{beat.get('beat_id') or f'beat-{beat_index + 1}'}~broll-{broll_master_idx}",
+                     **({"id": f"{beat.get('beat_id') or f'beat-{beat_index + 1}'}~broll-{broll_master_idx}"} if "id" in beat else {}),
+                     "source_beat_id": beat.get("beat_id") or f"beat-{beat_index + 1}",
+                     "start": broll_ranges[beat_index][1], "duration": float(beat["duration_sec"]),
+                     "speaker": "", "speakers": [], "dialogue": "", "speech_mode": "off_screen",
+                     "visual_track": "broll_overlay",
+                     "visual_intent": beat.get("broll_hint") or beat["visual_intent"],
+                     "source_beat_index": beat_index}
+                    for beat_index, beat in selected_group
+                ],
             })
     shots = []
     cursors = {master["idx"]: 0.0 for master in masters}
@@ -1322,6 +1370,7 @@ def _storyboard(script: dict) -> dict:
         video_master_idx = broll_target[0] if broll_target else master_idx
         broll_start = broll_target[1] if broll_target else None
         shots.append({
+            **visual_contract.project_fields(beat),
             "idx": index,
             "beat": beat["beat"],
             "source_beat_index": source_beat_index,
@@ -1439,7 +1488,7 @@ def _storyboard(script: dict) -> dict:
                 profile["background_description"]
             )
         storyboard_characters.append(profile)
-    return {
+    storyboard = {
         "production_profile": "standard",
         "production_mode": "native_master_local_director",
         "characters": storyboard_characters,
@@ -1495,6 +1544,8 @@ def _storyboard(script: dict) -> dict:
             }),
         },
     }
+    visual_contract.attach_visual_plans(storyboard)
+    return storyboard
 
 
 def _approved_payload(row) -> dict:

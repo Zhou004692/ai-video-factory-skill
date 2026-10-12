@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 from typing import Literal, Mapping
 
-from . import master_dependencies, production_complexity
+from . import master_dependencies, production_complexity, visual_contract
 from .clients import music, seedance
 from .creative_ir import (
     CreativeBeat, CreativeIR, SPEECH_MODES, explicit_visible_cast,
@@ -141,6 +141,8 @@ class _Unit:
     character_ids: tuple[str, ...]
     dialogue: str
     adaptation_actions: tuple[str, ...]
+    fragment_index: int = 1
+    fragment_count: int = 1
 
 
 def _canonical(value: object) -> str:
@@ -377,6 +379,8 @@ def _units(
                 character_ids=_beat_cast(beat),
                 dialogue=dialogue,
                 adaptation_actions=tuple(actions),
+                fragment_index=part_index,
+                fragment_count=part_count,
             ))
     return result
 
@@ -390,8 +394,10 @@ def _master_groups(
     current_scene = ""
     for unit in units:
         scene_changed = bool(current and unit.scene_key != current_scene)
+        track_changed = bool(current and unit.beat.extensions.get("visual_track")
+                             != current[-1].beat.extensions.get("visual_track"))
         overflow = bool(current and current_duration + unit.duration_sec > max_duration)
-        if scene_changed or overflow:
+        if scene_changed or track_changed or overflow:
             groups.append(current)
             current = []
             current_duration = 0.0
@@ -412,9 +418,11 @@ def _runtime_performance_beats(group: list[_Unit]) -> list[dict[str, object]]:
         beat = unit.beat
         payload = deepcopy(dict(beat.extensions))
         payload.pop("source_master_idx", None)
+        unit_id = beat.beat_id if unit.fragment_count == 1 else f"{beat.beat_id}~provider-fragment-{unit.fragment_index}"
         payload.update({
             "beat": beat.kind,
-            "source_beat_id": beat.beat_id,
+            "beat_id": unit_id,
+            "source_beat_id": beat.extensions.get("source_beat_id") or beat.beat_id,
             "speaker": beat.speakers[0] if beat.speakers else "",
             "speakers": list(beat.speakers),
             "start": round(start, 2),
@@ -426,6 +434,10 @@ def _runtime_performance_beats(group: list[_Unit]) -> list[dict[str, object]]:
             "must_preserve": list(beat.must_preserve),
             "may_adapt": list(beat.may_adapt),
         })
+        if "id" in payload:
+            payload["id"] = unit_id
+        if unit.fragment_count > 1:
+            payload.update({"fragment_index": unit.fragment_index, "fragment_count": unit.fragment_count})
         result.append(payload)
         start += unit.duration_sec
     return result
@@ -700,6 +712,25 @@ def _compiled_runtime_storyboard(
         _remap_source_director_shots(source, groups, masters)
         or _compiled_runtime_shots(runtime_masters)
     )
+    # Source edits carry timing, not a second authority for creative intent.
+    # Refresh contract fields from the actual compiled video unit, including
+    # B-roll overlays whose audio master is a different production object.
+    for shot in storyboard["shots"]:
+        source_id = str(shot.get("source_beat_id") or "")
+        if not source_id:
+            continue
+        video_master = next((m for m in runtime_masters if int(m["idx"]) == int(shot["video_master_idx"])), {})
+        candidates = [b for b in video_master.get("performance_beats") or []
+                      if str(b.get("source_beat_id") or "") == source_id
+                      and float(b.get("start") or 0) - 0.05 <= float(shot.get("video_start") or 0)
+                      < float(b.get("start") or 0) + float(b.get("duration") or 0)]
+        if len(candidates) == 1:
+            contract = visual_contract.project_fields(candidates[0])
+            for key in visual_contract.CONTRACT_FIELDS:
+                if key not in {"beat_id", "id", "source_beat_id"}:
+                    shot.pop(key, None)
+            shot.update({key: value for key, value in contract.items()
+                         if key not in {"beat_id", "id", "source_beat_id"}})
     director_plan = deepcopy(dict(storyboard.get("director_plan") or {}))
     dialogue_master_count = sum(
         1 for master in runtime_masters if master.get("type") == "dialogue"
@@ -722,6 +753,7 @@ def _compiled_runtime_storyboard(
     storyboard["master_dependency_graph"] = (
         master_dependencies.build_master_dependency_graph(runtime_masters)
     )
+    visual_contract.attach_visual_plans(storyboard)
     return storyboard
 
 
@@ -861,6 +893,7 @@ def compile_ir(
     runtime_storyboard: Mapping[str, object] | None = None,
 ) -> ProductionCompilationV2:
     """Compile creative intent without submitting or mutating paid work."""
+    visual_contract.validate_beats([beat.as_dict() for beat in creative.beats])
     required_content = _unique(
         requirement
         for beat in creative.beats

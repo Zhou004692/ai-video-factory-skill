@@ -3855,7 +3855,7 @@ def _cinematic_director_time_beats(
     else:
         allocated = [1] * count
 
-    camera = non_text_visual_text(shot.get("camera") or "").strip(" ；;，,")
+    master_camera = non_text_visual_text(shot.get("camera") or "").strip(" ；;，,")
     cursor = 0
     lines: list[str] = []
     for index, beat in enumerate(raw_beats):
@@ -3877,8 +3877,21 @@ def _cinematic_director_time_beats(
         clauses = [f"{start}-{end}秒"]
         if visual:
             clauses.append(f"画面与动作：{visual}")
+        camera = non_text_visual_text(beat.get("camera_intent") or master_camera).strip(" ；;，,")
         if camera:
             clauses.append(f"运镜：{camera}")
+        for requirement in beat.get("visual_requirements") or []:
+            clauses.append(f"必须可见 [{requirement['id']}]：{requirement['description']}")
+        for field, label in (("must_preserve", "必须保留"), ("may_adapt", "允许调整")):
+            values = beat.get(f"{field}_details", beat.get(field, []))
+            values = [values] if isinstance(values, str) else values
+            for value in values:
+                text = value.get("description") if isinstance(value, dict) else value
+                if text:
+                    clauses.append(f"{label}：{text}")
+        control = beat.get("reference_control")
+        if control:
+            clauses.append(f"参考/控制意图：{control['choice']}；原因：{control['rationale']}；仅执行已有授权素材")
         performance_labels = (
             ("emotion", "情绪"), ("tone", "语气"), ("pace", "语速"),
             ("volume", "音量"), ("pause", "停顿"),
@@ -3899,7 +3912,7 @@ def _cinematic_director_time_beats(
             voice_label = "旁白" if speech_mode == "narration" else "画外音"
             clauses.extend([
                 f"{voice_label}{speaker}说出 {{台词：{dialogue}}}",
-                "该声音不入镜、不需要人物形象、不做口型；"
+                "该声音不要求说话者入镜，不做口型同步；明确出镜名单与反应设计仍须保留；"
                 "画面内人物不朗读画外台词，不随画外语音做口型同步；"
                 "保留明确的表情、视线与无声动作，包括惊讶张嘴、喘息等反应",
             ])
@@ -3963,12 +3976,15 @@ def _build_scene_voiceover_video_prompt(
         ])
     parts.extend([
         "时间轴：",
-        *_director_time_beats(
+        *(_cinematic_director_time_beats(
+            shot, duration=duration, editorial_duration=editorial_duration,
+        ) if any(any(beat.get(field) for field in ("camera_intent", "visual_requirements", "must_preserve", "may_adapt", "reference_control"))
+                 for beat in shot.get("performance_beats") or []) else _director_time_beats(
             duration,
             dialogue=voiceover,
             scene_voiceover=True,
             editorial_duration=editorial_duration,
-        ),
+        )),
         "这是画外音(V.O.)场景，下面的台词只进入原生音轨，不在画面中呈现说话者",
         "画外音必须完整说出且只能说出时间轴中标注的内容",
         "使用自然、清晰、专业的中国成年人普通话；不得改写、增删、重复或复述其他内容",
@@ -4146,6 +4162,14 @@ def _build_native_dialogue_prompt(
         str(shot.get("render_mode") or "presenter").lower()
         == "cinematic_character"
     )
+    directed_beats = list(shot.get("performance_beats") or [])
+    has_visual_direction = any(any(beat.get(key) for key in (
+        "camera_intent", "visual_requirements", "must_preserve", "may_adapt", "reference_control"
+    )) for beat in directed_beats)
+    has_background_turn = any(creative_ir.normalize_speech_mode(
+        beat.get("speech_mode"), speaker=str(beat.get("speaker") or "")
+    ) in {"off_screen", "narration"} and str(beat.get("dialogue") or "").strip()
+        for beat in directed_beats)
     master_speakers = [
         str(item).strip() for item in (
             shot.get("audio_speakers") or shot.get("speakers") or []
@@ -4164,7 +4188,7 @@ def _build_native_dialogue_prompt(
             shot,
             duration=duration,
             editorial_duration=editorial_duration,
-        ) if cinematic else _director_time_beats(
+        ) if cinematic or has_visual_direction else _director_time_beats(
             duration,
             dialogue=voiceover,
             editorial_duration=editorial_duration,
@@ -4217,6 +4241,21 @@ def _build_native_dialogue_prompt(
         "安全帽、反光背心、工服、工程机械、设备铭牌、工牌、文件、屏幕和背景标牌一律纯色无字，或通过背面、遮挡、裁切、浅景深使其不可辨认。",
         "禁止企业名称、品牌、设备编号、车牌、字母、数字、二维码、字幕、标识或水印。",
     ]
+    if has_background_turn:
+        # Authored audio-only turns can coexist with visible on-screen turns.
+        # Mouth visibility still applies to every on-screen spoken interval.
+        parts = [part for part in parts if part not in {
+            "不得改写、增删、重复台词，不得加入旁白、未列出的第三人声或背景音乐。",
+            "不得改写、增删、重复台词，不得加入旁白、第二个人声或背景音乐。",
+            "非台词时间窗允许有动机的走位、环绕、推拉、反应镜头和动作特写；其他同场人物始终闭嘴，只做无声表演。",
+            "嘴唇、牙齿、舌位和下颌逐字同步，句末自然闭嘴。",
+            "只在台词所在的关键音节时间窗保护口型可见性：说话者保持正面或四分之三中近景，禁止口部遮挡、快速甩镜或在句中切离说话者。",
+        }]
+        parts.extend([
+            "不得改写、增删、重复台词或加入未列出的声音；仅标为 off_screen/narration 的节拍使用画外对白或旁白。",
+            "仅 on_screen 入镜对白节拍保护口型可见性：说话者嘴唇、牙齿、舌位和下颌逐字同步，保持正面或四分之三中近景，不遮挡嘴部，不在句中切离。",
+            "入镜对白节拍保护可见嘴部并逐字同步；画外对白节拍允许明确出镜人物的无声反应，包括惊讶张嘴，不能让反应人物朗读画外台词。",
+        ])
     if reference_manifest:
         parts[1:1] = [
             "素材职责（编号严格对应本次请求顺序）：",
@@ -4284,11 +4323,15 @@ def _build_native_dialogue_prompt(
             "对白区间不得用运镜破坏口型可见性。",
             *(["同场人物设定：", *cast_lines] if cast_lines else []),
             (
+                "对白约束：严格遵循各节拍的 speech_mode 与说话人；画外音不要求入镜口型，明确出镜人物可以做无声反应。"
+                if has_background_turn else
+                (
                 "对白约束：仅剧情节拍中当前标注的角色可以在对应时间段开口；"
                 "其他同场人物只能做动作和反应，不得抢词、串词或增加台词。"
                 if multi_speaker else
                 f"对白约束：只有{character_name or '当前主角'}说出台词；"
                 "其他同场人物只能做动作和反应，不得开口、旁白或发出可辨识人声。"
+                )
             ),
         ]
     if anchored:
@@ -4328,7 +4371,10 @@ def _build_broll_video_prompt(
         f"动作：{action}",
         f"运镜：{camera}",
         "连续整数秒导演时间轴：",
-        f"0-{duration}秒；画面与动作：{visual or action}；运镜：{camera}。",
+        *(_cinematic_director_time_beats(
+            {**shot, "performance_beats": [{**beat, "dialogue": ""} for beat in shot.get("performance_beats") or []]},
+            duration=duration, editorial_duration=float(shot.get("duration_sec") or shot.get("duration") or duration),
+        ) if shot.get("performance_beats") else [f"0-{duration}秒；画面与动作：{visual or action}；运镜：{camera}。"]),
         "无对白、无人声、无旁白；只保留与动作同步的环境音和物件音；无 BGM。",
         "禁止任何可读文字、字幕、品牌、设备编号、车牌、字母、数字、二维码或水印。",
     ]

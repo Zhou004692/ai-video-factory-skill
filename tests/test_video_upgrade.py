@@ -3644,7 +3644,7 @@ class Seedance25DialogueTests(unittest.TestCase):
 
         for expected in (
             "画外音背景台词",
-            "不入镜、不需要人物形象、不做口型",
+            "不要求说话者入镜，不做口型同步",
             "女博主闭嘴转向画面右侧反应",
             "情绪：质疑",
             "语气：画外反问",

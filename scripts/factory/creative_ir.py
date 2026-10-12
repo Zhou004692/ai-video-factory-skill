@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import re
 from typing import Mapping
+from . import visual_contract
 
 
 CREATIVE_IR_VERSION = 1
@@ -151,6 +152,12 @@ def _creative_beat(
     }
     if source_master_idx is not None:
         extensions["source_master_idx"] = source_master_idx
+    for field in ("must_preserve", "may_adapt"):
+        raw = beat.get(field) or []
+        if isinstance(raw, (list, tuple)) and any(isinstance(item, Mapping) for item in raw):
+            extensions[f"{field}_details"] = deepcopy(list(raw))
+    if "id" in beat:
+        extensions["authored_id"] = deepcopy(beat["id"])
     action = _text(beat.get("action") or beat.get("visual_intent"))
     return CreativeBeat(
         beat_id=_text(beat.get("id") or beat.get("beat_id")) or f"beat-{index}",
@@ -221,10 +228,12 @@ def from_storyboard(source: Mapping[str, object]) -> CreativeIR:
         item for item in (source.get("beats") or [])
         if isinstance(item, Mapping)
     ]
+    visual_contract.validate_beats(raw_beats)
     beats = (
         [_creative_beat(beat, index) for index, beat in enumerate(raw_beats, 1)]
         if raw_beats else _beats_from_masters(source)
     )
+    visual_contract.validate_beats([beat.as_dict() for beat in beats])
     if duration is None and source.get("masters"):
         duration = sum(
             float(master.get("duration_sec", master.get("duration")) or 0)
@@ -253,11 +262,18 @@ def from_storyboard(source: Mapping[str, object]) -> CreativeIR:
 def from_dict(source: Mapping[str, object]) -> CreativeIR:
     """Restore an already-normalized Creative IR without losing extensions."""
     raw_beats = source.get("beats") or []
+    visual_contract.validate_beats(raw_beats)
     beats: list[CreativeBeat] = []
     for index, raw in enumerate(raw_beats, 1):
         if not isinstance(raw, Mapping):
             continue
-        extensions = raw.get("extensions")
+        extensions = deepcopy(dict(raw.get("extensions") or {}))
+        extensions.update({key: deepcopy(value) for key, value in raw.items()
+                           if key not in _BEAT_FIELDS and key != "extensions"})
+        for field in ("must_preserve", "may_adapt"):
+            items = raw.get(field) or []
+            if isinstance(items, (list, tuple)) and any(isinstance(item, Mapping) for item in items):
+                extensions[f"{field}_details"] = deepcopy(list(items))
         beats.append(CreativeBeat(
             beat_id=_text(raw.get("beat_id") or raw.get("id")) or f"beat-{index}",
             kind=_text(raw.get("kind")) or "scene",
@@ -277,7 +293,9 @@ def from_dict(source: Mapping[str, object]) -> CreativeIR:
         duration = float(raw_duration) if raw_duration is not None else None
     except (TypeError, ValueError):
         duration = None
-    extensions = source.get("extensions")
+    extensions = deepcopy(dict(source.get("extensions") or {}))
+    extensions.update({key: deepcopy(value) for key, value in source.items()
+                       if key not in _ROOT_FIELDS and key not in {"version", "extensions"}})
     return CreativeIR(
         version=int(source.get("version") or CREATIVE_IR_VERSION),
         title=_text(source.get("title")),

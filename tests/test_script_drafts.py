@@ -693,7 +693,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         )
         self.assertEqual(
             script_drafts.PROMPT_VERSION,
-            "complete-script-v12-voice-presence-performance-fidelity"
+            "complete-script-v13-visual-direction-contract"
         )
 
     def test_video_structure_is_passed_to_reconstruction_prompt(self):
@@ -946,7 +946,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("确实只有单一视角时无需硬凑多人", prompt)
         self.assertEqual(
             script_drafts.PROMPT_VERSION,
-            "complete-script-v12-voice-presence-performance-fidelity",
+            "complete-script-v13-visual-direction-contract",
         )
 
     def test_generation_prompt_samples_head_middle_and_tail_of_long_sources(self):
@@ -987,7 +987,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         self.assertIn("不得由 presenter 转述或代说", prompt)
         self.assertEqual(
             script_drafts.PROMPT_VERSION,
-            "complete-script-v12-voice-presence-performance-fidelity",
+            "complete-script-v13-visual-direction-contract",
         )
 
     def test_normalization_rejects_missing_speaker_instead_of_adding_presenter(self):
