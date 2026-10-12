@@ -86,6 +86,12 @@ _EVENT_RULES: dict[str, tuple[frozenset[str], str | None]] = {
     "resume_local_post": (
         frozenset({"FAILED", "PROVIDER_ACTION_REQUIRED"}), "SHOTS_OK",
     ),
+    'content_review_changed': (
+        frozenset({'COMPOSED', 'READY_TO_PUBLISH'}), 'BGM_OK',
+    ),
+    'resume_content_local': (
+        frozenset({'FAILED', 'BGM_OK', 'PRODUCTION_REVIEW_REQUIRED'}), 'BGM_OK',
+    ),
     "review_decided": (
         frozenset({"FAILED", "PRODUCTION_REVIEW_REQUIRED", "PROVIDER_ACTION_REQUIRED", "BUDGET_CONFIRMATION_REQUIRED"}), None,
     ),

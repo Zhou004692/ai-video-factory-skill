@@ -11,10 +11,19 @@
 import os
 
 from ..db import conn
+from .. import ASSETS_DIR, content_review
 
 
 async def run(job_id: str) -> None:
     db = conn()
+    try:
+        await _run(job_id, db)
+    finally:
+        db.close()
+
+
+async def _run(job_id, db):
+    content_review.require_final(db, ASSETS_DIR, job_id)
     job = db.execute(
         "SELECT final_path FROM jobs WHERE job_id=?", (job_id,)
     ).fetchone()

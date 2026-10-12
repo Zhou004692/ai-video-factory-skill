@@ -75,6 +75,10 @@ def _projected_state(
         }[str(final_review["state"])]
     if local_compose and local_compose["state"] == "SUCCEEDED":
         return "COMPOSED", "review_final_video"
+    if local_compose and local_compose['state'] == 'REVIEW_REQUIRED' and database.execute(
+        "SELECT 1 FROM production_nodes WHERE job_id=? AND node_id='local_compose' AND error_code='content_review_required'", (job_id,)
+    ).fetchone():
+        return 'PRODUCTION_REVIEW_REQUIRED', 'review_visual_content'
     anchor_rows = database.execute(
         "SELECT node_type,state FROM production_nodes WHERE job_id=? "
         "AND node_type IN ('character_anchor','scene_anchor')",

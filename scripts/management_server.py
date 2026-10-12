@@ -546,14 +546,21 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 return
             except (IndexError, ValueError) as exc:
                 return self._json({"error": str(exc)}, 404)
+        if (parsed.path.startswith('/api/videos/') and parsed.path.endswith('/content-review') and '/masters/' in parsed.path):
+            try:
+                parts = parsed.path.split('/')
+                source = parse_qs(parsed.query).get('source', ['candidate'])[0]
+                return self._json(self.service.content_review_detail(parts[3], int(parts[5]), source))
+            except (IndexError, ValueError) as exc:
+                return self._json({'error': str(exc)}, 400)
         if (parsed.path.startswith("/api/videos/")
-                and parsed.path.endswith("/candidate")
+                and (parsed.path.endswith("/candidate") or parsed.path.endswith('/content-preview'))
                 and "/masters/" in parsed.path):
             try:
                 parts = parsed.path.split("/")
-                path = self.service.master_candidate_file(
-                    parts[3], int(parts[5])
-                )
+                path = (self.service.content_review_source_file(parts[3], int(parts[5]),
+                    parse_qs(parsed.query).get('source', ['candidate'])[0]) if parsed.path.endswith('/content-preview')
+                    else self.service.master_candidate_file(parts[3], int(parts[5])))
                 size = path.stat().st_size
                 byte_range = self.headers.get("Range")
                 start, end = (0, size - 1)
@@ -995,6 +1002,11 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     extension_sec=float(payload.get("extension_sec")),
                     direction=str(payload.get("direction") or ""),
                 )
+            elif (request_path.startswith('/api/videos/') and request_path.endswith('/content-review') and '/masters/' in request_path):
+                parts = request_path.split('/')
+                result = self.service.record_content_review(parts[3], int(parts[5]), payload)
+            elif request_path.startswith('/api/videos/') and request_path.endswith('/resume-visual-content'):
+                result = self.service.resume_visual_content(request_path.split('/')[3])
             elif (request_path.startswith("/api/videos/")
                   and request_path.endswith("/candidate-review")
                   and "/masters/" in request_path):

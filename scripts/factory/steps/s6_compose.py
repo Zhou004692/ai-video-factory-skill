@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 import shutil
 
-from .. import ASSETS_DIR, master_transcriptions, subtitles, visual_evidence
+from .. import ASSETS_DIR, master_transcriptions, subtitles, visual_evidence, content_review
 from ..db import conn
 from ..clients import bigasr, ffmpeg
 from ..review_candidates import finalize_accepted_candidates
@@ -259,6 +259,10 @@ async def _refresh_director_speech_timeline(
     if not (storyboard.get("production_settings") or {}).get(
             "asr_enabled", True):
         return False
+    local_fingerprint = None
+    if content_review.enabled(storyboard):
+        live_row = database.execute('SELECT storyboard FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+        local_fingerprint = content_review.edit_plan_fingerprint(content_review.object_json(live_row['storyboard'])) if live_row else None
     paths = {int(row["idx"]): Path(row["video_path"]) for row in master_rows}
     master_types = {
         int(master["idx"]): str(master.get("type") or "")
@@ -356,6 +360,13 @@ async def _refresh_director_speech_timeline(
     changed = _synchronize_master_contract_durations(storyboard) or changed
 
     if changed:
+        if content_review.enabled(storyboard):
+            try:
+                merged = content_review.persist_effective_storyboard(database, job_id, storyboard,
+                    expected_local_fingerprint=local_fingerprint)
+            except ValueError as exc:
+                raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_effective_plan_changed']}) from exc
+            storyboard.clear(); storyboard.update(merged)
         encoded = json.dumps(storyboard, ensure_ascii=False)
         database.execute(
             "UPDATE jobs SET storyboard=? WHERE job_id=?",
@@ -478,27 +489,16 @@ def _commit_content_final(final, staged_final, report, staged_report):
 
 
 async def _content_retention(sb, rows):
-    masters = {}
+    durations = {}
     for row in rows:
-        try:
-            qa = json.loads(row["video_qa"] or "{}")
-        except (TypeError, ValueError):
-            qa = {}
-        qa = qa if isinstance(qa, dict) else {}
-        raw = qa.get("result") or qa.get("diagnostic") or {}
-        raw = raw if isinstance(raw, dict) else {}
         path = Path(row["video_path"])
         try:
-            masters[int(row["idx"])] = {
-                "asset_sha256": visual_evidence.asset_fingerprint(path),
-                "duration_sec": await ffmpeg.probe_duration(path),
-                "evidence": raw.get("visual_evidence"),
-            }
+            durations[int(row['idx'])] = await ffmpeg.probe_duration(path)
         except (OSError, RuntimeError, ValueError) as exc:
             raise visual_evidence.ContentReviewRequired({"passed": False,
                 "master_idx": int(row["idx"]), "reasons": ["content_asset_unavailable"]}) from exc
     try:
-        report = visual_evidence.retention_report(sb, masters)
+        report = content_review.retention(sb, rows, durations)
     except (TypeError, ValueError) as exc:
         raise visual_evidence.ContentReviewRequired({"passed": False,
             "reasons": ["content_invalid_contract"]}) from exc
@@ -516,6 +516,14 @@ async def _run(job_id: str, db, *, storyboard_override: dict | None = None) -> N
         if storyboard_override is not None
         else json.loads(job["storyboard"]) if job and job["storyboard"] else {}
     )
+    live_sb = content_review.object_json(job['storyboard']) if job else {}
+    initial_local_fingerprint = None
+    if content_review.enabled(sb) or content_review.enabled(live_sb):
+        initial_local_fingerprint = content_review.edit_plan_fingerprint(live_sb)
+        try:
+            content_review.effective_storyboard(live_sb, sb)
+        except ValueError as exc:
+            raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_stale_requirements']}) from exc
     sb_shots = {s["idx"]: s for s in sb.get("shots", [])}
     hook_text = sb.get("hook", "")
     in_video_hook = _in_video_hook_text(sb)
@@ -537,10 +545,19 @@ async def _run(job_id: str, db, *, storyboard_override: dict | None = None) -> N
         sb.get("production_mode") == "native_master_local_director"
     )
     if director_mode:
-        await _refresh_director_speech_timeline(job_id, sb, rows, db)
+        refreshed = await _refresh_director_speech_timeline(job_id, sb, rows, db)
+        if content_review.enabled(sb):
+            try:
+                sb = content_review.persist_effective_storyboard(db, job_id, sb,
+                    expected_local_fingerprint=content_review.edit_plan_fingerprint(sb) if refreshed else initial_local_fingerprint)
+            except ValueError as exc:
+                raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_effective_plan_changed']}) from exc
+            (base / 'storyboard.json').write_text(json.dumps(sb, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
         segments = _director_segments(sb, rows)
-        if sb.get("visual_requirements"):
+        if content_review.enabled(sb):
             await _content_retention(sb, rows)
+            render_source_hashes = content_review.source_hashes(sb, rows, base / 'bgm.mp3')
+            render_edit_fingerprint = content_review.edit_plan_fingerprint(sb)
         first_idx = min(segment["idx"] for segment in segments)
         norm_paths = await asyncio.gather(*[
             _prep_director_segment(
@@ -551,7 +568,7 @@ async def _run(job_id: str, db, *, storyboard_override: dict | None = None) -> N
             for segment in segments
         ])
     else:
-        if sb.get("visual_requirements"):
+        if content_review.enabled(sb):
             # Structured contracts are compiled for native director edits;
             # absent picture mapping cannot be replaced by audio/intent proof.
             raise visual_evidence.ContentReviewRequired({"passed": False,
@@ -580,12 +597,23 @@ async def _run(job_id: str, db, *, storyboard_override: dict | None = None) -> N
     # 4. 混入 BGM(-12dB,提升存在感缓解片段间割裂)
     bgm = base / "bgm.mp3"
     final = base / "final.mp4"
-    if sb.get("visual_requirements"):
+    if content_review.enabled(sb):
         staged_final = base / ".final.content-candidate.mp4"
         await ffmpeg.mix_bgm(concat_out, bgm, staged_final, bgm_db=-12.0)
         # Recheck source files after rendering too: a replacement during the
         # render cannot inherit evidence from the earlier master.
+        rows = db.execute("SELECT idx,video_path,video_qa FROM shots WHERE job_id=? AND state='OK' ORDER BY idx", (job_id,)).fetchall()
+        current_sb = content_review.object_json(db.execute('SELECT storyboard FROM jobs WHERE job_id=?', (job_id,)).fetchone()['storyboard'])
+        if (content_review.edit_plan_fingerprint(sb) != render_edit_fingerprint or
+            content_review.edit_plan_fingerprint(current_sb) != render_edit_fingerprint
+                or content_review.contract_hash(current_sb) != content_review.contract_hash(sb)):
+            raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_edit_changed_during_render']})
         report = await _content_retention(sb, rows)
+        report['source_hashes'] = content_review.source_hashes(sb, rows, bgm)
+        if report['source_hashes'] != render_source_hashes:
+            raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_source_changed_during_render']})
+        report['contract_hash'] = content_review.contract_hash(sb)
+        report['edit_plan_fingerprint'] = content_review.edit_plan_fingerprint(sb)
         report["final_sha256"] = visual_evidence.asset_fingerprint(staged_final)
         report["final_path"] = str(final)
         staged_report = base / ".content_retention.json.tmp"

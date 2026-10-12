@@ -25,6 +25,7 @@ BACKEND_VIDEO_ACTION_IDS = {
     "review_continuity_anchors",
     "review_final_video",
     "review_master_candidates",
+    "review_visual_content",
     "review_quality_failure",
     "revise_output_prompt",
     "submit_publish",
@@ -51,6 +52,7 @@ _BACKEND_EVIDENCE_ACTIONS = {
     "review_continuity_anchors",
     "review_final_video",
     "review_master_candidates",
+    "review_visual_content",
     "revise_output_prompt",
     "submit_publish",
 }

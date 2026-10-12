@@ -20,6 +20,7 @@ LABELS = {
     'view_progress': '查看生成进度',
     'resume_failed_video': '继续生成剩余母片',
     'confirm_budget': '继续生成剩余母片',
+    'review_visual_content': '复核画面内容并恢复本地合成',
 }
 
 
@@ -80,6 +81,10 @@ def _resolve(database, job_id):
                           '内容政策失败需要人工诊断；远端费用记录仍须核查，不能自动恢复生成',
                           task_ids=unresolved)
         return result(['reconcile_provider_task', *review_actions], '远端提交或产物尚未核对，保留已有候选，禁止重复生成', task_ids=unresolved)
+    content_pause = any(r['node_id'] == 'local_compose' and r['state'] == 'REVIEW_REQUIRED'
+        and r['error_code'] == 'content_review_required' for r in nodes)
+    if content_pause and all(r['state'] == 'SUCCEEDED' for r in nodes if r['node_type'] == 'master'):
+        return result(['review_visual_content'], '画面内容需要人工复核；仅恢复本地合成，不重新生成母片或配乐', recovery_kind='visual_content')
     if 'RUNNING' in states:
         return result(['view_progress'], '后台节点仍在运行；如进度未变化，请执行过期租约恢复扫描')
     retry = network_recovery.retry_indexes(database, job_id)

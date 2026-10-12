@@ -27,7 +27,7 @@ from . import (
     provider_health, provider_tasks, recovery_controller, scene_assets,
     script_drafts, script_sources, source_analysis, source_scheduler,
     state_machine, task_doctor, topic_briefs, transport_diagnostics,
-    master_download_recovery,
+    master_download_recovery, content_review,
 )
 from .clients import douyin, music, seedance, video_qa, volc_assets, volc_tts
 from .video_routing import AUDIO_MODE_FIXED_TTS, normalize_audio_mode
@@ -3493,6 +3493,8 @@ class ManagementService:
                 and has_approved_script
             )
             job["planned_masters"] = planned_masters
+            job['has_visual_requirements'] = content_review.enabled(plan_storyboard)
+            job['visual_requirements_summary'] = plan_storyboard.get('visual_requirements') or []
             job["director_timeline"] = _director_timeline(plan_storyboard)
             shots = _rows(self.database.execute(
                 "SELECT idx,duration_sec,state,provider,cost_cents,video_path,"
@@ -3507,6 +3509,11 @@ class ManagementService:
                 except (json.JSONDecodeError, TypeError):
                     qa = {}
                 qa_by_master_idx[int(shot["idx"])] = qa
+                plan_master = next((m for m in plan_storyboard.get('masters') or [] if int(m['idx']) == int(shot['idx'])), {})
+                shot['has_visual_requirements'] = bool(content_review.requirements(plan_master))
+                shot['content_review_summary'] = [{'asset_sha256': r.get('asset_sha256'),
+                    'requirement_set_hash': r.get('requirement_set_hash'), 'items': r.get('items'), 'reviewed_at': r.get('reviewed_at')}
+                    for r in qa.get('content_reviews') or [] if isinstance(r, dict) and r.get('authority') == content_review.AUTHORITY]
                 shot["manual_review_required"] = (
                     qa.get("status") == "manual_review_required"
                 )
@@ -4154,6 +4161,10 @@ class ManagementService:
                     shot["candidate_review_eligible"] = bool(
                         shot.get("candidate_preview_url") and "review_master_candidates" in plan["action_ids"]
                     )
+            elif job['has_visual_requirements'] and job['state'] in {'FAILED', 'BGM_OK', 'PRODUCTION_REVIEW_REQUIRED'} and shots and all(s['state'] == 'OK' for s in shots) and (
+                job.get('failure_code') == 'content_review_required' or (self.data_dir / 'assets' / job['job_id'] / 'content_retention.review.json').is_file()):
+                job['next_action'] = {'id': 'review_visual_content', 'label': '复核画面内容并恢复本地合成'}
+                job['allowed_actions'] = [job['next_action']]
         return {"jobs": jobs}
 
     def upgrade_director_plan(self, job_id: str) -> dict:
@@ -5427,6 +5438,8 @@ class ManagementService:
             raise ValueError("验收通过前必须确认全部验收项")
         if decision != "approved" and not str(notes or "").strip():
             raise ValueError("验收不通过时必须填写问题说明")
+        if decision == 'approved':
+            content_review.require_final(self.database, self.data_dir / 'assets', job_id)
         with self._final_review_lock:
             self.database.execute("BEGIN IMMEDIATE")
             try:
@@ -5438,6 +5451,8 @@ class ManagementService:
                 ).fetchone()
                 if locked_row is None or str(locked_row["state"]) != "COMPOSED":
                     raise ValueError("final_review is stale: job is not COMPOSED")
+                if decision == 'approved':
+                    binding = content_review.require_final(self.database, self.data_dir / 'assets', job_id)
                 if not locked_row["final_path"] or not Path(
                     locked_row["final_path"]
                 ).is_file():
@@ -5500,7 +5515,8 @@ class ManagementService:
                         "final_review",
                         "approve" if decision == "approved" else "reject",
                         event_id=(
-                            f"{job_id}:final-review:{str(decision).strip()}"
+                            f"{job_id}:final-review:{str(decision).strip()}" +
+                            (':' + content_review.digest(binding) if decision == 'approved' and binding else '')
                         ),
                         payload={
                             "decision": str(decision),
@@ -5807,6 +5823,12 @@ class ManagementService:
         return {"dispatched_jobs": dispatched, "failed_workers": exited_jobs}
 
     def submit_for_publish(self, job_id: str) -> dict:
+        content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+        with self._final_review_lock, node_state_machine.atomic(self.database):
+            content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+            return self._submit_for_publish_impl(job_id)
+
+    def _submit_for_publish_impl(self, job_id: str) -> dict:
         row = self.database.execute(
             "SELECT state,final_path FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()
@@ -5828,7 +5850,6 @@ class ManagementService:
             "UPDATE jobs SET state='READY_TO_PUBLISH',error=NULL,updated_at=CURRENT_TIMESTAMP "
             "WHERE job_id=?", (job_id,)
         )
-        self.database.commit()
         return {"job_id": job_id, "state": "READY_TO_PUBLISH"}
 
     def video_file(self, job_id: str) -> Path:
@@ -5872,6 +5893,131 @@ class ManagementService:
         if path is None:
             raise ValueError("待复核候选母片不存在")
         return path
+
+    def content_review_source_file(self, job_id: str, master_idx: int, source='candidate') -> Path:
+        return content_review.selected(self.database, self.data_dir / 'assets', job_id, master_idx, source)[-1]
+
+    def resume_visual_content(self, job_id: str) -> dict:
+        with self._final_review_lock, node_state_machine.atomic(self.database):
+            job = self.database.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            if not job:
+                raise ValueError('content job not found')
+            sb = content_review.object_json(job['storyboard'])
+            if not content_review.enabled(sb):
+                raise ValueError('content contract required for local resume')
+            if job['state'] in {'PUBLISHED', 'REJECTED', 'REJECTED_PENDING_RECONCILIATION'}:
+                raise ValueError('content terminated job cannot resume')
+            self._assert_no_unresolved_provider_tasks(job_id)
+            rows = self.database.execute('SELECT idx,state,video_path,video_qa FROM shots WHERE job_id=? ORDER BY idx', (job_id,)).fetchall()
+            if not rows or any(r['state'] != 'OK' for r in rows):
+                raise ValueError('content local resume requires all masters OK')
+            for row in rows:
+                self.content_review_source_file(job_id, row['idx'], 'active')
+            report = content_review.retention(sb, rows, {int(r['idx']): content_review.probe_duration(Path(r['video_path'])) for r in rows})
+            if report.get('passed') is not True:
+                raise ValueError('content local resume blocked: ' + ', '.join(report['reasons']) + '; review current source or locally recut/repair cropped action')
+            bgm = self._controlled_job_asset(job_id, job['bgm_path'], label='content BGM', require_file=True)
+            if bgm is None:
+                raise ValueError('content local resume requires existing BGM; paid regeneration is not authorized')
+            if job['state'] in {'COMPOSED', 'READY_TO_PUBLISH'}:
+                try:
+                    content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+                except ValueError:
+                    epoch = self.database.execute('SELECT COALESCE(MAX(rowid),0) FROM job_transitions WHERE job_id=?', (job_id,)).fetchone()[0]
+                    self._invalidate_content_final(job_id, f'local-resume:{epoch}')
+                    job = self.database.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+                else:
+                    return {'job_id': job_id, 'state': job['state'], 'already_queued': True, 'local_only': True}
+            node = self.database.execute("SELECT * FROM production_nodes WHERE job_id=? AND node_id='local_compose'", (job_id,)).fetchone()
+            if job['execution_engine'] == 'graph_v2':
+                if not node:
+                    raise ValueError('content local compose node missing')
+                if node['state'] in {'READY', 'RUNNING', 'SUCCEEDED'}:
+                    prior = self.database.execute("SELECT 1 FROM production_node_events WHERE job_id=? AND node_id='local_compose' AND event='resume_visual_content'", (job_id,)).fetchone()
+                    if prior:
+                        return {'job_id': job_id, 'state': job['state'], 'already_queued': True, 'local_only': True}
+                recovery_plan.require_action(self.database, job_id, 'review_visual_content')
+                if node['state'] != 'REVIEW_REQUIRED' or node['error_code'] != 'content_review_required':
+                    raise ValueError('content local compose is not awaiting content review')
+                epoch = self.database.execute("SELECT COALESCE(MAX(rowid),0) FROM production_node_events WHERE job_id=? AND node_id='local_compose'", (job_id,)).fetchone()[0]
+                node_state_machine.transition_node_in_transaction(self.database, job_id, 'local_compose', 'resume_visual_content',
+                    event_id=f'{job_id}:content-local-resume:{epoch}', payload={'edit_plan_fingerprint': content_review.edit_plan_fingerprint(sb)})
+                self.database.execute("UPDATE production_nodes SET error_code=NULL,next_action=NULL,output_json='{}' WHERE job_id=? AND node_id='local_compose'", (job_id,))
+                self.database.execute('UPDATE jobs SET error=NULL,failure_code=NULL WHERE job_id=?', (job_id,))
+                projected = production_projection.persist(self.database, job_id)
+                return {'job_id': job_id, 'state': projected.projected_job_state, 'already_queued': False, 'local_only': True}
+            if job['state'] not in {'FAILED', 'BGM_OK', 'PRODUCTION_REVIEW_REQUIRED'}:
+                raise ValueError('content legacy local pause changed')
+            state_machine.transition(self.database, job_id, 'resume_content_local',
+                event_id=f'{job_id}:content-local-resume:{content_review.digest(report)}', updates={'error': None, 'failure_code': None})
+        # Existing legacy BGM_OK path preserves the already-available music.
+        return self._resume_failed_video_impl(job_id)
+
+    def content_review_detail(self, job_id: str, master_idx: int, source='candidate') -> dict:
+        _, _, _, master, qa, path = content_review.selected(
+            self.database, self.data_dir / 'assets', job_id, master_idx, source)
+        reqs = content_review.requirements(master)
+        sha = content_review.visual_evidence.asset_fingerprint(path)
+        try:
+            duration = content_review.probe_duration(path)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise ValueError('content selected source duration unavailable') from exc
+        return {'job_id': job_id, 'master_idx': int(master_idx), 'source': source,
+            'asset_sha256': sha, 'requirement_set_hash': content_review.visual_contract.requirement_set_hash(reqs),
+            'duration_sec': duration, 'requirements': reqs, 'visual_plan': master.get('visual_plan'),
+            'automatic_findings': content_review.visual_evidence.evaluate(reqs, content_review.automatic(qa),
+                asset_sha256=sha, duration_sec=duration),
+            'human_review': content_review.matching_human(qa, reqs, sha),
+            'preview_url': f'/api/videos/{job_id}/masters/{int(master_idx)}/content-preview?source={source}'}
+
+    def record_content_review(self, job_id: str, master_idx: int, payload: dict) -> dict:
+        source = payload.get('source', 'candidate')
+        with self._final_review_lock, node_state_machine.atomic(self.database):
+            # File, shot and contract are re-read under the same write lock that
+            # owns persistence. Client hashes never establish human authority.
+            detail = self.content_review_detail(job_id, master_idx, source)
+            current_job = self.database.execute('SELECT state FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            if current_job['state'] in {'PUBLISHED', 'REJECTED', 'REJECTED_PENDING_RECONCILIATION'}:
+                raise ValueError('content review cannot mutate a terminated job')
+            if (payload.get('expected_asset_sha256') != detail['asset_sha256'] or
+                payload.get('expected_requirement_set_hash') != detail['requirement_set_hash']):
+                raise ValueError('content review is stale; refresh selected source')
+            items = content_review.validate_items(detail['requirements'], payload.get('items'), detail['duration_sec'])
+            _, shot, _, _, qa, path = content_review.selected(self.database, self.data_dir / 'assets', job_id, master_idx, source)
+            if content_review.visual_evidence.asset_fingerprint(path) != detail['asset_sha256']:
+                raise ValueError('content asset changed during review')
+            record = {'version': 1, 'authority': content_review.AUTHORITY, 'provenance': 'human',
+                'asset_sha256': detail['asset_sha256'], 'requirement_set_hash': detail['requirement_set_hash'],
+                'items': items}
+            existing = detail['human_review']
+            if existing and existing.get('items') == items:
+                return {'job_id': job_id, 'master_idx': int(master_idx), 'review': existing, 'already_recorded': True}
+            record['reviewed_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            records = qa.get('content_reviews') or []
+            if not isinstance(records, list):
+                records = []
+            qa['content_reviews'] = [*records, record]
+            self.database.execute('UPDATE shots SET video_qa=? WHERE job_id=? AND idx=?',
+                (json.dumps(qa, ensure_ascii=False, allow_nan=False), job_id, int(master_idx)))
+            self.database.execute('UPDATE jobs SET updated_at=CURRENT_TIMESTAMP WHERE job_id=?', (job_id,))
+            if source in {'active', 'prior'} and current_job['state'] in {'COMPOSED', 'READY_TO_PUBLISH'}:
+                self._invalidate_content_final(job_id, content_review.digest(record))
+            return {'job_id': job_id, 'master_idx': int(master_idx), 'review': record, 'already_recorded': False}
+
+    def _invalidate_content_final(self, job_id: str, epoch: str) -> None:
+        job = self.database.execute('SELECT execution_engine FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+        if job['execution_engine'] == 'graph_v2':
+            node_state_machine.transition_node_in_transaction(self.database, job_id, 'local_compose', 'invalidate_content',
+                event_id=f'{job_id}:content-invalidate:{epoch}')
+            final = self.database.execute("SELECT state FROM production_nodes WHERE job_id=? AND node_id='final_review'", (job_id,)).fetchone()
+            if final and final['state'] in {'REVIEW_REQUIRED', 'SUCCEEDED'}:
+                node_state_machine.transition_node_in_transaction(self.database, job_id, 'final_review', 'invalidate_final_review',
+                    event_id=f'{job_id}:content-final-invalidate:{epoch}')
+            self.database.execute("UPDATE production_nodes SET error_code='content_review_required',next_action='review_visual_content' WHERE job_id=? AND node_id='local_compose'", (job_id,))
+            production_projection.persist(self.database, job_id)
+        else:
+            state_machine.transition(self.database, job_id, 'content_review_changed', event_id=f'{job_id}:content-invalidate:{epoch}')
+        self.database.execute("UPDATE jobs SET failure_code='content_review_required',error='Content proof changed; review and locally recompose' WHERE job_id=?", (job_id,))
 
     def master_repair_source_file(
         self, job_id: str, master_idx: int
@@ -6021,6 +6167,8 @@ class ManagementService:
         except (json.JSONDecodeError, TypeError):
             qa = {}
         existing_operation = qa.get("review_operation")
+        if not isinstance(existing_operation, dict):
+            existing_operation = qa.get('content_candidate_acceptance')
         if (
             isinstance(existing_operation, dict)
             and existing_operation.get("phase") == "committed"
@@ -6028,6 +6176,12 @@ class ManagementService:
             committed_decision = str(existing_operation.get("decision") or "")
             if committed_decision != normalized:
                 raise ValueError("该母片已提交其他复核决定")
+            if normalized in {'accept_candidate', 'keep_prior'} and content_review.enabled(content_review.object_json(job['storyboard'])):
+                with node_state_machine.atomic(self.database):
+                    content_review.require_selected(self.database, self.data_dir / 'assets', job_id, master_idx, 'active')
+                    locked_shot = self.database.execute('SELECT video_path,video_qa FROM shots WHERE job_id=? AND idx=?', (job_id, int(master_idx))).fetchone()
+                    if locked_shot['video_qa'] != shot['video_qa'] or existing_operation.get('selected_sha256', existing_operation.get('candidate_sha256')) != _file_sha256(Path(locked_shot['video_path'])):
+                        raise ValueError('content committed source is stale')
             return {
                 "job_id": job_id,
                 "master_idx": int(master_idx),
@@ -6057,6 +6211,9 @@ class ManagementService:
             job_id, prior_value, label="旧母片", require_file=True
         ) if prior_value and normalized in {"accept_candidate", "keep_prior"} else None
         has_prior = prior is not None
+        if normalized in {'accept_candidate', 'keep_prior'}:
+            content_review.require_selected(self.database, self.data_dir / 'assets', job_id, master_idx,
+                'candidate' if normalized == 'accept_candidate' else 'active')
         if normalized == "keep_prior" and not has_prior:
             raise ValueError("当前母片没有可保留的旧版，请接受候选或单条重做")
         candidate = (
@@ -6162,6 +6319,16 @@ class ManagementService:
             self.database.execute("BEGIN IMMEDIATE")
             if normalized != "reject_job":
                 recovery_plan.require_review_decision(self.database, job_id, normalized)
+            if normalized in {'accept_candidate', 'keep_prior'}:
+                locked_shot = self.database.execute('SELECT video_qa,video_path FROM shots WHERE job_id=? AND idx=?', (job_id, int(master_idx))).fetchone()
+                locked_job = self.database.execute('SELECT storyboard FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+                if (locked_shot['video_qa'] != shot['video_qa'] or locked_shot['video_path'] != shot['video_path']
+                    or locked_job['storyboard'] != job['storyboard']):
+                    raise ValueError('content candidate review changed; refresh before accepting')
+                content_review.require_selected(self.database, self.data_dir / 'assets', job_id, master_idx,
+                    'candidate' if normalized == 'accept_candidate' else 'active')
+                if normalized == 'accept_candidate' and _file_sha256(candidate) != operation['candidate_sha256']:
+                    raise ValueError('content candidate source changed before claim')
             claimed = self.database.execute(
                 "UPDATE shots SET state='REVIEW_DECIDING',video_qa=? "
                 "WHERE job_id=? AND idx=? AND state=? "
@@ -6348,6 +6515,8 @@ class ManagementService:
                 changed = self.database.execute(shot_sql, shot_params)
                 if int(changed.rowcount or 0) != 1:
                     raise ValueError("该视频任务已被人工终止或并发处理")
+                if normalized in {'accept_candidate', 'keep_prior'}:
+                    content_review.require_selected(self.database, self.data_dir / 'assets', job_id, master_idx, 'active')
                 self._sync_graph_master_review_decision(
                     job_id,
                     int(master_idx),
@@ -6550,6 +6719,8 @@ class ManagementService:
                             raise OSError("旧母片音频备份校验失败")
                 prepared_video = Path(operation["prepared_video_path"])
                 shutil.copy2(candidate, prepared_video)
+                if _file_sha256(prepared_video) != operation['candidate_sha256']:
+                    raise ValueError('content candidate changed during file preparation')
                 prepared_audio = prepared_video.with_suffix(".wav")
                 if candidate_audio.is_file():
                     shutil.copy2(candidate_audio, prepared_audio)
@@ -6580,6 +6751,9 @@ class ManagementService:
                 })
                 operation["phase"] = "committed"
                 qa["review_operation"] = operation
+                if content_review.enabled(content_review.object_json(job['storyboard'])):
+                    qa['content_candidate_acceptance'] = {'phase': 'committed', 'decision': normalized,
+                        'selected_sha256': operation['candidate_sha256']}
                 decision_commit = commit_decision(
                     "UPDATE shots SET state='OK',video_path=?,video_url=?,"
                     "video_qa=?,error=NULL WHERE job_id=? AND idx=? "
@@ -6694,6 +6868,9 @@ class ManagementService:
                     "candidate_path": str(candidate) if candidate else None,
                 })
                 qa["review_operation"] = operation
+                if content_review.enabled(content_review.object_json(job['storyboard'])):
+                    qa['content_candidate_acceptance'] = {'phase': 'committed', 'decision': normalized,
+                        'selected_sha256': _file_sha256(prior)}
                 decision_commit = commit_decision(
                     "UPDATE shots SET state='OK',video_qa=?,error=NULL "
                     "WHERE job_id=? AND idx=? AND state='REVIEW_DECIDING'",
@@ -8470,6 +8647,7 @@ class ManagementService:
         if missing:
             raise ValueError("缺少发布字段：" + ", ".join(missing))
         job_id = str(payload["job_id"]).strip()
+        content_review.require_final(self.database, self.data_dir / 'assets', job_id)
         platform = str(payload["platform"]).strip()
         if platform not in {"douyin", "weixin_channels"}:
             raise ValueError("发布渠道仅支持抖音或微信视频号")
@@ -8519,6 +8697,7 @@ class ManagementService:
         return {"publication_id": publication_id, "status": "saved"}
 
     def publish_to_douyin(self, job_id: str, payload: dict) -> dict:
+        content_review.require_final(self.database, self.data_dir / 'assets', job_id)
         if payload.get("confirmed") is not True:
             raise ValueError("请确认标题、封面和目标账号后再提交抖音发布")
         job_id = str(job_id or "").strip()
@@ -8574,6 +8753,7 @@ class ManagementService:
         try:
             credentials = self._douyin_credentials(client)
             if not upload_id:
+                content_review.require_final(self.database, self.data_dir / 'assets', job_id)
                 uploaded = client.upload_video(
                     access_token=credentials["access_token"],
                     open_id=credentials["account_id"],
@@ -8586,6 +8766,7 @@ class ManagementService:
                     (upload_id, submission_id),
                 )
                 self.database.commit()
+            content_review.require_final(self.database, self.data_dir / 'assets', job_id)
             created = client.create_video(
                 access_token=credentials["access_token"],
                 open_id=credentials["account_id"],
@@ -8665,6 +8846,7 @@ class ManagementService:
 
     def register_publications(self, payload: dict) -> dict:
         job_id = str(payload.get("job_id") or "").strip()
+        content_review.require_final(self.database, self.data_dir / 'assets', job_id)
         channels = payload.get("channels") or []
         if not job_id or not isinstance(channels, list) or not channels:
             raise ValueError("请选择待发布成片和至少一个渠道")

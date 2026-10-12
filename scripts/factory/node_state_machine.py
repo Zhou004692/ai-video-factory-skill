@@ -19,6 +19,10 @@ _TRANSITIONS = {
     ("RUNNING", "require_review"): "REVIEW_REQUIRED",
     ("REVIEW_REQUIRED", "approve"): "SUCCEEDED",
     ("REVIEW_REQUIRED", "regenerate"): "READY",
+    ("REVIEW_REQUIRED", "resume_visual_content"): "READY",
+    ("SUCCEEDED", "invalidate_content"): "REVIEW_REQUIRED",
+    ("SUCCEEDED", "invalidate_final_review"): "PENDING",
+    ("REVIEW_REQUIRED", "invalidate_final_review"): "PENDING",
     # Approving an unexpected replacement identity unblocks an unfinished
     # master; it does not approve a generated master candidate.
     ("REVIEW_REQUIRED", "resume_anchor_dependency"): "READY",
@@ -100,6 +104,8 @@ def finish_attempt(database, job_id, node_id, event, *, lease_id, event_id,
                        'require_action': 'reconcile_provider_task',
                        'require_budget': 'increase_job_budget',
                        'fail': 'preserve_and_diagnose', 'recover_unsubmitted': 'retry_node'}.get(event)
+        if event == 'require_review' and node_id == 'local_compose' and error_code == 'content_review_required':
+            next_action = 'review_visual_content'
         task_id = output.get('provider_task_id') or output.get('task_id') or None
         database.execute(
             'UPDATE production_nodes SET output_json=?,error_code=?,next_action=?, '

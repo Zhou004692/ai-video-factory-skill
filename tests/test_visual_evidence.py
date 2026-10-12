@@ -356,9 +356,10 @@ class ComposeEvidenceTests(unittest.IsolatedAsyncioTestCase):
         from factory import visual_evidence
         base = Path(tmp)/"job"; base.mkdir()
         source = base/"master.mp4"; source.write_bytes(b"candidate")
+        (base/'bgm.mp3').write_bytes(b'local-bgm')
         old = base/"final.mp4"; old.write_bytes(b"old-final")
         proof = visual_evidence.bind_observations(REQS, observation(), asset_sha256=SHA, duration_sec=4)
-        board = {"production_mode": "native_master_local_director", "masters": [{"idx": 1, "visual_requirements": REQS}],
+        board = {"production_mode": "native_master_local_director", "masters": [{"idx": 1, "visual_requirements": [] if legacy else REQS}],
             "visual_requirements": [] if legacy else REQS, "shots": [{"idx": 1, "video_master_idx": 1,
                 "audio_master_idx": 1, "video_start": 2.1 if crop else 0, "duration": 1 if crop else 3}]}
         database=Mock(); row = {"idx": 1, "video_path": str(source), "video_qa": json.dumps({"result": {"visual_evidence": proof}})}
