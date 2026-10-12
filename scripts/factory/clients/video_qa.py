@@ -266,9 +266,10 @@ def _mixed_mouth_result(result, plan, duration):
         return None
     segments = result.get("observed_mouth_intervals") or []
     onscreen_words = [_normalized_text(beat["dialogue"]) for beat in spoken if beat.get("speech_mode") == "on_screen"]
-    if len(onscreen_words) != len(set(onscreen_words)):
+    spoken_words = [_normalized_text(beat["dialogue"]) for beat in spoken]
+    if any(spoken_words.count(words) != 1 for words in onscreen_words):
         # Without transcript character positions, repeated identical phrases
-        # cannot be assigned to distinct authored turns reliably.
+        # across any speech modes cannot be assigned to the on-screen turn.
         return ["content_mouth_evidence_missing"]
     for beat in spoken:
         if beat.get("speech_mode") != "on_screen":

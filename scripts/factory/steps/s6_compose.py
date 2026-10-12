@@ -449,9 +449,15 @@ async def run(job_id: str, *, storyboard_override: dict | None = None) -> None:
 def _commit_content_final(final, staged_final, report, staged_report):
     """Keep the prior final/report pair on either local replacement failure."""
     backups = {}
+    backup_paths = {path: path.with_name(f".{path.name}.content-backup") for path in (final, report)}
+    pending = {str(path): str(backup) for path, backup in backup_paths.items() if backup.exists()}
+    if pending:
+        raise visual_evidence.ContentReviewRequired({"passed": False,
+            "reasons": ["content_commit_recovery_required"], "recovery_paths": pending})
+    retain_backups = False
     try:
         for path in (final, report):
-            backup = path.with_name(f".{path.name}.content-backup")
+            backup = backup_paths[path]
             if path.is_file():
                 shutil.copy2(path, backup)
                 backups[path] = backup
@@ -461,16 +467,27 @@ def _commit_content_final(final, staged_final, report, staged_report):
             staged_final.replace(final)
             staged_report.replace(report)
         except OSError:
+            restore_failed = []
             for path, backup in backups.items():
-                if backup is not None:
-                    shutil.copy2(backup, path)
-                else:
-                    path.unlink(missing_ok=True)
+                try:
+                    if backup is not None:
+                        shutil.copy2(backup, path)
+                    else:
+                        path.unlink(missing_ok=True)
+                except OSError:
+                    restore_failed.append(str(path))
+            if restore_failed:
+                retain_backups = True
+                raise visual_evidence.ContentReviewRequired({"passed": False,
+                    "reasons": ["content_commit_recovery_required"],
+                    "restore_failed": restore_failed,
+                    "recovery_paths": {str(path): str(backup) for path, backup in backups.items() if backup is not None}})
             raise
     finally:
-        for backup in backups.values():
-            if backup is not None:
-                backup.unlink(missing_ok=True)
+        if not retain_backups:
+            for backup in backups.values():
+                if backup is not None:
+                    backup.unlink(missing_ok=True)
 
 
 async def _content_retention(sb, rows):

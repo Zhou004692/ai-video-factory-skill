@@ -90,6 +90,17 @@ class EvidenceTests(unittest.TestCase):
             "dialogue": "Ready", "alignment": .95, "confidence": .9, "visible_speaking_mouth": True}]
         self.assertFalse(video_qa.evaluate(raw, expect_speech=True, visual_plan=plan, actual_duration_sec=4).passed)
 
+    def test_same_words_across_onscreen_and_offscreen_turns_are_ambiguous(self):
+        plan = {"beats": [{"speech_mode": "on_screen", "dialogue": "Ready"},
+                          {"speech_mode": "off_screen", "dialogue": "Ready!"}]}
+        raw = observation(); raw.update(transcript="Ready Ready", lip_sync=False,
+            lip_sync_evidence={"overall_alignment": .1, "confidence": .99, "segments": []})
+        raw["observed_mouth_intervals"] = [{"start_sec": 2, "end_sec": 3, "dialogue": "Ready",
+            "alignment": .99, "confidence": .99, "visible_speaking_mouth": True}]
+        decision = video_qa.evaluate(raw, expect_speech=True, visual_plan=plan, actual_duration_sec=4)
+        self.assertFalse(decision.passed)
+        self.assertIn("content_mouth_evidence_missing", decision.reasons)
+
     def test_retention_uses_picture_intervals_and_current_hashes(self):
         from factory import visual_evidence
         proof = visual_evidence.bind_observations(REQS, observation(), asset_sha256=SHA, duration_sec=4)
@@ -166,6 +177,36 @@ class GenerationEvidenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("content_mouth_evidence_missing", raised.exception.reasons)
 
 class ComposeEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rollback_failure_retains_backups_and_reports_recovery_paths(self):
+        from factory import visual_evidence
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); final = root/"final.mp4"; report = root/"content_retention.json"
+            candidate = root/"candidate.mp4"; staged = root/"staged.json"
+            final.write_bytes(b"old"); report.write_text("old-proof", encoding="utf-8")
+            candidate.write_bytes(b"new"); staged.write_text("new-proof", encoding="utf-8")
+            original_replace = Path.replace; original_copy = s6_compose.shutil.copy2
+            def fail_report(path, target):
+                if path == staged:
+                    raise OSError("injected report replacement failure")
+                return original_replace(path, target)
+            def fail_final_restore(source, target):
+                if Path(source).name == ".final.mp4.content-backup":
+                    raise OSError("injected rollback failure")
+                return original_copy(source, target)
+            with patch.object(Path, "replace", fail_report), patch.object(s6_compose.shutil, "copy2", fail_final_restore):
+                with self.assertRaises(visual_evidence.ContentReviewRequired) as raised:
+                    s6_compose._commit_content_final(final, candidate, report, staged)
+            paths = raised.exception.report["recovery_paths"]
+            self.assertEqual(Path(paths[str(final)]).read_bytes(), b"old")
+            self.assertEqual(Path(paths[str(report)]).read_text(encoding="utf-8"), "old-proof")
+            self.assertEqual(report.read_text(encoding="utf-8"), "old-proof")
+            self.assertIn("content_commit_recovery_required", raised.exception.report["reasons"])
+            # Reentry must preserve the original recovery backup rather than
+            # copying the partially committed new final over it.
+            with self.assertRaises(visual_evidence.ContentReviewRequired):
+                s6_compose._commit_content_final(final, candidate, report, staged)
+            self.assertEqual(Path(paths[str(final)]).read_bytes(), b"old")
+
     async def test_missing_master_has_actionable_content_review_signal(self):
         from factory import visual_evidence
         with self.assertRaises(visual_evidence.ContentReviewRequired) as raised:
