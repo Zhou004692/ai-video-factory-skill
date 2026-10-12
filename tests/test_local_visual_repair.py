@@ -398,6 +398,52 @@ class LocalVisualRepairTests(unittest.TestCase):
             run.assert_not_awaited()
         self.assertEqual(json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0]),approved)
 
+    def assert_post_validation_edit_preserved(self, authorization):
+        from factory import visual_repair
+        if authorization=='alignment':
+            approved=self.queued_alignment(with_speech=True)
+            verifier_name='verify_alignment'
+        else:
+            self.prepare();self.sb['shots'][0]['subtitle']='Approved';self.save()
+            cached=s6_compose.bigasr.Transcription('Approved',0,1000,(s6_compose.bigasr.TimedUtterance('Approved',0,1000),))
+            master_transcriptions.persist(self.database,'J',1,self.active,cached);self.database.commit()
+            self.service.apply_visual_recut('J',1,self.command(self.plan()))
+            approved=json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0])
+            verifier_name='verify_overlay'
+        changed=deepcopy(approved);changed['shots'][0]['video_start']=.75;changed['hook']='AFTER S6 VALIDATION'
+        original=getattr(visual_repair,verifier_name);calls=[]
+        def verify_then_edit(*args,**kwargs):
+            result=original(*args,**kwargs);calls.append(True)
+            if len(calls)==3:
+                self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(changed),));self.database.commit()
+            return result
+        class RenderConnection:
+            def __getattr__(_self,name):return getattr(self.database,name)
+            def close(_self):pass
+        async def cut(_picture,_audio,output,**_kwargs):Path(output).write_bytes(b'cut')
+        async def mix(_concat,_bgm,output,**_kwargs):Path(output).write_bytes(b'final-if-overwritten')
+        node=self.database.execute("SELECT * FROM production_nodes WHERE node_id='local_compose'").fetchone()
+        with patch.object(visual_repair,verifier_name,side_effect=verify_then_edit), \
+             patch.object(s6_compose,'ASSETS_DIR',self.root/'data'/'assets'), \
+             patch.object(s6_compose,'conn',return_value=RenderConnection()), \
+             patch.object(s6_compose.ffmpeg,'probe_duration',new=AsyncMock(return_value=4)), \
+             patch.object(s6_compose.ffmpeg,'cut_director_segment',new=AsyncMock(side_effect=cut)), \
+             patch.object(s6_compose.ffmpeg,'concat_shots',new=AsyncMock()), \
+             patch.object(s6_compose.ffmpeg,'make_cta_card',new=AsyncMock()), \
+             patch.object(s6_compose.ffmpeg,'mix_bgm',new=AsyncMock(side_effect=mix)), \
+             patch.object(s6_compose.bigasr,'transcribe_detailed',side_effect=AssertionError('New ASR POST forbidden')) as asr, \
+             patch.dict('os.environ',{'GEN_THUMBNAIL':'false','GEN_MARKETING_THUMBNAIL':'false'}):
+            with self.assertRaises(visual_evidence.ContentReviewRequired):asyncio.run(production_adapters.run_local_compose_node(self.database,node))
+            asr.assert_not_called()
+        self.assertEqual(len(calls),3)
+        self.assertEqual(json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0]),changed)
+
+    def test_alignment_edit_after_third_validation_is_not_adopted_as_persist_identity(self):
+        self.assert_post_validation_edit_preserved('alignment')
+
+    def test_recut_edit_after_third_validation_is_not_adopted_as_persist_identity(self):
+        self.assert_post_validation_edit_preserved('recut')
+
     def test_stale_conflict_is_review_first_and_provider_junk_does_not_crash_routing(self):
         self.prepare()
         qa={'status':'passed','diagnostic':{'visual_evidence':{'provenance':'automatic','asset_sha256':'old-source',

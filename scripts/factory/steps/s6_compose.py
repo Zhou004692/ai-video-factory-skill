@@ -273,8 +273,15 @@ async def _refresh_director_speech_timeline(
         return False
     local_fingerprint = None
     if content_review.enabled(storyboard):
-        live_row = database.execute('SELECT storyboard FROM jobs WHERE job_id=?', (job_id,)).fetchone()
-        local_fingerprint = content_review.edit_plan_fingerprint(content_review.object_json(live_row['storyboard'])) if live_row else None
+        # Keep the identity we just validated. A later live edit must fail the
+        # persist CAS, never become a new authorization through a fresh read.
+        if visual_repair.OVERLAY_KEY in storyboard:
+            local_fingerprint = storyboard[visual_repair.OVERLAY_KEY]['effective_edit_plan_fingerprint']
+        elif visual_repair.ALIGNMENT_KEY in storyboard:
+            local_fingerprint = storyboard[visual_repair.ALIGNMENT_KEY]['live_edit_plan_fingerprint']
+        else:
+            live_row = database.execute('SELECT storyboard FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            local_fingerprint = content_review.edit_plan_fingerprint(content_review.object_json(live_row['storyboard'])) if live_row else None
     paths = {int(row["idx"]): Path(row["video_path"]) for row in master_rows}
     master_types = {
         int(master["idx"]): str(master.get("type") or "")
@@ -541,6 +548,7 @@ async def _content_retention(sb, rows):
 
 
 async def _run(job_id: str, db, *, storyboard_override: dict | None = None) -> None:
+    from .. import visual_repair
     base = ASSETS_DIR / job_id
     job = db.execute("SELECT storyboard FROM jobs WHERE job_id=?",
                      (job_id,)).fetchone()
@@ -552,7 +560,12 @@ async def _run(job_id: str, db, *, storyboard_override: dict | None = None) -> N
     live_sb = content_review.object_json(job['storyboard']) if job else {}
     initial_local_fingerprint = None
     if content_review.enabled(sb) or content_review.enabled(live_sb):
-        initial_local_fingerprint = content_review.edit_plan_fingerprint(live_sb)
+        if visual_repair.OVERLAY_KEY in sb:
+            initial_local_fingerprint = sb[visual_repair.OVERLAY_KEY]['effective_edit_plan_fingerprint']
+        elif visual_repair.ALIGNMENT_KEY in sb:
+            initial_local_fingerprint = sb[visual_repair.ALIGNMENT_KEY]['live_edit_plan_fingerprint']
+        else:
+            initial_local_fingerprint = content_review.edit_plan_fingerprint(live_sb)
         try:
             content_review.effective_storyboard(live_sb, sb)
         except ValueError as exc:
@@ -568,7 +581,6 @@ async def _run(job_id: str, db, *, storyboard_override: dict | None = None) -> N
     ).fetchall()
     if not rows:
         raise RuntimeError("no OK shots to compose")
-    from .. import visual_repair
     if visual_repair.ALIGNMENT_KEY in sb:
         try:
             visual_repair.verify_alignment(db, job_id, sb, rows)
