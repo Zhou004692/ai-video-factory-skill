@@ -7,7 +7,7 @@ import re
 
 import httpx
 
-from .. import transport_diagnostics
+from .. import transport_diagnostics, visual_evidence
 from .claude import _extract_json
 from . import doubao_llm
 
@@ -181,7 +181,9 @@ def evaluate(result: dict, *, expect_speech: bool,
              require_broll_semantics: bool = False,
              min_confidence: float = 0.8,
              min_transcript_similarity: float = 0.95,
-             min_visual_alignment: float = 0.75) -> QADecision:
+             min_visual_alignment: float = 0.75,
+             visual_requirements=None, visual_plan=None,
+             actual_duration_sec=None) -> QADecision:
     """Convert model output into a deterministic pipeline decision."""
     reasons: list[str] = []
     transcript = _normalized_text(result.get("transcript"))
@@ -211,7 +213,10 @@ def evaluate(result: dict, *, expect_speech: bool,
         )
         for segment in lip_sync_evidence["segments"]
     )
-    if expect_speech and require_lip_sync and (
+    mixed = _mixed_mouth_result(result, visual_plan, actual_duration_sec) if expect_speech and require_lip_sync else None
+    if mixed is not None:
+        reasons.extend(mixed)
+    elif expect_speech and require_lip_sync and (
         result.get("lip_sync") is False or located_mismatch
     ):
         reasons.append("lip_sync_mismatch")
@@ -242,7 +247,54 @@ def evaluate(result: dict, *, expect_speech: bool,
             if dominant in {"hand", "hands", "finger", "fingers"} \
                     and hand_ratio >= 0.55:
                 reasons.append("meaningless_hand_closeup")
-    return QADecision(not reasons, tuple(reasons), similarity)
+    if visual_requirements:
+        proof = visual_evidence.bind_observations(visual_requirements, result,
+            asset_sha256="qa-observation", duration_sec=actual_duration_sec)
+        content = visual_evidence.evaluate(visual_requirements, proof,
+            asset_sha256="qa-observation", duration_sec=actual_duration_sec)
+        result["content_result"] = content
+        reasons.extend(content["reasons"])
+    return QADecision(not reasons, tuple(dict.fromkeys(reasons)), similarity)
+
+
+def _mixed_mouth_result(result, plan, duration):
+    """Only actual localized mouth proof may exempt authored off-screen speech."""
+    beats = (plan or {}).get("beats") or []
+    spoken = [beat for beat in beats if str(beat.get("dialogue") or "").strip()]
+    modes = {beat.get("speech_mode") for beat in spoken}
+    if "on_screen" not in modes or not (modes & {"off_screen", "narration"}):
+        return None
+    segments = result.get("observed_mouth_intervals") or []
+    onscreen_words = [_normalized_text(beat["dialogue"]) for beat in spoken if beat.get("speech_mode") == "on_screen"]
+    if len(onscreen_words) != len(set(onscreen_words)):
+        # Without transcript character positions, repeated identical phrases
+        # cannot be assigned to distinct authored turns reliably.
+        return ["content_mouth_evidence_missing"]
+    for beat in spoken:
+        if beat.get("speech_mode") != "on_screen":
+            continue
+        matches = [segment for segment in segments if isinstance(segment, dict)
+            and visual_evidence.valid_interval(segment, duration)
+            and segment.get("visible_speaking_mouth") is True
+            and _normalized_text(segment.get("dialogue")) == _normalized_text(beat["dialogue"])
+            and visual_evidence._number(segment.get("confidence")) is not None
+            and .65 <= float(segment["confidence"]) <= 1]
+        if not matches:
+            return ["content_mouth_evidence_missing"]
+        if any(visual_evidence._number(segment.get("alignment")) is None
+               or not .78 <= float(segment["alignment"]) <= 1
+               or visual_evidence._number(segment.get("offset_ms", 0)) is None
+               or abs(float(segment.get("offset_ms", 0))) >= 160 for segment in matches):
+            return ["lip_sync_mismatch"]
+    # A localized mismatch intersecting the proved on-screen mouth is still a
+    # failure, regardless of global verdict or off-screen exemptions.
+    for mismatch in result.get("lip_sync_evidence", {}).get("segments", []):
+        if mismatch.get("confidence", 0) >= .65 and (mismatch.get("alignment", 1) < .75 or abs(mismatch.get("offset_ms", 0)) >= 160):
+            if any(visual_evidence.valid_interval(segment, duration)
+                   and max(segment["start_sec"], mismatch["start_sec"]) < min(segment["end_sec"], mismatch["end_sec"])
+                   for segment in segments if isinstance(segment, dict) and segment.get("visible_speaking_mouth") is True):
+                return ["lip_sync_mismatch"]
+    return []
 
 
 def evaluate_continuity(
@@ -392,7 +444,8 @@ def analyze(video_url: str, *, expect_speech: bool,
             forbid_readable_text: bool = False,
             require_broll_semantics: bool = False,
             model: str | None = None,
-            timeout: int = 180) -> tuple[dict, QADecision]:
+            timeout: int = 180, visual_requirements=None, visual_plan=None,
+            actual_duration_sec=None) -> tuple[dict, QADecision]:
     """Analyze a remotely accessible MP4 and return raw output + decision."""
     key = os.environ.get("ARK_API_KEY")
     if not key:
@@ -416,6 +469,16 @@ def analyze(video_url: str, *, expect_speech: bool,
         '"has_visible_person":false,"has_readable_text":false,'
         '"notes":"其他观察"}。'
     )
+    if visual_requirements or visual_plan:
+        prompt += (
+            '\nAlso output observed_visual_events: [{"id":"e1","start_sec":0.0,"end_sec":1.0,'
+            '"observed_description":"concrete visible action","confidence":0.0}]. '
+            'Times must be actual video observations; do not infer from audio/transcript or invent missing actions. '
+            'For all audible phrases output observed_mouth_intervals: [{"start_sec":0.0,"end_sec":1.0,'
+            '"dialogue":"exact audible words in interval","visible_speaking_mouth":true,'
+            '"alignment":1.0,"confidence":0.0,"offset_ms":0}]. '
+            'Record only visible speaking mouths; uncertain observations must have low confidence.'
+        )
     if require_broll_semantics:
         prompt += (
             "\n这是行业场景 B-roll 语义质检。还必须输出 broll_semantics："
@@ -462,16 +525,24 @@ def analyze(video_url: str, *, expect_speech: bool,
         body = response.json()
     content = body["choices"][0]["message"]["content"]
     raw = _extract_json(content)
-    if expected_visual:
+    if expected_visual or visual_requirements:
         observed = str(raw.get("observed_visual") or raw.get("notes") or "")
         try:
+            comparison_prompt = _visual_comparison_prompt(expected_visual or "", observed)
+            if visual_requirements:
+                comparison_prompt += ('\nSeparately map each visual requirement ID to observed_visual_events. '
+                    'Return requirement_evidence:[{"id":"requirement ID","status":"satisfied|conflicting|insufficient_evidence|not_applicable",'
+                    '"event_refs":["blind event ID"]}]. Missing/unmentioned actions are insufficient_evidence even if alignment is high. '
+                    'Use one concrete observed event per requirement; never invent timestamps or events.\nrequirements='
+                    + json.dumps(visual_requirements, ensure_ascii=False) + '\nobserved_visual_events='
+                    + json.dumps(raw.get("observed_visual_events") or [], ensure_ascii=False))
             comparison, _ = doubao_llm.complete_json(
-                _visual_comparison_prompt(expected_visual, observed),
+                comparison_prompt,
                 system=(
                     "你只做目标与观察的语义比较，严格输出 JSON。"
                     "主体对象不同必须判为不匹配。"
                 ),
-                max_tokens=600,
+                max_tokens=1800 if visual_requirements else 600,
                 model=model,
             )
         except Exception as exc:
@@ -492,4 +563,7 @@ def analyze(video_url: str, *, expect_speech: bool,
         forbid_people=forbid_people,
         forbid_readable_text=forbid_readable_text,
         require_broll_semantics=require_broll_semantics,
+        visual_requirements=visual_requirements,
+        visual_plan=visual_plan,
+        actual_duration_sec=actual_duration_sec,
     )

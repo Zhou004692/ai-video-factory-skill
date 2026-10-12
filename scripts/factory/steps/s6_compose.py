@@ -15,8 +15,9 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import shutil
 
-from .. import ASSETS_DIR, master_transcriptions, subtitles
+from .. import ASSETS_DIR, master_transcriptions, subtitles, visual_evidence
 from ..db import conn
 from ..clients import bigasr, ffmpeg
 from ..review_candidates import finalize_accepted_candidates
@@ -427,8 +428,83 @@ def _in_video_hook_text(storyboard: dict) -> str | None:
 
 
 async def run(job_id: str, *, storyboard_override: dict | None = None) -> None:
-    base = ASSETS_DIR / job_id
     db = conn()
+    try:
+        await _run(job_id, db, storyboard_override=storyboard_override)
+    except visual_evidence.ContentReviewRequired as exc:
+        base = ASSETS_DIR / job_id
+        base.mkdir(parents=True, exist_ok=True)
+        try:
+            (base / "content_retention.review.json").write_text(
+                json.dumps(exc.report, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        except OSError:
+            # The exception retains the actionable report even if the artifact
+            # directory becomes unwritable; do not mask the review pause.
+            pass
+        raise
+    finally:
+        db.close()
+
+
+def _commit_content_final(final, staged_final, report, staged_report):
+    """Keep the prior final/report pair on either local replacement failure."""
+    backups = {}
+    try:
+        for path in (final, report):
+            backup = path.with_name(f".{path.name}.content-backup")
+            if path.is_file():
+                shutil.copy2(path, backup)
+                backups[path] = backup
+            else:
+                backups[path] = None
+        try:
+            staged_final.replace(final)
+            staged_report.replace(report)
+        except OSError:
+            for path, backup in backups.items():
+                if backup is not None:
+                    shutil.copy2(backup, path)
+                else:
+                    path.unlink(missing_ok=True)
+            raise
+    finally:
+        for backup in backups.values():
+            if backup is not None:
+                backup.unlink(missing_ok=True)
+
+
+async def _content_retention(sb, rows):
+    masters = {}
+    for row in rows:
+        try:
+            qa = json.loads(row["video_qa"] or "{}")
+        except (TypeError, ValueError):
+            qa = {}
+        qa = qa if isinstance(qa, dict) else {}
+        raw = qa.get("result") or qa.get("diagnostic") or {}
+        raw = raw if isinstance(raw, dict) else {}
+        path = Path(row["video_path"])
+        try:
+            masters[int(row["idx"])] = {
+                "asset_sha256": visual_evidence.asset_fingerprint(path),
+                "duration_sec": await ffmpeg.probe_duration(path),
+                "evidence": raw.get("visual_evidence"),
+            }
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise visual_evidence.ContentReviewRequired({"passed": False,
+                "master_idx": int(row["idx"]), "reasons": ["content_asset_unavailable"]}) from exc
+    try:
+        report = visual_evidence.retention_report(sb, masters)
+    except (TypeError, ValueError) as exc:
+        raise visual_evidence.ContentReviewRequired({"passed": False,
+            "reasons": ["content_invalid_contract"]}) from exc
+    if not report["passed"]:
+        raise visual_evidence.ContentReviewRequired(report)
+    return report
+
+
+async def _run(job_id: str, db, *, storyboard_override: dict | None = None) -> None:
+    base = ASSETS_DIR / job_id
     job = db.execute("SELECT storyboard FROM jobs WHERE job_id=?",
                      (job_id,)).fetchone()
     sb = (
@@ -441,7 +517,7 @@ async def run(job_id: str, *, storyboard_override: dict | None = None) -> None:
     in_video_hook = _in_video_hook_text(sb)
 
     rows = db.execute(
-        "SELECT idx, video_path "
+        "SELECT idx, video_path, video_qa "
         "FROM shots WHERE job_id=? AND state='OK' ORDER BY idx",
         (job_id,)
     ).fetchall()
@@ -459,6 +535,8 @@ async def run(job_id: str, *, storyboard_override: dict | None = None) -> None:
     if director_mode:
         await _refresh_director_speech_timeline(job_id, sb, rows, db)
         segments = _director_segments(sb, rows)
+        if sb.get("visual_requirements"):
+            await _content_retention(sb, rows)
         first_idx = min(segment["idx"] for segment in segments)
         norm_paths = await asyncio.gather(*[
             _prep_director_segment(
@@ -469,6 +547,11 @@ async def run(job_id: str, *, storyboard_override: dict | None = None) -> None:
             for segment in segments
         ])
     else:
+        if sb.get("visual_requirements"):
+            # Structured contracts are compiled for native director edits;
+            # absent picture mapping cannot be replaced by audio/intent proof.
+            raise visual_evidence.ContentReviewRequired({"passed": False,
+                "reasons": ["content_picture_mapping_missing"]})
         first_idx = min(r["idx"] for r in rows)
         norm_paths = await asyncio.gather(*[
             _prep_shot(
@@ -493,7 +576,19 @@ async def run(job_id: str, *, storyboard_override: dict | None = None) -> None:
     # 4. 混入 BGM(-12dB,提升存在感缓解片段间割裂)
     bgm = base / "bgm.mp3"
     final = base / "final.mp4"
-    await ffmpeg.mix_bgm(concat_out, bgm, final, bgm_db=-12.0)
+    if sb.get("visual_requirements"):
+        staged_final = base / ".final.content-candidate.mp4"
+        await ffmpeg.mix_bgm(concat_out, bgm, staged_final, bgm_db=-12.0)
+        # Recheck source files after rendering too: a replacement during the
+        # render cannot inherit evidence from the earlier master.
+        report = await _content_retention(sb, rows)
+        report["final_sha256"] = visual_evidence.asset_fingerprint(staged_final)
+        report["final_path"] = str(final)
+        staged_report = base / ".content_retention.json.tmp"
+        staged_report.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        _commit_content_final(final, staged_final, base / "content_retention.json", staged_report)
+    else:
+        await ffmpeg.mix_bgm(concat_out, bgm, final, bgm_db=-12.0)
 
     # 5. 默认封面与最终时间轴首帧同源，避免点击播放时画面跳变。
     #    强营销封面作为独立可选资产保存，不再覆盖默认播放封面。
@@ -518,8 +613,3 @@ async def run(job_id: str, *, storyboard_override: dict | None = None) -> None:
                (str(final), job_id))
     db.commit()
     finalize_accepted_candidates(db, ASSETS_DIR, job_id)
-    # The desktop service normally keeps its primary connection for the
-    # process lifetime, but compose owns this auxiliary connection. Releasing
-    # it here prevents locked SQLite files after an isolated regression run or
-    # a portable-runtime shutdown.
-    db.close()

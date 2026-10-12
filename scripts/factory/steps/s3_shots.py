@@ -18,7 +18,7 @@ import shutil
 from .. import (
     ASSETS_DIR, SKILL_ROOT, anchor_generation, asset_library,
     character_assets, character_voices, master_dependencies,
-    creative_ir, master_transcriptions,
+    creative_ir, master_transcriptions, visual_evidence,
     production_config, provider_capacity, provider_health,
     provider_executor as provider_tasks,
     reference_attention, scene_assets, subtitles,
@@ -2830,6 +2830,19 @@ async def _preflight_reference_manifest(request: dict, *, model: str) -> list[di
     return manifest
 
 
+def _visual_generation_kwargs(unit):
+    requirements = unit.get("visual_requirements") or (unit.get("visual_plan") or {}).get("visual_requirements")
+    plan = unit.get("visual_plan")
+    if not requirements and not plan:
+        return {}
+    plan = deepcopy(plan or {})
+    if unit.get("performance_beats"):
+        # The persisted intent plan omits dialogue; authored performance beats
+        # retain exact words needed to match blind speaking-mouth observations.
+        plan["beats"] = deepcopy(unit["performance_beats"])
+    return {"visual_requirements": requirements, "visual_plan": plan}
+
+
 async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                                     request_kwargs: dict,
                                     out_path: Path,
@@ -2848,6 +2861,8 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                                      fixed_audio_path: Path | None = None,
                                      fixed_transcription: bigasr.Transcription | None = None,
                                      generation_snapshot: dict | None = None,
+                                     visual_requirements=None,
+                                     visual_plan: dict | None = None,
                                      ) -> SeedanceGenerationResult:
     """Generate, upload and gate a Seedance shot.
 
@@ -3365,6 +3380,13 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         transcription = fixed_transcription or bigasr.Transcription("")
         transcription_available = fixed_transcription is not None
         try:
+            actual_duration = (
+                await ffmpeg.probe_duration(candidate_path)
+                if visual_requirements or visual_plan else None
+            )
+            content_kwargs = ({"visual_requirements": visual_requirements,
+                "visual_plan": visual_plan, "actual_duration_sec": actual_duration}
+                if visual_requirements or visual_plan else {})
             raw, _ = await asyncio.to_thread(
                 video_qa.analyze,
                 url,
@@ -3374,6 +3396,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 forbid_people=forbid_people,
                 forbid_readable_text=True,
                 require_broll_semantics=require_broll_semantics,
+                **content_kwargs,
             )
             transcript = transcription.text
             if (
@@ -3390,14 +3413,22 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             raw["confidence"] = 1.0
             decision = video_qa.evaluate(
                 raw,
-                expect_speech=bool(expected_text) and asr_enabled,
+                expect_speech=bool(expected_text) and (asr_enabled or bool(visual_plan)),
                 require_lip_sync=require_lip_sync,
                 expected_text=expected_text if asr_enabled else None,
                 expected_visual=prompt,
                 forbid_people=forbid_people,
                 forbid_readable_text=True,
                 require_broll_semantics=require_broll_semantics,
+                **content_kwargs,
             )
+            if visual_requirements:
+                fingerprint = visual_evidence.asset_fingerprint(candidate_path)
+                proof = visual_evidence.bind_observations(visual_requirements, raw,
+                    asset_sha256=fingerprint, duration_sec=actual_duration)
+                raw["visual_evidence"] = proof
+                raw["content_result"] = visual_evidence.evaluate(visual_requirements, proof,
+                    asset_sha256=fingerprint, duration_sec=actual_duration)
             if continuity_context:
                 continuity_raw, continuity_decision = await asyncio.to_thread(
                     video_qa.analyze_continuity,
@@ -3443,7 +3474,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
     video, video_path, video_url, audio_path = await generate(
         route.model, route.generate_audio
     )
-    if not route.qa_required:
+    if not route.qa_required and not visual_requirements and not visual_plan:
         video_path, audio_path = commit_candidate(video_path, audio_path)
         return SeedanceGenerationResult(
             video, video_path, video_url,
@@ -3467,6 +3498,18 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         },
         ensure_ascii=False,
     )
+
+    if any(reason.startswith("content_") for reason in decision.reasons):
+        review_path = preserve_candidate()
+        error = SeedanceQualityError(
+            "Visual content needs manual review; automatic paid retry skipped",
+            cost_cents=spent_cost_cents, provider_calls=tuple(provider_calls),
+            reasons=decision.reasons, candidate_path=review_path, candidate_url=video_url,
+            transcription=transcription, transcription_available=transcription_available,
+            qa_evidence=raw)
+        error.stable_code = error.code = error.error_code = "content_review_required"
+        error.content_result = raw.get("content_result") or {"passed": False, "reasons": decision.reasons}
+        raise error
 
     if decision.reasons == ("qa_error",):
         review_path = preserve_candidate()
@@ -3706,6 +3749,7 @@ async def _gen_dialogue(job_id: str, shot: dict, char: dict, sb_shot: dict,
                     job_id=job_id,
                     shot_idx=shot["idx"],
                     expected_text=(None if extend_mode else combined["voiceover"]),
+                    **_visual_generation_kwargs(combined),
                     continuity_context=continuity_context,
                     paid_batch_id=paid_batch_id,
                     asr_enabled=asr_enabled,
@@ -4538,6 +4582,7 @@ async def _gen_broll(job_id: str, shot: dict,
                 shot_idx=shot["idx"],
                 forbid_people=scene_voiceover and not (background_voiceover and cast_characters),
                 require_lip_sync=not background_voiceover,
+                **_visual_generation_kwargs(sb_shot),
                 expected_text=(
                     sb_shot.get("voiceover") or shot.get("voiceover")
                     if scene_voiceover and not extend_mode else None
