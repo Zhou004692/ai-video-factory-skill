@@ -996,6 +996,9 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     start_sec=float(payload.get("repair_start_sec")),
                     end_sec=float(payload.get("repair_end_sec")),
                     reason=str(payload.get("reason") or ""),
+                    source=str(payload.get('source') or 'active'),
+                    source_confirmed=payload.get('source_confirmed') is True,
+                    affected_requirement_ids=payload.get('affected_requirement_ids'),
                 )
             elif (request_path.startswith("/api/videos/")
                   and request_path.endswith("/extend")
@@ -1008,7 +1011,12 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     master_idx,
                     extension_sec=float(payload.get("extension_sec")),
                     direction=str(payload.get("direction") or ""),
+                    source=str(payload.get('source') or 'active'),
+                    source_confirmed=payload.get('source_confirmed') is True,
+                    continuation_only_confirmed=payload.get('continuation_only_confirmed') is True,
                 )
+            elif request_path.startswith('/api/videos/') and request_path.endswith('/native-repair/discard'):
+                result = self.service.discard_native_repair_preparation(request_path.split('/')[3])
             elif (request_path.startswith('/api/videos/') and request_path.endswith('/align-local-timeline') and '/masters/' in request_path):
                 parts = request_path.split('/')
                 result = self.service.align_cached_visual_timeline(parts[3], int(parts[5]), payload)

@@ -189,6 +189,10 @@ def audit(database: sqlite3.Connection, job_id: str) -> InvariantReport:
 
     issues: list[InvariantIssue] = []
     spec = _json_object(row["production_spec_json"])
+    if spec and spec.get('nodes'):
+        from . import native_visual_repair
+        for subject in native_visual_repair.graph_errors(database,job_id,spec):
+            issues.append(InvariantIssue('native_repair_authorization_invalid','blocking',subject,'native repair graph addition is not authorized'))
     frozen = spec.get("runtime_storyboard") if spec else None
     if not isinstance(frozen, dict):
         issues.append(InvariantIssue(

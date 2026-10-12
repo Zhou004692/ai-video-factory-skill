@@ -43,7 +43,7 @@ SEEDANCE_25_CAPABILITIES = {
         "reference_video": 10,
         "reference_audio": 10,
     },
-    "task_types": frozenset({"auto", "edit", "extend"}),
+    "task_types": frozenset({"auto", "reference", "edit", "extend"}),
     "reference_duration_limits": {"video": 30, "audio": 30},
 }
 
@@ -539,9 +539,9 @@ def _video_task_payload(*, model: str, content: list, duration: float,
     # on pure text-to-video requests makes the provider validate a reference
     # task that has no reference input and is rejected synchronously.  Keep it
     # for actual multimodal/edit/extend requests only.
-    if "seedance-2-5" in model.lower() and roles:
+    if "seedance-2-5" in model.lower() and roles & {"reference_image","reference_video","reference_audio"}:
         payload["omni_reference_task_type"] = (
-            "auto" if task_intent == "generate" else task_intent
+            "reference" if task_intent == "generate" else task_intent
         )
     if not ({"first_frame", "last_frame"} & roles):
         payload["ratio"] = ratio
@@ -632,6 +632,7 @@ async def text_to_video(
     metadata_out: dict | None = None,
     on_task_created=None,
     on_task_updated=None,
+    before_submit=None,
     timeout: int = 600,
 ) -> bytes:
     """文+多 reference → 视频。返回 mp4 字节。
@@ -759,6 +760,8 @@ async def text_to_video(
 
     async with httpx.AsyncClient(timeout=timeout, headers=_headers()) as cli:
         # 1. 提交任务
+        if before_submit is not None:
+            before_submit()
         try:
             r = await cli.post(
                 f"{ARK_BASE}/contents/generations/tasks", json=payload

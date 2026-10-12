@@ -303,7 +303,7 @@ class ProductionAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             set(handlers),
             {
-                "character_anchor", "scene_anchor", "master", "bgm",
+                "character_anchor", "scene_anchor", "master", "native_repair", "bgm",
                 "local_compose", "final_review",
             },
         )

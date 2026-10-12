@@ -1327,6 +1327,10 @@ class ManagementService:
             "FROM provider_calls WHERE job_id=? AND task_id=?",
             (job_id, str(task_id)),
         ).fetchone()
+        if call:
+            from . import native_visual_repair
+            native_result=native_visual_repair.reconcile(self,job_id,call)
+            if native_result is not None:return native_result
         if call is None:
             for candidate in self.database.execute(
                 "SELECT task_id,shot_idx,provider,intent,cost_cents,usage_json "
@@ -4021,6 +4025,17 @@ class ManagementService:
                 (job["job_id"],),
             ).fetchone()
             job["latest_review"] = dict(review) if review else None
+            from . import native_visual_repair
+            attempt=native_visual_repair.current(self.database,job['job_id'])
+            job['native_visual_repair']=attempt
+            if attempt:
+                job['preflight']={**(job.get('preflight') or {}), 'estimated_cost_cents':attempt['estimated_cost_cents'],
+                    'current_cost_cents':attempt['source_guards']['current_cost_cents'],
+                    'projected_total_cost_cents':attempt['required_cumulative_budget_cents'],
+                    'budget_cents':(storyboard.get('production_settings') or {}).get('budget_cents') or 0,
+                    'budget_ok':False, 'estimated_paid_calls':1,'estimated_tts_cost_cents':0}
+            for master_shot in job.get('shots') or []:
+                master_shot['native_visual_repair_eligible']=bool(job.get('execution_engine')=='graph_v2' and master_shot.get('video_path') and job['state'] in {'COMPOSED','FAILED','BLOCKED','PRODUCTION_REVIEW_REQUIRED','READY_TO_PUBLISH'})
             if job["latest_review"]:
                 try:
                     job["latest_review"]["checks"] = json.loads(
@@ -4730,6 +4745,9 @@ class ManagementService:
         self, job_id: str, master_idx: int, *, reason: str = ""
     ) -> dict:
         """Invalidate one master while preserving every other paid result."""
+        engine=self.database.execute('SELECT execution_engine FROM jobs WHERE job_id=?',(job_id,)).fetchone()
+        if engine and engine['execution_engine']=='graph_v2':
+            raise ValueError('new generation directions cannot replace an existing paid graph; native visual edit/extend can be prepared separately, or review/regenerate the original frozen candidate')
         job = self.database.execute(
             "SELECT state,storyboard FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()
@@ -4859,266 +4877,29 @@ class ManagementService:
 
     def prepare_master_lip_sync_repair(
         self, job_id: str, master_idx: int, *, start_sec: float,
-        end_sec: float, reason: str = "",
+        end_sec: float, reason: str = "", source: str = 'active',
+        source_confirmed: bool = False, affected_requirement_ids=None,
     ) -> dict:
         """Queue a Seedance edit that changes only one master's mouth motion."""
-        job = self.database.execute(
-            "SELECT state,storyboard FROM jobs WHERE job_id=?", (job_id,)
-        ).fetchone()
-        if not job:
-            raise ValueError("视频任务不存在")
-        if job["state"] not in {
-            "COMPOSED", "FAILED", "BLOCKED", "PRODUCTION_REVIEW_REQUIRED",
-        }:
-            raise ValueError("只有已生成或待人工复核的视频任务可以修复口型")
-        self._assert_no_unresolved_provider_tasks(job_id)
-        target = self.database.execute(
-            "SELECT idx,state,duration_sec,cost_cents,video_path,video_url,"
-            "video_qa FROM shots "
-            "WHERE job_id=? AND idx=?",
-            (job_id, int(master_idx)),
-        ).fetchone()
-        if not target:
-            raise ValueError("需要修复的母片不存在")
-        if target["state"] not in {"OK", "FAILED", "REVIEW_REQUIRED"}:
-            raise ValueError("该母片尚未形成可修复的视频")
-        other_incomplete = self.database.execute(
-            "SELECT COUNT(*) FROM shots WHERE job_id=? AND idx!=? AND state!='OK'",
-            (job_id, int(master_idx)),
-        ).fetchone()[0]
-        if other_incomplete:
-            raise ValueError("任务还有其他未完成母片，请先完成或复核后再修复口型")
-
-        try:
-            storyboard = json.loads(job["storyboard"] or "{}")
-        except json.JSONDecodeError as exc:
-            raise ValueError("视频任务的导演计划无法读取") from exc
-        masters = storyboard.get("masters") or storyboard.get("shots") or []
-        master = next((
-            item for item in masters
-            if int(item.get("idx") or 0) == int(master_idx)
-        ), None)
-        if master is None:
-            raise ValueError("导演计划中不存在该母片")
-        if str(master.get("type") or "dialogue") != "dialogue":
-            raise ValueError("只有包含人物对白的母片可以执行口型局部修复")
-
-        source = controlled_job_asset_path(
-            self.data_dir / "assets", job_id, target["video_path"],
-            require_file=True,
-        )
-        source_kind = "active_master"
-        source_url = str(target["video_url"] or "").strip()
-        if source is None:
-            try:
-                qa = json.loads(target["video_qa"] or "{}")
-            except (json.JSONDecodeError, TypeError):
-                qa = {}
-            source = controlled_candidate_path(
-                self.data_dir / "assets", job_id,
-                qa.get("candidate_path"),
-            )
-            source_kind = "review_candidate"
-            source_url = str(qa.get("candidate_url") or "").strip()
-        if (
-            source is None
-            and str(master.get("repair_mode") or "")
-            == "seedance_lip_sync_edit"
-        ):
-            source = controlled_job_asset_path(
-                self.data_dir / "assets", job_id,
-                master.get("repair_source_path"), require_file=True,
-            )
-            source_kind = "persisted_repair_source"
-            source_url = str(master.get("repair_source_url") or "").strip()
-        if source is None:
-            raise ValueError("原始母片文件不存在，不能执行保留式口型修复")
-
-        duration = max(0.1, float(
-            master.get("duration") or target["duration_sec"] or 0
-        ))
-        start = max(0.0, float(start_sec))
-        end = min(duration, float(end_sec))
-        if end <= start:
-            raise ValueError("口型修复结束时间必须晚于开始时间且位于母片时长内")
-        reason_text = str(reason or "").strip() or "口型与原生语音不同步"
-        interval_dialogue: list[str] = []
-        for edit in storyboard.get("shots") or []:
-            if int(edit.get("audio_master_idx") or 0) != int(master_idx):
-                continue
-            audio_start = float(edit.get("audio_start") or 0)
-            for cue in edit.get("subtitle_cues") or []:
-                cue_start = audio_start + float(cue.get("start") or 0)
-                cue_end = audio_start + float(cue.get("end") or cue_start)
-                if cue_end <= start or cue_start >= end:
-                    continue
-                text = str(cue.get("text") or "").strip()
-                if text and text not in interval_dialogue:
-                    interval_dialogue.append(text)
-        repair_dialogue = "，".join(interval_dialogue).strip() or str(
-            master.get("voiceover") or ""
-        ).strip()
-        native_audio = source.with_suffix(".wav")
-        master.update({
-            "repair_mode": "seedance_lip_sync_edit",
-            "repair_source_path": str(source),
-            "repair_start_sec": start,
-            "repair_end_sec": end,
-            "repair_dialogue": repair_dialogue,
-            "repair_direction": reason_text,
-            "repair_baseline_cost_cents": max(
-                0,
-                int(
-                    master.get("repair_baseline_cost_cents")
-                    or target["cost_cents"]
-                    or 0
-                ),
-            ),
-        })
-        if source_url.startswith("https://"):
-            master["repair_source_url"] = source_url
-        else:
-            master.pop("repair_source_url", None)
-        if native_audio.is_file():
-            master["repair_audio_path"] = str(native_audio)
-        repair_prompt = s3_shots._build_lip_sync_edit_prompt({
-            **master,
-            "duration_sec": duration,
-        })
-        self.database.execute(
-            "UPDATE shots SET state='PENDING',prompt=?,provider=NULL,"
-            "video_model=NULL,native_audio=0,error=NULL "
-            "WHERE job_id=? AND idx=?",
-            (repair_prompt, job_id, int(master_idx)),
-        )
-        self.database.execute(
-            "UPDATE jobs SET state='STORYBOARDED',storyboard=?,error=NULL,"
-            "retries=0,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-            (json.dumps(storyboard, ensure_ascii=False), job_id),
-        )
-        self.database.execute("DELETE FROM review_events WHERE job_id=?", (job_id,))
-        self.database.execute(
-            "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
-            (
-                job_id, "master_lip_sync_repair", "info",
-                f"母片 #{int(master_idx)} 已进入 Seedance 2.5 "
-                f"{start:g}-{end:g} 秒口型局部修复",
-            ),
-        )
-        self.database.commit()
-        return {
-            "job_id": job_id,
-            "state": "STORYBOARDED",
-            "repair_kind": "seedance_lip_sync_edit",
-            "repair_source_kind": source_kind,
-            "repair_master_idx": int(master_idx),
-            "repair_start_sec": start,
-            "repair_end_sec": end,
-        }
+        from . import native_visual_repair
+        return native_visual_repair.prepare(self, job_id, int(master_idx), kind='edit',
+            start_sec=start_sec, end_sec=end_sec, direction=reason, source=source,
+            source_confirmed=source_confirmed, affected_requirement_ids=affected_requirement_ids)
 
     def prepare_master_extension(
         self, job_id: str, master_idx: int, *, extension_sec: float,
-        direction: str,
+        direction: str, source: str = 'active', source_confirmed: bool = False,
+        continuation_only_confirmed: bool = False,
     ) -> dict:
         """Queue a Seedance extend candidate without replacing the prior master."""
-        job = self.database.execute(
-            "SELECT state,storyboard FROM jobs WHERE job_id=?", (job_id,)
-        ).fetchone()
-        if not job:
-            raise ValueError("视频任务不存在")
-        if job["state"] not in {
-            "COMPOSED", "FAILED", "BLOCKED", "PRODUCTION_REVIEW_REQUIRED",
-        }:
-            raise ValueError("只有已生成或待人工复核的视频任务可以延长母片")
-        self._assert_no_unresolved_provider_tasks(job_id)
-        target = self.database.execute(
-            "SELECT idx,state,duration_sec,video_path FROM shots "
-            "WHERE job_id=? AND idx=?",
-            (job_id, int(master_idx)),
-        ).fetchone()
-        if not target:
-            raise ValueError("需要延长的母片不存在")
-        if target["state"] not in {"OK", "FAILED", "REVIEW_REQUIRED"}:
-            raise ValueError("该母片尚未形成可延长的视频")
-        other_incomplete = self.database.execute(
-            "SELECT COUNT(*) FROM shots WHERE job_id=? AND idx!=? AND state!='OK'",
-            (job_id, int(master_idx)),
-        ).fetchone()[0]
-        if other_incomplete:
-            raise ValueError("任务还有其他未完成母片，请先完成或复核后再延长")
-        try:
-            extension = float(extension_sec)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("延长时长必须在 4 到 30 秒之间") from exc
-        if extension < 4 or extension > 30:
-            raise ValueError("延长时长必须在 4 到 30 秒之间")
-        direction_text = str(direction or "").strip()
-        if not direction_text:
-            raise ValueError("请填写延长后的动作、运镜和结束状态")
+        from . import native_visual_repair
+        return native_visual_repair.prepare(self, job_id, int(master_idx), kind='extend',
+            extension_sec=extension_sec, direction=direction, source=source,
+            source_confirmed=source_confirmed,continuation_only_confirmed=continuation_only_confirmed)
 
-        try:
-            storyboard = json.loads(job["storyboard"] or "{}")
-        except json.JSONDecodeError as exc:
-            raise ValueError("视频任务的导演计划无法读取") from exc
-        masters = storyboard.get("masters") or storyboard.get("shots") or []
-        master = next((
-            item for item in masters
-            if int(item.get("idx") or 0) == int(master_idx)
-        ), None)
-        if master is None:
-            raise ValueError("导演计划中不存在该母片")
-        source = controlled_job_asset_path(
-            self.data_dir / "assets", job_id, target["video_path"],
-            require_file=True,
-        )
-        if source is None:
-            raise ValueError("原始母片文件不存在，不能执行保留式延长")
-
-        for key in (
-            "repair_start_sec", "repair_end_sec", "repair_dialogue",
-            "repair_audio_path",
-        ):
-            master.pop(key, None)
-        master.update({
-            "repair_mode": "seedance_extend",
-            "repair_source_path": str(source),
-            "extend_duration_sec": extension,
-            "extend_direction": direction_text,
-        })
-        extend_prompt = s3_shots._build_extend_prompt({
-            **master,
-            "duration_sec": float(
-                master.get("duration") or target["duration_sec"] or 0
-            ),
-        })
-        self.database.execute(
-            "UPDATE shots SET state='PENDING',prompt=?,provider=NULL,"
-            "video_model=NULL,native_audio=0,error=NULL "
-            "WHERE job_id=? AND idx=?",
-            (extend_prompt, job_id, int(master_idx)),
-        )
-        self.database.execute(
-            "UPDATE jobs SET state='STORYBOARDED',storyboard=?,error=NULL,"
-            "retries=0,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",
-            (json.dumps(storyboard, ensure_ascii=False), job_id),
-        )
-        self.database.execute("DELETE FROM review_events WHERE job_id=?", (job_id,))
-        self.database.execute(
-            "INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)",
-            (
-                job_id, "master_extension", "info",
-                f"母片 #{int(master_idx)} 已进入 Seedance 2.5 "
-                f"延长 {extension:g} 秒候选生成",
-            ),
-        )
-        self.database.commit()
-        return {
-            "job_id": job_id,
-            "state": "STORYBOARDED",
-            "repair_kind": "seedance_extend",
-            "repair_master_idx": int(master_idx),
-            "extension_sec": extension,
-        }
+    def discard_native_repair_preparation(self,job_id: str) -> dict:
+        from . import native_visual_repair
+        return native_visual_repair.discard_prepared(self,job_id)
 
     def configure_video(self, job_id: str, settings: dict) -> dict:
         row = self.database.execute(
@@ -6158,6 +5939,13 @@ class ManagementService:
     def master_repair_source_file(
         self, job_id: str, master_idx: int
     ) -> Path:
+        from . import native_visual_repair
+        attempt = native_visual_repair.current(self.database, job_id)
+        if attempt and attempt['master_idx']==int(master_idx):
+            path=controlled_job_asset_path(self.data_dir/'assets',job_id,attempt['source_guards']['source_path'],require_file=True)
+            if path is None or _file_sha256(path)!=attempt['source_guards']['asset_sha256']:
+                raise ValueError('native repair selected source changed; refresh full preview')
+            return path
         row = self.database.execute(
             "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()
@@ -6230,6 +6018,11 @@ class ManagementService:
             "SELECT state,provider_task_id FROM production_nodes WHERE job_id=? AND node_id=?",
             (job_id, node_id),
         ).fetchone()
+        from . import native_visual_repair
+        repair_node = native_visual_repair.review_node(self.database, job_id, int(master_idx))
+        if repair_node:
+            native_visual_repair.close_review(self.database, repair_node, decision, operation_id)
+            return True
         if not node:
             return False
         current = str(node["state"])
@@ -6302,6 +6095,14 @@ class ManagementService:
             qa = json.loads(shot["video_qa"] or "{}")
         except (json.JSONDecodeError, TypeError):
             qa = {}
+        if qa.get('native_repair_attempt_id') and normalized=='accept_candidate' and not qa.get('native_repair_full_candidate'):
+            raise ValueError('raw native candidate cannot be accepted; reconcile full candidate assembly or keep prior')
+        if qa.get('native_repair_attempt_id') and normalized=='regenerate_master':
+            raise ValueError('native repair requires a new prepared attempt and explicit budget; review/keep prior first')
+        if qa.get('native_repair_attempt_id') and normalized=='accept_candidate':
+            from . import native_visual_repair
+            native_node=native_visual_repair.review_node(self.database,job_id,int(master_idx))
+            native_visual_repair.require_full_candidate(self.database,native_node,Path(qa['candidate_path']))
         existing_operation = qa.get("review_operation")
         if not isinstance(existing_operation, dict):
             existing_operation = qa.get('content_candidate_acceptance')
@@ -8398,6 +8199,10 @@ class ManagementService:
     ) -> dict:
         if not confirmed:
             raise ValueError("开始付费生成前必须明确确认预算")
+        from . import native_visual_repair
+        attempt = native_visual_repair.current(self.database, job_id)
+        if attempt:
+            return native_visual_repair.start(self, attempt, approved_budget_cents)
         job = self.database.execute(
             "SELECT state,execution_engine FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()

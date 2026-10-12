@@ -422,6 +422,8 @@ async def run_local_compose_node(
     )
     from . import visual_repair
     storyboard = visual_repair.adapter_storyboard(database, job_id, storyboard, spec['spec_hash'])
+    from . import native_visual_repair
+    storyboard = native_visual_repair.accepted_storyboard(database,job_id,storyboard)
     await s6_compose.run(job_id, storyboard_override=storyboard)
     row = database.execute(
         "SELECT final_path FROM jobs WHERE job_id=?", (job_id,)
@@ -459,7 +461,9 @@ async def run_final_review_node(
 
 def build_handlers(database: sqlite3.Connection):
     """Return handlers bound to the worker's durable database connection."""
+    from . import native_visual_repair
     return {
+        "native_repair": lambda node: native_visual_repair.run(database, node),
         "character_anchor": (
             lambda node: run_character_anchor_node(database, node)
         ),

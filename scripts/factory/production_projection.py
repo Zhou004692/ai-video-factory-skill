@@ -51,6 +51,14 @@ def _projected_state(
 ) -> tuple[str, str]:
     if provider_tasks.unresolved_task_ids(database, job_id):
         return "PROVIDER_ACTION_REQUIRED", "reconcile_provider_task"
+    repair_states={str(r['state']) for r in database.execute("SELECT state FROM production_nodes WHERE job_id=? AND node_type='native_repair' AND state!='SUCCEEDED'",(job_id,)).fetchall()}
+    if repair_states:
+        selected=next(state for state in PRIORITY if state in repair_states)
+        return {'ACTION_REQUIRED':('PROVIDER_ACTION_REQUIRED','reconcile_provider_task'),
+            'BUDGET_REQUIRED':('BUDGET_CONFIRMATION_REQUIRED','increase_job_budget'),
+            'FAILED':('FAILED','preserve_and_diagnose'), 'REVIEW_REQUIRED':('PRODUCTION_REVIEW_REQUIRED','review_candidate'),
+            'RUNNING':('PRODUCTION_RUNNING','view_progress'), 'READY':('PRODUCTION_QUEUED','view_progress'),
+            'PENDING':('RECOVERY_REQUIRED','preserve_and_diagnose')}[selected]
     local_compose = database.execute(
         "SELECT state FROM production_nodes WHERE job_id=? AND node_id='local_compose'",
         (job_id,),

@@ -1422,7 +1422,7 @@ class MusicFallbackTests(unittest.IsolatedAsyncioTestCase):
             generate_audio=True,
         )
 
-        self.assertEqual(payload["omni_reference_task_type"], "auto")
+        self.assertEqual(payload["omni_reference_task_type"], "reference")
 
     def test_local_image_accepts_path_objects(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

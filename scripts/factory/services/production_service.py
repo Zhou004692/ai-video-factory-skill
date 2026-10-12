@@ -147,6 +147,14 @@ class ProductionService:
 
     def compile(self, job_id: str) -> dict:
         """Compile and explain v2 production without a provider submission."""
+        from .. import native_visual_repair
+        attempt = native_visual_repair.current(self.database, job_id)
+        if attempt:
+            native_visual_repair.verify(self.database, self.root/'data'/'assets', attempt)
+            return {'job_id':job_id, 'compilable':True, 'version':2,
+                'spec_hash':attempt['source_guards']['spec_hash'], 'blockers':[], 'decisions':[],
+                'estimated_cost_cents':attempt['estimated_cost_cents'], 'budget_cents':attempt['required_cumulative_budget_cents'],
+                'required_content':[], 'native_repair':attempt, 'preparation_only':True}
         job = self.database.execute(
             "SELECT storyboard FROM jobs WHERE job_id=?", (job_id,)
         ).fetchone()

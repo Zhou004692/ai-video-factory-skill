@@ -701,11 +701,7 @@ def _env_nonnegative_int(name: str, default: int) -> int:
 def _estimated_request_cost_cents(request_kwargs: dict) -> int:
     """Conservative pre-submit estimate from measured Seedance 2.5 calls."""
     if str(request_kwargs.get("task_intent") or "generate") == "edit":
-        duration = max(
-            1, int(math.ceil(float(
-                request_kwargs.get("reference_video_duration_sec") or 30
-            )))
-        )
+        duration = float(request_kwargs.get("reference_video_duration_sec") or 30)
     else:
         duration = seedance.normalize_generation_duration(
             request_kwargs.get("duration")
@@ -716,11 +712,9 @@ def _estimated_request_cost_cents(request_kwargs: dict) -> int:
     )
     reference_duration = 0.0
     if request_kwargs.get("reference_videos"):
-        reference_duration = max(
-            duration,
-            float(request_kwargs.get("reference_video_duration_sec") or 0),
-        )
-    return round((duration + reference_duration) * cents_per_second)
+        reference_duration = float(request_kwargs.get("reference_video_duration_sec") or duration)
+    return round(duration * request_kwargs.get('native_output_rate_cents_per_second',cents_per_second)
+        + reference_duration * request_kwargs.get('native_input_rate_cents_per_second',cents_per_second))
 
 
 def _job_budget_cents(storyboard: dict) -> int:
@@ -2638,8 +2632,8 @@ def _lip_sync_edit_request_kwargs(shot: dict) -> dict:
     source = str(shot.get("repair_source_path") or "").strip()
     if not source:
         raise ValueError("口型局部修复缺少原始母片")
-    source_url = str(shot.get("repair_source_url") or "").strip()
-    reference = source_url if source_url.startswith("https://") else source
+    # Native repair always binds actual local bytes, never a historic URL.
+    reference = source
     duration = max(0.1, float(shot.get("duration_sec") or 0))
     snapshot = production_config.snapshot_from_unit(shot) or {}
     request = {
@@ -2863,6 +2857,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                                      generation_snapshot: dict | None = None,
                                      visual_requirements=None,
                                      visual_plan: dict | None = None,
+                                     native_repair: dict | None = None,
                                      ) -> SeedanceGenerationResult:
     """Generate, upload and gate a Seedance shot.
 
@@ -2883,11 +2878,11 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             "SELECT n.provider_task_id,n.output_json FROM production_nodes n "
             "JOIN jobs j ON j.job_id=n.job_id AND j.production_spec_hash=n.spec_hash "
             "WHERE n.job_id=? AND n.node_id=? AND n.state='RUNNING'",
-            (job_id, f"master:{shot_idx}"),
+            (job_id, native_repair['node_id'] if native_repair else f"master:{shot_idx}"),
         ).fetchone()
         if recovery_node is not None:
             output = json.loads(recovery_node["output_json"] or "{}")
-            recovery_id = str(output.get("resume_provider_task_id") or "")
+            recovery_id = str(output.get("resume_provider_task_id") or (recovery_node['provider_task_id'] if native_repair else '') or '')
             if recovery_id:
                 recovery_call = health_database.execute(
                     "SELECT task_id,intent,usage_json,cost_cents FROM provider_calls "
@@ -2896,6 +2891,10 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 ).fetchone()
                 if recovery_call is None or recovery_id != recovery_node["provider_task_id"]:
                     raise RuntimeError("paid master recovery task ownership mismatch")
+                if native_repair:
+                    usage = json.loads(recovery_call['usage_json'] or '{}')
+                    if usage.get('owner_node_id') != native_repair['node_id']:
+                        raise RuntimeError('native repair recovery ledger ownership mismatch')
 
     def update_staged_artifact(task_id: str, artifact_path: Path) -> None:
         if health_database is None or not task_id:
@@ -3028,6 +3027,8 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         provider_kwargs = dict(call_kwargs)
         provider_kwargs.pop("reference_video_duration_sec", None)
         provider_kwargs.pop("reference_audio_duration_sec", None)
+        provider_kwargs.pop('native_input_rate_cents_per_second',None)
+        provider_kwargs.pop('native_output_rate_cents_per_second',None)
         chosen_manifest = provider_kwargs.pop("reference_manifest", [])
         reference_audit = reference_attention.sanitized_manifest(chosen_manifest)
         if recovery_call is None:
@@ -3174,6 +3175,9 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             except provider_tasks.ProviderTaskBudgetError as exc:
                 raise SeedanceBudgetError(str(exc)) from exc
         try:
+            def check_native_submission():
+                from .. import native_visual_repair as repair
+                repair.verify(health_database,ASSETS_DIR,native_repair['attempt'],budget=native_repair['budget'],worker=True)
             if recovery_call is not None:
                 inspected = await seedance.inspect_task(recovery_call["task_id"])
                 video = inspected.get("video")
@@ -3195,6 +3199,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                     metadata_out=metadata,
                     on_task_created=persist_pending_task,
                     on_task_updated=persist_task_state,
+                    **({'before_submit':check_native_submission} if native_repair else {}),
                     **provider_kwargs,
                 )
             if reservation_id:
@@ -3224,10 +3229,8 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                     if str(request_kwargs.get("task_intent") or "generate") == "edit"
                     else request_kwargs.get("duration") or 0
                 )
-                call_cost = seedance.estimate_cost_cents(
-                    fallback_duration,
-                    request_kwargs.get("resolution", "720p"),
-                )
+                call_cost = (_estimated_request_cost_cents(request_kwargs) if native_repair else seedance.estimate_cost_cents(
+                    fallback_duration, request_kwargs.get("resolution", "720p")))
             spent_cost_cents += call_cost
             final_call = {
                 "task_id": metadata.get("task_id"),
@@ -3261,10 +3264,29 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 )
             provider_output.write_bytes(video)
             if provider_output != target_path:
-                await ffmpeg.transcode_edit_mov_to_mp4(
-                    provider_output, target_path
-                )
+                try:
+                    await ffmpeg.transcode_edit_mov_to_mp4(provider_output, target_path)
+                except Exception as exc:
+                    if not native_repair:raise
+                    raise SeedanceQualityError('Native browser conversion needs manual reconciliation: '+str(exc),
+                        cost_cents=spent_cost_cents,provider_calls=tuple(provider_calls),
+                        reasons=('native_repair_assembly_required',),candidate_path=provider_output) from exc
                 video = target_path.read_bytes()
+            if native_repair:
+                from .. import native_visual_repair as repair
+                bound = native_repair['attempt']
+                source = Path(bound['source_guards']['source_path'])
+                full = target_path.with_name(f'.{target_path.stem}.full.mp4')
+                try:
+                    if visual_evidence.asset_fingerprint(source) != bound['source_guards']['asset_sha256']:
+                        raise ValueError('selected source changed after paid task; reconcile retained raw candidate')
+                    await repair.assemble(bound,source,target_path,full)
+                    full.replace(target_path)
+                    video = target_path.read_bytes()
+                except Exception as exc:
+                    raise SeedanceQualityError(str(exc),cost_cents=spent_cost_cents,
+                        provider_calls=tuple(provider_calls),reasons=('native_repair_assembly_required',),
+                        candidate_path=target_path,candidate_url=None) from exc
             audio_path = fixed_audio_path
             if fixed_audio_path is not None:
                 visual_path = target_path.with_name(
@@ -3304,7 +3326,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                         "artifact_url": url,
                     },
                 )
-            if provider_output != target_path:
+            if provider_output != target_path and not native_repair:
                 provider_output.unlink(missing_ok=True)
             return video, target_path, url, audio_path
         except BaseException as exc:
@@ -3498,6 +3520,16 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         },
         ensure_ascii=False,
     )
+
+    if native_repair:
+        # No automatic repurchase, even when machine QA is green. Full reviewed
+        # bytes (after browser conversion and bounded assembly) need acceptance.
+        review_path = preserve_candidate()
+        raise SeedanceQualityError('Native repair requires explicit full-candidate review',
+            cost_cents=spent_cost_cents,provider_calls=tuple(provider_calls),
+            reasons=tuple(dict.fromkeys([*decision.reasons,'repair_candidate_ready'])),
+            candidate_path=review_path,candidate_url=video_url,qa_evidence=raw,
+            transcription=transcription,transcription_available=transcription_available)
 
     if any(reason.startswith("content_") for reason in decision.reasons):
         review_path = preserve_candidate()
