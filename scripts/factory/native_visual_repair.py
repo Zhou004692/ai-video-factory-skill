@@ -7,11 +7,14 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import secrets
 import subprocess
+import tempfile
 
 from . import content_review, node_state_machine, provider_tasks, visual_contract, visual_evidence
 from .clients import ffmpeg, seedance
@@ -20,6 +23,7 @@ PREPARED = 'native_visual_repair_prepared'
 AUTHORIZED = 'native_visual_repair_authorized'
 CLOSED = 'native_visual_repair_closed'
 AUTHORITY = 'native_visual_repair_v1'
+SOURCE_SEALED = 'native_visual_repair_source_sealed'
 
 
 class StaleRepairError(ValueError):
@@ -59,6 +63,74 @@ def probe_source(path):
 def event(database, job_id, step, payload):
     database.execute('INSERT INTO events(job_id,step,level,message) VALUES(?,?,?,?)',
         (job_id, step, 'info', json.dumps(payload, ensure_ascii=False, allow_nan=False)))
+
+
+def source_archive_path(assets, attempt):
+    root = (Path(assets) / attempt['job_id']).resolve()
+    path = (root / 'shots' / 'review' / 'repairs' / (attempt['attempt_id'] + '.source.mp4')).resolve()
+    if not path.is_relative_to(root): raise StaleRepairError('native source archive path is uncontrolled')
+    return path
+
+
+def source_archive_record(assets, attempt):
+    return {'attempt_id':attempt['attempt_id'], 'source_path':str(source_archive_path(assets,attempt)),
+        'asset_sha256':attempt['source_guards']['asset_sha256'],
+        'source_media':attempt['source_guards']['media'], 'request_fingerprint':attempt['request_fingerprint']}
+
+
+def archived_source_bytes(database, assets, attempt):
+    """Read the attempt's durable source once, independent of its mutable original."""
+    expected = source_archive_record(assets,attempt)
+    rows = database.execute('SELECT message FROM events WHERE job_id=? AND step=?',
+        (attempt['job_id'],SOURCE_SEALED)).fetchall()
+    if not any(content_review.object_json(row['message']) == expected for row in rows):
+        raise StaleRepairError('native source archive authority is missing; retrieve raw paid output and reconcile manually')
+    return _read_source_archive(assets,attempt)
+
+
+def _read_source_archive(assets,attempt):
+    expected=source_archive_record(assets,attempt)
+    try: consumed = Path(expected['source_path']).read_bytes()
+    except OSError as exc:
+        raise StaleRepairError('native source archive is unavailable; retrieve raw paid output and reconcile manually') from exc
+    if hashlib.sha256(consumed).hexdigest() != expected['asset_sha256']:
+        raise StaleRepairError('native source archive bytes changed; retrieve raw paid output and reconcile manually')
+    return consumed
+
+
+def seal_source(database, assets, attempt):
+    """Persist the exact POST source before dispatch; never replace an owned archive."""
+    if database.in_transaction:
+        raise StaleRepairError('native source cannot be dispatched from an uncommitted transaction')
+    expected = source_archive_record(assets,attempt)
+    rows = database.execute('SELECT message FROM events WHERE job_id=? AND step=?',
+        (attempt['job_id'],SOURCE_SEALED)).fetchall()
+    if any(content_review.object_json(row['message']) == expected for row in rows):
+        consumed=archived_source_bytes(database,assets,attempt)
+        _verify_sealed_media(consumed,attempt)
+        return consumed
+    consumed = Path(attempt['source_guards']['source_path']).read_bytes()
+    if hashlib.sha256(consumed).hexdigest() != expected['asset_sha256']:
+        raise StaleRepairError('native consumed source bytes changed before submission')
+    _verify_sealed_media(consumed,attempt)
+    path = Path(expected['source_path']); path.parent.mkdir(parents=True,exist_ok=True)
+    if path.exists():
+        if path.read_bytes() != consumed: raise StaleRepairError('native uncommitted source archive changed; discard and reprepare')
+    else:
+        with path.open('xb') as target:
+            target.write(consumed); target.flush(); os.fsync(target.fileno())
+    with node_state_machine.atomic(database):
+        event(database,attempt['job_id'],SOURCE_SEALED,expected)
+    return archived_source_bytes(database,assets,attempt)
+
+
+def _verify_sealed_media(consumed,attempt):
+    # Measure a private copy of those exact bytes, rather than a source path
+    # that might have changed since preparation's SHA or picture probe.
+    with tempfile.TemporaryDirectory(prefix='native-preflight-') as directory:
+        source=Path(directory)/'source.mp4'; source.write_bytes(consumed)
+        if probe_source(source)!=attempt['source_guards']['media']:
+            raise StaleRepairError('native archived source media differs from confirmed scope/cost; discard and reprepare')
 
 
 def current(database, job_id):
@@ -335,8 +407,14 @@ def accepted_storyboard(database,job_id,storyboard):
         closes=database.execute('SELECT message FROM events WHERE job_id=? AND step=? ORDER BY id DESC',(job_id,CLOSED)).fetchall()
         closure=next((content_review.object_json(r['message']) for r in closes if content_review.object_json(r['message']).get('attempt_id')==attempt['attempt_id']),{})
         if closure.get('decision')!='accept_candidate':continue
-        shot=database.execute('SELECT video_path,video_qa FROM shots WHERE job_id=? AND idx=?',(job_id,idx)).fetchone()
-        if content_review.object_json(shot['video_qa']).get('native_repair_attempt_id')!=attempt['attempt_id']:continue
+        shot=database.execute('SELECT video_path FROM shots WHERE job_id=? AND idx=?',(job_id,idx)).fetchone()
+        # Later candidate QA belongs to another attempt. Only the active bytes
+        # decide which historical accepted assembly still supplies its bounds.
+        records=database.execute('SELECT message FROM events WHERE job_id=? AND step=? ORDER BY id DESC',
+            (job_id,'native_visual_repair_candidate')).fetchall()
+        record=next((content_review.object_json(r['message']) for r in records
+            if content_review.object_json(r['message']).get('attempt_id')==attempt['attempt_id']),{})
+        if record.get('candidate_sha256')!=visual_evidence.asset_fingerprint(Path(shot['video_path'])):continue
         record=require_full_candidate(database,row,Path(shot['video_path']))
         next(m for m in result['masters'] if m['idx']==idx)['duration']=record['candidate_picture_duration_sec']
     return result
@@ -380,6 +458,16 @@ def start(service, attempt, budget, *, attempt_id=None,request_fingerprint=None)
 
 async def assemble(attempt, source, provider_output, output):
     """Keep original audio and unedited picture intervals; never pad picture."""
+    # The source pathname is only a compatibility argument. FFmpeg must consume
+    # a private copy of the same archived bytes used for POST, including on GET.
+    from .steps import s3_shots
+    consumed=_read_source_archive(s3_shots.ASSETS_DIR,attempt)
+    with tempfile.TemporaryDirectory(prefix='native-source-') as directory:
+        sealed=Path(directory)/'source.mp4'; sealed.write_bytes(consumed)
+        return await _assemble_sealed(attempt,sealed,provider_output,output)
+
+
+async def _assemble_sealed(attempt, source, provider_output, output):
     raw = json.loads(await ffmpeg._ffprobe(['-show_streams','-of','json',str(provider_output)]))
     stream=next(s for s in raw['streams'] if s.get('codec_type')=='video')
     actual=finite(stream.get('duration'),'provider picture duration')

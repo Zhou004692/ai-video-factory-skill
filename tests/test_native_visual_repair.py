@@ -55,7 +55,11 @@ class NativeRepairTests(unittest.TestCase):
         calls=[]; uploaded={}
         def transport(req):
             calls.append((req.method,str(req.url),json.loads(req.content) if req.content else None))
-            if req.method=='POST': return httpx.Response(200,json={'id':'offline-'+attempt['attempt_id']})
+            if req.method=='POST':
+                self.assertFalse(self.database.in_transaction,'POST must follow committed archive/authorization')
+                sealed=native_visual_repair.archived_source_bytes(self.database,self.root/'data'/'assets',attempt)
+                self.assertEqual(len(sealed),attempt['source_guards']['media']['size_bytes'])
+                return httpx.Response(200,json={'id':'offline-'+attempt['attempt_id']})
             if '/tasks/' in str(req.url): return httpx.Response(200,json={'status':'succeeded','content':{'video_url':'https://8.8.8.8/media'},'usage':{'cost_cents':attempt['estimated_cost_cents']}})
             return httpx.Response(200,content=provider.read_bytes())
         real_client=httpx.AsyncClient
@@ -222,6 +226,135 @@ class NativeRepairTests(unittest.TestCase):
             recovered,_=self.execute(attempt,provider)
         self.assertFalse(any(c[0]=='POST' for c in recovered));self.assertTrue(any('/tasks/' in c[1] for c in recovered))
         self.assertEqual(self.database.execute('SELECT cost_cents FROM jobs').fetchone()[0],total)
+
+    def review_candidate(self,decision):
+        qa=content_review.object_json(self.database.execute('SELECT video_qa FROM shots').fetchone()[0])
+        target=Path(qa['candidate_path']) if decision=='accept_candidate' else self.active
+        payload=fixture.ContentReviewTests.payload(self,'candidate' if decision=='accept_candidate' else 'active')
+        payload['expected_asset_sha256']=visual_evidence.asset_fingerprint(target)
+        self.service.record_content_review('J',1,payload)
+        with patch.object(self.service,'dispatch_production_queue',return_value={'dispatched_jobs':[]}), \
+             patch.object(s3_shots.ffmpeg,'probe_duration',new=AsyncMock(return_value=8)), \
+             patch('factory.management_api.s6_compose.run',new=AsyncMock()):
+            return self.service.review_master_candidate('J',1,decision=decision)
+
+    def queue_owned_recovery(self):
+        self.database.execute("UPDATE production_nodes SET state='ACTION_REQUIRED',output_json='{}' WHERE node_type='native_repair'")
+        self.database.commit()
+        task=self.database.execute("SELECT provider_task_id FROM production_nodes WHERE node_type='native_repair'").fetchone()[0]
+        with patch.object(self.service,'dispatch_production_queue',return_value={'dispatched_jobs':[]}):
+            self.assertTrue(self.service.reconcile_provider_task('J',task)['get_only'])
+
+    def test_assembly_source_archive_survives_original_ABA_and_get_only_restart(self):
+        import base64
+        self.real_graph('broll');attempt=self.prepare();self.start(attempt);original=self.active.read_bytes()
+        replacement=self.base/'replacement.mp4';self.media(replacement,color='green',tone=880)
+        provider=self.base/'reply.mov';self.media(provider,color='blue',tone=1200)
+        assemble=native_visual_repair.assemble
+        async def mutate_original(bound,source,raw,output):
+            source.write_bytes(replacement.read_bytes())
+            try:return await assemble(bound,source,raw,output)
+            finally:source.write_bytes(original)
+        with patch.object(native_visual_repair,'assemble',side_effect=mutate_original):
+            calls,candidate=self.execute(attempt,provider)
+        body=next(call[2] for call in calls if call[0]=='POST')
+        sent=next(item['video_url']['url'] for item in body['content'] if item.get('role')=='reference_video')
+        self.assertEqual(base64.b64decode(sent.split(',',1)[1]),original)
+        archive=native_visual_repair.source_archive_path(self.root/'data'/'assets',attempt)
+        self.assertEqual(archive.read_bytes(),original)
+        self.assertGreater(self.pixel(candidate,.5)[0],200);self.assertTrue(430<self.tone(candidate)<450)
+        self.assertEqual(self.active.read_bytes(),original)
+        total=self.database.execute('SELECT cost_cents FROM jobs').fetchone()[0]
+        self.active.write_bytes(replacement.read_bytes());self.queue_owned_recovery()
+        with patch.object(native_visual_repair,'probe_source',side_effect=AssertionError('Recovery cannot apply new submission profile')):
+            recovered,candidate=self.execute(attempt,provider)
+        self.assertFalse(any(call[0]=='POST' for call in recovered))
+        self.assertGreater(self.pixel(candidate,.5)[0],200);self.assertTrue(430<self.tone(candidate)<450)
+        self.assertEqual(self.active.read_bytes(),replacement.read_bytes())
+        self.assertEqual(self.database.execute('SELECT cost_cents FROM jobs').fetchone()[0],total)
+
+    def test_missing_or_corrupt_archive_recovery_retains_raw_without_full_proof(self):
+        for corruption in ['missing','changed']:
+            with self.subTest(corruption=corruption):
+                if corruption=='changed':self.tearDown();self.setUp()
+                self.real_graph();attempt=self.prepare();self.start(attempt)
+                provider=self.base/'reply.mov';self.media(provider,color='blue')
+                self.execute(attempt,provider);total=self.database.execute('SELECT cost_cents FROM jobs').fetchone()[0]
+                archive=native_visual_repair.source_archive_path(self.root/'data'/'assets',attempt)
+                if corruption=='missing':archive.unlink()
+                else:archive.write_bytes(b'corrupt archive')
+                self.queue_owned_recovery();calls,candidate=self.execute(attempt,provider,full=False)
+                self.assertFalse(any(call[0]=='POST' for call in calls));self.assertTrue(candidate.is_file())
+                qa=content_review.object_json(self.database.execute('SELECT video_qa FROM shots').fetchone()[0])
+                self.assertFalse(qa['native_repair_full_candidate'])
+                with self.assertRaisesRegex(ValueError,'raw native'):
+                    self.service.review_master_candidate('J',1,decision='accept_candidate')
+                self.assertEqual(self.database.execute('SELECT cost_cents FROM jobs').fetchone()[0],total)
+
+    def test_extension_then_keep_prior_uses_active_historical_bounds_in_real_local_adapter(self):
+        self.real_graph('broll');first=self.prepare(kind='extend');self.start(first)
+        provider=self.base/'tail.mov';self.media(provider,color='blue')
+        self.execute(first,provider);self.review_candidate('accept_candidate')
+        self.database.execute("UPDATE production_nodes SET state='SUCCEEDED' WHERE node_id IN ('local_compose','final_review')")
+        self.database.execute("UPDATE jobs SET state='COMPOSED'");self.database.commit()
+        extended=self.active.read_bytes()
+        second=self.prepare();self.start(second)
+        replacement=self.base/'edit.mov';self.media(replacement,color='yellow',seconds=8)
+        self.execute(second,replacement)
+        frozen=json.loads(self.database.execute('SELECT production_spec_json FROM jobs').fetchone()[0])['runtime_storyboard']
+        projected=native_visual_repair.accepted_storyboard(self.database,'J',frozen)
+        self.assertEqual(projected['masters'][0]['duration'],8,'Pending candidate cannot replace active accepted bounds')
+        self.review_candidate('keep_prior');self.assertEqual(self.active.read_bytes(),extended)
+        compose=AsyncMock();node=self.database.execute("SELECT * FROM production_nodes WHERE node_id='local_compose'").fetchone()
+        with patch('factory.production_adapters.s6_compose.run',new=compose):
+            with self.assertRaisesRegex(RuntimeError,'no final video'):
+                asyncio.run(production_adapters.run_local_compose_node(self.database,node))
+        projected=compose.call_args.kwargs['storyboard_override']
+        live=json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0])
+        content_review.persist_effective_storyboard(self.database,'J',projected,
+            expected_local_fingerprint=content_review.edit_plan_fingerprint(live))
+        persisted=json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0])
+        self.assertEqual(projected['masters'][0]['duration'],8);self.assertEqual(persisted['masters'][0]['duration'],8)
+        self.assertEqual(self.database.execute("SELECT state FROM production_nodes WHERE node_id='final_review'").fetchone()[0],'PENDING')
+
+    def test_cleanup_accept_retry_is_read_only_and_changed_active_is_stale(self):
+        from factory import review_candidates
+        self.real_graph();attempt=self.prepare();self.start(attempt)
+        provider=self.base/'reply.mov';self.media(provider,color='blue')
+        self.execute(attempt,provider);self.review_candidate('accept_candidate')
+        accepted=self.active.read_bytes()
+        self.assertEqual(review_candidates.finalize_accepted_candidates(self.database,self.root/'data'/'assets','J'),1)
+        before='\n'.join(self.database.iterdump())
+        with patch.object(self.service,'dispatch_production_queue') as dispatch:
+            self.assertTrue(self.service.review_master_candidate('J',1,decision='accept_candidate')['already_committed'])
+        dispatch.assert_not_called();self.assertEqual(before,'\n'.join(self.database.iterdump()))
+        self.media(self.active,color='green')
+        with self.assertRaises(ValueError):self.service.review_master_candidate('J',1,decision='accept_candidate')
+        self.assertEqual(before,'\n'.join(self.database.iterdump()))
+        self.active.write_bytes(accepted)
+        self.database.execute("UPDATE production_nodes SET state='SUCCEEDED' WHERE node_id IN ('local_compose','final_review')")
+        self.database.execute("UPDATE jobs SET state='COMPOSED'");self.database.commit()
+        later=self.prepare();self.start(later);self.media(provider,color='yellow')
+        self.execute(later,provider)
+        before='\n'.join(self.database.iterdump())
+        with self.assertRaises(ValueError):self.service.review_master_candidate('J',1,decision='accept_candidate')
+        self.assertEqual(before,'\n'.join(self.database.iterdump()))
+
+    def test_archive_media_must_match_confirmed_scope_before_post(self):
+        self.real_graph();attempt=self.prepare();self.start(attempt)
+        node=self.database.execute("SELECT * FROM production_nodes WHERE node_type='native_repair'").fetchone()
+        actual=native_visual_repair.probe_source
+        def wrong_archived_media(path):
+            result=actual(path)
+            if str(path).endswith('source.mp4'):result={**result,'fps':60}
+            return result
+        provider=self.base/'reply.mov';self.media(provider)
+        with patch.object(native_visual_repair,'probe_source',side_effect=wrong_archived_media):
+            with self.assertRaises(AssertionError):self.execute(attempt,provider)
+        node=self.database.execute("SELECT * FROM production_nodes WHERE node_type='native_repair'").fetchone()
+        self.assertIn('confirmed scope/cost',node['output_json']);self.assertFalse(node['provider_task_id'])
+        self.assertEqual(self.database.execute('SELECT COUNT(*) FROM provider_calls').fetchone()[0],0)
+        self.assertEqual(self.database.execute('SELECT cost_cents FROM jobs').fetchone()[0],123)
 
     def test_actual_before_post_guard_rejects_operator_budget_change(self):
         self.real_graph();attempt=self.prepare();self.start(attempt)

@@ -6374,10 +6374,6 @@ class ManagementService:
             raise ValueError('raw native candidate cannot be accepted; reconcile full candidate assembly or keep prior')
         if qa.get('native_repair_attempt_id') and normalized=='regenerate_master':
             raise ValueError('native repair requires a new prepared attempt and explicit budget; review/keep prior first')
-        if qa.get('native_repair_attempt_id') and normalized=='accept_candidate':
-            from . import native_visual_repair
-            native_node=native_visual_repair.review_node(self.database,job_id,int(master_idx))
-            native_visual_repair.require_full_candidate(self.database,native_node,Path(qa['candidate_path']))
         existing_operation = qa.get("review_operation")
         if not isinstance(existing_operation, dict):
             existing_operation = qa.get('content_candidate_acceptance')
@@ -6388,12 +6384,22 @@ class ManagementService:
             committed_decision = str(existing_operation.get("decision") or "")
             if committed_decision != normalized:
                 raise ValueError("该母片已提交其他复核决定")
-            if normalized in {'accept_candidate', 'keep_prior'} and content_review.enabled(content_review.object_json(job['storyboard'])):
+            if normalized in {'accept_candidate', 'keep_prior'} and (
+                qa.get('native_repair_attempt_id') or content_review.enabled(content_review.object_json(job['storyboard']))
+            ):
                 with node_state_machine.atomic(self.database):
-                    content_review.require_selected(self.database, self.data_dir / 'assets', job_id, master_idx, 'active')
                     locked_shot = self.database.execute('SELECT video_path,video_qa FROM shots WHERE job_id=? AND idx=?', (job_id, int(master_idx))).fetchone()
                     if locked_shot['video_qa'] != shot['video_qa'] or existing_operation.get('selected_sha256', existing_operation.get('candidate_sha256')) != _file_sha256(Path(locked_shot['video_path'])):
                         raise ValueError('content committed source is stale')
+                    if content_review.enabled(content_review.object_json(job['storyboard'])):
+                        content_review.require_selected(self.database, self.data_dir / 'assets', job_id, master_idx, 'active')
+                    if qa.get('native_repair_attempt_id'):
+                        from . import native_visual_repair
+                        native_node=native_visual_repair.review_node(self.database,job_id,int(master_idx))
+                        if shot['state']!='OK' or native_node['state']!='SUCCEEDED':
+                            raise ValueError('native committed decision is stale; review the current candidate')
+                        if normalized=='accept_candidate':
+                            native_visual_repair.require_full_candidate(self.database,native_node,Path(locked_shot['video_path']))
             return {
                 "job_id": job_id,
                 "master_idx": int(master_idx),
@@ -6406,6 +6412,10 @@ class ManagementService:
                 ).fetchone()[0]),
                 "already_committed": True,
             }
+        if qa.get('native_repair_attempt_id') and normalized=='accept_candidate':
+            from . import native_visual_repair
+            native_node=native_visual_repair.review_node(self.database,job_id,int(master_idx))
+            native_visual_repair.require_full_candidate(self.database,native_node,Path(qa.get('candidate_path') or ''))
         legacy_review = bool(
             job["state"] == "FAILED"
             and shot["state"] == "FAILED"
@@ -6963,7 +6973,7 @@ class ManagementService:
                 })
                 operation["phase"] = "committed"
                 qa["review_operation"] = operation
-                if content_review.enabled(content_review.object_json(job['storyboard'])):
+                if qa.get('native_repair_attempt_id') or content_review.enabled(content_review.object_json(job['storyboard'])):
                     qa['content_candidate_acceptance'] = {'phase': 'committed', 'decision': normalized,
                         'selected_sha256': operation['candidate_sha256']}
                 decision_commit = commit_decision(
@@ -7080,7 +7090,7 @@ class ManagementService:
                     "candidate_path": str(candidate) if candidate else None,
                 })
                 qa["review_operation"] = operation
-                if content_review.enabled(content_review.object_json(job['storyboard'])):
+                if qa.get('native_repair_attempt_id') or content_review.enabled(content_review.object_json(job['storyboard'])):
                     qa['content_candidate_acceptance'] = {'phase': 'committed', 'decision': normalized,
                         'selected_sha256': _file_sha256(prior)}
                 decision_commit = commit_decision(

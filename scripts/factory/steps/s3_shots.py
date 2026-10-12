@@ -3041,7 +3041,10 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             # checks cannot establish this identity across an A→B→A file race.
             bound=(native_repair['attempt']['source_guards'] if native_repair else
                 {'source_path':call_kwargs['reference_videos'][0],'asset_sha256':legacy_seal})
-            consumed=Path(bound['source_path']).read_bytes()
+            if native_repair:
+                from .. import native_visual_repair as repair
+                consumed=repair.seal_source(health_database,ASSETS_DIR,native_repair['attempt'])
+            else: consumed=Path(bound['source_path']).read_bytes()
             if hashlib.sha256(consumed).hexdigest()!=bound['asset_sha256']:
                 from ..native_visual_repair import StaleRepairError
                 raise StaleRepairError('native consumed source bytes changed before submission')
@@ -3196,6 +3199,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             def check_native_submission():
                 from .. import native_visual_repair as repair
                 repair.verify(health_database,ASSETS_DIR,native_repair['attempt'],budget=native_repair['budget'],worker=True)
+                repair.archived_source_bytes(health_database,ASSETS_DIR,native_repair['attempt'])
             if recovery_call is not None:
                 inspected = await seedance.inspect_task(recovery_call["task_id"])
                 video = inspected.get("video")
@@ -3296,8 +3300,7 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
                 source = Path(bound['source_guards']['source_path'])
                 full = target_path.with_name(f'.{target_path.stem}.full.mp4')
                 try:
-                    if visual_evidence.asset_fingerprint(source) != bound['source_guards']['asset_sha256']:
-                        raise ValueError('selected source changed after paid task; reconcile retained raw candidate')
+                    repair.archived_source_bytes(health_database,ASSETS_DIR,bound)
                     await repair.assemble(bound,source,target_path,full)
                     full.replace(target_path)
                     video = target_path.read_bytes()
