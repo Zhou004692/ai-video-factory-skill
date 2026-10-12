@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -56,7 +57,148 @@ def paid_database(data: Path, asset: Path) -> sqlite3.Connection:
     return database
 
 
+def original_signature(source: Path, auxiliary: Path | None = None) -> str:
+    """212dc9b signature algorithm, independent of the production implementation."""
+    import runtime_paths
+
+    digest = hashlib.sha256()
+    roots = [("primary", source)]
+    if auxiliary is not None:
+        roots.extend((f"auxiliary/{name}", auxiliary / name) for name in runtime_paths.LEGACY_AUXILIARY_SUBTREES)
+    for label, root in roots:
+        if not disk(root).is_dir():
+            continue
+        for path in sorted((p for p in disk(root).rglob("*") if p.is_file()), key=lambda p: p.relative_to(disk(root)).as_posix()):
+            if path.name in {".gitkeep", "factory.db-shm"}:
+                continue
+            digest.update(label.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.relative_to(disk(root)).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def old_migration_fixture(tmp: Path):
+    import runtime_paths
+
+    root, home = tmp / "skill", tmp / "external"
+    source, target = root / "data", home / "data"
+    asset = long_asset(source)
+    disk(asset.parent).mkdir(parents=True)
+    disk(asset).write_bytes(b"paid")
+    for name in ("factory.db-wal", "factory.db-shm"):
+        disk(asset.parent / name).write_bytes(b"nested-" + name.encode())
+    writer = paid_database(source, asset)
+    writer.close()
+    shutil.copytree(disk(source), disk(target))
+    marker = target / runtime_paths.LEGACY_MIGRATION_MARKER
+    marker.write_text(json.dumps({"source": str(source), "auxiliary": None, "signature": original_signature(source)}), encoding="utf-8")
+    (target / "runtime.json").write_text("{}", encoding="utf-8")
+    return root, home, source, target, asset, marker
+
+
 class LegacyLongPathTests(unittest.TestCase):
+    def test_original_marker_with_complete_nested_sidecars_upgrades_and_repeats(self):
+        import runtime_paths
+
+        with disposable_tree() as tmp:
+            root, home, source, target, asset, marker = old_migration_fixture(tmp)
+            self.assertEqual(original_signature(source), runtime_paths._legacy_state_signature(source, None, version=1))
+            with patch("runtime_paths.os.replace", wraps=os.replace) as replace:
+                result = runtime_paths.prepare_runtime_state(root, {"FACTORY_RUNTIME_HOME": str(home)})
+            self.assertFalse(result["data_migrated"])
+            upgraded = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(upgraded["version"], 2)
+            self.assertEqual(upgraded["signature"], runtime_paths._legacy_state_signature(source, None))
+            self.assertTrue(any(Path(call.args[1]).name == marker.name for call in replace.call_args_list))
+            repeated = runtime_paths.prepare_runtime_state(root, {"FACTORY_RUNTIME_HOME": str(home)})
+            self.assertFalse(repeated["data_migrated"])
+            self.assertFalse(list(target.glob(marker.name + ".tmp-*")))
+
+    def test_original_marker_atomic_upgrade_failure_preserves_marker_and_retries(self):
+        import runtime_paths
+
+        with disposable_tree() as tmp:
+            root, home, source, target, asset, marker = old_migration_fixture(tmp)
+            before = marker.read_bytes()
+            with patch("runtime_paths.os.replace", side_effect=PermissionError("injected marker write interruption")):
+                with self.assertRaisesRegex(PermissionError, "injected"):
+                    runtime_paths.prepare_runtime_state(root, {"FACTORY_RUNTIME_HOME": str(home)})
+            self.assertEqual(marker.read_bytes(), before)
+            self.assertFalse(list(target.glob(marker.name + ".tmp-*")))
+            self.assertEqual(disk(asset).read_bytes(), b"paid")
+            runtime_paths.prepare_runtime_state(root, {"FACTORY_RUNTIME_HOME": str(home)})
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["version"], 2)
+
+    def test_original_marker_excludes_root_live_sidecars_from_destination_comparison(self):
+        import runtime_paths
+
+        with disposable_tree() as tmp:
+            root, home, source, target, asset, marker = old_migration_fixture(tmp)
+            writer = sqlite3.connect(source / "factory.db")
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("UPDATE paid_tasks SET provider_id='paid-root-wal'")
+                writer.commit()
+                self.assertTrue((source / "factory.db-wal").is_file())
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+                payload["signature"] = original_signature(source)
+                marker.write_text(json.dumps(payload), encoding="utf-8")
+                self.assertFalse((target / "factory.db-wal").exists())
+                runtime_paths.prepare_runtime_state(root, {"FACTORY_RUNTIME_HOME": str(home)})
+                self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["version"], 2)
+            finally:
+                writer.close()
+
+    def test_original_marker_missing_or_conflicting_nested_sidecar_is_actionable(self):
+        import runtime_paths
+
+        for sidecar, problem in (("factory.db-wal", "missing"), ("factory.db-shm", "missing"), ("factory.db-wal", "conflict"), ("factory.db-shm", "conflict")):
+            with self.subTest(sidecar=sidecar, problem=problem), disposable_tree() as tmp:
+                root, home, source, target, asset, marker = old_migration_fixture(tmp)
+                copied = target / asset.parent.relative_to(source) / sidecar
+                if problem == "missing":
+                    disk(copied).unlink()
+                else:
+                    disk(copied).write_bytes(b"different-paid-state")
+                before = marker.read_bytes()
+                with self.assertRaises(RuntimeError) as raised:
+                    runtime_paths.prepare_runtime_state(root, {"FACTORY_RUNTIME_HOME": str(home)})
+                for expected in (str(asset.parent / sidecar), str(copied), "备份", "人工", "重试", "缺失" if problem == "missing" else "冲突"):
+                    self.assertIn(expected, str(raised.exception))
+                self.assertEqual(marker.read_bytes(), before)
+                self.assertEqual(disk(asset).read_bytes(), b"paid")
+                if problem == "missing":
+                    self.assertFalse(disk(copied).exists())
+                else:
+                    self.assertEqual(disk(copied).read_bytes(), b"different-paid-state")
+
+    def test_original_marker_does_not_trust_changed_paid_source_or_wrong_path(self):
+        import runtime_paths
+
+        for mutation in ("paid-asset", "paid-db", "source-path", "auxiliary-path", "unknown-version"):
+            with self.subTest(mutation=mutation), disposable_tree() as tmp:
+                root, home, source, target, asset, marker = old_migration_fixture(tmp)
+                if mutation == "paid-asset":
+                    disk(asset).write_bytes(b"new-paid-output")
+                elif mutation == "paid-db":
+                    db = sqlite3.connect(source / "factory.db")
+                    try:
+                        db.execute("UPDATE paid_tasks SET cost=99.25")
+                        db.commit()
+                    finally:
+                        db.close()
+                else:
+                    payload = json.loads(marker.read_text(encoding="utf-8"))
+                    payload[{"source-path": "source", "auxiliary-path": "auxiliary", "unknown-version": "version"}[mutation]] = 999 if mutation == "unknown-version" else str(tmp / "unrelated")
+                    marker.write_text(json.dumps(payload), encoding="utf-8")
+                before = marker.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, "同时存在"):
+                    runtime_paths.prepare_runtime_state(root, {"FACTORY_RUNTIME_HOME": str(home)})
+                self.assertEqual(marker.read_bytes(), before)
+
     def test_migration_preserves_long_tree_wal_paid_rows_and_logical_paths(self):
         import runtime_paths
 
@@ -93,6 +235,7 @@ class LegacyLongPathTests(unittest.TestCase):
                 self.assertEqual(writer.execute("SELECT id,provider_id,cost FROM paid_tasks").fetchall(), source_rows)
                 self.assertEqual(writer.execute("SELECT path FROM paid_tasks").fetchone()[0], str(asset))
                 marker = json.loads((target / runtime_paths.LEGACY_MIGRATION_MARKER).read_text(encoding="utf-8"))
+                self.assertEqual(marker["version"], 2)
                 self.assertEqual(marker["source"], str(source))
                 self.assertEqual(marker["signature"], runtime_paths._legacy_state_signature(source, None))
                 self.assertNotIn("\\\\?\\", json.dumps(marker))

@@ -234,6 +234,8 @@ def _same_file_content(left: Path, right: Path) -> bool:
 def _legacy_state_signature(
     source: Path,
     auxiliary_data: Path | None,
+    *,
+    version: int = 2,
 ) -> str:
     digest = hashlib.sha256()
     roots: list[tuple[str, Path]] = [("primary", source)]
@@ -249,7 +251,7 @@ def _legacy_state_signature(
             (item for item in iter_tree(root) if filesystem_path(item).is_file()),
             key=lambda item: item.relative_to(root).as_posix(),
         ):
-            if path.name == ".gitkeep" or (
+            if path.name == ".gitkeep" or (version == 1 and path.name == "factory.db-shm") or (
                 label == "primary" and path == source / "factory.db-shm"
             ):
                 continue
@@ -277,12 +279,57 @@ def _legacy_migration_matches(
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
     expected_auxiliary = str(auxiliary_data.resolve()) if auxiliary_data else None
-    return (
-        payload.get("source") == str(source.resolve())
-        and payload.get("auxiliary") == expected_auxiliary
-        and payload.get("signature")
-        == _legacy_state_signature(source, auxiliary_data)
-    )
+    if not isinstance(payload, dict) or (
+        payload.get("source") != str(source.resolve())
+        or payload.get("auxiliary") != expected_auxiliary
+    ):
+        return False
+    if payload.get("version") == 2:
+        return payload.get("signature") == _legacy_state_signature(source, auxiliary_data)
+    if "version" in payload:
+        return False
+    # Unversioned markers use the original signature, which omitted all SHM
+    # files. First require its known source to be unchanged, then verify the
+    # nested sidecars the old copier could omit. Root live sidecars are covered
+    # by SQLite's online backup and must not be compared as ordinary files.
+    if payload.get("signature") != _legacy_state_signature(source, auxiliary_data, version=1):
+        return False
+    roots = [(source, destination)]
+    if auxiliary_data is not None:
+        roots.extend((auxiliary_data / name, destination / name) for name in LEGACY_AUXILIARY_SUBTREES)
+    for original, copied in roots:
+        if not filesystem_path(original).is_dir():
+            continue
+        for path in iter_tree(original):
+            if path.name not in {"factory.db-wal", "factory.db-shm"}:
+                continue
+            if original == source and path.parent == source:
+                continue
+            if not filesystem_path(path).is_file():
+                continue
+            target = copied / path.relative_to(original)
+            if not filesystem_path(target).is_file():
+                issue = "缺失"
+            elif not _same_file_content(path, target):
+                issue = "冲突"
+            else:
+                continue
+            raise RuntimeError(
+                f"旧版迁移标记核验发现嵌套文件{issue}；已停止升级。"
+                f"源文件：{path}；目标文件：{target}。"
+                "源数据、目标数据及原标记均已保留；请先分别备份，由人工核对"
+                "嵌套数据库及 WAL/SHM 的完整恢复方式，修复后重试。"
+                "不要直接覆盖冲突文件或删除未知状态。"
+            )
+    upgraded = {**payload, "version": 2, "signature": _legacy_state_signature(source, auxiliary_data)}
+    temporary = marker.with_name(marker.name + f".tmp-{uuid.uuid4().hex}")
+    try:
+        with filesystem_path(temporary).open("x", encoding="utf-8") as stream:
+            json.dump(upgraded, stream, ensure_ascii=False, indent=2)
+        os.replace(filesystem_path(temporary), filesystem_path(marker))
+    finally:
+        filesystem_path(temporary).unlink(missing_ok=True)
+    return True
 
 
 def _merge_legacy_subtree(source: Path, destination: Path) -> None:
@@ -356,6 +403,7 @@ def _copy_legacy_data(
         filesystem_path(staging / LEGACY_MIGRATION_MARKER).write_text(
             json.dumps(
                 {
+                    "version": 2,
                     "source": str(source.resolve()),
                     "auxiliary": (
                         str(auxiliary_data.resolve()) if auxiliary_data else None
