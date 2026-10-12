@@ -99,6 +99,59 @@ class EvidenceTests(unittest.TestCase):
                 report = visual_evidence.retention_report(board, masters)
                 self.assertEqual(report["passed"], expected)
 
+    def test_fades_exclude_cross_cut_and_single_clip_boundary_actions(self):
+        from factory import visual_evidence
+        board = {"visual_requirements": REQS, "masters": [{"idx": 1, "visual_requirements": REQS}],
+            "shots": [{"idx": 1, "video_master_idx": 1, "video_start": 1, "duration": 1},
+                      {"idx": 2, "video_master_idx": 1, "video_start": 2, "duration": 1,
+                       "transition_type": "dip_to_black", "transition_duration_sec": .25}]}
+        for start, end, second_master, transition, expected in (
+            (1.95, 2.05, 1, "dip_to_black", False),
+            (1.90, 1.98, 2, "dip_to_black", False),
+            (1.2, 1.4, 2, "dip_to_black", True),
+            (1.95, 2.05, 1, "none", True),
+        ):
+            with self.subTest(start=start, second_master=second_master, transition=transition):
+                raw = observation(); raw["observed_visual_events"][0].update(start_sec=start, end_sec=end)
+                proof = visual_evidence.bind_observations(REQS, raw, asset_sha256=SHA, duration_sec=4)
+                masters = {1: {"asset_sha256": SHA, "duration_sec": 4, "evidence": proof},
+                           2: {"asset_sha256": "other", "duration_sec": 4}}
+                board["shots"][1].update(video_master_idx=second_master, transition_type=transition)
+                report = visual_evidence.retention_report(board, masters)
+                self.assertEqual(report["passed"], expected)
+                self.assertEqual(report["kept_intervals"][0]["end_sec"], 2)
+                visible_end = 1.75 if transition == "dip_to_black" else 2
+                self.assertEqual(report["visible_intervals"][0]["end_sec"], visible_end)
+
+    def test_gate_and_renderer_share_capped_transition_projection(self):
+        from factory import visual_evidence
+        rows = [{"idx": 1, "video_path": "one.mp4"}]
+        for second_duration, expected in ((1, .25), (.1, .05)):
+            shots = [{"idx": 1, "video_master_idx": 1, "duration": 1, "video_start": 0},
+                     {"idx": 2, "video_master_idx": 1, "duration": second_duration, "video_start": 1,
+                      "transition_type": "dip_to_black", "transition_duration_sec": 5}]
+            projected = visual_evidence.picture_transitions(shots)
+            rendered = s6_compose._director_segments({"shots": shots}, rows)
+            self.assertEqual(projected[0]["video_fade_out_sec"], expected)
+            self.assertEqual(projected[1]["video_fade_in_sec"], expected)
+            for index in range(2):
+                self.assertEqual(projected[index]["video_fade_in_sec"], rendered[index]["video_fade_in_sec"])
+                self.assertEqual(projected[index]["video_fade_out_sec"], rendered[index]["video_fade_out_sec"])
+
+    def test_invalid_transition_duration_cannot_reach_renderer_or_pass_gate(self):
+        from factory import visual_evidence
+        proof = visual_evidence.bind_observations(REQS, observation(), asset_sha256=SHA, duration_sec=4)
+        for invalid in (float("nan"), float("inf"), -.1, "invalid"):
+            shots = [{"idx": 1, "video_master_idx": 1, "duration": 1, "video_start": 0},
+                     {"idx": 2, "video_master_idx": 1, "duration": 1, "video_start": 1,
+                      "transition_type": "dip_to_black", "transition_duration_sec": invalid}]
+            board = {"visual_requirements": REQS, "masters": [{"idx": 1, "visual_requirements": REQS}], "shots": shots}
+            with self.subTest(invalid=invalid):
+                self.assertFalse(visual_evidence.retention_report(board,
+                    {1: {"asset_sha256": SHA, "duration_sec": 4, "evidence": proof}})["passed"])
+                with self.assertRaises(visual_evidence.ContentReviewRequired):
+                    s6_compose._director_segments(board, [{"idx": 1, "video_path": "one.mp4"}])
+
     def test_stale_and_forged_human_proof_are_rejected(self):
         from factory import visual_evidence
         proof = visual_evidence.bind_observations(REQS, observation(), asset_sha256=SHA, duration_sec=4)

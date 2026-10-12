@@ -78,9 +78,7 @@ def _director_segments(sb: dict, master_rows) -> list[dict]:
                 edit.get("continuity_relation") or ""
             ),
             "transition_type": str(edit.get("transition_type") or "none"),
-            "transition_duration_sec": float(
-                edit.get("transition_duration_sec") or 0
-            ),
+            "transition_duration_sec": edit.get("transition_duration_sec", 0),
             "transition_reason": str(edit.get("transition_reason") or ""),
             "preserve_audio_continuity": bool(
                 edit.get("preserve_audio_continuity")
@@ -88,19 +86,8 @@ def _director_segments(sb: dict, master_rows) -> list[dict]:
             "video_fade_in_sec": 0.0,
             "video_fade_out_sec": 0.0,
         })
-    for index, segment in enumerate(segments):
-        if index == 0 or segment["transition_type"] != "dip_to_black":
-            continue
-        previous = segments[index - 1]
-        requested = max(float(segment["transition_duration_sec"]), 0.0)
-        duration = min(
-            requested,
-            0.25,
-            float(previous["duration"]) / 2,
-            float(segment["duration"]) / 2,
-        )
-        previous["video_fade_out_sec"] = duration
-        segment["video_fade_in_sec"] = duration
+    for segment, transition in zip(segments, visual_evidence.picture_transitions(segments)):
+        segment.update(transition)
     return segments
 
 

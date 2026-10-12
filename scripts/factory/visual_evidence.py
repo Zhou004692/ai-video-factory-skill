@@ -162,18 +162,48 @@ def _evaluate(requirements, evidence, *, asset_sha256, duration_sec, human):
     return _json_safe({"version": 1, "passed": not reasons, "asset_sha256": asset_sha256,
             "requirement_set_hash": wanted_hash, "items": output, "reasons": list(dict.fromkeys(reasons))})
 
+def picture_transitions(segments):
+    """Project exactly the fades used by local director rendering.
+
+    A dip splits its effective length over neither side: each side fades for
+    min(requested, .25, previous_duration/2, current_duration/2).
+    """
+    projected = [{"video_fade_in_sec": 0., "video_fade_out_sec": 0.} for _ in segments]
+    durations = []
+    for index, segment in enumerate(segments):
+        duration = _number(segment.get("duration"))
+        requested = _number(segment.get("transition_duration_sec", 0))
+        if duration is None or duration <= 0 or requested is None or requested < 0:
+            raise ContentReviewRequired({"passed": False, "edit_idx": segment.get("idx"),
+                "reasons": ["content_invalid_transition"]})
+        durations.append(duration)
+        if index == 0 or segment.get("transition_type") != "dip_to_black":
+            continue
+        fade = min(requested, .25, durations[index - 1] / 2, duration / 2)
+        projected[index - 1]["video_fade_out_sec"] = fade
+        projected[index]["video_fade_in_sec"] = fade
+    return projected
+
+
 def retention_report(storyboard, masters, *, verified_human_master_ids=()):
     """Check full observed action intervals against the final picture edits."""
     requirements = normalize_requirements(storyboard.get("visual_requirements") or [])
     definitions = {req["id"]: req for req in requirements}
     report = {"version": 1, "passed": True, "requirement_set_hash": requirement_set_hash(requirements),
-              "master_hashes": {}, "kept_intervals": [], "items": [], "reasons": []}
+              "master_hashes": {}, "kept_intervals": [], "visible_intervals": [], "items": [], "reasons": []}
     if not requirements:
         return report
     if storyboard.get("requirement_set_hash", report["requirement_set_hash"]) != report["requirement_set_hash"]:
         report["reasons"].append("content_stale_requirements")
+    edits = storyboard.get("shots") or []
+    try:
+        transitions = picture_transitions(edits)
+    except ContentReviewRequired as exc:
+        report["passed"] = False
+        report["reasons"].extend(exc.report["reasons"])
+        return report
     picture_runs = []
-    for edit in storyboard.get("shots") or []:
+    for edit, transition in zip(edits, transitions):
         start, duration = _number(edit.get("video_start", 0)), _number(edit.get("duration"))
         idx = edit.get("video_master_idx")
         master = masters.get(idx, {})
@@ -181,15 +211,20 @@ def retention_report(storyboard, masters, *, verified_human_master_ids=()):
         if start is None or duration is None or actual is None or not 0 <= start < start + duration <= actual:
             report["reasons"].append("content_invalid_edit_interval")
             continue
-        # Preserve output order. An action may span cuts only if the same
-        # source continues immediately at its previous ending frame. Sorted
-        # unions lose reversals, intervening shots and repeated frames.
+        visible_start = start + transition["video_fade_in_sec"]
+        visible_end = start + duration - transition["video_fade_out_sec"]
+        no_fade = not any(transition.values())
+        # Faded regions are conservatively excluded from content proof. Only
+        # unfaded adjacent cuts may join one uninterrupted observed action.
         if (picture_runs and picture_runs[-1][0] == idx
-                and abs(start - picture_runs[-1][2]) <= .001):
-            picture_runs[-1] = (idx, picture_runs[-1][1], start + duration)
+                and no_fade and picture_runs[-1][3]
+                and abs(visible_start - picture_runs[-1][2]) <= .001):
+            picture_runs[-1] = (idx, picture_runs[-1][1], visible_end, True)
         else:
-            picture_runs.append((idx, start, start + duration))
+            picture_runs.append((idx, visible_start, visible_end, no_fade))
         report["kept_intervals"].append({"video_master_idx": idx, "edit_idx": edit.get("idx"), "start_sec": start, "end_sec": start + duration})
+        report["visible_intervals"].append({"video_master_idx": idx, "edit_idx": edit.get("idx"),
+            "start_sec": visible_start, "end_sec": visible_end, **transition})
     proved = set()
     for master_plan in storyboard.get("masters") or []:
         reqs = master_plan.get("visual_requirements") or (master_plan.get("visual_plan") or {}).get("visual_requirements") or []
@@ -207,7 +242,7 @@ def retention_report(storyboard, masters, *, verified_human_master_ids=()):
             kept = item["status"] == "not_applicable" and proof["passed"]
             if item["status"] == "satisfied" and proof["passed"]:
                 kept = any(source_idx == idx and start <= item["start_sec"] and end >= item["end_sec"]
-                           for source_idx, start, end in picture_runs)
+                           for source_idx, start, end, _no_fade in picture_runs)
                 if not kept:
                     report["reasons"].append("content_event_cropped")
             if kept:
