@@ -460,9 +460,78 @@ class ContentReviewTests(unittest.TestCase):
         final,_,client=self.publish_fixture()
         def upload(**_kwargs): final.write_bytes(b'replaced-during-upload'); return {'video_id':'unsafe-upload'}
         client.upload_video.side_effect=upload
+        client.create_video.return_value={'item_id':'unsafe-item','video_id':'public'}
         with self.assertRaisesRegex(ValueError,'content'): self.publish_with(client)
         client.create_video.assert_not_called()
         self.assertNotIn('upload_binding',json.loads(self.database.execute('SELECT metadata_json FROM platform_submissions').fetchone()[0]))
+
+    def test_selected_upload_path_cannot_inherit_a_new_job_final_identity(self):
+        final,report,client=self.publish_fixture()
+        replacement=self.base/'new-final.mp4'; replacement.write_bytes(b'new-final-B')
+        new_report=deepcopy(report); new_report['final_sha256']=visual_evidence.asset_fingerprint(replacement)
+        original_video_file=self.service.video_file
+        def switch_after_selection(job_id):
+            selected=original_video_file(job_id)
+            self.database.execute('UPDATE jobs SET final_path=? WHERE job_id=?',(str(replacement),job_id)); self.database.commit()
+            (self.base/'content_retention.json').write_text(json.dumps(new_report),encoding='utf-8')
+            return selected
+        uploaded=[]
+        def upload(**kwargs): uploaded.append((kwargs['path'],Path(kwargs['path']).read_bytes())); return {'video_id':'unsafe-A-upload'}
+        client.upload_video.side_effect=upload
+        client.create_video.return_value={'item_id':'unsafe-item','video_id':'public'}
+        with patch.object(self.service,'video_file',side_effect=switch_after_selection):
+            with self.assertRaisesRegex(ValueError,'content'):
+                self.publish_with(client)
+        self.assertEqual(uploaded,[])
+        client.create_video.assert_not_called()
+
+    def test_same_sha_job_path_switch_during_upload_is_not_authorized(self):
+        final,_,client=self.publish_fixture()
+        client.create_video.return_value={'item_id':'unsafe-item','video_id':'public'}
+        replacement=self.base/'same-bytes.mp4'; replacement.write_bytes(final.read_bytes())
+        def upload(**kwargs):
+            self.assertEqual(Path(kwargs['path']).resolve(),final.resolve())
+            self.database.execute('UPDATE jobs SET final_path=?',(str(replacement),)); self.database.commit()
+            return {'video_id':'old-path-upload'}
+        client.upload_video.side_effect=upload
+        with self.assertRaisesRegex(ValueError,'content'): self.publish_with(client)
+        client.create_video.assert_not_called()
+        self.assertNotIn('upload_binding',json.loads(self.database.execute('SELECT metadata_json FROM platform_submissions').fetchone()[0]))
+
+    def test_legacy_same_sha_new_path_reuploads_and_then_reuses_that_snapshot(self):
+        final,_,client=self.publish_fixture()
+        self.database.execute("UPDATE jobs SET storyboard='{}'"); self.database.commit()
+        client.create_video.side_effect=[RuntimeError('retry'),{'item_id':'known-item','video_id':'public'}]
+        uploaded_paths=[]
+        def upload(**kwargs):
+            uploaded_paths.append(Path(kwargs['path']).resolve())
+            return {'video_id':f'upload-{len(uploaded_paths)}'}
+        client.upload_video.side_effect=upload
+        with self.assertRaisesRegex(RuntimeError,'retry'): self.publish_with(client)
+        original_binding=json.loads(self.database.execute('SELECT metadata_json FROM platform_submissions').fetchone()[0])['upload_binding']
+        replacement=self.base/'same-bytes.mp4'; replacement.write_bytes(final.read_bytes())
+        self.database.execute('UPDATE jobs SET final_path=?',(str(replacement),)); self.database.commit()
+        self.publish_with(client)
+        fresh_binding=json.loads(self.database.execute('SELECT metadata_json FROM platform_submissions').fetchone()[0])['upload_binding']
+        self.assertEqual(uploaded_paths,[final.resolve(),replacement.resolve()])
+        self.assertEqual(original_binding['final_sha256'],fresh_binding['final_sha256'])
+        self.assertEqual(fresh_binding['final_path'],str(replacement.resolve()))
+        self.assertEqual(client.create_video.call_args.kwargs['video_id'],'upload-2')
+        self.assertTrue(self.publish_with(client)['reused'])
+        self.assertEqual(client.create_video.call_count,2); self.assertEqual(client.upload_video.call_count,2)
+
+    def test_cached_upload_checks_selected_path_before_create_even_when_sha_matches(self):
+        final,_,client=self.publish_fixture()
+        client.create_video.side_effect=[RuntimeError('retry'),{'item_id':'unsafe-item','video_id':'public'}]
+        with self.assertRaisesRegex(RuntimeError,'retry'): self.publish_with(client)
+        replacement=self.base/'same-bytes.mp4'; replacement.write_bytes(final.read_bytes())
+        def credentials(_client):
+            self.database.execute('UPDATE jobs SET final_path=?',(str(replacement),)); self.database.commit()
+            return {'access_token':'offline','account_id':'test'}
+        with patch('factory.management_api.douyin.DouyinClient',return_value=client),patch.object(self.service,'_douyin_credentials',side_effect=credentials):
+            with self.assertRaisesRegex(ValueError,'content'): self.service.publish_to_douyin('J',{'confirmed':True,'text':'Title'})
+        self.assertEqual(client.upload_video.call_count,1)
+        self.assertEqual(client.create_video.call_count,1)
 
     def test_stale_during_create_preserves_known_remote_item_and_blocks_retry(self):
         final,_,client=self.publish_fixture()

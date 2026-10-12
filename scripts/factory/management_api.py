@@ -8710,19 +8710,27 @@ class ManagementService:
         return {"publication_id": publication_id, "status": "saved"}
 
     def _douyin_publish_identity(self, job_id: str) -> dict:
-        report = content_review.require_final(self.database, self.data_dir / 'assets', job_id)
         path = self.video_file(job_id)
         sha = _file_sha256(path)
+        report = content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+        if (self.video_file(job_id) != path or _file_sha256(path) != sha
+            or (report and report.get('final_sha256') != sha)):
+            raise ValueError('content selected upload path changed during identity verification')
         revision = (content_review.publication_revision(self.database, job_id, report)
             if report else content_review.digest({'legacy_final_sha256': sha}))
-        return {'final_sha256': sha, 'verified_revision': revision}
+        return {'final_path': str(path), 'final_sha256': sha, 'verified_revision': revision}
 
     def _require_douyin_publish_identity(self, job_id: str, expected: dict) -> None:
         row = self.database.execute('SELECT state FROM jobs WHERE job_id=?', (job_id,)).fetchone()
         if row is None or row['state'] not in {'READY_TO_PUBLISH', 'PUBLISHED'}:
             raise ValueError('content publication authorization changed; reconcile before retry')
+        actual_upload_path = Path(expected['final_path'])
+        if _file_sha256(actual_upload_path) != expected['final_sha256']:
+            raise ValueError('content actual upload file changed; reconcile before retry')
         if self._douyin_publish_identity(job_id) != expected:
             raise ValueError('content final/review revision changed during publication; reconcile before retry')
+        if _file_sha256(actual_upload_path) != expected['final_sha256']:
+            raise ValueError('content actual upload file changed during identity verification')
 
     @staticmethod
     def _matching_douyin_upload_binding(submission, identity: dict) -> bool:
@@ -8755,8 +8763,10 @@ class ManagementService:
             raise ValueError("视频任务不存在")
         if job["state"] not in {"READY_TO_PUBLISH", "PUBLISHED"}:
             raise ValueError("只有已验收并提交发布的成片才能推送到抖音")
-        final_path = self.video_file(job_id)
         identity = self._douyin_publish_identity(job_id)
+        # The upload consumes the path in this verified snapshot. Never select
+        # a path separately and let a later job read authorize different bytes.
+        final_path = Path(identity['final_path'])
         cover_tsp = payload.get("cover_tsp")
         submission = self.database.execute(
             "SELECT * FROM platform_submissions WHERE job_id=? AND platform='douyin'",
