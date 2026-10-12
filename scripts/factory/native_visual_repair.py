@@ -110,7 +110,11 @@ def prepare(service, job_id, idx, *, kind='edit', start_sec=None, end_sec=None,
         raise ValueError('native edit price/support unknown for configured model; use manual/alternate route')
     with node_state_machine.atomic(service.database):
         job, shot, sb, master, qa, path, guards = snapshot(service.database, service.data_dir/'assets', job_id, idx, source)
-        if not isinstance(expected_preview_identity,dict) or expected_preview_identity!=preview_identity(sb,master,source,path,job['production_spec_hash']):
+        # Authorize the exact snapshot that will be frozen into the attempt.
+        # A second source read could approve preview A while guards bind B.
+        identity = {key:guards[key] for key in ('source','source_path','asset_sha256','spec_hash',
+            'contract_hash','requirement_set_hash','effective_edit_hash')}
+        if not isinstance(expected_preview_identity,dict) or expected_preview_identity!=identity:
             raise StaleRepairError('native repair preview identity is missing/stale; refresh full source preview')
         service._assert_no_unresolved_provider_tasks(job_id)
         prior = current(service.database, job_id)

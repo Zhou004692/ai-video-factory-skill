@@ -384,6 +384,24 @@ for(const id of ['#native-source-confirmed','#native-direction','#native-start',
             self.service.prepare_master_lip_sync_repair('J',1,start_sec=1,end_sec=2,reason='Fix A',source='candidate',source_confirmed=True,expected_preview_identity=expected)
         self.assertEqual(before,'\n'.join(self.database.iterdump()))
 
+    def test_preview_check_uses_frozen_snapshot_without_second_identity_read(self):
+        self.real_graph();expected=self.preview('candidate');original=self.candidate.read_bytes()
+        self.media(self.candidate,color='blue')
+        before='\n'.join(self.database.iterdump());fingerprint=visual_evidence.asset_fingerprint;reads=0
+        def restore_preview_after_snapshot_read(path):
+            nonlocal reads
+            value=fingerprint(path)
+            if Path(path).resolve()==self.candidate.resolve():
+                reads+=1
+                if reads==1:self.candidate.write_bytes(original)
+            return value
+        with patch.object(visual_evidence,'asset_fingerprint',side_effect=restore_preview_after_snapshot_read):
+            with self.assertRaisesRegex(ValueError,'preview identity'):
+                self.service.prepare_master_lip_sync_repair('J',1,start_sec=1,end_sec=2,reason='Fix preview A',
+                    source='candidate',source_confirmed=True,expected_preview_identity=expected)
+        self.assertEqual(reads,1,'Authorization must compare the exact first snapshot, never re-read source identity')
+        self.assertEqual(before,'\n'.join(self.database.iterdump()))
+
     def test_real_http_rejects_bool_stale_preview_and_old_budget_modal(self):
         import management_server
         self.real_graph();management_server.ConsoleHandler.service=self.service
