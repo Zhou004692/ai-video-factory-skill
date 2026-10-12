@@ -1,13 +1,14 @@
 """Offline submission contracts: validation must precede every paid POST."""
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from factory import reference_attention
+from factory import character_assets, db, reference_attention
 from factory.clients import seedance, video_qa
 from factory.steps import s3_shots
 from factory.video_routing import VideoRoute
@@ -126,6 +127,138 @@ class DurationAttentionTests(unittest.TestCase):
 
 
 class SubmissionPreflightTests(unittest.IsolatedAsyncioTestCase):
+    def _overlong_builder(self, kind):
+        members = [{"id": str(i), "generation_mode": "ai_generated"} for i in range(3)]
+        anchors = {character_assets.character_identity_key(member): s3_shots.DialogueAnchor(
+            video_url=f"https://example.invalid/old-{member['id']}.mp4", duration_sec=12)
+            for member in members}
+        if kind == "dialogue":
+            return s3_shots._dialogue_request_kwargs(
+                {"duration_sec": 8}, None, character=members[0], cast_characters=members[1:], identity_anchors=anchors)
+        if kind == "broll":
+            return s3_shots._broll_request_kwargs({"duration_sec": 8}, cast_characters=members, identity_anchors=anchors)
+        return s3_shots._extend_request_kwargs({"duration_sec": 36, "extend_duration_sec": 8,
+                                                "repair_source_path": "https://example.invalid/old.mp4"})
+
+    def test_production_builders_preserve_old_paid_overlong_materials_until_ledger_check(self):
+        for kind in ("dialogue", "broll", "extend"):
+            with self.subTest(kind=kind):
+                request = self._overlong_builder(kind)
+                self.assertEqual(sum(item["duration_sec"] for item in request["reference_manifest"]), 36)
+
+    async def test_matching_paid_36_second_ledger_recovers_with_real_get_and_no_post(self):
+        database = self._budget_database(1)
+        database.execute("UPDATE jobs SET production_spec_hash='old-spec' WHERE job_id='J-REFERENCE-BUDGET'")
+        database.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json,cost_cents) "
+                         "VALUES('old-paid-task','J-REFERENCE-BUDGET',1,'seedance','generate','{}',0)")
+        database.execute("INSERT INTO production_nodes(job_id,node_id,node_type,state,spec_hash,output_json,idempotency_key,provider_task_id) "
+                         "VALUES('J-REFERENCE-BUDGET','master:1','master','RUNNING','old-spec',?, 'old-master-key','old-paid-task')",
+                         (json.dumps({"resume_provider_task_id": "old-paid-task"}),))
+        database.commit()
+        requests = []
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={"status": "completed", "content": {"video_url": "https://example.invalid/old.mp4"}})
+        real_client = httpx.AsyncClient
+        with tempfile.TemporaryDirectory() as temp, patch.object(seedance, "_headers", return_value={}), patch.object(
+            seedance.httpx, "AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler))), patch.object(
+            seedance.provider_downloads, "download_bytes", new=AsyncMock(return_value=(b"old-paid-video", "https://example.invalid/old.mp4"))), patch.object(
+            seedance, "text_to_video", new=AsyncMock()) as submit, patch.object(
+            s3_shots.tos, "upload", return_value="https://example.invalid/recovered.mp4"):
+            result = await s3_shots._generate_seedance_video(
+                prompt="old generation", route=VideoRoute(MODEL, "seedance25", False, False),
+                request_kwargs=self._overlong_builder("broll"), out_path=Path(temp) / "out.mp4", key_hint="offline",
+                job_id="J-REFERENCE-BUDGET", shot_idx=1, database=database)
+        self.assertEqual(result.video, b"old-paid-video")
+        self.assertEqual([request.method for request in requests], ["GET"])
+        self.assertTrue(requests[0].url.path.endswith("/tasks/old-paid-task"))
+        submit.assert_not_awaited()
+
+    async def test_unmatched_or_forged_resume_does_not_bypass_new_submission_preflight(self):
+        database = self._budget_database(5000)
+        with tempfile.TemporaryDirectory() as temp, patch.object(seedance, "text_to_video", new=AsyncMock()) as submit, patch.object(
+            seedance, "inspect_task", new=AsyncMock()) as inspect:
+            for kind in ("dialogue", "broll", "extend"):
+                with self.subTest(kind=kind):
+                    request = self._overlong_builder(kind)
+                    request["resume_provider_task_id"] = "forged-paid-task"
+                    with self.assertRaisesRegex(seedance.SeedanceParameterError, "video.*36.*30"):
+                        await s3_shots._generate_seedance_video(
+                            prompt="new generation", route=VideoRoute(MODEL, "seedance25", False, False),
+                            request_kwargs=request, out_path=Path(temp) / "out.mp4", key_hint="offline",
+                            job_id="J-REFERENCE-BUDGET", shot_idx=1, database=database)
+        submit.assert_not_awaited()
+        inspect.assert_not_awaited()
+
+    async def test_old_model_required_unknown_duration_has_clear_preflight_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(seedance, "text_to_video", new=AsyncMock()) as submit:
+            with self.assertRaisesRegex(seedance.SeedanceParameterError, "duration unavailable"):
+                await s3_shots._generate_seedance_video(
+                    prompt="test", route=VideoRoute(LEGACY, "legacy", False, False),
+                    request_kwargs={"duration": 8, "reference_videos": ["https://example.invalid/unknown.mp4"]},
+                    out_path=Path(temp) / "out.mp4", key_hint="offline")
+            submit.assert_not_awaited()
+
+    def _budget_database(self, budget_cents):
+        database = sqlite3.connect(":memory:")
+        self.addCleanup(database.close)
+        database.row_factory = sqlite3.Row
+        database.executescript(db.DDL)
+        storyboard = json.dumps({"production_settings": {"budget_cents": budget_cents}})
+        database.execute(
+            "INSERT INTO jobs(job_id,topic_id,title,state,storyboard,cost_cents) "
+            "VALUES('J-REFERENCE-BUDGET','T-1','offline budget','PRODUCTION_RUNNING',?,0)",
+            (storyboard,))
+        database.execute("INSERT INTO shots(job_id,idx,state,cost_cents) VALUES('J-REFERENCE-BUDGET',1,'GENERATING',0)")
+        database.commit()
+        return database
+
+    async def test_canonical_reference_duration_blocks_underfunded_production_before_client(self):
+        database = self._budget_database(2500)
+        item = media("video", 20)
+        request = {"duration": 8, "resolution": "720p", "reference_videos": [item["uri"]],
+                   "reference_manifest": [item]}
+        with tempfile.TemporaryDirectory() as temp, patch.object(s3_shots, "conn", return_value=database), patch.object(
+            seedance, "text_to_video", new=AsyncMock(return_value=b"offline")) as submit, patch.object(
+            s3_shots.tos, "upload", return_value="https://example.invalid/offline.mp4"):
+            with self.assertRaisesRegex(s3_shots.SeedanceBudgetError, "next_estimate=4284"):
+                await s3_shots._generate_seedance_video(
+                    prompt="test", route=VideoRoute(MODEL, "seedance25", False, False),
+                    request_kwargs=request, out_path=Path(temp) / "out.mp4", key_hint="offline",
+                    job_id="J-REFERENCE-BUDGET", shot_idx=1, database=database)
+            submit.assert_not_awaited()
+
+    async def test_budget_reservation_client_and_audit_share_canonical_reference_durations(self):
+        database = self._budget_database(5000)
+        video, audio = media("video", 20), media("audio", 3)
+        request = {"duration": 8, "resolution": "720p", "reference_videos": [video["uri"]],
+                   "reference_audios": [audio["uri"]], "reference_manifest": [video, audio],
+                   "reference_video_duration_sec": 1, "reference_audio_duration_sec": 1}
+        async def generated(**kwargs):
+            kwargs["on_task_created"]("offline-budget-task")
+            kwargs["metadata_out"].update(task_id="offline-budget-task", usage={"cost_cents": 1000})
+            return b"offline-video"
+        original_reserve = s3_shots.provider_tasks.reserve_paid_submit
+        original_budget = s3_shots._assert_paid_call_within_job_budget
+        with tempfile.TemporaryDirectory() as temp, patch.object(s3_shots, "conn", return_value=database), patch.object(
+            seedance, "text_to_video", new=AsyncMock(side_effect=generated)) as submit, patch.object(
+            s3_shots.tos, "upload", return_value="https://example.invalid/offline.mp4"), patch.object(
+            s3_shots.provider_tasks, "reserve_paid_submit", wraps=original_reserve) as reserve, patch.object(
+            s3_shots, "_assert_paid_call_within_job_budget", wraps=original_budget) as budget:
+            result = await s3_shots._generate_seedance_video(
+                prompt="test", route=VideoRoute(MODEL, "seedance25", False, False),
+                request_kwargs=request, out_path=Path(temp) / "out.mp4", key_hint="offline",
+                job_id="J-REFERENCE-BUDGET", shot_idx=1, database=database)
+        checked = budget.call_args.kwargs["request_kwargs"]
+        self.assertEqual(checked["reference_video_duration_sec"], 20)
+        self.assertEqual(checked["reference_audio_duration_sec"], 3)
+        self.assertEqual(reserve.call_args.kwargs["estimated_cost_cents"], 4284)
+        self.assertEqual(submit.call_args.kwargs["reference_video_durations"], [20])
+        self.assertEqual(submit.call_args.kwargs["reference_audio_durations"], [3])
+        self.assertNotIn("reference_video_duration_sec", submit.call_args.kwargs)
+        audit = result.provider_calls[-1]["usage"]["reference_manifest"]
+        self.assertEqual([item["duration_sec"] for item in audit], [20, 3])
+
     async def test_generation_wrapper_duplicate_metadata_cannot_hide_31_seconds(self):
         long = media("video", 31)
         short = media("video", 5)

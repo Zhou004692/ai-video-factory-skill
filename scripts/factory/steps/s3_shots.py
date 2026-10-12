@@ -2016,7 +2016,8 @@ def _apply_dialogue_reference_manifest(
     manifest = reference_attention.select_manifest(
         candidates,
         max_video_references=production_reference_video_budget(snapshot),
-        **_reference_duration_caps(snapshot.get("model") or seedance.DEFAULT_MODEL),
+        # The wrapper checks the paid ledger before applying new-submit caps.
+        max_video_duration_sec=None, max_audio_duration_sec=None,
     )
     request["reference_manifest"] = manifest
     videos = [item for item in manifest if item["kind"] == "video"]
@@ -2616,7 +2617,8 @@ def _broll_request_kwargs(
                 ))
     manifest = reference_attention.select_manifest(
         candidates, max_video_references=reference_budget,
-        **_reference_duration_caps(snapshot.get("model") or seedance.DEFAULT_MODEL),
+        # Preserve old paid requests for GET-only recovery; preflight gates POST.
+        max_video_duration_sec=None, max_audio_duration_sec=None,
     )
     request["reference_manifest"] = manifest
     videos = [item for item in manifest if item["kind"] == "video"]
@@ -2684,7 +2686,8 @@ def _extend_request_kwargs(shot: dict) -> dict:
                 source, kind="video", duty="scene_continuity",
                 duration_sec=source_duration,
             )
-        ], max_video_references=1),
+        ], max_video_references=1,
+            max_video_duration_sec=None, max_audio_duration_sec=None),
     }
 
 
@@ -2978,6 +2981,16 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
             call_kwargs["reference_manifest"] = await _preflight_reference_manifest(
                 call_kwargs, model=model,
             )
+            # Budget checks and paid reservations must use the same measured
+            # durations as the provider request and its sanitized audit.
+            for kind in ("video", "audio"):
+                durations = [item["duration_sec"] for item in call_kwargs["reference_manifest"]
+                             if item["kind"] == kind]
+                field = f"reference_{kind}_duration_sec"
+                if durations and all(seconds is not None for seconds in durations):
+                    call_kwargs[field] = sum(durations)
+                elif not durations:
+                    call_kwargs.pop(field, None)
         try:
             configured_capacity_limit = max(1, int(
                 (generation_snapshot or {}).get("max_concurrent_masters")

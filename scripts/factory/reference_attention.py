@@ -109,8 +109,8 @@ def select_manifest(
     *,
     max_video_references: int,
     max_total_references: int = 8,
-    max_video_duration_sec: float = 30,
-    max_audio_duration_sec: float = 30,
+    max_video_duration_sec: float | None = 30,
+    max_audio_duration_sec: float | None = 30,
 ) -> list[dict]:
     """Return an immutable request manifest ordered by product attention.
 
