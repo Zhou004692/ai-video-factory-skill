@@ -82,6 +82,15 @@ class CreativeProductionBridgeTests(unittest.TestCase):
             self.assertEqual(report['ready'], ready)
             probe.assert_called_once()
 
+    def test_environment_file_cannot_bypass_live_provider_runtime(self):
+        env_file=self.root/'.env'
+        env_file.write_text('FACTORY_PROVIDER_MODE=replay\n',encoding='utf-8')
+        service = ManagementService(self.database, self.root, worker_mode='external', env_path=env_file, transport_preflight_enabled=True)
+        with patch.dict('os.environ', {'FACTORY_PROVIDER_MODE':'live'}), patch('factory.transport_diagnostics.run_preflight', return_value={'ready':False}) as probe:
+            report=service.run_transport_preflight()
+        self.assertFalse(report['ready'], 'Transport mode must match the actual ProviderRuntime resolver')
+        probe.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()
