@@ -256,6 +256,18 @@ async def _refresh_director_speech_timeline(
     database,
 ) -> bool:
     """Backfill ASR after manual review and align cuts to actual native speech."""
+    from .. import visual_repair
+    approved_shots = deepcopy(storyboard.get('shots') or [])
+    if storyboard.get(visual_repair.ALIGNMENT_KEY):
+        try:
+            visual_repair.verify_alignment(database, job_id, storyboard, master_rows)
+        except (ValueError, OSError, KeyError) as exc:
+            raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_stale_cached_alignment']}) from exc
+    if storyboard.get(visual_repair.OVERLAY_KEY):
+        try:
+            visual_repair.verify_overlay(database, job_id, storyboard, master_rows)
+        except (ValueError, OSError) as exc:
+            raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_stale_local_overlay']}) from exc
     if not (storyboard.get("production_settings") or {}).get(
             "asr_enabled", True):
         return False
@@ -295,6 +307,11 @@ async def _refresh_director_speech_timeline(
         transcription = master_transcriptions.load_matching(
             database, job_id, master_idx, master_path
         )
+        if transcription is None and (visual_repair.OVERLAY_KEY in storyboard or visual_repair.ALIGNMENT_KEY in storyboard):
+            # Recheck at the actual ASR dispatch boundary: a cache can vanish
+            # after preparation. A free command never authorizes a new request.
+            raise visual_evidence.ContentReviewRequired({'passed': False,
+                'reasons': ['content_authorized_asr_cache_missing']})
         derived_artifact_missing = transcription is None
         try:
             transcription = transcription or await asyncio.to_thread(
@@ -358,6 +375,9 @@ async def _refresh_director_speech_timeline(
 
     changed = _synchronize_native_picture_timeline(storyboard) or changed
     changed = _synchronize_master_contract_durations(storyboard) or changed
+    # ASR still runs for speech/subtitles. Approved silent/reaction coverage is
+    # restored afterwards, only if all protected audio clocks stayed identical.
+    changed = visual_repair.restore_after_asr(storyboard, approved_shots) or changed
 
     if changed:
         if content_review.enabled(storyboard):
@@ -543,6 +563,17 @@ async def _run(job_id: str, db, *, storyboard_override: dict | None = None) -> N
     ).fetchall()
     if not rows:
         raise RuntimeError("no OK shots to compose")
+    from .. import visual_repair
+    if visual_repair.ALIGNMENT_KEY in sb:
+        try:
+            visual_repair.verify_alignment(db, job_id, sb, rows)
+        except (ValueError, OSError, KeyError) as exc:
+            raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_stale_cached_alignment']}) from exc
+    if visual_repair.OVERLAY_KEY in sb:
+        try:
+            visual_repair.verify_overlay(db, job_id, sb, rows)
+        except (ValueError, OSError) as exc:
+            raise visual_evidence.ContentReviewRequired({'passed': False, 'reasons': ['content_stale_local_overlay']}) from exc
 
     prep_dir = base / "shots_prep"
     prep_dir.mkdir(parents=True, exist_ok=True)

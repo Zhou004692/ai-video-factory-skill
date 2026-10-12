@@ -420,6 +420,8 @@ async def run_local_compose_node(
     storyboard = production_compiler.ensure_director_timeline(
         spec["runtime_storyboard"]
     )
+    from . import visual_repair
+    storyboard = visual_repair.adapter_storyboard(database, job_id, storyboard, spec['spec_hash'])
     await s6_compose.run(job_id, storyboard_override=storyboard)
     row = database.execute(
         "SELECT final_path FROM jobs WHERE job_id=?", (job_id,)

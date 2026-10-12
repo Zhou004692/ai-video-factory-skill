@@ -546,6 +546,13 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 return
             except (IndexError, ValueError) as exc:
                 return self._json({"error": str(exc)}, 404)
+        if (parsed.path.startswith('/api/videos/') and parsed.path.endswith('/visual-repair') and '/masters/' in parsed.path):
+            try:
+                parts = parsed.path.split('/')
+                source = parse_qs(parsed.query).get('source', ['candidate'])[0]
+                return self._json(self.service.visual_repair_plan(parts[3], int(parts[5]), source))
+            except (IndexError, ValueError) as exc:
+                return self._json({'error': str(exc)}, 400)
         if (parsed.path.startswith('/api/videos/') and parsed.path.endswith('/content-review') and '/masters/' in parsed.path):
             try:
                 parts = parsed.path.split('/')
@@ -1002,6 +1009,12 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     extension_sec=float(payload.get("extension_sec")),
                     direction=str(payload.get("direction") or ""),
                 )
+            elif (request_path.startswith('/api/videos/') and request_path.endswith('/align-local-timeline') and '/masters/' in request_path):
+                parts = request_path.split('/')
+                result = self.service.align_cached_visual_timeline(parts[3], int(parts[5]), payload)
+            elif (request_path.startswith('/api/videos/') and request_path.endswith('/local-recut') and '/masters/' in request_path):
+                parts = request_path.split('/')
+                result = self.service.apply_visual_recut(parts[3], int(parts[5]), payload)
             elif (request_path.startswith('/api/videos/') and request_path.endswith('/content-review') and '/masters/' in request_path):
                 parts = request_path.split('/')
                 result = self.service.record_content_review(parts[3], int(parts[5]), payload)

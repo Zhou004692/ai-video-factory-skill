@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -5707,6 +5708,12 @@ class ManagementService:
 
     def dispatch_production_queue(self) -> dict:
         """Atomically claim queued jobs up to the local concurrency limit."""
+        if self.database.in_transaction:
+            # A shared-connection supervisor can see uncommitted queue rows.
+            # Never commit its caller's command or launch work before that
+            # caller has chosen to commit; the next supervisor tick can retry.
+            return {'worker_mode': self.worker_mode, 'queued_jobs': [],
+                    'dispatched_jobs': [], 'failed_workers': [], 'dispatch_deferred': True}
         if self.worker_mode == "external":
             queued = self.database.execute(
                 "SELECT job_id FROM jobs WHERE state='PRODUCTION_QUEUED' "
@@ -5906,10 +5913,115 @@ class ManagementService:
             raise ValueError("待复核候选母片不存在")
         return path
 
+    def visual_repair_plan(self, job_id: str, master_idx: int, source='candidate') -> dict:
+        from . import visual_repair
+        return visual_repair.plan(self.database, self.data_dir / 'assets', job_id, master_idx, source)
+
+    def apply_visual_recut(self, job_id: str, master_idx: int, payload: dict) -> dict:
+        from . import visual_repair
+        caller_owns_transaction = self.database.in_transaction
+        # Own one command transaction, including invalidation and queueing. A
+        # caller's transaction remains its caller's transaction (savepoints).
+        with self._final_review_lock, node_state_machine.atomic(self.database):
+            job = self.database.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            if not job or job['state'] in visual_repair.TERMINATED:
+                raise ValueError('content terminated or missing job cannot recut')
+            if payload.get('confirmed') is not True or payload.get('source') != 'active':
+                raise ValueError('content explicit active picture-window confirmation required')
+            self._assert_no_unresolved_provider_tasks(job_id)
+            sb = content_review.object_json(job['storyboard'])
+            command = content_review.digest({'master_idx': int(master_idx), 'payload': payload})
+            overlay = sb.get(visual_repair.OVERLAY_KEY) or {}
+            if overlay.get('command_fingerprint') == command:
+                rows = self.database.execute('SELECT idx,state,video_path,video_qa FROM shots WHERE job_id=? ORDER BY idx', (job_id,)).fetchall()
+                visual_repair.verify_overlay(self.database, job_id, sb, rows)
+                return {'job_id': job_id, 'local_only': True, 'already_queued': True, 'state': job['state'], 'dispatch_deferred': caller_owns_transaction}
+            current = self.visual_repair_plan(job_id, master_idx, 'active')
+            if set(payload) != {*current['guards'], 'source', 'confirmed', 'edits'}:
+                raise ValueError('content local recut accepts only explicit picture edits and current guards')
+            if any(payload.get(key) != value for key, value in current['guards'].items()):
+                raise ValueError('content local recut is stale; refresh selected source and repair plan')
+            if current['unresolved_provider_task_ids']:
+                raise ValueError('content reconcile existing paid task first')
+            local = current['routes'][0]
+            if not local['executable_now']:
+                raise ValueError('content safe local recut unavailable: ' + local['reason'])
+            node = self.database.execute("SELECT * FROM production_nodes WHERE job_id=? AND node_id='local_compose'", (job_id,)).fetchone()
+            if job['execution_engine'] != 'graph_v2' or not node or node['state'] not in {'SUCCEEDED', 'REVIEW_REQUIRED'}:
+                raise ValueError('content local recut requires paused graph local compose')
+            rows = self.database.execute('SELECT idx,state,video_path,video_qa FROM shots WHERE job_id=? ORDER BY idx', (job_id,)).fetchall()
+            durations = {int(idx): binding['duration_sec'] for idx, binding in current['guards']['expected_source_bindings'].items()}
+            edited = visual_repair.make_overlay(sb, payload.get('edits'), current['guards'], durations)
+            if not visual_repair.authored_safe(self.database, job_id, payload['edits'], sb['shots']):
+                raise ValueError('content local recut cannot change authored mouth/coverage constraints')
+            changed = {e['edit_idx'] for e in payload['edits']}
+            if any(int(e.get('video_master_idx', -1)) != int(master_idx) for e in sb['shots'] if e['idx'] in changed):
+                raise ValueError('content local recut must stay within selected master')
+            if content_review.retention(edited, rows, durations)['passed'] is not True:
+                raise ValueError('content local recut must retain all complete observed actions after fades/output order')
+            edited[visual_repair.OVERLAY_KEY]['command_fingerprint'] = command
+            self.database.execute('UPDATE jobs SET storyboard=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?',
+                (json.dumps(edited, ensure_ascii=False, allow_nan=False), job_id))
+            if node['state'] == 'SUCCEEDED':
+                self._invalidate_content_final(job_id, command)
+            elif node['error_code'] != 'content_review_required':
+                raise ValueError('content local compose is paused for a different reason')
+            # Existing recovery authority closes the final approval cycle and
+            # readies only local compose; it never schedules masters or music.
+            result = self.resume_visual_content(job_id)
+            return {**result, 'repair_route': 'local_recut', 'edits': payload['edits'], 'dispatch_deferred': caller_owns_transaction}
+
     def content_review_source_file(self, job_id: str, master_idx: int, source='candidate') -> Path:
         return content_review.selected(self.database, self.data_dir / 'assets', job_id, master_idx, source)[-1]
 
-    def resume_visual_content(self, job_id: str) -> dict:
+    def align_cached_visual_timeline(self, job_id: str, master_idx: int, payload: dict) -> dict:
+        from . import visual_repair
+        caller_owns_transaction = self.database.in_transaction
+        with self._final_review_lock, node_state_machine.atomic(self.database):
+            job = self.database.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            if not job or job['state'] in visual_repair.TERMINATED:
+                raise ValueError('content terminated or missing job cannot realign')
+            current = self.visual_repair_plan(job_id, master_idx, 'active')
+            if (payload.get('confirmed') is not True or payload.get('source') != 'active' or
+                set(payload) != {*current['guards'], 'source', 'confirmed'}):
+                raise ValueError('content explicit cached alignment/discard confirmation required')
+            request_fingerprint = content_review.digest({'master_idx': int(master_idx), 'payload': payload})
+            sb = content_review.object_json(job['storyboard'])
+            prior = next((item for item in sb.get('local_visual_edit_history') or []
+                          if item.get('request_fingerprint') == request_fingerprint), None)
+            if prior:
+                stable_guards = ('expected_asset_sha256', 'expected_requirement_set_hash', 'expected_spec_hash', 'expected_contract_hash', 'expected_source_bindings')
+                if (any(payload.get(key) != current['guards'][key] for key in stable_guards) or
+                    prior['cache_bindings'] != current['guards']['expected_asr_cache_bindings']['frozen']):
+                    raise ValueError('content cached alignment repeat is stale')
+                self._assert_no_unresolved_provider_tasks(job_id)
+                return {'job_id': job_id, 'state': job['state'], 'local_only': True, 'alignment_only': True, 'already_queued': True, 'dispatch_deferred': caller_owns_transaction}
+            if any(payload.get(key) != value for key, value in current['guards'].items()):
+                raise ValueError('content cached alignment is stale; refresh current source and ASR cache')
+            if not current['local_alignment_recovery']['executable_now']:
+                raise ValueError('content alignment requires matching cached ASR and accepted, paused local graph')
+            self._assert_no_unresolved_provider_tasks(job_id)
+            overlay = sb.pop(visual_repair.OVERLAY_KEY, None)
+            if overlay:
+                sb['shots'] = deepcopy(overlay['base_shots'])
+            sb[visual_repair.ALIGNMENT_KEY] = {'authority': visual_repair.AUTHORITY,
+                'spec_hash': current['guards']['expected_spec_hash'], 'contract_hash': current['guards']['expected_contract_hash'],
+                'source_bindings': current['guards']['expected_source_bindings'],
+                'asr_cache_bindings': current['local_alignment_recovery']['cache_bindings']}
+            epoch = content_review.digest({'payload': payload, 'prior_overlay': overlay})
+            history = sb.setdefault('local_visual_edit_history', [])
+            if not isinstance(history, list):
+                raise ValueError('content local edit audit history is invalid')
+            history.append({'authority': visual_repair.AUTHORITY, 'action': 'discard_overlay_and_align_cached_speech',
+                'prior_overlay': overlay, 'cache_bindings': current['local_alignment_recovery']['cache_bindings'],
+                'command_fingerprint': epoch, 'request_fingerprint': request_fingerprint})
+            self.database.execute('UPDATE jobs SET storyboard=? WHERE job_id=?', (json.dumps(sb, ensure_ascii=False, allow_nan=False), job_id))
+            node = self.database.execute("SELECT state FROM production_nodes WHERE job_id=? AND node_id='local_compose'", (job_id,)).fetchone()
+            if node['state'] == 'SUCCEEDED':
+                self._invalidate_content_final(job_id, epoch)
+            return {**self.resume_visual_content(job_id, _cached_alignment=True), 'alignment_only': True, 'dispatch_deferred': caller_owns_transaction}
+
+    def resume_visual_content(self, job_id: str, *, _cached_alignment=False) -> dict:
         with self._final_review_lock, node_state_machine.atomic(self.database):
             job = self.database.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
             if not job:
@@ -5926,7 +6038,12 @@ class ManagementService:
             for row in rows:
                 self.content_review_source_file(job_id, row['idx'], 'active')
             report = content_review.retention(sb, rows, {int(r['idx']): content_review.probe_duration(Path(r['video_path'])) for r in rows})
-            if report.get('passed') is not True:
+            if _cached_alignment:
+                from . import visual_repair, production_compiler
+                frozen = production_compiler.ensure_director_timeline(content_review.object_json(job['production_spec_json']).get('runtime_storyboard') or {})
+                if not visual_repair.cached_alignment(self.database, job_id, frozen, rows)['available']:
+                    raise ValueError('content local alignment requires matching cached ASR; new ASR calls are not authorized')
+            if report.get('passed') is not True and not _cached_alignment:
                 raise ValueError('content local resume blocked: ' + ', '.join(report['reasons']) + '; review current source or locally recut/repair cropped action')
             bgm = self._controlled_job_asset(job_id, job['bgm_path'], label='content BGM', require_file=True)
             if bgm is None:
@@ -5953,7 +6070,7 @@ class ManagementService:
                     raise ValueError('content local compose is not awaiting content review')
                 epoch = self.database.execute("SELECT COALESCE(MAX(rowid),0) FROM production_node_events WHERE job_id=? AND node_id='local_compose'", (job_id,)).fetchone()[0]
                 node_state_machine.transition_node_in_transaction(self.database, job_id, 'local_compose', 'resume_visual_content',
-                    event_id=f'{job_id}:content-local-resume:{epoch}', payload={'edit_plan_fingerprint': content_review.edit_plan_fingerprint(sb)})
+                    event_id=f'{job_id}:content-local-resume:{epoch}', payload={'edit_plan_fingerprint': content_review.edit_plan_fingerprint(sb), 'cached_alignment_only': bool(_cached_alignment)})
                 self.database.execute("UPDATE production_nodes SET error_code=NULL,next_action=NULL,output_json='{}' WHERE job_id=? AND node_id='local_compose'", (job_id,))
                 self.database.execute('UPDATE jobs SET error=NULL,failure_code=NULL WHERE job_id=?', (job_id,))
                 projected = production_projection.persist(self.database, job_id)

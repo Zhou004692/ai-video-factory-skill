@@ -106,6 +106,12 @@ def effective_storyboard(live, actual):
     if contract_hash(live) != contract_hash(actual):
         raise ValueError('content current requirements differ from frozen local compose input')
     merged = deepcopy(live)
+    # Only local-compose may update the server-authorized picture overlay.
+    # Preserve concurrent operator/budget metadata from live, never a full
+    # frozen snapshot. Overlay fingerprint follows actual ASR subtitle cues.
+    from . import visual_repair
+    if visual_repair.OVERLAY_KEY in actual:
+        merged[visual_repair.OVERLAY_KEY] = deepcopy(actual[visual_repair.OVERLAY_KEY])
     for field in ('production_mode', 'shots', 'hook'):
         if field in actual:
             merged[field] = deepcopy(actual[field])
