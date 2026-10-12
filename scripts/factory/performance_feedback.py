@@ -170,21 +170,28 @@ def capture_context(db, job_id, *, assets_dir=None) -> dict:
         tag = db.execute('SELECT hook_type,narrative_pattern,proof_type,cta_type FROM creative_angle_tags WHERE brief_id=? AND angle_index=?', (brief['brief_id'],index)).fetchone()
         context['tags'] = dict(tag) if tag else {}
         context['sources'] = [dict(r) for r in db.execute('SELECT s.source_id,s.title FROM topic_brief_sources l JOIN script_sources s ON s.source_id=l.source_id WHERE l.brief_id=? ORDER BY s.source_id',(brief['brief_id'],))]
-    if frozen or sha:
-        # An asset exists: do not pass current drafts/tags off as its creative.
-        from . import creative_ir
-        context['declared_association'] = {key:context.pop(key,None) for key in
-            ('brief_id','selected_angle_index','selected_title','source_score','tags','sources')}
-        context.update(creative_ir=creative_ir.from_storyboard(frozen).as_dict() if frozen else {},
-            creative_ir_version=1 if frozen else None,
-            creative_provenance='frozen_production_input' if frozen else 'unknown',
-            production_spec_hash=job['production_spec_hash'] if 'production_spec_hash' in job.keys() else None,
-            frozen_creative_ir_hash=spec.get('creative_ir_hash'),
-            selected_title=frozen_meta.get('title') or frozen.get('title'),
-            tags=frozen_meta.get('creative_tags') or frozen.get('creative_tags') or {},
-            tags_provenance='frozen_production_input' if (frozen_meta.get('creative_tags') or frozen.get('creative_tags')) else 'unknown',
-            intent=frozen_meta.get('creative_thesis') or frozen.get('intent') or frozen.get('creative_intent'),
-            sources=[{'source_id':source_id,'title':None} for source_id in frozen_meta.get('source_ids') or []])
+    # A current brief is only an association declaration, even for legacy jobs.
+    # Absence of a render/frozen input must never promote live tags to evidence.
+    from . import creative_ir
+    context['declared_association'] = {key:context.pop(key,None) for key in
+        ('brief_id','selected_angle_index','selected_title','source_score','tags','sources',
+         'creative_ir','creative_ir_version')}
+    score = frozen_meta.get('source_score')
+    if isinstance(score, dict):
+        score = score.get('overall')
+    context.update(creative_ir=creative_ir.from_storyboard(frozen).as_dict() if frozen else {},
+        creative_ir_version=1 if frozen else None,
+        creative_provenance='frozen_production_input' if frozen else 'unknown',
+        production_spec_hash=job['production_spec_hash'] if 'production_spec_hash' in job.keys() else None,
+        frozen_creative_ir_hash=spec.get('creative_ir_hash'),
+        brief_id=frozen_meta.get('brief_id'), selected_angle_index=frozen_meta.get('selected_angle_index'),
+        selected_title=frozen_meta.get('title') or frozen.get('title'),
+        source_score=score, source_score_provenance='frozen_production_input' if score is not None else 'unknown',
+        tags=frozen_meta.get('creative_tags') or frozen.get('creative_tags') or {},
+        tags_provenance='frozen_production_input' if (frozen_meta.get('creative_tags') or frozen.get('creative_tags')) else 'unknown',
+        intent=frozen_meta.get('creative_thesis') or frozen.get('intent') or frozen.get('creative_intent'),
+        source_provenance='frozen_production_input' if frozen_meta.get('source_ids') else 'unknown',
+        sources=[{'source_id':source_id,'title':None} for source_id in frozen_meta.get('source_ids') or []])
     return context
 
 
@@ -826,18 +833,21 @@ def learning_report(
         by_context.setdefault((row['job_id'],row['observation_key']), []).append(row)
 
     creatives = []
+    observations = []
     source_groups = {}
     band_rows = {}
     for (job_id, observation_key), snapshots in by_context.items():
         metrics = _aggregate(snapshots)
+        context = content_review.object_json(snapshots[0].get('context_json'))
+        observations.append({'job_id':job_id,'publication_id':snapshots[0]['publication_id'],
+            'platform':snapshots[0]['platform'],'creative_provenance':context.get('creative_provenance','unknown'),**metrics})
         if metrics['views'] is None or metrics['views'] < min_views:
             continue
-        context = content_review.object_json(snapshots[0].get('context_json'))
-        if not context.get('brief_id') and not context.get('creative_ir'):
+        if context.get('creative_provenance') != 'frozen_production_input' or not context.get('creative_ir'):
             excluded.append({'job_id': job_id,'platform': snapshots[0]['platform'],
                 'publication_id': snapshots[0]['publication_id'],'reason': 'historical_creative_context_unknown'})
             continue
-        score = context.get('source_score')
+        score = context.get('source_score') if context.get('source_score_provenance') == 'frozen_production_input' else None
         creative = {'job_id':job_id,'publication_id':snapshots[0]['publication_id'],
             'creative_version': observation_key, 'topic_id':context.get('topic_id'),
             'brief_id':context.get('brief_id'),'selected_angle_index':context.get('selected_angle_index'),
@@ -846,7 +856,9 @@ def learning_report(
         creatives.append(creative)
         if score is not None:
             band_rows.setdefault(_band(float(score)), []).extend(snapshots)
-        for source in context.get('sources') or []:
+        sources = ((context.get('sources') or [])
+                   if context.get('source_provenance','frozen_production_input') == 'frozen_production_input' else [])
+        for source in sources:
             group = source_groups.setdefault(source['source_id'], {'source_id':source['source_id'],
                 'title':source.get('title'),'snapshots':[],'creative_ids':set()})
             group['snapshots'].extend(snapshots)
@@ -875,6 +887,7 @@ def learning_report(
             "Distribution observations are not visual quality or causal contribution. Source metrics are shared exposure."
         ),
         "creatives": creatives,
+        "observations": observations,
         "sources": source_rows,
         "score_bands": score_bands,
         "excluded": sorted(

@@ -41,6 +41,16 @@ def observed_tag(tags, dimension: str) -> str | None:
     return value if isinstance(value, str) and value in VOCABULARY[dimension] else None
 
 
+def published_tags(creative: dict) -> dict:
+    """Only frozen creative evidence permits dimensional attribution."""
+    context = creative.get('creative_context') or {}
+    if (context.get('creative_provenance') == 'frozen_production_input'
+            and context.get('tags_provenance') == 'frozen_production_input'):
+        tags = creative.get('tags')
+        return tags if isinstance(tags, dict) else {}
+    return {}
+
+
 def tag_angle(
     db: sqlite3.Connection,
     brief_id: str,
@@ -114,7 +124,7 @@ def strategy_report(
         min_views=min_views, min_window_coverage=min_window_coverage,
     )
     untagged = [creative["job_id"] for creative in base["creatives"]
-                if not any(observed_tag(creative.get("tags"), dimension)
+                if not any(observed_tag(published_tags(creative), dimension)
                            for dimension in VOCABULARY)]
 
     dimensions: list[dict] = []
@@ -122,7 +132,7 @@ def strategy_report(
         groups: dict[str, list[dict]] = {}
         unknown: list[dict] = []
         for creative in base["creatives"]:
-            value = observed_tag(creative.get("tags"), dimension)
+            value = observed_tag(published_tags(creative), dimension)
             if value is None:
                 unknown.append({"job_id": creative["job_id"],
                                 "publication_id": creative.get("publication_id"),

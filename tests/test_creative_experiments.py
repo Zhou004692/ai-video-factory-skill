@@ -74,6 +74,13 @@ class CreativeExperimentTests(unittest.TestCase):
             hook_type=hook_type, narrative_pattern=narrative_pattern,
             proof_type="source_quote", cta_type="consult",
         )
+        # Positive experimental observations require captured production intent.
+        frozen = {**storyboard,"script_metadata":{"title":job_id,"creative_tags":{
+            "hook_type":hook_type,"narrative_pattern":narrative_pattern,
+            "proof_type":"source_quote","cta_type":"consult"}}}
+        self.memory_db.execute("UPDATE jobs SET production_spec_json=? WHERE job_id=?",
+            (json.dumps({"runtime_storyboard":frozen}),job_id))
+        self.memory_db.commit()
         if published:
             performance_feedback.register_publication(
                 self.memory_db, job_id, platform="douyin",

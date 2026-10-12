@@ -271,6 +271,64 @@ class PublicationFeedbackVersionsTests(unittest.TestCase):
             self.assertEqual(dimensions[dimension]['coverage']['unknown_samples'],1)
             self.assertEqual(dimensions[dimension]['unknown'][0]['publication_id'],publication)
 
+    def test_unverified_current_association_is_preserved_without_creative_attribution(self):
+        brief = {'recommended_index':0,'source_score':{'overall':90},'angles':[{'title':'Mutable draft'}]}
+        self.db.execute("INSERT INTO topic_briefs(brief_id,status,recommended_title,brief_json,approved_job_id,approved_angle_index) VALUES('B','approved','Mutable draft',?,'J',0)",(json.dumps(brief),))
+        self.db.execute("INSERT INTO script_sources(source_id,fingerprint,source_type,title,content) VALUES('S','fp','text','Raw source','Actual source text')")
+        self.db.execute("INSERT INTO topic_brief_sources(brief_id,source_id) VALUES('B','S')")
+        self.db.commit()
+        creative_learning.tag_angle(self.db,'B',angle_index=0,hook_type='question',narrative_pattern='comparison',proof_type='none',cta_type='follow')
+        service = self.service()
+        publication = service.register_publication({'job_id':'J','platform':'douyin','item_id':'declaration','published_at':'2026-08-12T00:00:00Z'})['publication_id']
+        service.record_performance_snapshot(publication,{'views':100,'completion_rate':0.9,'captured_at':'2026-08-12T22:00:00Z'})
+        context = json.loads(self.db.execute('SELECT context_json FROM platform_publications').fetchone()[0])
+        self.assertEqual(context['tags'],{})
+        self.assertEqual(context['tags_provenance'],'unknown')
+        self.assertEqual(context['declared_association']['tags']['hook_type'],'question')
+        report = feedback.learning_report(self.db,platform='douyin',window_hours=24)
+        self.assertEqual(report['creatives'],[])
+        self.assertEqual(report['sources'],[])
+        self.assertEqual(report['score_bands'],[])
+        self.assertEqual(report['observations'][0]['views'],100)
+        self.assertEqual(report['observations'][0]['completion_rate'],0.9)
+        self.assertEqual(self.db.execute("SELECT content FROM script_sources WHERE source_id='S'").fetchone()[0],'Actual source text')
+        self.assertTrue(all(not row['eligible'] for row in creative_learning.strategy_report(self.db,platform='douyin',window_hours=24,min_samples=1)['dimensions']))
+
+    def test_persisted_unverified_tags_are_not_promoted_by_report(self):
+        publication = feedback.register_publication(self.db,'J',platform='douyin',item_id='stored-bad',published_at='2026-08-12T00:00:00Z')
+        bad = {'brief_id':'B','creative_provenance':'unverified_current_association','tags_provenance':'unverified_current_association',
+            'creative_ir':{'title':'Mutable draft'},'tags':{'hook_type':'question','narrative_pattern':'comparison','proof_type':'none','cta_type':'follow'},
+            'sources':[{'source_id':'S','title':'Mutable source'}],'source_score':90}
+        original = json.dumps(bad)
+        self.db.execute('UPDATE platform_publications SET context_json=? WHERE publication_id=?',(original,publication))
+        self.db.commit()
+        self.snapshot(publication_id=publication,views=100,completion_rate=0.9)
+        report = feedback.learning_report(self.db)
+        self.assertEqual(report['creatives'],[])
+        self.assertEqual(report['sources'],[])
+        self.assertEqual(report['score_bands'],[])
+        self.assertEqual(report['observations'][0]['views'],100)
+        self.assertEqual(self.db.execute('SELECT context_json FROM platform_publications').fetchone()[0],original)
+        # Defense at the strategy boundary even when a caller supplies a pre-existing read model.
+        with patch.object(feedback,'learning_report',return_value={'creatives':[{'job_id':'J','publication_id':publication,
+            'views':100,'completion_rate':0.9,'tags':bad['tags'],'creative_context':bad}],
+            'excluded':[],'platform':'douyin','window_hours':24}):
+            strategy = creative_learning.strategy_report(self.db,platform='douyin',window_hours=24,min_samples=1)
+        self.assertTrue(all(not row['eligible'] for row in strategy['dimensions']))
+
+    def test_frozen_manual_association_keeps_intent_observations_without_upload_claim(self):
+        frozen = {'script_metadata':{'title':'Frozen intent','creative_tags':{'hook_type':'question'},'source_ids':['S']}}
+        self.db.execute('UPDATE jobs SET production_spec_json=? WHERE job_id=?',(json.dumps({'runtime_storyboard':frozen}),'J'))
+        self.db.commit()
+        service = self.service()
+        publication = service.register_publication({'job_id':'J','platform':'douyin','item_id':'manual-frozen','published_at':'2026-08-12T00:00:00Z'})['publication_id']
+        service.record_performance_snapshot(publication,{'views':100,'completion_rate':0.6,'captured_at':'2026-08-12T22:00:00Z'})
+        context = json.loads(self.db.execute('SELECT context_json FROM platform_publications').fetchone()[0])
+        self.assertNotEqual(context['binding_status'],'server_verified_douyin_upload')
+        strategy = creative_learning.strategy_report(self.db,platform='douyin',window_hours=24,min_samples=1)
+        self.assertEqual(strategy['dimensions'][0]['eligible'][0]['value'],'question')
+        self.assertEqual(feedback.learning_report(self.db)['sources'][0]['source_id'],'S')
+
     def test_experiment_missing_primary_metrics_never_selects_winner(self):
         from factory import creative_experiments
         experiment,jobs = self.experiment_fixture()
@@ -356,4 +414,3 @@ class PublicationFeedbackVersionsTests(unittest.TestCase):
         self.assertIsNone(row['comments'])
         invalid = subprocess.run(args+['--shares','1.5'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=20)
         self.assertNotEqual(invalid.returncode,0)
-

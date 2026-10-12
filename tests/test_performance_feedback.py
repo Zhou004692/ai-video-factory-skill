@@ -58,6 +58,28 @@ class PerformanceFeedbackTests(unittest.TestCase):
                 "VALUES('BRIEF-FEEDBACK',?)", (source_id,),
             )
         self.memory_db.commit()
+        self._freeze_job_context("J-FEEDBACK")
+
+    def _freeze_job_context(self, job_id):
+        """Positive fixtures carry production inputs, not only a mutable brief."""
+        row = self.memory_db.execute(
+            "SELECT * FROM topic_briefs WHERE approved_job_id=?", (job_id,),
+        ).fetchone()
+        brief = json.loads(row["brief_json"])
+        index = row["approved_angle_index"]
+        tag = self.memory_db.execute(
+            "SELECT hook_type,narrative_pattern,proof_type,cta_type FROM creative_angle_tags "
+            "WHERE brief_id=? AND angle_index=?", (row["brief_id"],index),
+        ).fetchone()
+        metadata = {"brief_id":row["brief_id"],"selected_angle_index":index,
+                    "title":brief["angles"][index]["title"],
+                    "source_score":brief["source_score"],"creative_tags":dict(tag) if tag else {},
+                    "source_ids":[r[0] for r in self.memory_db.execute(
+                        "SELECT source_id FROM topic_brief_sources WHERE brief_id=? ORDER BY source_id",
+                        (row["brief_id"],),)]}
+        self.memory_db.execute("UPDATE jobs SET production_spec_json=? WHERE job_id=?",
+            (json.dumps({"runtime_storyboard":{"script_metadata":metadata}},ensure_ascii=False),job_id))
+        self.memory_db.commit()
 
     def tearDown(self):
         self.memory_db.close()
@@ -204,6 +226,7 @@ class PerformanceFeedbackTests(unittest.TestCase):
             "VALUES('BRIEF-FEEDBACK-2','SRC-A')"
         )
         self.memory_db.commit()
+        self._freeze_job_context("J-FEEDBACK-2")
         performance_feedback.record_snapshot(
             self.memory_db, "J-FEEDBACK", platform="douyin", views=200,
             completion_rate=0.5,
@@ -800,6 +823,7 @@ class PerformanceFeedbackTests(unittest.TestCase):
             hook_type=hook_type, narrative_pattern=narrative_pattern,
             proof_type="source_quote", cta_type="consult",
         )
+        self._freeze_job_context(job_id)
         performance_feedback.register_publication(
             self.memory_db, job_id, platform="douyin", item_id=f"ITEM-{suffix}",
             published_at="2026-08-12T00:00:00Z",
