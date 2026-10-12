@@ -1519,19 +1519,6 @@ async function openVisualContentReview(job,shot=null,source=null){
       return `<section class="detail-section" data-content-id="${esc(req.id)}"><h3>${esc(req.description)}</h3><p>自动发现：${esc(statusLabels[machine.status]||'证据不足')} · ${esc(interval)}</p><p>实际观察：${esc(machine.observed_description||'尚无可验证观察')}</p><p>原因：${esc(machine.reason||'未提供原因')}</p><label>人工状态<select data-content-status><option value="">请选择审核结论</option>${Object.entries(statusLabels).map(([value,label])=>`<option value="${value}" ${saved.status===value?'selected':''}>${label}</option>`).join('')}</select></label><div class="form-grid two"><label>开始秒<input data-content-start type="number" min="0" step="0.01" value="${esc(saved.start_sec??'')}"></label><label>结束秒<input data-content-end type="number" min="0" step="0.01" value="${esc(saved.end_sec??'')}"></label></div><label>实际观察<textarea data-content-description>${esc(saved.observed_description||'')}</textarea></label><label>豁免 / 问题原因<textarea data-content-reason>${esc(saved.reason||'')}</textarea></label></section>`;
     }).join('');
     openModal('CONTENT REVIEW',`画面内容复核 · 母片 #${shot.idx}`,`<div class="form-stack"><label>母片<select id="content-master">${eligible.map(item=>`<option value="${item.idx}" ${item.idx===shot.idx?'selected':''}>母片 #${item.idx}</option>`).join('')}</select></label><label>审核版本<select id="content-source">${[['candidate','候选版本'],['active','当前版本'],['prior','旧版本']].map(([value,label])=>`<option value="${value}" ${value===source?'selected':''}>${label}</option>`).join('')}</select></label><video class="video-preview" controls preload="metadata" src="${esc(detail.preview_url)}"></video><p>实际时长 ${esc(detail.duration_sec)} 秒。保存内容结论后仍需单独接受候选；证据被剪掉时须本地重剪或修复。</p><input type="hidden" id="content-sha" value="${esc(detail.asset_sha256)}"><input type="hidden" id="content-reqhash" value="${esc(detail.requirement_set_hash)}">${rows}</div><div class="modal-actions"><button class="primary-action" id="save-content-review">保存内容结论</button>${shot.candidate_preview_url?'<button class="mini-action" id="return-candidate-review">返回候选审核</button>':''}${source!=='candidate'?'<button class="mini-action" id="resume-content-local">复核后恢复本地合成</button>':''}</div>`);
-    const repair=await api(`/api/videos/${encodeURIComponent(job.job_id)}/masters/${shot.idx}/visual-repair?source=${encodeURIComponent(source)}`);
-    if(repair.routes){
-      const actions=$('#modal .modal-actions');
-      actions?.insertAdjacentHTML('beforebegin',visualRepairMarkup(repair));
-      if(repair.routes.some(route=>route.id==='local_recut'&&route.executable_now)){
-        actions?.insertAdjacentHTML('afterbegin','<button class="mini-action" id="preview-free-recut">查看免费重剪方案</button>');
-        $('#preview-free-recut').onclick=()=>openFreeVisualRecut(job,shot,detail,repair);
-      }
-      if(repair.local_alignment_recovery?.executable_now){
-        actions?.insertAdjacentHTML('afterbegin','<button class="mini-action" id="preview-cached-alignment">确认已有语音时序并重新对齐</button>');
-        $('#preview-cached-alignment').onclick=()=>openCachedVisualAlignment(job,shot,repair);
-      }
-    }
     $('#content-source').onchange=e=>openVisualContentReview(job,shot,e.target.value);
     $('#content-master').onchange=e=>openVisualContentReview(job,eligible.find(item=>String(item.idx)===e.target.value));
     $('#return-candidate-review')?.addEventListener('click',()=>openMasterCandidateReview(job,shot));
@@ -1545,6 +1532,30 @@ async function openVisualContentReview(job,shot=null,source=null){
       catch(e){toast(e.message,true)}
     };
     $('#resume-content-local')?.addEventListener('click',async()=>{try{const result=await api(`/api/videos/${encodeURIComponent(job.job_id)}/resume-visual-content`,{method:'POST',body:'{}'});closeModal();toast(result.already_queued?'本地合成已排队':'仅本地合成已恢复');await loadPage('videos')}catch(e){toast(e.message,true)}});
+    const reviewBody=$('#modal-body'),reviewSave=$('#save-content-review'),reviewActions=$('#modal .modal-actions'),reviewIdentity={};
+    if(reviewBody)reviewBody._visualContentReviewIdentity=reviewIdentity;
+    const isCurrentReview=()=>$('#modal-body')===reviewBody&&reviewBody?._visualContentReviewIdentity===reviewIdentity&&$('#save-content-review')===reviewSave&&$('#modal')?.hidden!==true;
+    try{
+      const repair=await api(`/api/videos/${encodeURIComponent(job.job_id)}/masters/${shot.idx}/visual-repair?source=${encodeURIComponent(source)}`);
+      if(!isCurrentReview())return;
+      if(repair.routes){
+        reviewActions?.insertAdjacentHTML('beforebegin',visualRepairMarkup(repair));
+        if(repair.routes.some(route=>route.id==='local_recut'&&route.executable_now)){
+          reviewActions?.insertAdjacentHTML('afterbegin','<button class="mini-action" id="preview-free-recut">查看免费重剪方案</button>');
+          $('#preview-free-recut').onclick=()=>openFreeVisualRecut(job,shot,detail,repair);
+        }
+        if(repair.local_alignment_recovery?.executable_now){
+          reviewActions?.insertAdjacentHTML('afterbegin','<button class="mini-action" id="preview-cached-alignment">确认已有语音时序并重新对齐</button>');
+          $('#preview-cached-alignment').onclick=()=>openCachedVisualAlignment(job,shot,repair);
+        }
+      }
+    }catch(e){
+      if(!isCurrentReview())return;
+      $('.visual-repair-plan',reviewBody)?.remove?.();
+      $('#preview-free-recut',reviewBody)?.remove?.();
+      $('#preview-cached-alignment',reviewBody)?.remove?.();
+      reviewActions?.insertAdjacentHTML('beforebegin',`<section class="detail-section visual-repair-unavailable"><h3>修复建议暂不可用</h3><p>${esc(e.message||'暂时无法读取修复建议')}。当前素材的内容复核仍可继续，修复操作需要重新读取建议后确认。</p></section>`);
+    }
   }catch(e){toast(e.message,true)}
 }
 function visualRepairMarkup(repair){

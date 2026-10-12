@@ -505,6 +505,68 @@ class LocalVisualRepairTests(unittest.TestCase):
         self.assertIn('放弃上次已批准的画面重剪',output['markup'])
         self.assertNotIn('confirm-native-edit',output['markup'])
 
+    def test_real_missing_neighbor_plan_keeps_actual_node_review_form_usable(self):
+        self.prepare()
+        self.sb['masters'].append({'idx':2,'duration':4,'type':'broll'})
+        self.database.execute("INSERT INTO shots(job_id,idx,state,video_path,video_qa) VALUES('J',2,'OK',?,'{}')",(str(self.base/'02.mp4'),));self.save()
+        detail=self.service.content_review_detail('J',1,'active')
+        with self.assertRaisesRegex(ValueError,'selected source') as failure:self.service.visual_repair_plan('J',1,'active')
+        source=(Path(__file__).resolve().parents[1]/'scripts'/'management_ui'/'app.js').read_text(encoding='utf-8')
+        ui=source.split('async function openVisualContentReview',1)[1].split('const openCandidateWithContentBase',1)[0]
+        setup=r"""
+        const elements=new Map(),toasts=[],posts=[];let markup='',modalOpened=false;
+        const row={dataset:{contentId:'hand'}};
+        const fields={'#content-sha':detail.asset_sha256,'#content-reqhash':detail.requirement_set_hash,'[data-content-status]':'satisfied','[data-content-start]':'1','[data-content-end]':'2','[data-content-description]':'Hand rises in selected current source','[data-content-reason]':''};
+        function $(selector){if(!elements.has(selector))elements.set(selector,{value:fields[selector]??'',listeners:{},insertAdjacentHTML(_where,html){markup+=html},addEventListener(type,handler){this.listeners[type]=handler}});return elements.get(selector)}
+        function $$(selector){return selector==='[data-content-id]'?[row]:[]}function esc(value){return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
+        function toast(value){toasts.push(value)}function openModal(_type,_title,html){modalOpened=true;markup=html}function closeModal(){}async function loadPage(){}
+        async function api(url,options){if(options){posts.push({url,body:JSON.parse(options.body)});return {already_queued:false}}if(url.includes('/visual-repair'))throw Error(repairFailure);return detail}
+        """
+        script='const detail='+json.dumps(detail,ensure_ascii=False)+';const repairFailure='+json.dumps(str(failure.exception))+';\n'+setup+'\nasync function openVisualContentReview'+ui+r"""
+        (async()=>{const shot={idx:1,has_visual_requirements:true};await openVisualContentReview({job_id:'J',shots:[shot]},shot,'active');const core={save:typeof elements.get('#save-content-review')?.onclick==='function',source:typeof elements.get('#content-source')?.onchange==='function',master:typeof elements.get('#content-master')?.onchange==='function',resume:typeof elements.get('#resume-content-local')?.listeners.click==='function'};if(core.save)await elements.get('#save-content-review').onclick();process.stdout.write(JSON.stringify({modalOpened,core,markup,toasts,posts}))})();
+        """
+        result=subprocess.run(['node','-e',script],capture_output=True,encoding='utf-8',timeout=20)
+        self.assertEqual(result.returncode,0,result.stderr);output=json.loads(result.stdout)
+        self.assertTrue(output['modalOpened']);self.assertTrue(all(output['core'].values()),output['core'])
+        self.assertIn('修复建议暂不可用',output['markup']);self.assertIn(str(failure.exception),output['markup'])
+        self.assertNotIn('id="preview-free-recut"',output['markup']);self.assertNotIn('confirm-native-edit',output['markup'])
+        self.assertEqual(output['posts'][0]['url'],'/api/videos/J/masters/1/content-review')
+        saved=self.service.record_content_review('J',1,output['posts'][0]['body'])
+        self.assertFalse(saved['already_recorded']);self.assertEqual(saved['review']['items'][0]['observed_description'],'Hand rises in selected current source')
+        # Rendering a malformed optional response is isolated just like a
+        # rejected GET; it cannot disable the already bound core review form.
+        malformed_script=script.replace('throw Error(repairFailure);','return {routes:{}};')
+        malformed=subprocess.run(['node','-e',malformed_script],capture_output=True,encoding='utf-8',timeout=20)
+        self.assertEqual(malformed.returncode,0,malformed.stderr);rendered=json.loads(malformed.stdout)
+        self.assertTrue(all(rendered['core'].values()),rendered['core'])
+        self.assertIn('修复建议暂不可用',rendered['markup']);self.assertNotIn('id="preview-free-recut"',rendered['markup'])
+
+    def test_pending_old_repair_response_cannot_change_new_selected_modal_scope(self):
+        self.prepare();active_detail=self.service.content_review_detail('J',1,'active');active_plan=self.plan()
+        prior_detail=self.service.content_review_detail('J',1,'prior');prior_plan=self.service.visual_repair_plan('J',1,'prior')
+        source=(Path(__file__).resolve().parents[1]/'scripts'/'management_ui'/'app.js').read_text(encoding='utf-8')
+        ui=source.split('async function openVisualContentReview',1)[1].split('const openCandidateWithContentBase',1)[0]
+        setup=r"""
+        const elements=new Map(),toasts=[],posts=[];let markup='',resolveOld,rejectOld,announceOld;
+        const oldStarted=new Promise(resolve=>announceOld=resolve);
+        function $(selector){if(!elements.has(selector))elements.set(selector,{value:'value',listeners:{},insertAdjacentHTML(_where,html){markup+=html},addEventListener(type,handler){this.listeners[type]=handler}});return elements.get(selector)}
+        function $$(selector){return []}function esc(value){return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
+        function toast(value){toasts.push(value)}function openModal(_type,_title,html){markup=html}function closeModal(){}async function loadPage(){}
+        async function api(url,options){if(options){posts.push({url,body:JSON.parse(options.body)});return {already_queued:false}}if(url.includes('/visual-repair')&&url.includes('source=active'))return new Promise((resolve,reject)=>{resolveOld=resolve;rejectOld=reject;announceOld()});if(url.includes('/visual-repair'))return priorPlan;return url.includes('source=prior')?priorDetail:activeDetail}
+        """
+        for outcome in ['resolve','reject']:
+            with self.subTest(outcome=outcome):
+                bindings='const activeDetail='+json.dumps(active_detail,ensure_ascii=False)+';const priorDetail='+json.dumps(prior_detail,ensure_ascii=False)+';const activePlan='+json.dumps(active_plan,ensure_ascii=False)+';const priorPlan='+json.dumps(prior_plan,ensure_ascii=False)+';const outcome='+json.dumps(outcome)+';\n'
+                script=bindings+setup+'\nasync function openVisualContentReview'+ui+r"""
+                (async()=>{const shot={idx:1,has_visual_requirements:true},job={job_id:'J',shots:[shot]};const pending=openVisualContentReview(job,shot,'active');await oldStarted;const earlySource=typeof elements.get('#content-source')?.onchange==='function';if(earlySource)await elements.get('#content-source').onchange({target:{value:'prior'}});else await openVisualContentReview(job,shot,'prior');if(outcome==='resolve')resolveOld(activePlan);else rejectOld(Error('OLD TARGET ERROR'));await pending;await elements.get('#save-content-review').onclick();process.stdout.write(JSON.stringify({earlySource,markup,toasts,posts}))})();
+                """
+                result=subprocess.run(['node','-e',script],capture_output=True,encoding='utf-8',timeout=20)
+                self.assertEqual(result.returncode,0,result.stderr);output=json.loads(result.stdout)
+                self.assertTrue(output['earlySource'])
+                self.assertNotIn('id="preview-free-recut"',output['markup'])
+                self.assertNotIn('OLD TARGET ERROR',output['markup']);self.assertNotIn('OLD TARGET ERROR',output['toasts'])
+                self.assertEqual(output['posts'][0]['body']['source'],'prior')
+
     def test_stale_commands_do_not_mutate_or_queue(self):
         self.prepare(); command = self.command(self.plan())
         for key in ['expected_asset_sha256', 'expected_requirement_set_hash', 'expected_edit_plan_fingerprint', 'expected_spec_hash', 'expected_contract_hash', 'expected_source_bindings']:
