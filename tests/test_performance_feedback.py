@@ -168,7 +168,9 @@ class PerformanceFeedbackTests(unittest.TestCase):
         self.assertEqual(creative["selected_title"], "人工选择的第二案")
         self.assertEqual(creative["views"], 500)
         self.assertAlmostEqual(creative["completion_rate"], 0.56)
-        self.assertAlmostEqual(creative["engagement_rate"], 0.11)
+        # Missing shares/saves are unknown, so total engagement is unavailable.
+        self.assertIsNone(creative["engagement_rate"])
+        self.assertEqual(creative["coverage"]["engagement_rate"]["snapshots"], 0)
         self.assertAlmostEqual(creative["follow_rate"], 0.02)
         self.assertAlmostEqual(creative["lead_rate"], 0.01)
         self.assertAlmostEqual(creative["average_watch_sec"], 15.6)
@@ -494,17 +496,19 @@ class PerformanceFeedbackTests(unittest.TestCase):
         self.assertIn("录入绩效", js)
         self.assertNotIn("自动生成绩效", js)
 
-    def test_one_job_has_only_one_canonical_publication_per_platform(self):
-        performance_feedback.register_publication(
+    def test_one_job_preserves_history_with_one_current_publication_per_platform(self):
+        first = performance_feedback.register_publication(
             self.memory_db, "J-FEEDBACK", platform="douyin",
             item_id="740001",
         )
 
-        with self.assertRaisesRegex(ValueError, "canonical publication"):
-            performance_feedback.register_publication(
-                self.memory_db, "J-FEEDBACK", platform="douyin",
-                item_id="740002",
-            )
+        second = performance_feedback.register_publication(
+            self.memory_db, "J-FEEDBACK", platform="douyin", item_id="740002",
+        )
+        rows = self.memory_db.execute(
+            "SELECT publication_id,is_current FROM platform_publications ORDER BY item_id"
+        ).fetchall()
+        self.assertEqual([(row[0],row[1]) for row in rows], [(first,0),(second,1)])
 
     def test_douyin_native_export_resolves_job_by_item_id(self):
         performance_feedback.register_publication(

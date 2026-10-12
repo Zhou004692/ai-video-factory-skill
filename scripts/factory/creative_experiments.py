@@ -348,6 +348,9 @@ def experiment_report(db: sqlite3.Connection, experiment_id: str) -> dict:
         min_views=int(experiment["min_views"]),
         min_window_coverage=float(experiment["min_window_coverage"]),
     )
+    current = {row['job_id']:row['publication_id'] for row in db.execute(
+        'SELECT job_id,publication_id FROM platform_publications WHERE platform=? AND is_current=1',(experiment['platform'],))}
+    base['creatives'] = [item for item in base['creatives'] if item.get('publication_id') == current.get(item['job_id'])]
     by_arm: dict[str, list[dict]] = {"control": [], "treatment": []}
     eligible_ids: set[str] = set()
     for creative in base["creatives"]:
@@ -402,8 +405,8 @@ def experiment_report(db: sqlite3.Connection, experiment_id: str) -> dict:
             attrition.append({**common, "reason": "slot_unbound"})
             continue
         publication = db.execute(
-            "SELECT published_at FROM platform_publications "
-            "WHERE job_id=? AND platform=?",
+            "SELECT publication_id,published_at FROM platform_publications "
+            "WHERE job_id=? AND platform=? AND is_current=1",
             (job_id, experiment["platform"]),
         ).fetchone()
         if not publication:
@@ -411,8 +414,8 @@ def experiment_report(db: sqlite3.Connection, experiment_id: str) -> dict:
             continue
         snapshot_count = db.execute(
             "SELECT COUNT(*) FROM performance_snapshots "
-            "WHERE job_id=? AND platform=?",
-            (job_id, experiment["platform"]),
+            "WHERE publication_id=?",
+            (publication["publication_id"],),
         ).fetchone()[0]
         if not snapshot_count:
             attrition.append({**common, "reason": "snapshot_missing"})
@@ -433,6 +436,8 @@ def experiment_report(db: sqlite3.Connection, experiment_id: str) -> dict:
 
     enough = all(
         arms[arm]["sample_count"] >= int(experiment["min_jobs_per_arm"])
+        and arms[arm]["coverage"][experiment["primary_metric"]]["samples"] >= int(experiment["min_jobs_per_arm"])
+        and arms[arm][experiment["primary_metric"]] is not None
         for arm in ARMS
     )
     absolute_delta = None

@@ -80,30 +80,15 @@ def tag_angle(
 
 
 def _aggregate_creatives(creatives: list[dict]) -> dict:
-    views = sum(int(item["views"]) for item in creatives)
-    completion = sum(
-        float(item["completion_rate"]) * int(item["views"])
-        for item in creatives
-    )
-    engagement = sum(
-        float(item["engagement_rate"]) * int(item["views"])
-        for item in creatives
-    )
-    follows = sum(
-        float(item["follow_rate"]) * int(item["views"])
-        for item in creatives
-    )
-    leads = sum(
-        float(item["lead_rate"]) * int(item["views"])
-        for item in creatives
-    )
-    return {
-        "sample_count": len(creatives), "views": views,
-        "completion_rate": completion / views if views else 0.0,
-        "engagement_rate": engagement / views if views else 0.0,
-        "follow_rate": follows / views if views else 0.0,
-        "lead_rate": leads / views if views else 0.0,
-    }
+    views = sum(item['views'] for item in creatives if item.get('views') is not None)
+    result = {'sample_count':len(creatives), 'views':views, 'coverage':{}}
+    for metric in ('completion_rate','engagement_rate','follow_rate','lead_rate'):
+        eligible = [item for item in creatives if item.get(metric) is not None and item.get('views') is not None]
+        weights = [(item, (item.get('coverage') or {}).get(metric,{}).get('views',item['views'])) for item in eligible]
+        denominator = sum(weight for _,weight in weights)
+        result[metric] = sum(item[metric]*weight for item,weight in weights)/denominator if denominator else None
+        result['coverage'][metric] = {'samples':len(eligible), 'views':denominator}
+    return result
 
 
 def strategy_report(
@@ -125,11 +110,7 @@ def strategy_report(
     tagged: list[tuple[dict, sqlite3.Row]] = []
     untagged: list[str] = []
     for creative in base["creatives"]:
-        tag = db.execute(
-            "SELECT hook_type, narrative_pattern, proof_type, cta_type "
-            "FROM creative_angle_tags WHERE brief_id=? AND angle_index=?",
-            (creative["brief_id"], creative["selected_angle_index"]),
-        ).fetchone()
+        tag = creative.get('tags')
         if tag:
             tagged.append((creative, tag))
         else:
@@ -145,8 +126,8 @@ def strategy_report(
             for value, creatives in groups.items()
         ]
         values.sort(key=lambda item: (-item["sample_count"], item["value"]))
-        eligible = [item for item in values if item["sample_count"] >= min_samples]
-        insufficient = [item for item in values if item["sample_count"] < min_samples]
+        eligible = [item for item in values if item["sample_count"] >= min_samples and item["coverage"]["completion_rate"]["samples"] >= min_samples]
+        insufficient = [item for item in values if item["sample_count"] < min_samples or item["coverage"]["completion_rate"]["samples"] < min_samples]
         eligible.sort(
             key=lambda item: (-item["completion_rate"], -item["views"], item["value"])
         )

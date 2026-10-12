@@ -166,23 +166,24 @@ def review(job_id, decision, minutes, notes, first_pass):
 @click.argument("job_id")
 @click.option("--platform", required=True)
 @click.option("--captured-at", default=None, help="ISO-8601 snapshot time.")
+@click.option("--publication-id", default=None, help="Select a previously published work.")
 @click.option("--views", type=int, required=True)
 @click.option("--completed-views", type=int, default=None)
 @click.option("--completion-rate", type=float, default=None)
 @click.option("--average-watch-sec", type=float, default=None)
-@click.option("--likes", type=int, default=0, show_default=True)
-@click.option("--comments", type=int, default=0, show_default=True)
-@click.option("--shares", type=int, default=0, show_default=True)
-@click.option("--saves", type=int, default=0, show_default=True)
-@click.option("--follows", type=int, default=0, show_default=True)
-@click.option("--leads", type=int, default=0, show_default=True)
-def performance_add(job_id, platform, captured_at, views, completed_views,
+@click.option("--likes", type=int, default=None)
+@click.option("--comments", type=int, default=None)
+@click.option("--shares", type=int, default=None)
+@click.option("--saves", type=int, default=None)
+@click.option("--follows", type=int, default=None)
+@click.option("--leads", type=int, default=None)
+def performance_add(job_id, platform, captured_at, publication_id, views, completed_views,
                     completion_rate, average_watch_sec, likes, comments,
                     shares, saves, follows, leads):
     """Record one cumulative performance snapshot for a published video."""
     try:
         snapshot_id = performance_feedback.record_snapshot(
-            conn(), job_id, platform=platform, captured_at=captured_at,
+            conn(), job_id, platform=platform, publication_id=publication_id, captured_at=captured_at,
             views=views, completed_views=completed_views,
             completion_rate=completion_rate,
             average_watch_sec=average_watch_sec, likes=likes,

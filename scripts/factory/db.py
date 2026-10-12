@@ -521,20 +521,25 @@ CREATE TABLE IF NOT EXISTS performance_snapshots (
     job_id            TEXT NOT NULL,
     platform          TEXT NOT NULL,
     captured_at       TEXT NOT NULL,
-    views             INTEGER NOT NULL DEFAULT 0,
+    views             INTEGER,
     completed_views   INTEGER,
     completion_rate   REAL,
     average_watch_sec REAL,
-    likes             INTEGER NOT NULL DEFAULT 0,
-    comments          INTEGER NOT NULL DEFAULT 0,
-    shares            INTEGER NOT NULL DEFAULT 0,
-    saves              INTEGER NOT NULL DEFAULT 0,
-    follows            INTEGER NOT NULL DEFAULT 0,
-    leads              INTEGER NOT NULL DEFAULT 0,
+    likes             INTEGER,
+    comments          INTEGER,
+    shares            INTEGER,
+    saves              INTEGER,
+    follows            INTEGER,
+    leads              INTEGER,
     metadata_json      TEXT NOT NULL DEFAULT '{}',
     created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(job_id, platform, captured_at),
+    publication_id TEXT,
+    observation_key TEXT NOT NULL DEFAULT 'unbound',
+    measurement_version INTEGER NOT NULL DEFAULT 0,
+    context_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(job_id, platform, observation_key, captured_at),
+    FOREIGN KEY(publication_id) REFERENCES platform_publications(publication_id),
     FOREIGN KEY(job_id) REFERENCES jobs(job_id)
 );
 
@@ -552,8 +557,9 @@ CREATE TABLE IF NOT EXISTS platform_publications (
     metadata_json   TEXT NOT NULL DEFAULT '{}',
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_current INTEGER NOT NULL DEFAULT 1,
+    context_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(platform, item_id),
-    UNIQUE(job_id, platform),
     FOREIGN KEY(job_id) REFERENCES jobs(job_id)
 );
 
@@ -697,6 +703,49 @@ def _add_cols_if_missing(db: sqlite3.Connection, table: str,
             db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
+def _migrate_publication_history(db: sqlite3.Connection) -> None:
+    """Rebuild the two legacy uniqueness constraints atomically, preserving IDs.
+
+    Raw legacy metric values/metadata are retained; measurement_version=0 makes
+    ambiguous zero counts unknown on public projection. No live job is used to
+    reconstruct historical creative or asset evidence.
+    """
+    if 'observation_key' in {r[1] for r in db.execute('PRAGMA table_info(performance_snapshots)')}:
+        return
+    db.commit()
+    db.execute('PRAGMA foreign_keys=OFF')
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        old_pub = [dict(r) for r in db.execute('SELECT * FROM platform_publications')]
+        old_perf = [dict(r) for r in db.execute('SELECT * FROM performance_snapshots')]
+        db.execute('DROP TABLE performance_snapshots')
+        db.execute('DROP TABLE platform_publications')
+        start = DDL.index('CREATE TABLE IF NOT EXISTS performance_snapshots (')
+        end = DDL.index('CREATE TABLE IF NOT EXISTS platform_submissions (', start)
+        # execute individually: executescript would commit the migration early.
+        for statement in DDL[start:end].split(';'):
+            if statement.strip():
+                db.execute(statement)
+        for row in old_pub:
+            cols = list(row)
+            db.execute(f"INSERT INTO platform_publications({','.join(cols)}) VALUES({','.join('?' for _ in cols)})", tuple(row.values()))
+        by_context = {(r['job_id'],r['platform']): r['publication_id'] for r in old_pub}
+        for row in old_perf:
+            pub = by_context.get((row['job_id'],row['platform']))
+            row.update(publication_id=pub, observation_key=pub or 'unbound',
+                       measurement_version=0, context_json='{}')
+            cols = list(row)
+            db.execute(f"INSERT INTO performance_snapshots({','.join(cols)}) VALUES({','.join('?' for _ in cols)})", tuple(row.values()))
+        if db.execute('PRAGMA foreign_key_check').fetchone():
+            raise ValueError('publication history migration found invalid foreign keys')
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.execute('PRAGMA foreign_keys=ON')
+
+
 def database_path() -> Path:
     """Resolve the database path, allowing isolated test/runtime instances."""
     override = os.environ.get("FACTORY_DB_PATH", "").strip()
@@ -780,6 +829,8 @@ def conn() -> sqlite3.Connection:
         ("published_at", "TEXT"),
         ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
     ])
+    _migrate_publication_history(db)
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_publication_current ON platform_publications(job_id,platform) WHERE is_current=1")
     _add_cols_if_missing(db, "creative_experiment_jobs", [
         ("assignment_method", "TEXT NOT NULL DEFAULT 'manual'"),
         ("allocation_token", "TEXT"),

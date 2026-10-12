@@ -2622,7 +2622,7 @@ class ManagementService:
                 video = dict(job) if job else None
                 publications = sorted(
                     item["platform"] for item in self.database.execute(
-                        "SELECT platform FROM platform_publications WHERE job_id=?", (job_id,),
+                        "SELECT platform FROM platform_publications WHERE job_id=? AND is_current=1", (job_id,),
                     ).fetchall()
                 )
             if not brief:
@@ -7247,7 +7247,7 @@ class ManagementService:
         ))
         publications = _rows(self.database.execute(
             "SELECT p.publication_id,p.job_id,p.platform,p.item_id,p.item_url,"
-            "p.title,p.published_at,p.metadata_json,j.title AS job_title "
+            "p.title,p.published_at,p.metadata_json,p.context_json,p.is_current,j.title AS job_title "
             "FROM platform_publications p JOIN jobs j ON j.job_id=p.job_id "
             "ORDER BY p.created_at DESC LIMIT 60"
         ))
@@ -7261,7 +7261,7 @@ class ManagementService:
         supported = {"douyin", "weixin_channels"}
         for item in ready:
             channel_rows = self.database.execute(
-                    "SELECT platform,metadata_json FROM platform_publications WHERE job_id=?",
+                    "SELECT platform,metadata_json FROM platform_publications WHERE job_id=? AND is_current=1",
                     (item["job_id"],),
                 ).fetchall()
             pending = {
@@ -7277,13 +7277,13 @@ class ManagementService:
             item["remaining_platforms"] = sorted(supported - published - pending)
         for publication in publications:
             snapshot = self.database.execute(
-                "SELECT snapshot_id,captured_at,views,completed_views,completion_rate,"
-                "average_watch_sec,likes,comments,shares,saves,follows,leads "
-                "FROM performance_snapshots WHERE job_id=? AND platform=? "
+                "SELECT * FROM performance_snapshots WHERE publication_id=? "
                 "ORDER BY captured_at DESC LIMIT 1",
-                (publication["job_id"], publication["platform"]),
+                (publication["publication_id"],),
             ).fetchone()
-            publication["latest_snapshot"] = dict(snapshot) if snapshot else None
+            publication["latest_snapshot"] = performance_feedback.project_snapshot(snapshot) if snapshot else None
+            publication["creative_context"] = content_review.object_json(publication.pop("context_json",None))
+            publication["binding_status"] = publication["creative_context"].get("binding_status", "legacy_unverified")
             metadata = _publication_metadata(publication.pop("metadata_json", None))
             publication["metadata"] = metadata
             publication["verification_status"] = (
@@ -8902,25 +8902,19 @@ class ManagementService:
         platform = str(payload["platform"]).strip()
         if platform not in {"douyin", "weixin_channels"}:
             raise ValueError("发布渠道仅支持抖音或微信视频号")
-        publication_id = f"PUB-{payload['platform']}-{payload['item_id']}"
-        metadata = payload.get("metadata") or {}
-        if not isinstance(metadata, dict):
-            raise ValueError("发布元数据格式错误")
-        self.database.execute(
-            "INSERT INTO platform_publications(publication_id,job_id,platform,"
-            "item_id,item_url,title,published_at,metadata_json) VALUES(?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(job_id,platform) DO UPDATE SET item_id=excluded.item_id,"
-            "item_url=excluded.item_url,title=excluded.title,"
-            "published_at=excluded.published_at,metadata_json=excluded.metadata_json,"
-            "updated_at=CURRENT_TIMESTAMP",
-            (
-                publication_id, job_id, platform,
-                str(payload["item_id"]).strip(), str(payload.get("item_url") or "").strip(),
-                str(payload.get("title") or "").strip(),
-                str(payload.get("published_at") or "").strip() or None,
-                json.dumps(metadata, ensure_ascii=False),
-            ),
-        )
+        context = performance_feedback.capture_context(self.database,job_id,assets_dir=self.data_dir / 'assets')
+        if platform == 'douyin':
+            submission = self.database.execute("SELECT * FROM platform_submissions WHERE job_id=? AND platform='douyin'",(job_id,)).fetchone()
+            if submission and submission['item_id'] == str(payload['item_id']).strip() and context.get('final_sha256'):
+                binding = content_review.object_json(submission['metadata_json']).get('upload_binding')
+                identity = self._douyin_publish_identity(job_id)
+                if self._matching_douyin_upload_binding(submission,identity):
+                    context['binding_status'] = 'server_verified_douyin_upload'
+                    context['upload_binding'] = binding
+        metadata = performance_feedback._metadata(payload.get('metadata'))
+        publication_id = performance_feedback.persist_publication(self.database,job_id,
+            platform=platform,item_id=payload['item_id'],item_url=payload.get('item_url'),
+            title=payload.get('title'),published_at=payload.get('published_at'),metadata=metadata,context=context)
         if platform == "douyin":
             submission_state = (
                 "pending_review"
@@ -9168,7 +9162,7 @@ class ManagementService:
         for channel in normalized:
             saved.append(self._register_publication_in_transaction({**channel, "job_id": job_id}))
         publication_rows = self.database.execute(
-            "SELECT platform,metadata_json FROM platform_publications WHERE job_id=?",
+            "SELECT platform,metadata_json FROM platform_publications WHERE job_id=? AND is_current=1",
             (job_id,),
         ).fetchall()
         published = {
@@ -9200,7 +9194,7 @@ class ManagementService:
         fields = (
             "captured_at", "views", "completed_views", "completion_rate",
             "average_watch_sec", "likes", "comments", "shares", "saves",
-            "follows", "leads",
+            "follows", "leads", "metadata",
         )
         values = {
             key: payload[key] for key in fields
@@ -9208,11 +9202,9 @@ class ManagementService:
         }
         snapshot_id = performance_feedback.record_snapshot(
             self.database, publication["job_id"],
-            platform=publication["platform"], **values,
+            platform=publication["platform"], publication_id=publication_id, **values,
         )
         snapshot = self.database.execute(
-            "SELECT snapshot_id,captured_at,views,completed_views,completion_rate,"
-            "average_watch_sec,likes,comments,shares,saves,follows,leads "
-            "FROM performance_snapshots WHERE snapshot_id=?", (snapshot_id,)
+            "SELECT * FROM performance_snapshots WHERE snapshot_id=?", (snapshot_id,)
         ).fetchone()
-        return {"snapshot_id": snapshot_id, "latest_snapshot": dict(snapshot)}
+        return {"snapshot_id": snapshot_id, "latest_snapshot": performance_feedback.project_snapshot(snapshot)}

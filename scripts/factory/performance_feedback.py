@@ -7,6 +7,9 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import math
+from decimal import Decimal, InvalidOperation
+from . import content_review
 
 
 COUNT_FIELDS = (
@@ -76,22 +79,139 @@ PLATFORM_EXPORT_FIELDS = {
 PERFORMANCE_WINDOWS_HOURS = (24, 72, 168)
 
 
-def _nonnegative(name: str, value: int | float | None) -> int | None:
-    if value is None:
+def _nonnegative(name: str, value) -> int | None:
+    if value is None or value == '':
         return None
-    number = int(value)
-    if number < 0:
-        raise ValueError(f"{name} must be >= 0")
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{name} must be a finite nonnegative integer")
+    try:
+        number = Decimal(str(value))
+        if not number.is_finite() or number < 0 or number != number.to_integral_value() or number > 9223372036854775807:
+            raise ValueError(f"{name} must be a finite nonnegative integer")
+        return int(number)
+    except InvalidOperation as exc:
+        raise ValueError(f"{name} must be a finite nonnegative integer") from exc
+
+
+def _number(name: str, value, *, upper=None):
+    if value is None or value == '':
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be finite and >= 0") from exc
+    if isinstance(value, bool) or not math.isfinite(number) or number < 0 or (upper is not None and number > upper):
+        raise ValueError(f"{name} must be finite and between 0 and {upper}" if upper is not None else f"{name} must be finite and >= 0")
     return number
 
 
-def _rate(name: str, value: float | None) -> float | None:
-    if value is None:
-        return None
-    number = float(value)
-    if not 0 <= number <= 1:
-        raise ValueError(f"{name} must be between 0 and 1")
-    return number
+def _rate(name, value):
+    return _number(name, value, upper=1)
+
+
+RESERVED_METADATA = {'provided_fields', 'provenance', 'creative_context', 'creative_version',
+    'source_proof', 'final_sha256', 'upload_binding', 'verified_revision', 'publication_context'}
+
+
+def _metadata(value):
+    if value is not None and not isinstance(value, dict):
+        raise ValueError('metadata must be an object')
+    return {k:v for k,v in (value or {}).items() if k not in RESERVED_METADATA}
+
+
+def project_snapshot(row) -> dict:
+    """Public projection never treats ambiguous legacy zeros as measurements."""
+    result = dict(row)
+    if not result.get('measurement_version'):
+        for field in COUNT_FIELDS:
+            if result.get(field) == 0:
+                result[field] = None
+        result['provenance'] = 'legacy_nonzero_only; zero_presence_unknown'
+    else:
+        result['provenance'] = 'recorded_measurement'
+    result['provided_fields'] = [f for f in COUNT_FIELDS + ('completion_rate','average_watch_sec') if result.get(f) is not None]
+    result['creative_context'] = content_review.object_json(result.get('context_json'))
+    return result
+
+
+def capture_context(db, job_id, *, assets_dir=None) -> dict:
+    """Capture what is actually authorized now, never reconstruct old history."""
+    from . import db as database
+    from .review_candidates import controlled_job_asset_path
+    job = db.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+    assets = Path(assets_dir) if assets_dir is not None else database.database_path().parent / 'assets'
+    report = content_review.require_final(db, assets, job_id)
+    final = controlled_job_asset_path(assets, job_id, job['final_path'], require_file=True)
+    sha = None
+    if final:
+        with final.open('rb') as handle:
+            sha = hashlib.file_digest(handle, 'sha256').hexdigest()
+    sb = content_review.object_json(job['storyboard'])
+    spec = content_review.object_json(job['production_spec_json']) if 'production_spec_json' in job.keys() else {}
+    frozen = spec.get('runtime_storyboard') if isinstance(spec.get('runtime_storyboard'),dict) else {}
+    frozen_meta = frozen.get('script_metadata') or {}
+    context = {'version': 1, 'authority': 'local_publication_context_v1',
+        'binding_status': 'local_asset_captured' if sha else 'legacy_unverified',
+        'final_sha256': sha, 'content_contract_hash': content_review.contract_hash(sb) if content_review.enabled(sb) else None,
+        'edit_plan_fingerprint': content_review.edit_plan_fingerprint(sb) if sb else None,
+        'review_proof': report, 'publication_revision': content_review.publication_revision(db, job_id, report) if report else None,
+        'creative_ir': content_review.object_json(job['creative_ir_json']) if 'creative_ir_json' in job.keys() else {},
+        'creative_ir_version': job['creative_ir_version'] if 'creative_ir_version' in job.keys() else None,
+        'intent': None, 'topic_id': job['topic_id'],
+        'creative_provenance': 'unverified_current_association', 'tags_provenance': 'unverified_current_association'}
+    brief = db.execute("SELECT * FROM topic_briefs WHERE approved_job_id=? AND status='approved' ORDER BY created_at DESC LIMIT 1", (job_id,)).fetchone()
+    if brief:
+        data = content_review.object_json(brief['brief_json'])
+        index = brief['approved_angle_index'] if brief['approved_angle_index'] is not None else int(data.get('recommended_index') or 0)
+        angles = data.get('angles') or []
+        context.update(brief_id=brief['brief_id'], selected_angle_index=index,
+            selected_title=(angles[index].get('title') if index in range(len(angles)) else job['title']),
+            source_score=(data.get('source_score') or {}).get('overall'))
+        tag = db.execute('SELECT hook_type,narrative_pattern,proof_type,cta_type FROM creative_angle_tags WHERE brief_id=? AND angle_index=?', (brief['brief_id'],index)).fetchone()
+        context['tags'] = dict(tag) if tag else {}
+        context['sources'] = [dict(r) for r in db.execute('SELECT s.source_id,s.title FROM topic_brief_sources l JOIN script_sources s ON s.source_id=l.source_id WHERE l.brief_id=? ORDER BY s.source_id',(brief['brief_id'],))]
+    if frozen or sha:
+        # An asset exists: do not pass current drafts/tags off as its creative.
+        from . import creative_ir
+        context['declared_association'] = {key:context.pop(key,None) for key in
+            ('brief_id','selected_angle_index','selected_title','source_score','tags','sources')}
+        context.update(creative_ir=creative_ir.from_storyboard(frozen).as_dict() if frozen else {},
+            creative_ir_version=1 if frozen else None,
+            creative_provenance='frozen_production_input' if frozen else 'unknown',
+            production_spec_hash=job['production_spec_hash'] if 'production_spec_hash' in job.keys() else None,
+            frozen_creative_ir_hash=spec.get('creative_ir_hash'),
+            selected_title=frozen_meta.get('title') or frozen.get('title'),
+            tags=frozen_meta.get('creative_tags') or frozen.get('creative_tags') or {},
+            tags_provenance='frozen_production_input' if (frozen_meta.get('creative_tags') or frozen.get('creative_tags')) else 'unknown',
+            intent=frozen_meta.get('creative_thesis') or frozen.get('intent') or frozen.get('creative_intent'),
+            sources=[{'source_id':source_id,'title':None} for source_id in frozen_meta.get('source_ids') or []])
+    return context
+
+
+def persist_publication(db, job_id, *, platform, item_id, item_url=None, title=None,
+                        published_at=None, metadata=None, context=None) -> str:
+    """Caller holds transaction and publication authorization; contexts never update."""
+    platform = _platform(platform)
+    item_id = str(item_id or '').strip()
+    if not item_id:
+        raise ValueError('item_id is required')
+    published_at = (_utc_time(published_at, field='published_at')
+                    if published_at is not None and published_at != "" else None)
+    metadata = _metadata(metadata)
+    existing = db.execute('SELECT * FROM platform_publications WHERE platform=? AND item_id=?', (platform,item_id)).fetchone()
+    if existing:
+        if existing['job_id'] != job_id:
+            raise ValueError(f'{platform} item {item_id} is already mapped to {existing["job_id"]}')
+        db.execute('UPDATE platform_publications SET item_url=COALESCE(?,item_url),title=COALESCE(?,title),published_at=COALESCE(published_at,?),metadata_json=?,updated_at=CURRENT_TIMESTAMP WHERE publication_id=?',
+            (item_url,title,published_at,json.dumps(metadata,ensure_ascii=False),existing['publication_id']))
+        return existing['publication_id']
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_publication_current ON platform_publications(job_id,platform) WHERE is_current=1')
+    identity = f'{job_id}\0{platform}\0{item_id}'
+    pub_id = 'PUB-' + hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
+    db.execute('UPDATE platform_publications SET is_current=0 WHERE job_id=? AND platform=?',(job_id,platform))
+    db.execute('INSERT INTO platform_publications(publication_id,job_id,platform,item_id,item_url,title,published_at,metadata_json,context_json) VALUES(?,?,?,?,?,?,?,?,?)',
+        (pub_id,job_id,platform,item_id,item_url,title,published_at,json.dumps(metadata,ensure_ascii=False),json.dumps(context or {},ensure_ascii=False,allow_nan=False)))
+    return pub_id
 
 
 def _platform(value: str) -> str:
@@ -105,6 +225,8 @@ def _platform(value: str) -> str:
 
 
 def _utc_time(value: str, *, field: str) -> str:
+    if not isinstance(value,str):
+        raise ValueError(f"{field} must be ISO-8601 with timezone")
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError as exc:
@@ -161,8 +283,8 @@ def performance_due_tasks(
             datetime.fromisoformat(str(row[0]).replace("Z", "+00:00")).astimezone(timezone.utc)
             for row in db.execute(
                 "SELECT captured_at FROM performance_snapshots "
-                "WHERE job_id=? AND platform=? ORDER BY captured_at",
-                (publication["job_id"], publication["platform"]),
+                "WHERE publication_id=? ORDER BY captured_at",
+                (publication["publication_id"],),
             ).fetchall()
         ]
         for index, window_hours in enumerate(PERFORMANCE_WINDOWS_HOURS):
@@ -192,75 +314,26 @@ def performance_due_tasks(
     return sorted(tasks, key=lambda item: (item["due_at"], item["publication_id"]))
 
 
-def register_publication(
-    db: sqlite3.Connection,
-    job_id: str,
-    *,
-    platform: str,
-    item_id: str,
-    item_url: str | None = None,
-    title: str | None = None,
-    published_at: str | None = None,
-    metadata: dict | None = None,
-) -> str:
-    """Map one canonical platform item to one published factory job."""
+def register_publication(db, job_id, *, platform, item_id, item_url=None, title=None,
+                         published_at=None, metadata=None) -> str:
+    """Register a manual association; this is not verification of remote bytes."""
+    from .node_state_machine import atomic
     job_id = str(job_id).strip()
     platform = _platform(platform)
-    item_id = str(item_id).strip()
-    if not item_id:
-        raise ValueError("item_id is required")
-    published_at = (
-        _utc_time(published_at, field="published_at")
-        if published_at else None
-    )
-    job = db.execute(
-        "SELECT state, publish_url FROM jobs WHERE job_id=?", (job_id,)
-    ).fetchone()
-    if not job:
-        raise ValueError(f"job {job_id} not found")
-    if job["state"] != "PUBLISHED" and not job["publish_url"]:
-        raise ValueError(f"job {job_id} is not published")
-    item_owner = db.execute(
-        "SELECT job_id, publication_id FROM platform_publications "
-        "WHERE platform=? AND item_id=?", (platform, item_id),
-    ).fetchone()
-    if item_owner and item_owner["job_id"] != job_id:
-        raise ValueError(
-            f"{platform} item {item_id} is already mapped to "
-            f"{item_owner['job_id']}"
-        )
-    job_item = db.execute(
-        "SELECT item_id, publication_id FROM platform_publications "
-        "WHERE job_id=? AND platform=?", (job_id, platform),
-    ).fetchone()
-    if job_item and job_item["item_id"] != item_id:
-        raise ValueError(
-            f"job {job_id} already has canonical publication "
-            f"{job_item['item_id']} on {platform}"
-        )
-    identity = f"{job_id}\0{platform}\0{item_id}"
-    publication_id = "PUB-" + hashlib.sha256(
-        identity.encode("utf-8")
-    ).hexdigest()[:16]
-    db.execute(
-        "INSERT INTO platform_publications(publication_id, job_id, platform, "
-        "item_id, item_url, title, published_at, metadata_json) "
-        "VALUES(?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(platform, item_id) DO UPDATE SET "
-        "item_url=excluded.item_url, title=excluded.title, "
-        "published_at=COALESCE(excluded.published_at, "
-        "platform_publications.published_at), "
-        "metadata_json=excluded.metadata_json, updated_at=CURRENT_TIMESTAMP",
-        (
-            publication_id, job_id, platform, item_id,
-            str(item_url).strip() if item_url else None,
-            str(title).strip() if title else None,
-            published_at,
-            json.dumps(metadata or {}, ensure_ascii=False),
-        ),
-    )
-    db.commit()
-    return publication_id
+    with atomic(db):
+        existing = db.execute('SELECT * FROM platform_publications WHERE platform=? AND item_id=?',(platform,str(item_id).strip())).fetchone()
+        if existing:
+            if existing['job_id'] != job_id:
+                raise ValueError(f'{platform} item {item_id} is already mapped to {existing["job_id"]}')
+            return persist_publication(db,job_id,platform=platform,item_id=item_id,item_url=item_url,title=title,published_at=published_at,metadata=metadata)
+        job = db.execute('SELECT state,publish_url FROM jobs WHERE job_id=?',(job_id,)).fetchone()
+        if not job:
+            raise ValueError(f'job {job_id} not found')
+        if job['state'] != 'PUBLISHED' and not job['publish_url']:
+            raise ValueError(f'job {job_id} is not published')
+        context = capture_context(db, job_id)
+        return persist_publication(db,job_id,platform=platform,item_id=item_id,
+            item_url=item_url,title=title,published_at=published_at,metadata=metadata,context=context)
 
 
 def _normalize_snapshot(
@@ -268,33 +341,47 @@ def _normalize_snapshot(
     job_id: str,
     *,
     platform: str,
+    publication_id: str | None = None,
     captured_at: str | None = None,
-    views: int = 0,
+    views: int | None = None,
     completed_views: int | None = None,
     completion_rate: float | None = None,
     average_watch_sec: float | None = None,
-    likes: int = 0,
-    comments: int = 0,
-    shares: int = 0,
-    saves: int = 0,
-    follows: int = 0,
-    leads: int = 0,
+    likes: int | None = None,
+    comments: int | None = None,
+    shares: int | None = None,
+    saves: int | None = None,
+    follows: int | None = None,
+    leads: int | None = None,
     metadata: dict | None = None,
 ) -> dict:
     """Validate and normalize one snapshot without mutating the database."""
     job_id = str(job_id).strip()
-    platform = str(platform).strip().lower()
-    platform = PLATFORM_ALIASES.get(platform, platform)
-    job = db.execute(
-        "SELECT state, publish_url FROM jobs WHERE job_id=?", (job_id,)
-    ).fetchone()
+    platform = _platform(platform)
+    publication = db.execute('SELECT * FROM platform_publications WHERE publication_id=?', (publication_id,)).fetchone() if publication_id else db.execute('SELECT * FROM platform_publications WHERE job_id=? AND platform=? AND is_current=1',(job_id,platform)).fetchone()
+    if publication_id and not publication:
+        raise ValueError('publication not found')
+    if publication and (publication['job_id'] != job_id or publication['platform'] != platform):
+        raise ValueError('publication does not match job/platform')
+    if publication and str(content_review.object_json(publication['metadata_json']).get('review_status') or '').lower() in {'pending','pending_review','submitted'}:
+        raise ValueError('publication is pending platform review')
+    job = db.execute('SELECT state,publish_url FROM jobs WHERE job_id=?',(job_id,)).fetchone()
     if not job:
-        raise ValueError(f"job {job_id} not found")
-    if job["state"] != "PUBLISHED" and not job["publish_url"]:
-        raise ValueError(f"job {job_id} is not published")
-    if not platform:
-        raise ValueError("platform is required")
-    captured_at = captured_at or datetime.now(timezone.utc).isoformat()
+        raise ValueError(f'job {job_id} not found')
+    if not publication and job['state'] != 'PUBLISHED' and not job['publish_url']:
+        raise ValueError(f'job {job_id} is not published')
+    metadata = _metadata(metadata)
+    if 'observation_window_hours' in metadata:
+        metadata['observation_window_hours'] = _number('observation_window_hours',metadata['observation_window_hours'])
+        if not metadata['observation_window_hours']:
+            raise ValueError('observation_window_hours must be > 0')
+    for field in ('observation_start_at','observation_end_at'):
+        if metadata.get(field) is not None:
+            metadata[field] = _utc_time(metadata[field],field=field)
+    if metadata.get('observation_start_at') and metadata.get('observation_end_at') and metadata['observation_start_at'] >= metadata['observation_end_at']:
+        raise ValueError('observation window start must precede end')
+    if captured_at is None or captured_at == "":
+        captured_at = datetime.now(timezone.utc).isoformat()
     captured_at = _utc_time(captured_at, field="captured_at")
 
     values = {
@@ -303,27 +390,38 @@ def _normalize_snapshot(
         "follows": follows, "leads": leads,
     }
     counts = {name: _nonnegative(name, value) for name, value in values.items()}
-    views = counts["views"] or 0
+    views = counts["views"]
     completed_views = counts["completed_views"]
     supplied_rate = _rate("completion_rate", completion_rate)
     derived_rate = (
         completed_views / views if completed_views is not None and views else None
     )
-    if completed_views is not None and completed_views > views:
+    if completed_views is not None and views is not None and completed_views > views:
         raise ValueError("completed_views must not exceed views")
     if (supplied_rate is not None and derived_rate is not None
-            and abs(supplied_rate - derived_rate) > 0.001):
+            and abs(supplied_rate - derived_rate) > 0.0051):
         raise ValueError("completion_rate does not match completed_views/views")
     completion_rate = derived_rate if derived_rate is not None else supplied_rate
-    if average_watch_sec is not None and float(average_watch_sec) < 0:
-        raise ValueError("average_watch_sec must be >= 0")
-
-    identity = f"{job_id}\0{platform}\0{captured_at}"
+    average_watch_sec = _number('average_watch_sec',average_watch_sec)
+    if metadata.get('observation_end_at') and metadata['observation_end_at'] > captured_at:
+        raise ValueError('observation window ends after capture')
+    if all(metadata.get(field) for field in ('observation_start_at','observation_end_at','observation_window_hours')):
+        hours = (datetime.fromisoformat(metadata['observation_end_at']) -
+                 datetime.fromisoformat(metadata['observation_start_at'])).total_seconds() / 3600
+        if abs(hours - metadata['observation_window_hours']) > 1 / 3600:
+            raise ValueError('observation_window_hours does not match start/end')
+    publication_id = publication['publication_id'] if publication else None
+    observation_key = publication_id or 'unbound'
+    context = content_review.object_json(publication['context_json']) if publication else capture_context(db,job_id)
+    metadata.update(provided_fields=[f for f,v in {**counts,'completion_rate':supplied_rate,'average_watch_sec':average_watch_sec}.items() if v is not None],provenance='recorded_measurement')
+    identity = f"{job_id}\0{platform}\0{observation_key}\0{captured_at}"
     return {
         "snapshot_id": "PERF-" + hashlib.sha256(
             identity.encode("utf-8")
         ).hexdigest()[:16],
         "job_id": job_id, "platform": platform, "captured_at": captured_at,
+        "publication_id": publication_id, "observation_key": observation_key,
+        "measurement_version": 1, "context_json": json.dumps(context,ensure_ascii=False,allow_nan=False),
         "views": views, "completed_views": completed_views,
         "completion_rate": completion_rate,
         "average_watch_sec": (
@@ -336,25 +434,15 @@ def _normalize_snapshot(
     }
 
 
-def _write_snapshot(db: sqlite3.Connection, snapshot: dict) -> None:
-    db.execute(
-        "INSERT INTO performance_snapshots(snapshot_id, job_id, platform, "
-        "captured_at, views, completed_views, completion_rate, "
-        "average_watch_sec, likes, comments, shares, saves, follows, leads, "
-        "metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(job_id, platform, captured_at) DO UPDATE SET "
-        "views=excluded.views, completed_views=excluded.completed_views, "
-        "completion_rate=excluded.completion_rate, "
-        "average_watch_sec=excluded.average_watch_sec, likes=excluded.likes, "
-        "comments=excluded.comments, shares=excluded.shares, "
-        "saves=excluded.saves, follows=excluded.follows, leads=excluded.leads, "
-        "metadata_json=excluded.metadata_json, updated_at=CURRENT_TIMESTAMP",
-        tuple(snapshot[field] for field in (
-            "snapshot_id", "job_id", "platform", "captured_at", "views",
-            "completed_views", "completion_rate", "average_watch_sec", "likes",
-            "comments", "shares", "saves", "follows", "leads", "metadata_json",
-        )),
-    )
+def _write_snapshot(db: sqlite3.Connection, snapshot: dict) -> str:
+    # Replace measurements at one item/instant; preserve immutable captured context.
+    fields = list(snapshot)
+    updates = [f for f in fields if f not in {'snapshot_id','job_id','platform','captured_at','publication_id','observation_key','context_json'}]
+    db.execute(f"INSERT INTO performance_snapshots({','.join(fields)}) VALUES({','.join('?' for _ in fields)}) "
+        "ON CONFLICT(job_id,platform,observation_key,captured_at) DO UPDATE SET " +
+        ','.join(f'{f}=excluded.{f}' for f in updates) + ',updated_at=CURRENT_TIMESTAMP', tuple(snapshot.values()))
+    return db.execute('SELECT snapshot_id FROM performance_snapshots WHERE job_id=? AND platform=? AND observation_key=? AND captured_at=?',
+        (snapshot['job_id'],snapshot['platform'],snapshot['observation_key'],snapshot['captured_at'])).fetchone()[0]
 
 
 def record_snapshot(
@@ -362,30 +450,31 @@ def record_snapshot(
     job_id: str,
     *,
     platform: str,
+    publication_id: str | None = None,
     captured_at: str | None = None,
-    views: int = 0,
+    views: int | None = None,
     completed_views: int | None = None,
     completion_rate: float | None = None,
     average_watch_sec: float | None = None,
-    likes: int = 0,
-    comments: int = 0,
-    shares: int = 0,
-    saves: int = 0,
-    follows: int = 0,
-    leads: int = 0,
+    likes: int | None = None,
+    comments: int | None = None,
+    shares: int | None = None,
+    saves: int | None = None,
+    follows: int | None = None,
+    leads: int | None = None,
     metadata: dict | None = None,
 ) -> str:
     """Upsert one cumulative platform snapshot for a published job."""
     snapshot = _normalize_snapshot(
-        db, job_id, platform=platform, captured_at=captured_at, views=views,
+        db, job_id, platform=platform, publication_id=publication_id, captured_at=captured_at, views=views,
         completed_views=completed_views, completion_rate=completion_rate,
         average_watch_sec=average_watch_sec, likes=likes, comments=comments,
         shares=shares, saves=saves, follows=follows, leads=leads,
         metadata=metadata,
     )
-    _write_snapshot(db, snapshot)
+    persisted_id = _write_snapshot(db, snapshot)
     db.commit()
-    return snapshot["snapshot_id"]
+    return persisted_id
 
 
 def _field(row: dict[str, str], name: str) -> str:
@@ -406,7 +495,7 @@ def _csv_int(value: str, *, default: int | None = None) -> int | None:
     value = value.strip().replace(",", "")
     if not value:
         return default
-    return int(float(value))
+    return _nonnegative("CSV count", value)
 
 
 def _csv_float(value: str) -> float | None:
@@ -451,9 +540,9 @@ def import_csv(
                         "captured_at is required in CSV or as a default"
                     )
                 snapshot = _normalize_snapshot(
-                    db, job_id, platform=platform,
+                    db, job_id, platform=platform, publication_id=row.get("publication_id") or None,
                     captured_at=captured_at,
-                    views=_csv_int(_field(row, "views"), default=0) or 0,
+                    views=_csv_int(_field(row, "views"), default=None),
                     completed_views=_csv_int(
                         _field(row, "completed_views"), default=None
                     ),
@@ -461,12 +550,12 @@ def import_csv(
                     average_watch_sec=_csv_float(
                         _field(row, "average_watch_sec")
                     ),
-                    likes=_csv_int(_field(row, "likes"), default=0) or 0,
-                    comments=_csv_int(_field(row, "comments"), default=0) or 0,
-                    shares=_csv_int(_field(row, "shares"), default=0) or 0,
-                    saves=_csv_int(_field(row, "saves"), default=0) or 0,
-                    follows=_csv_int(_field(row, "follows"), default=0) or 0,
-                    leads=_csv_int(_field(row, "leads"), default=0) or 0,
+                    likes=_csv_int(_field(row, "likes"), default=None),
+                    comments=_csv_int(_field(row, "comments"), default=None),
+                    shares=_csv_int(_field(row, "shares"), default=None),
+                    saves=_csv_int(_field(row, "saves"), default=None),
+                    follows=_csv_int(_field(row, "follows"), default=None),
+                    leads=_csv_int(_field(row, "leads"), default=None),
                     metadata={"import_file": path.name, "import_row": line_number},
                 )
             except (TypeError, ValueError) as exc:
@@ -483,8 +572,8 @@ def import_csv(
         snapshot["snapshot_id"]
         for snapshot in snapshots
         if db.execute(
-            "SELECT 1 FROM performance_snapshots WHERE snapshot_id=?",
-            (snapshot["snapshot_id"],),
+            "SELECT 1 FROM performance_snapshots WHERE job_id=? AND platform=? AND observation_key=? AND captured_at=?",
+            (snapshot["job_id"],snapshot["platform"],snapshot["observation_key"],snapshot["captured_at"]),
         ).fetchone()
     }
     result = {
@@ -529,7 +618,7 @@ def import_platform_csv(
                 if not item_id:
                     raise ValueError("platform item_id is required")
                 publication = db.execute(
-                    "SELECT job_id FROM platform_publications "
+                    "SELECT job_id,publication_id FROM platform_publications "
                     "WHERE platform=? AND item_id=?", (platform, item_id),
                 ).fetchone()
                 if not publication:
@@ -537,11 +626,11 @@ def import_platform_csv(
                         f"platform item {item_id} is not mapped to a job"
                     )
                 snapshot = _normalize_snapshot(
-                    db, publication["job_id"], platform=platform,
+                    db, publication["job_id"], platform=platform, publication_id=publication["publication_id"],
                     captured_at=captured_at,
                     views=_csv_int(
-                        _aliased_field(row, aliases["views"]), default=0
-                    ) or 0,
+                        _aliased_field(row, aliases["views"]), default=None
+                    ),
                     completed_views=_csv_int(
                         _aliased_field(row, aliases["completed_views"]),
                         default=None,
@@ -553,23 +642,23 @@ def import_platform_csv(
                         _aliased_field(row, aliases["average_watch_sec"])
                     ),
                     likes=_csv_int(
-                        _aliased_field(row, aliases["likes"]), default=0
-                    ) or 0,
+                        _aliased_field(row, aliases["likes"]), default=None
+                    ),
                     comments=_csv_int(
-                        _aliased_field(row, aliases["comments"]), default=0
-                    ) or 0,
+                        _aliased_field(row, aliases["comments"]), default=None
+                    ),
                     shares=_csv_int(
-                        _aliased_field(row, aliases["shares"]), default=0
-                    ) or 0,
+                        _aliased_field(row, aliases["shares"]), default=None
+                    ),
                     saves=_csv_int(
-                        _aliased_field(row, aliases["saves"]), default=0
-                    ) or 0,
+                        _aliased_field(row, aliases["saves"]), default=None
+                    ),
                     follows=_csv_int(
-                        _aliased_field(row, aliases["follows"]), default=0
-                    ) or 0,
+                        _aliased_field(row, aliases["follows"]), default=None
+                    ),
                     leads=_csv_int(
-                        _aliased_field(row, aliases["leads"]), default=0
-                    ) or 0,
+                        _aliased_field(row, aliases["leads"]), default=None
+                    ),
                     metadata={
                         "adapter": platform, "platform_item_id": item_id,
                         "platform_title": _aliased_field(row, aliases["title"]),
@@ -588,8 +677,8 @@ def import_platform_csv(
     existing = {
         snapshot["snapshot_id"] for snapshot in snapshots
         if db.execute(
-            "SELECT 1 FROM performance_snapshots WHERE snapshot_id=?",
-            (snapshot["snapshot_id"],),
+            "SELECT 1 FROM performance_snapshots WHERE job_id=? AND platform=? AND observation_key=? AND captured_at=?",
+            (snapshot["job_id"],snapshot["platform"],snapshot["observation_key"],snapshot["captured_at"]),
         ).fetchone()
     }
     result = {
@@ -616,14 +705,14 @@ def _latest_snapshots(
 ) -> list[sqlite3.Row]:
     platform_clause = "p.platform=? AND " if platform else ""
     params = (platform,) if platform else ()
-    return db.execute(
+    return [project_snapshot(row) for row in db.execute(
         "SELECT p.* FROM performance_snapshots p WHERE " + platform_clause +
         "NOT EXISTS (SELECT 1 FROM performance_snapshots newer "
-        "WHERE newer.job_id=p.job_id AND newer.platform=p.platform "
+        "WHERE newer.job_id=p.job_id AND newer.platform=p.platform AND newer.observation_key=p.observation_key "
         "AND (newer.captured_at>p.captured_at OR "
         "(newer.captured_at=p.captured_at AND newer.updated_at>p.updated_at)))",
         params,
-    ).fetchall()
+    ).fetchall()]
 
 
 def _window_snapshots(
@@ -634,21 +723,21 @@ def _window_snapshots(
     params: list = [platform] if platform else []
     rows = db.execute(
         "SELECT p.*, pub.published_at FROM performance_snapshots p "
-        "LEFT JOIN platform_publications pub ON pub.job_id=p.job_id "
-        "AND pub.platform=p.platform WHERE 1=1 " + platform_sql +
+        "LEFT JOIN platform_publications pub ON pub.publication_id=p.publication_id "
+        "WHERE 1=1 " + platform_sql +
         "ORDER BY p.job_id, p.platform, p.captured_at",
         params,
     ).fetchall()
     groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
     for row in rows:
-        groups.setdefault((row["job_id"], row["platform"]), []).append(row)
+        groups.setdefault((row["job_id"], row["platform"], row["observation_key"]), []).append(project_snapshot(row))
     selected: list[sqlite3.Row] = []
     excluded: list[dict] = []
-    for (job_id, row_platform), snapshots in groups.items():
+    for (job_id, row_platform, observation_key), snapshots in groups.items():
         published_at = snapshots[0]["published_at"]
         if not published_at:
             excluded.append({
-                "job_id": job_id, "platform": row_platform,
+                "job_id": job_id, "platform": row_platform, "publication_id": snapshots[0]["publication_id"],
                 "reason": "published_at_missing",
             })
             continue
@@ -662,14 +751,14 @@ def _window_snapshots(
                 eligible.append((age_hours, snapshot))
         if not eligible:
             excluded.append({
-                "job_id": job_id, "platform": row_platform,
+                "job_id": job_id, "platform": row_platform, "publication_id": snapshots[0]["publication_id"],
                 "reason": "snapshot_before_publish_or_after_window",
             })
             continue
         coverage, snapshot = max(eligible, key=lambda item: item[0])
         if coverage < window_hours * min_window_coverage:
             excluded.append({
-                "job_id": job_id, "platform": row_platform,
+                "job_id": job_id, "platform": row_platform, "publication_id": snapshots[0]["publication_id"],
                 "reason": "window_not_mature",
                 "coverage_hours": round(coverage, 3),
             })
@@ -683,47 +772,30 @@ def _band(score: float) -> str:
     return "90-100" if lower == 90 else f"{lower}-{lower + 9}"
 
 
-def _aggregate(rows: list[sqlite3.Row]) -> dict:
-    views = sum(int(row["views"] or 0) for row in rows)
-    rate_views = sum(
-        int(row["views"] or 0) for row in rows
-        if row["completion_rate"] is not None
-    )
-    completion = sum(
-        float(row["completion_rate"] or 0) * int(row["views"] or 0)
-        for row in rows if row["completion_rate"] is not None
-    )
-    watch_views = sum(
-        int(row["views"] or 0) for row in rows
-        if row["average_watch_sec"] is not None
-    )
-    watch_seconds = sum(
-        float(row["average_watch_sec"] or 0) * int(row["views"] or 0)
-        for row in rows if row["average_watch_sec"] is not None
-    )
-    engagement = sum(
-        int(row[field] or 0) for row in rows
-        for field in ("likes", "comments", "shares", "saves")
-    )
-    follows = sum(int(row["follows"] or 0) for row in rows)
-    leads = sum(int(row["leads"] or 0) for row in rows)
-    completion_rate = completion / rate_views if rate_views else 0.0
-    engagement_rate = engagement / views if views else 0.0
-    follow_rate = follows / views if views else 0.0
-    lead_rate = leads / views if views else 0.0
-    return {
-        "views": views,
-        "completion_rate": completion_rate,
-        "completion_rate_bps": round(completion_rate * 10000),
-        "average_watch_sec": watch_seconds / watch_views if watch_views else 0.0,
-        "engagement_rate": engagement_rate,
-        "engagement_rate_bps": round(engagement_rate * 10000),
-        "follow_rate": follow_rate,
-        "follow_rate_bps": round(follow_rate * 10000),
-        "lead_rate": lead_rate,
-        "lead_rate_bps": round(lead_rate * 10000),
-        "snapshot_count": len(rows),
-    }
+def _aggregate(rows) -> dict:
+    rows = [project_snapshot(row) if 'measurement_version' in row.keys() and 'provided_fields' not in row.keys() else dict(row) for row in rows]
+    coverage = {}
+    view_rows = [r for r in rows if r.get('views') is not None]
+    views = sum(r['views'] for r in view_rows) if view_rows else None
+    coverage['views'] = {'snapshots': len(view_rows), 'views': views}
+    result = {'views': views, 'snapshot_count': len(rows)}
+    metrics = {'completion_rate': ('completion_rate',), 'average_watch_sec': ('average_watch_sec',),
+        'engagement_rate': ('likes','comments','shares','saves'), 'follow_rate': ('follows',), 'lead_rate': ('leads',)}
+    for metric, fields in metrics.items():
+        eligible = [r for r in rows if r.get('views') is not None and all(r.get(f) is not None for f in fields)]
+        denominator = sum(r['views'] for r in eligible)
+        numerator = sum(r[fields[0]] * r['views'] if metric in {'completion_rate','average_watch_sec'} else sum(r[f] for f in fields) for r in eligible)
+        result[metric] = numerator / denominator if denominator else None
+        coverage[metric] = {'snapshots': len(eligible), 'views': denominator, 'total_snapshots': len(rows)}
+        if metric != 'average_watch_sec':
+            result[metric + '_bps'] = round(result[metric]*10000) if result[metric] is not None else None
+    # Counts have independent measured coverage too; partial engagement is never filled in.
+    for field in COUNT_FIELDS[1:]:
+        known = [r for r in rows if r.get(field) is not None]
+        result[field] = sum(r[field] for r in known) if known else None
+        coverage[field] = {'snapshots': len(known), 'total_snapshots': len(rows)}
+    result['coverage'] = coverage
+    return result
 
 
 def learning_report(
@@ -749,52 +821,36 @@ def learning_report(
             db, platform=platform, window_hours=float(window_hours),
             min_window_coverage=float(min_window_coverage),
         )
-    by_job: dict[str, list[sqlite3.Row]] = {}
+    by_context = {}
     for row in snapshot_rows:
-        by_job.setdefault(row["job_id"], []).append(row)
+        by_context.setdefault((row['job_id'],row['observation_key']), []).append(row)
 
-    creatives: list[dict] = []
-    source_groups: dict[str, dict] = {}
-    band_rows: dict[str, list[sqlite3.Row]] = {}
-    for job_id, snapshots in by_job.items():
+    creatives = []
+    source_groups = {}
+    band_rows = {}
+    for (job_id, observation_key), snapshots in by_context.items():
         metrics = _aggregate(snapshots)
-        if metrics["views"] < min_views:
+        if metrics['views'] is None or metrics['views'] < min_views:
             continue
-        row = db.execute(
-            "SELECT b.brief_id, b.brief_json, b.approved_angle_index, "
-            "j.topic_id FROM topic_briefs b JOIN jobs j "
-            "ON j.job_id=b.approved_job_id WHERE b.approved_job_id=? "
-            "AND b.status='approved'", (job_id,),
-        ).fetchone()
-        if not row:
+        context = content_review.object_json(snapshots[0].get('context_json'))
+        if not context.get('brief_id') and not context.get('creative_ir'):
+            excluded.append({'job_id': job_id,'platform': snapshots[0]['platform'],
+                'publication_id': snapshots[0]['publication_id'],'reason': 'historical_creative_context_unknown'})
             continue
-        brief = json.loads(row["brief_json"])
-        angle_index = (
-            row["approved_angle_index"]
-            if row["approved_angle_index"] is not None
-            else int(brief["recommended_index"])
-        )
-        score = float((brief.get("source_score") or {}).get("overall") or 0)
-        creative = {
-            "job_id": job_id, "topic_id": row["topic_id"],
-            "brief_id": row["brief_id"], "selected_angle_index": angle_index,
-            "selected_title": brief["angles"][angle_index]["title"],
-            "source_score": score, **metrics,
-        }
+        score = context.get('source_score')
+        creative = {'job_id':job_id,'publication_id':snapshots[0]['publication_id'],
+            'creative_version': observation_key, 'topic_id':context.get('topic_id'),
+            'brief_id':context.get('brief_id'),'selected_angle_index':context.get('selected_angle_index'),
+            'selected_title':context.get('selected_title'),'source_score':score,
+            'tags':context.get('tags') or {}, 'creative_context':context, **metrics}
         creatives.append(creative)
-        band_rows.setdefault(_band(score), []).extend(snapshots)
-        sources = db.execute(
-            "SELECT s.source_id, s.title FROM topic_brief_sources l "
-            "JOIN script_sources s ON s.source_id=l.source_id "
-            "WHERE l.brief_id=? ORDER BY s.source_id", (row["brief_id"],),
-        ).fetchall()
-        for source in sources:
-            group = source_groups.setdefault(source["source_id"], {
-                "source_id": source["source_id"], "title": source["title"],
-                "snapshots": [], "creative_ids": set(),
-            })
-            group["snapshots"].extend(snapshots)
-            group["creative_ids"].add(job_id)
+        if score is not None:
+            band_rows.setdefault(_band(float(score)), []).extend(snapshots)
+        for source in context.get('sources') or []:
+            group = source_groups.setdefault(source['source_id'], {'source_id':source['source_id'],
+                'title':source.get('title'),'snapshots':[],'creative_ids':set()})
+            group['snapshots'].extend(snapshots)
+            group['creative_ids'].add((job_id,observation_key))
 
     score_bands = [
         {"band": band, **_aggregate(rows)}
@@ -816,7 +872,7 @@ def learning_report(
         "window_hours": window_hours,
         "min_window_coverage": min_window_coverage,
         "attribution_note": (
-            "Source metrics are shared exposure, not causal contribution."
+            "Distribution observations are not visual quality or causal contribution. Source metrics are shared exposure."
         ),
         "creatives": creatives,
         "sources": source_rows,
