@@ -5427,6 +5427,18 @@ class ManagementService:
         ).fetchone()
         if not row:
             raise ValueError("视频任务不存在")
+        if row['state'] == 'READY_TO_PUBLISH' and decision == 'approved':
+            with self._final_review_lock, node_state_machine.atomic(self.database):
+                live = self.database.execute('SELECT state FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+                report = content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+                if live and live['state'] == 'READY_TO_PUBLISH' and report and all(bool((checks or {}).get(key)) for key in REVIEW_CHECKS):
+                    if row['execution_engine'] == 'graph_v2':
+                        event_id = f'{job_id}:final-review:approved:' + content_review.approval_revision(self.database, job_id, report)
+                        prior = self.database.execute('SELECT 1 FROM production_node_events WHERE job_id=? AND event_id=? AND event=\'approve\'', (job_id, event_id)).fetchone()
+                    else:
+                        prior = self.database.execute('SELECT 1 FROM review_events WHERE job_id=? AND decision=\'approved\' LIMIT 1', (job_id,)).fetchone()
+                    if prior:
+                        return {'job_id': job_id, 'decision': decision, 'publish_unlocked': True, 'already_reviewed': True}
         if row["state"] != "COMPOSED":
             raise ValueError("只有已完成的成片可以进行人工验收")
         if not row["final_path"] or not Path(row["final_path"]).is_file():
@@ -5516,7 +5528,7 @@ class ManagementService:
                         "approve" if decision == "approved" else "reject",
                         event_id=(
                             f"{job_id}:final-review:{str(decision).strip()}" +
-                            (':' + content_review.digest(binding) if decision == 'approved' and binding else '')
+                            (':' + content_review.approval_revision(self.database, job_id, binding) if decision == 'approved' and binding else '')
                         ),
                         payload={
                             "decision": str(decision),
@@ -5954,8 +5966,9 @@ class ManagementService:
         return self._resume_failed_video_impl(job_id)
 
     def content_review_detail(self, job_id: str, master_idx: int, source='candidate') -> dict:
-        _, _, _, master, qa, path = content_review.selected(
+        _, _, sb, master, qa, path = content_review.selected(
             self.database, self.data_dir / 'assets', job_id, master_idx, source)
+        content_review.validate_contract(sb)
         reqs = content_review.requirements(master)
         sha = content_review.visual_evidence.asset_fingerprint(path)
         try:
@@ -8696,7 +8709,36 @@ class ManagementService:
         self.database.commit()
         return {"publication_id": publication_id, "status": "saved"}
 
+    def _douyin_publish_identity(self, job_id: str) -> dict:
+        report = content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+        path = self.video_file(job_id)
+        sha = _file_sha256(path)
+        revision = (content_review.publication_revision(self.database, job_id, report)
+            if report else content_review.digest({'legacy_final_sha256': sha}))
+        return {'final_sha256': sha, 'verified_revision': revision}
+
+    def _require_douyin_publish_identity(self, job_id: str, expected: dict) -> None:
+        row = self.database.execute('SELECT state FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+        if row is None or row['state'] not in {'READY_TO_PUBLISH', 'PUBLISHED'}:
+            raise ValueError('content publication authorization changed; reconcile before retry')
+        if self._douyin_publish_identity(job_id) != expected:
+            raise ValueError('content final/review revision changed during publication; reconcile before retry')
+
+    @staticmethod
+    def _matching_douyin_upload_binding(submission, identity: dict) -> bool:
+        if not submission:
+            return False
+        binding = content_review.object_json(submission['metadata_json']).get('upload_binding')
+        return (isinstance(binding, dict) and binding.get('version') == 1
+            and binding.get('authority') == 'management_douyin_upload_v1'
+            and bool(submission['upload_id']) and binding.get('upload_id') == submission['upload_id']
+            and all(binding.get(key) == value for key, value in identity.items()))
+
     def publish_to_douyin(self, job_id: str, payload: dict) -> dict:
+        with self._final_review_lock:
+            return self._publish_to_douyin_impl(job_id, payload)
+
+    def _publish_to_douyin_impl(self, job_id: str, payload: dict) -> dict:
         content_review.require_final(self.database, self.data_dir / 'assets', job_id)
         if payload.get("confirmed") is not True:
             raise ValueError("请确认标题、封面和目标账号后再提交抖音发布")
@@ -8714,12 +8756,17 @@ class ManagementService:
         if job["state"] not in {"READY_TO_PUBLISH", "PUBLISHED"}:
             raise ValueError("只有已验收并提交发布的成片才能推送到抖音")
         final_path = self.video_file(job_id)
+        identity = self._douyin_publish_identity(job_id)
         cover_tsp = payload.get("cover_tsp")
         submission = self.database.execute(
             "SELECT * FROM platform_submissions WHERE job_id=? AND platform='douyin'",
             (job_id,),
         ).fetchone()
-        if submission and submission["state"] in {"pending_review", "published"}:
+        upload_matches = self._matching_douyin_upload_binding(submission, identity)
+        if submission and submission['state'] in {'submitted', 'pending_review', 'published'}:
+            if not upload_matches or not submission['item_id'] or submission['state'] == 'submitted':
+                raise ValueError('content existing remote submission requires reconciliation; do not create another item')
+            self._require_douyin_publish_identity(job_id, identity)
             return {
                 "job_id": job_id,
                 "platform": "douyin",
@@ -8730,12 +8777,14 @@ class ManagementService:
                 "job_state": job["state"],
                 "reused": True,
             }
+        if job['state'] == 'PUBLISHED':
+            raise ValueError('content published job requires reconciliation; no new upload is authorized')
         submission_id = (
             str(submission["submission_id"])
             if submission else
             "SUB-douyin-" + hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:16]
         )
-        upload_id = str(submission["upload_id"] or "") if submission else ""
+        upload_id = str(submission['upload_id']) if upload_matches else ''
         self.database.execute(
             "INSERT INTO platform_submissions("
             "submission_id,job_id,platform,state,title,cover_tsp,last_error"
@@ -8753,20 +8802,25 @@ class ManagementService:
         try:
             credentials = self._douyin_credentials(client)
             if not upload_id:
-                content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+                self._require_douyin_publish_identity(job_id, identity)
                 uploaded = client.upload_video(
                     access_token=credentials["access_token"],
                     open_id=credentials["account_id"],
                     path=final_path,
                 )
                 upload_id = str(uploaded["video_id"])
-                self.database.execute(
-                    "UPDATE platform_submissions SET upload_id=?,last_error='',"
-                    "updated_at=CURRENT_TIMESTAMP WHERE submission_id=?",
-                    (upload_id, submission_id),
-                )
-                self.database.commit()
-            content_review.require_final(self.database, self.data_dir / 'assets', job_id)
+                with node_state_machine.atomic(self.database):
+                    self._require_douyin_publish_identity(job_id, identity)
+                    metadata_row = self.database.execute('SELECT metadata_json FROM platform_submissions WHERE submission_id=?', (submission_id,)).fetchone()
+                    metadata = content_review.object_json(metadata_row['metadata_json'])
+                    metadata['upload_binding'] = {'version': 1, 'authority': 'management_douyin_upload_v1',
+                        'upload_id': upload_id, **identity}
+                    self.database.execute(
+                        "UPDATE platform_submissions SET upload_id=?,metadata_json=?,last_error='',"
+                        "updated_at=CURRENT_TIMESTAMP WHERE submission_id=?",
+                        (upload_id, json.dumps(metadata, ensure_ascii=False), submission_id),
+                    )
+            self._require_douyin_publish_identity(job_id, identity)
             created = client.create_video(
                 access_token=credentials["access_token"],
                 open_id=credentials["account_id"],
@@ -8780,6 +8834,10 @@ class ManagementService:
                 (str(created["item_id"]), submission_id),
             )
             self.database.commit()
+            # A returned item is persisted before this check. If authorization
+            # changed during create, retries must reconcile that known remote
+            # item rather than silently create it a second time.
+            self._require_douyin_publish_identity(job_id, identity)
         except Exception as exc:
             expired = bool(re.search(
                 r"expired|invalid[^\n]{0,40}(?:access[_ -]?token|token)|"

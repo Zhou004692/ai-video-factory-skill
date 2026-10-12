@@ -30,8 +30,19 @@ def object_json(raw):
 
 
 def requirements(master):
-    return visual_contract.normalize_requirements(master.get('visual_requirements') or
-        (master.get('visual_plan') or {}).get('visual_requirements') or [])
+    plan = master.get('visual_plan') or {}
+    declarations = []
+    if 'visual_requirements' in master:
+        declarations.append(visual_contract.normalize_requirements(master['visual_requirements']))
+    if 'visual_requirements' in plan:
+        declarations.append(visual_contract.normalize_requirements(plan['visual_requirements']))
+    reqs = declarations[0] if declarations else []
+    expected_hash = visual_contract.requirement_set_hash(reqs)
+    if any(visual_contract.requirement_set_hash(value) != expected_hash for value in declarations[1:]):
+        raise ValueError('content direct/visual_plan requirement declarations are inconsistent')
+    if any(owner.get('requirement_set_hash') not in (None, expected_hash) for owner in (master, plan)):
+        raise ValueError('content requirement declaration hash is stale')
+    return reqs
 
 
 def enabled(storyboard):
@@ -45,6 +56,7 @@ def digest(value):
 
 
 def contract_hash(storyboard):
+    validate_contract(storyboard)
     return digest({'root': visual_contract.normalize_requirements(storyboard.get('visual_requirements') or []),
                    'masters': [{'idx': m['idx'], 'requirements': requirements(m)} for m in storyboard.get('masters') or []]})
 
@@ -52,9 +64,28 @@ def contract_hash(storyboard):
 def validate_contract(storyboard):
     root = {r['id']: r for r in visual_contract.normalize_requirements(storyboard.get('visual_requirements') or [])}
     declared = [r for m in storyboard.get('masters') or [] for r in requirements(m)]
+    if storyboard.get('requirement_set_hash') not in (None, visual_contract.requirement_set_hash(list(root.values()))):
+        raise ValueError('content root requirement hash is stale')
     if enabled(storyboard) and (not root or any(root.get(r['id']) != r for r in declared)
         or set(root) - {r['id'] for r in declared}):
-        raise ValueError('content contract root/master definitions are inconsistent')
+        raise ValueError('content contract root/master definitions are stale or inconsistent')
+
+
+def review_cycle(database, job_id):
+    """Stable within a final-review attempt, distinct across identical ABA renders."""
+    event = database.execute("SELECT event_id FROM production_node_events WHERE job_id=? AND node_id='final_review' "
+        "AND event IN ('start','require_review','reconcile_review') ORDER BY rowid DESC LIMIT 1", (job_id,)).fetchone()
+    return str(event['event_id']) if event else 'initial'
+
+
+def approval_revision(database, job_id, report):
+    return digest({'report': report, 'review_cycle': review_cycle(database, job_id)})
+
+
+def publication_revision(database, job_id, report):
+    review = database.execute('SELECT id FROM review_events WHERE job_id=? AND decision=\'approved\' ORDER BY id DESC LIMIT 1', (job_id,)).fetchone()
+    return digest({'approval_revision': approval_revision(database, job_id, report),
+        'approved_review_event_id': int(review['id']) if review else None})
 
 
 def edit_plan_fingerprint(storyboard):

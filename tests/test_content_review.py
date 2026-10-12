@@ -11,7 +11,7 @@ import threading
 from http.server import ThreadingHTTPServer
 from urllib import request, error
 import unittest
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, Mock
 
 from factory import db, visual_contract, visual_evidence, content_review, recovery_plan
 from factory.management_api import ManagementService, REVIEW_CHECKS
@@ -317,7 +317,7 @@ class ContentReviewTests(unittest.TestCase):
 
     def test_recomposed_graph_final_can_be_approved_as_new_revision(self):
         from factory import node_state_machine
-        final, _ = self.final_report()
+        final, first_report = self.final_report()
         self.database.execute("UPDATE jobs SET execution_engine='graph_v2'")
         for node_id, node_type, state in [('master:1','master','SUCCEEDED'),('local_compose','local_compose','SUCCEEDED'),('final_review','final_review','REVIEW_REQUIRED')]:
             self.database.execute('INSERT INTO production_nodes(job_id,node_id,node_type,state,spec_hash,idempotency_key) VALUES(?,?,?,?,?,?)', ('J',node_id,node_type,state,'frozen',node_id))
@@ -326,19 +326,188 @@ class ContentReviewTests(unittest.TestCase):
         self.assertTrue(first['publish_unlocked'])
         self.service.record_content_review('J', 1, self.payload('active','not_applicable'))
         self.assertEqual(self.database.execute("SELECT state FROM production_nodes WHERE node_id='final_review'").fetchone()[0], 'PENDING')
+        self.service.record_content_review('J', 1, self.payload('active','satisfied'))
         self.service.resume_visual_content('J')
         for node_id, events in [('local_compose',['start','succeed']),('final_review',['start','require_review'])]:
             for event in events: node_state_machine.transition_node(self.database, 'J', node_id, event, event_id=f'second:{node_id}:{event}')
-        final.write_bytes(b'recomposed-final')
         rows = self.database.execute('SELECT * FROM shots').fetchall()
         report = content_review.retention(self.sb, rows, {1:4})
         report.update(final_sha256=visual_evidence.asset_fingerprint(final),contract_hash=content_review.contract_hash(self.sb),
             edit_plan_fingerprint=content_review.edit_plan_fingerprint(self.sb),source_hashes=content_review.source_hashes(self.sb, rows, self.bgm))
         (self.base/'content_retention.json').write_text(json.dumps(report),encoding='utf-8')
+        self.assertEqual(content_review.digest(first_report), content_review.digest(report), 'ABA restores identical bytes and proof')
         self.database.execute("UPDATE jobs SET state='COMPOSED'"); self.database.commit()
         second = self.service.review_video('J', decision='approved', checks={c:True for c in REVIEW_CHECKS})
         self.assertTrue(second['publish_unlocked'])
+        duplicate = self.service.review_video('J', decision='approved', checks={c:True for c in REVIEW_CHECKS})
+        self.assertTrue(duplicate['already_reviewed'])
         self.assertEqual(self.database.execute("SELECT COUNT(*) FROM production_node_events WHERE node_id='final_review' AND event='approve'").fetchone()[0], 2)
+
+    def test_parallel_plan_declaration_cannot_hide_new_critical_requirement(self):
+        self.final_report()
+        self.sb['masters'][0]['visual_plan'] = {'visual_requirements': [*REQS, {'id':'extra','description':'Extra action','priority':'critical'}]}
+        self.database.execute('UPDATE jobs SET storyboard=?', (json.dumps(self.sb),)); self.database.commit()
+        with self.assertRaisesRegex(ValueError, 'content'):
+            content_review.require_final(self.database, self.root/'data'/'assets', 'J')
+        with self.assertRaisesRegex(ValueError, 'content'):
+            self.service.content_review_detail('J', 1, 'active')
+
+    def test_ui_form_renders_unicode_labels_and_machine_interval_reason(self):
+        source = (Path(__file__).resolve().parents[1]/'scripts'/'management_ui'/'app.js').read_text(encoding='utf-8')
+        ui = source.split('async function openVisualContentReview',1)[1]
+        setup = r"""
+        let rendered={}, entries=[];const elements=new Map();
+        function $(selector){if(!elements.has(selector))elements.set(selector,{addEventListener(){},insertAdjacentHTML(_where,html){entries.push(html)}});return elements.get(selector)}
+        function $$(selector){return []}function esc(value){return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
+        function toast(value){throw Error(value)}function openModal(_type,title,html){rendered={title,html}}
+        function openMasterCandidateReview(){}function openVideoDrawer(){}
+        async function api(){return {requirements:[{id:'hand',description:'Expected hand'}],duration_sec:4,
+          automatic_findings:{items:[{id:'hand',status:'conflicting',start_sec:.5,end_sec:1.25,observed_description:'Observed <hand>',reason:'Machine reason & warning'}]},preview_url:'/preview',asset_sha256:'hidden-sha',requirement_set_hash:'hidden-req'}}
+        """
+        script=setup+'\nasync function openVisualContentReview'+ui+r"""
+        (async()=>{const shot={idx:1,has_visual_requirements:true,candidate_preview_url:'/candidate'};const job={job_id:'J',has_visual_requirements:true,shots:[shot]};await openVisualContentReview(job,shot);openMasterCandidateReview(job,shot);openVideoDrawer(job);process.stdout.write(JSON.stringify({rendered,entries}))})();
+        """
+        result=subprocess.run(['node','-e',script],capture_output=True,encoding='utf-8',timeout=20)
+        self.assertEqual(result.returncode,0,result.stderr)
+        output=json.loads(result.stdout); html=output['rendered']['html']
+        for label in ['\u753b\u9762\u5185\u5bb9\u590d\u6838','\u4eba\u5de5\u72b6\u6001','\u4fdd\u5b58\u5185\u5bb9\u7ed3\u8bba','\u5019\u9009\u7248\u672c','\u5f53\u524d\u7248\u672c','\u65e7\u7248\u672c']:
+            self.assertIn(label, output['rendered']['title']+html)
+        self.assertIn('0.5',html); self.assertIn('1.25',html); self.assertIn('Machine reason &amp; warning',html)
+        self.assertIn('Observed &lt;hand&gt;',html)
+        self.assertNotIn('value="satisfied" selected',html)
+        self.assertIn('\u9010\u9879\u590d\u6838\u753b\u9762\u5185\u5bb9',''.join(output['entries']))
+
+    def test_old_unbound_upload_cannot_publish_current_final(self):
+        self.final_report(); self.database.execute("UPDATE jobs SET state='READY_TO_PUBLISH'")
+        self.database.execute("INSERT INTO platform_submissions(submission_id,job_id,platform,state,upload_id,metadata_json) VALUES('SUB','J','douyin','uploading','old-final-upload',?)", (json.dumps({'upload_binding':'client-forged'}),)); self.database.commit()
+        client=Mock(); client.upload_video.return_value={'video_id':'current-upload'}
+        client.create_video.return_value={'item_id':'current-item','video_id':'public'}
+        with patch('factory.management_api.douyin.DouyinClient',return_value=client), patch.object(self.service,'_douyin_credentials',return_value={'access_token':'offline','account_id':'test'}):
+            self.service.publish_to_douyin('J',{'confirmed':True,'text':'Title','upload_binding':'client-forged'})
+        client.upload_video.assert_called_once()
+        self.assertEqual(client.create_video.call_args.kwargs['video_id'],'current-upload')
+
+    def test_plan_only_and_parallel_identical_declarations_remain_valid(self):
+        master=self.sb['masters'][0]
+        master['visual_plan']={'visual_requirements':deepcopy(REQS),'requirement_set_hash':visual_contract.requirement_set_hash(REQS)}
+        master.pop('visual_requirements')
+        self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(self.sb),)); self.database.commit()
+        self.final_report()
+        content_review.require_final(self.database,self.root/'data'/'assets','J')
+        self.assertEqual(self.service.content_review_detail('J',1,'active')['requirements'],REQS)
+        master['visual_requirements']=deepcopy(REQS)
+        self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(self.sb),)); self.database.commit()
+        content_review.require_final(self.database,self.root/'data'/'assets','J')
+        master['visual_plan']['requirement_set_hash']='stale'
+        self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(self.sb),)); self.database.commit()
+        with self.assertRaisesRegex(ValueError,'content'): self.service.record_content_review('J',1,self.payload('active'))
+
+    def publish_fixture(self):
+        final,report=self.final_report()
+        self.database.execute("UPDATE jobs SET state='READY_TO_PUBLISH'"); self.database.commit()
+        client=Mock(); client.upload_video.side_effect=[{'video_id':'upload-first'},{'video_id':'upload-second'}]
+        return final,report,client
+
+    def publish_with(self, client):
+        with patch('factory.management_api.douyin.DouyinClient',return_value=client),patch.object(self.service,'_douyin_credentials',return_value={'access_token':'offline','account_id':'test'}):
+            return self.service.publish_to_douyin('J',{'confirmed':True,'text':'Title'})
+
+    def test_upload_binding_same_version_retry_and_registration_preserve_metadata(self):
+        _,_,client=self.publish_fixture()
+        client.create_video.side_effect=[RuntimeError('create unavailable'),{'item_id':'item','video_id':'public'}]
+        with self.assertRaisesRegex(RuntimeError,'create unavailable'): self.publish_with(client)
+        row=self.database.execute('SELECT metadata_json FROM platform_submissions').fetchone()
+        metadata=json.loads(row[0]); binding=deepcopy(metadata['upload_binding'])
+        self.assertEqual(binding['authority'],'management_douyin_upload_v1')
+        metadata['provider_checkpoint']={'task':'preserve'}
+        self.database.execute('UPDATE platform_submissions SET metadata_json=?',(json.dumps(metadata),)); self.database.commit()
+        result=self.publish_with(client)
+        self.assertEqual(result['verification_status'],'pending_review'); self.assertEqual(client.upload_video.call_count,1)
+        self.assertEqual(client.create_video.call_count,2)
+        fresh=json.loads(self.database.execute('SELECT metadata_json FROM platform_submissions').fetchone()[0])
+        self.assertEqual(fresh['upload_binding'],binding); self.assertEqual(fresh['provider_checkpoint'],metadata['provider_checkpoint'])
+        self.service.register_publication({'job_id':'J','platform':'douyin','item_id':'item','metadata':{'review_status':'published','upload_binding':'user-string'}})
+        self.assertEqual(json.loads(self.database.execute('SELECT metadata_json FROM platform_submissions').fetchone()[0])['upload_binding'],binding)
+        repeated=self.publish_with(client); self.assertTrue(repeated['reused']); self.assertEqual(client.create_video.call_count,2)
+
+    def test_cached_upload_is_replaced_for_changed_final_or_review_revision(self):
+        from factory import production_metrics
+        final,report,client=self.publish_fixture()
+        client.upload_video.side_effect=[{'video_id':'upload-first'},{'video_id':'upload-second'},{'video_id':'upload-third'}]
+        client.create_video.side_effect=[RuntimeError('create unavailable'),RuntimeError('create unavailable'),{'item_id':'item','video_id':'public'}]
+        with self.assertRaises(RuntimeError): self.publish_with(client)
+        final.write_bytes(b'new-valid-final'); report['final_sha256']=visual_evidence.asset_fingerprint(final)
+        (self.base/'content_retention.json').write_text(json.dumps(report),encoding='utf-8')
+        with self.assertRaises(RuntimeError): self.publish_with(client)
+        self.assertEqual(client.create_video.call_args.kwargs['video_id'],'upload-second')
+        production_metrics.record_review_in_transaction(self.database,'J','approved',checks={c:True for c in REVIEW_CHECKS}); self.database.commit()
+        self.publish_with(client)
+        self.assertEqual(client.upload_video.call_count,3)
+        self.assertEqual(client.create_video.call_args.kwargs['video_id'],'upload-third')
+
+    def test_old_submitted_items_require_reconciliation_without_duplicate_create(self):
+        final,report,client=self.publish_fixture()
+        client.create_video.return_value={'item_id':'known-item','video_id':'public'}
+        self.publish_with(client)
+        final.write_bytes(b'new-valid-final'); report['final_sha256']=visual_evidence.asset_fingerprint(final)
+        (self.base/'content_retention.json').write_text(json.dumps(report),encoding='utf-8')
+        for state in ['submitted','pending_review','published']:
+            self.database.execute('UPDATE platform_submissions SET state=?',(state,)); self.database.commit()
+            with self.assertRaisesRegex(ValueError,'reconcil'): self.publish_with(client)
+        self.assertEqual(client.upload_video.call_count,1); self.assertEqual(client.create_video.call_count,1)
+
+    def test_stale_during_upload_never_grants_binding_or_calls_create(self):
+        final,_,client=self.publish_fixture()
+        def upload(**_kwargs): final.write_bytes(b'replaced-during-upload'); return {'video_id':'unsafe-upload'}
+        client.upload_video.side_effect=upload
+        with self.assertRaisesRegex(ValueError,'content'): self.publish_with(client)
+        client.create_video.assert_not_called()
+        self.assertNotIn('upload_binding',json.loads(self.database.execute('SELECT metadata_json FROM platform_submissions').fetchone()[0]))
+
+    def test_stale_during_create_preserves_known_remote_item_and_blocks_retry(self):
+        final,_,client=self.publish_fixture()
+        def create(**_kwargs): final.write_bytes(b'replaced-during-create'); return {'item_id':'known-remote-item','video_id':'public'}
+        client.create_video.side_effect=create
+        with self.assertRaisesRegex(ValueError,'content'): self.publish_with(client)
+        row=self.database.execute('SELECT state,item_id FROM platform_submissions').fetchone()
+        self.assertEqual(tuple(row),('submitted','known-remote-item'))
+        # Restoring a valid local report cannot erase the known remote outcome.
+        final.write_bytes(b'final')
+        with self.assertRaisesRegex(ValueError,'reconcil'): self.publish_with(client)
+        self.assertEqual(client.create_video.call_count,1)
+
+    def test_legacy_cache_requires_actual_bytes_but_not_content_report(self):
+        final,_,client=self.publish_fixture()
+        self.database.execute("UPDATE jobs SET storyboard='{}'"); self.database.commit()
+        client.create_video.side_effect=[RuntimeError('retry'),RuntimeError('retry'),{'item_id':'item','video_id':'public'}]
+        with self.assertRaises(RuntimeError): self.publish_with(client)
+        with self.assertRaises(RuntimeError): self.publish_with(client)
+        self.assertEqual(client.upload_video.call_count,1)
+        final.write_bytes(b'legacy-changed-bytes')
+        self.publish_with(client)
+        self.assertEqual(client.upload_video.call_count,2)
+        self.assertEqual(client.create_video.call_args.kwargs['video_id'],'upload-second')
+
+    def test_ui_save_and_local_resume_callbacks_keep_readable_unicode_toasts(self):
+        source=(Path(__file__).resolve().parents[1]/'scripts'/'management_ui'/'app.js').read_text(encoding='utf-8')
+        ui=source.split('async function openVisualContentReview',1)[1].split('const openCandidateWithContentBase',1)[0]
+        setup=r"""
+        const elements=new Map(),toasts=[],posts=[];let markup='';
+        function $(selector){if(!elements.has(selector))elements.set(selector,{value:selector==='#content-sha'?'sha':'req',listeners:{},addEventListener(type,handler){this.listeners[type]=handler}});return elements.get(selector)}
+        function $$(selector){return []}function esc(value){return String(value)}
+        function toast(value){toasts.push(value)}function openModal(_type,_title,html){markup=html}function closeModal(){}async function loadPage(){}
+        async function api(url,options){if(options){posts.push({url,body:JSON.parse(options.body)});return {already_queued:false}}return {requirements:[],duration_sec:4,preview_url:'/preview',asset_sha256:'sha',requirement_set_hash:'req'}}
+        """
+        script=setup+'\nasync function openVisualContentReview'+ui+r"""
+        (async()=>{const shot={idx:1,has_visual_requirements:true};await openVisualContentReview({job_id:'J',shots:[shot]},shot,'active');await elements.get('#save-content-review').onclick();await elements.get('#resume-content-local').listeners.click();process.stdout.write(JSON.stringify({markup,toasts,posts}))})();
+        """
+        result=subprocess.run(['node','-e',script],capture_output=True,encoding='utf-8',timeout=20)
+        self.assertEqual(result.returncode,0,result.stderr); output=json.loads(result.stdout)
+        self.assertIn('\u590d\u6838\u540e\u6062\u590d\u672c\u5730\u5408\u6210',output['markup'])
+        self.assertIn('\u5185\u5bb9\u7ed3\u8bba\u5df2\u4fdd\u5b58',output['toasts'][0])
+        self.assertEqual(output['toasts'][1],'\u4ec5\u672c\u5730\u5408\u6210\u5df2\u6062\u590d')
+        self.assertEqual(output['posts'][0]['body']['expected_asset_sha256'],'sha')
+        self.assertEqual(output['posts'][1]['url'],'/api/videos/J/resume-visual-content')
 
     def test_bulk_projection_uses_content_metadata_without_asset_hashes(self):
         self.service.record_content_review('J', 1, self.payload())
