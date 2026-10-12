@@ -5,6 +5,7 @@
 - broll → 仅画面，不生成随机人声
 """
 import asyncio
+import base64
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
@@ -2632,8 +2633,10 @@ def _lip_sync_edit_request_kwargs(shot: dict) -> dict:
     source = str(shot.get("repair_source_path") or "").strip()
     if not source:
         raise ValueError("口型局部修复缺少原始母片")
-    # Native repair always binds actual local bytes, never a historic URL.
-    reference = source
+    # Newly authorized repairs seal local bytes. Historical request-builder
+    # callers retain their old URL behavior; owned paid recovery still GETs.
+    source_url=str(shot.get('repair_source_url') or '')
+    reference = source if shot.get('repair_source_sha256') or shot.get('_native_source_bound') else (source_url if source_url.startswith('https://') else source)
     duration = max(0.1, float(shot.get("duration_sec") or 0))
     snapshot = production_config.snapshot_from_unit(shot) or {}
     request = {
@@ -2649,6 +2652,7 @@ def _lip_sync_edit_request_kwargs(shot: dict) -> dict:
         "reference_videos": [reference],
         "reference_video_duration_sec": duration,
     }
+    if shot.get('repair_source_sha256'):request['sealed_source_sha256']=shot['repair_source_sha256']
     return request
 
 
@@ -2665,7 +2669,7 @@ def _extend_request_kwargs(shot: dict) -> dict:
         raise ValueError("延长秒数必须在 4 到 30 秒之间")
     source_duration = max(0.1, float(shot.get("duration_sec") or 0.1))
     snapshot = production_config.snapshot_from_unit(shot) or {}
-    return {
+    request = {
         "duration": seedance.normalize_generation_duration(extension),
         "resolution": snapshot.get("resolution") or os.getenv(
             "ARK_VIDEO_RESOLUTION", "720p"
@@ -2683,6 +2687,8 @@ def _extend_request_kwargs(shot: dict) -> dict:
         ], max_video_references=1,
             max_video_duration_sec=None, max_audio_duration_sec=None),
     }
+    if shot.get('repair_source_sha256'):request['sealed_source_sha256']=shot['repair_source_sha256']
+    return request
 
 
 def _build_extend_prompt(shot: dict) -> str:
@@ -3029,6 +3035,18 @@ async def _generate_seedance_video(*, prompt: str, route: VideoRoute,
         provider_kwargs.pop("reference_audio_duration_sec", None)
         provider_kwargs.pop('native_input_rate_cents_per_second',None)
         provider_kwargs.pop('native_output_rate_cents_per_second',None)
+        legacy_seal=provider_kwargs.pop('sealed_source_sha256',None)
+        if (native_repair or legacy_seal) and recovery_call is None:
+            # One read seals the bytes consumed by the actual request. Path
+            # checks cannot establish this identity across an A→B→A file race.
+            bound=(native_repair['attempt']['source_guards'] if native_repair else
+                {'source_path':call_kwargs['reference_videos'][0],'asset_sha256':legacy_seal})
+            consumed=Path(bound['source_path']).read_bytes()
+            if hashlib.sha256(consumed).hexdigest()!=bound['asset_sha256']:
+                from ..native_visual_repair import StaleRepairError
+                raise StaleRepairError('native consumed source bytes changed before submission')
+            provider_kwargs['reference_videos']=['data:video/mp4;base64,'+base64.b64encode(consumed).decode('ascii')]
+            provider_kwargs['expected_reference_video_sha256']=bound['asset_sha256']
         chosen_manifest = provider_kwargs.pop("reference_manifest", [])
         reference_audit = reference_attention.sanitized_manifest(chosen_manifest)
         if recovery_call is None:

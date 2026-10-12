@@ -568,7 +568,14 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 path = (self.service.content_review_source_file(parts[3], int(parts[5]),
                     parse_qs(parsed.query).get('source', ['candidate'])[0]) if parsed.path.endswith('/content-preview')
                     else self.service.master_candidate_file(parts[3], int(parts[5])))
-                size = path.stat().st_size
+                sealed_body=None
+                expected_sha=parse_qs(parsed.query).get('expected_sha256',[None])[0]
+                if expected_sha is not None:
+                    import hashlib
+                    sealed_body=path.read_bytes()
+                    if hashlib.sha256(sealed_body).hexdigest()!=expected_sha:
+                        raise ValueError('preview source identity changed; refresh source preview')
+                size = len(sealed_body) if sealed_body is not None else path.stat().st_size
                 byte_range = self.headers.get("Range")
                 start, end = (0, size - 1)
                 if byte_range:
@@ -586,6 +593,9 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                         "Content-Range", f"bytes {start}-{end}/{size}"
                     )
                 self.end_headers()
+                if sealed_body is not None:
+                    self.wfile.write(sealed_body[start:end+1])
+                    return
                 with path.open("rb") as stream:
                     stream.seek(start)
                     remaining = length
@@ -921,6 +931,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     high_risk_confirmed=(
                         payload.get("high_risk_confirmed") is True
                     ),
+                    **({key:payload[key] for key in ('native_repair_attempt_id','native_repair_request_fingerprint') if key in payload}),
                 )
             elif (request_path.startswith("/api/videos/")
                   and request_path.endswith("/budget-confirmation")):
@@ -990,15 +1001,14 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 parts = request_path.split("/")
                 job_id = parts[3]
                 master_idx = int(parts[5])
+                from factory.native_visual_repair import finite
                 result = self.service.prepare_master_lip_sync_repair(
                     job_id,
                     master_idx,
-                    start_sec=float(payload.get("repair_start_sec")),
-                    end_sec=float(payload.get("repair_end_sec")),
+                    start_sec=finite(payload.get("repair_start_sec"),'start'),
+                    end_sec=finite(payload.get("repair_end_sec"),'end'),
                     reason=str(payload.get("reason") or ""),
-                    source=str(payload.get('source') or 'active'),
-                    source_confirmed=payload.get('source_confirmed') is True,
-                    affected_requirement_ids=payload.get('affected_requirement_ids'),
+                    **({key:payload[key] for key in ('source','source_confirmed','affected_requirement_ids','expected_preview_identity') if key in payload}),
                 )
             elif (request_path.startswith("/api/videos/")
                   and request_path.endswith("/extend")
@@ -1006,17 +1016,16 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 parts = request_path.split("/")
                 job_id = parts[3]
                 master_idx = int(parts[5])
+                from factory.native_visual_repair import finite
                 result = self.service.prepare_master_extension(
                     job_id,
                     master_idx,
-                    extension_sec=float(payload.get("extension_sec")),
+                    extension_sec=finite(payload.get("extension_sec"),'continuation duration'),
                     direction=str(payload.get("direction") or ""),
-                    source=str(payload.get('source') or 'active'),
-                    source_confirmed=payload.get('source_confirmed') is True,
-                    continuation_only_confirmed=payload.get('continuation_only_confirmed') is True,
+                    **({key:payload[key] for key in ('source','source_confirmed','continuation_only_confirmed','expected_preview_identity') if key in payload}),
                 )
             elif request_path.startswith('/api/videos/') and request_path.endswith('/native-repair/discard'):
-                result = self.service.discard_native_repair_preparation(request_path.split('/')[3])
+                result = self.service.discard_native_repair_preparation(request_path.split('/')[3],payload.get('expected_attempt_id'))
             elif (request_path.startswith('/api/videos/') and request_path.endswith('/align-local-timeline') and '/masters/' in request_path):
                 parts = request_path.split('/')
                 result = self.service.align_cached_visual_timeline(parts[3], int(parts[5]), payload)

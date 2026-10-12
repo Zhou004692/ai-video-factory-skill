@@ -28,6 +28,7 @@ class StaleRepairError(ValueError):
 
 
 def finite(value, name):
+    if isinstance(value,bool):raise ValueError(f'{name} cannot be boolean')
     try: result = float(value)
     except (TypeError, ValueError): raise ValueError(f'{name} must be finite') from None
     if not math.isfinite(result): raise ValueError(f'{name} must be finite')
@@ -88,9 +89,18 @@ def snapshot(database, assets, job_id, idx, source):
     return job, shot, sb, master, qa, path, guards
 
 
+def preview_identity(sb,master,source,path,spec_hash=None):
+    return {'source':source,'source_path':str(path),'asset_sha256':visual_evidence.asset_fingerprint(path),'spec_hash':spec_hash,
+        'contract_hash':content_review.contract_hash(sb),
+        'requirement_set_hash':visual_contract.requirement_set_hash(content_review.requirements(master)),
+        'effective_edit_hash':content_review.edit_plan_fingerprint(sb)}
+
+
 def prepare(service, job_id, idx, *, kind='edit', start_sec=None, end_sec=None,
             direction='', extension_sec=None, source='active', source_confirmed=False, affected_requirement_ids=None,
-            continuation_only_confirmed=False):
+            continuation_only_confirmed=False,expected_preview_identity=None):
+    if kind=='edit':finite(start_sec,'start');finite(end_sec,'end')
+    else:finite(extension_sec,'continuation duration')
     if source not in {'active','candidate'}: raise ValueError('explicit source must be active or candidate')
     if source=='candidate' and source_confirmed is not True:
         raise ValueError('candidate source requires explicit full-preview confirmation')
@@ -100,6 +110,8 @@ def prepare(service, job_id, idx, *, kind='edit', start_sec=None, end_sec=None,
         raise ValueError('native edit price/support unknown for configured model; use manual/alternate route')
     with node_state_machine.atomic(service.database):
         job, shot, sb, master, qa, path, guards = snapshot(service.database, service.data_dir/'assets', job_id, idx, source)
+        if not isinstance(expected_preview_identity,dict) or expected_preview_identity!=preview_identity(sb,master,source,path,job['production_spec_hash']):
+            raise StaleRepairError('native repair preview identity is missing/stale; refresh full source preview')
         service._assert_no_unresolved_provider_tasks(job_id)
         prior = current(service.database, job_id)
         if job['state'] not in {'COMPOSED','FAILED','BLOCKED','PRODUCTION_REVIEW_REQUIRED','READY_TO_PUBLISH','STORYBOARDED'}:
@@ -129,7 +141,9 @@ def prepare(service, job_id, idx, *, kind='edit', start_sec=None, end_sec=None,
         pixels=guards['media']['width']*guards['media']['height']
         input_rate=(68 if pixels<=854*480 else 153 if pixels<=1280*720 else
                     max(344,math.ceil(pixels*344/(1920*1080))))
-        output_rate=max(rate,input_rate)  # Adaptive edit/continuation source dimensions are an upper bound.
+        fps_factor=max(1,guards['media']['fps']/24)
+        input_rate=math.ceil(input_rate*fps_factor)
+        output_rate=max(rate,input_rate)  # Explicit conservative internal 24FPS calibration bound.
         estimate = round(duration*input_rate + output*output_rate)
         request = {'kind':kind,'start_sec':start,'end_sec':end,'direction':direction,
             'affected_requirement_ids':ids, 'source_guards':guards, 'resolution':resolution,
@@ -142,6 +156,8 @@ def prepare(service, job_id, idx, *, kind='edit', start_sec=None, end_sec=None,
             'estimate_basis':{'input_seconds':duration,'provider_output_seconds':output,
                               'input_rate_cents_per_second':input_rate,'output_rate_cents_per_second':output_rate,
                               'source_pixels':pixels,'area_rate_cents_per_second':output_rate,
+                              'source_fps':guards['media']['fps'],'calibration_fps':24,'fps_multiplier':fps_factor,
+                              'fps_assumption':'internal conservative per-frame upper bound, not a verified provider billing formula',
                               'basis':'internal conservative calibration; not a guaranteed provider tariff','qa':'configured QA/ASR may incur separate charges'},
             'price_known':True, 'master_idx':int(idx), 'job_id':job_id, 'authority':AUTHORITY,'model':seedance.DEFAULT_MODEL}
         fingerprint = content_review.digest(request)
@@ -170,14 +186,28 @@ def verify(database, assets, attempt, *, budget=None, worker=False):
     return sb, master, path
 
 
-def discard_prepared(service,job_id):
+def discard_prepared(service,job_id,expected_attempt_id=None):
     with node_state_machine.atomic(service.database):
         attempt=current(service.database,job_id)
         if not attempt: return {'job_id':job_id,'already_closed':True}
-        if service.database.execute('SELECT 1 FROM production_nodes WHERE job_id=? AND node_id=?',(job_id,'native_repair:'+attempt['attempt_id'])).fetchone():
-            raise ValueError('started repair must be reconciled and explicitly reviewed; preparation cannot discard paid work')
+        if expected_attempt_id is not None and expected_attempt_id!=attempt['attempt_id']:
+            raise StaleRepairError('discard attempt identity is stale; refresh current repair')
+        node=service.database.execute('SELECT * FROM production_nodes WHERE job_id=? AND node_id=?',(job_id,'native_repair:'+attempt['attempt_id'])).fetchone()
+        if node:
+            authorized(service.database,node)
+            if (node['state'] not in {'READY','FAILED'} or node['provider_task_id'] or node['lease_id'] or node['actual_cost_cents']
+                or provider_tasks.unresolved_task_ids(service.database,job_id)
+                or content_review.object_json(node['output_json']).get('candidate_path')
+                or service.database.execute('SELECT 1 FROM events WHERE job_id=? AND step=? AND message LIKE ?',
+                    (job_id,'native_visual_repair_candidate','%'+attempt['attempt_id']+'%')).fetchone()):
+                raise ValueError('started repair owns paid/unresolved/candidate work; reconcile and review before discard')
+            service.database.execute("UPDATE production_nodes SET state='SUCCEEDED',error_code=NULL,next_action=NULL,output_json=? WHERE job_id=? AND node_id=?",
+                (json.dumps({'discarded_unsubmitted':True}),job_id,node['node_id']))
+            service.database.execute('INSERT INTO production_node_events(job_id,event_id,node_id,event,from_state,to_state,payload_json) VALUES(?,?,?,?,?,?,?)',
+                (job_id,node['node_id']+':discard-unsubmitted',node['node_id'],'discard_unsubmitted',node['state'],'SUCCEEDED','{}'))
         event(service.database,job_id,CLOSED,{'attempt_id':attempt['attempt_id'],'decision':'discard_preparation'})
-        service.database.execute('UPDATE jobs SET state=? WHERE job_id=? AND state=\'STORYBOARDED\'',(attempt['prior_job_state'],job_id))
+        restored_state='PRODUCTION_REVIEW_REQUIRED' if node else attempt['prior_job_state']
+        service.database.execute('UPDATE jobs SET state=? WHERE job_id=? AND state NOT IN (\'REJECTED\',\'PUBLISHED\',\'REJECTED_PENDING_RECONCILIATION\')',(restored_state,job_id))
         return {'job_id':job_id,'discarded_attempt_id':attempt['attempt_id']}
 
 
@@ -308,11 +338,16 @@ def accepted_storyboard(database,job_id,storyboard):
     return result
 
 
-def start(service, attempt, budget):
+def start(service, attempt, budget, *, attempt_id=None,request_fingerprint=None):
+    if attempt_id!=attempt['attempt_id'] or request_fingerprint!=attempt['request_fingerprint']:
+        raise StaleRepairError('native repair attempt identity is missing/stale; refresh exact scope and confirm again')
     database = service.database
     caller_owns = database.in_transaction
     node_id = 'native_repair:'+attempt['attempt_id']
     with node_state_machine.atomic(database):
+        live_attempt=current(database,attempt['job_id'])
+        if not live_attempt or live_attempt['attempt_id']!=attempt_id or live_attempt['request_fingerprint']!=request_fingerprint:
+            raise StaleRepairError('native repair attempt identity changed before budget authorization')
         existing = database.execute('SELECT * FROM production_nodes WHERE job_id=? AND node_id=?',(attempt['job_id'],node_id)).fetchone()
         if existing:
             authorized(database,existing)
@@ -384,6 +419,7 @@ async def run(database, node):
         sb,master,source=verify(database,assets,attempt,budget=value['approved_budget_cents'],worker=True)
         if provider_tasks.unresolved_task_ids(database,job_id): raise StaleRepairError('unresolved provider task requires reconciliation')
     unit={**master,'duration_sec':attempt['input_duration_sec'],'repair_source_path':str(source),
+        '_native_source_bound':True,
         'repair_start_sec':attempt['start_sec'],'repair_end_sec':attempt['end_sec'],'repair_direction':attempt['direction'],
         'extend_duration_sec':attempt['provider_output_duration_sec'],'extend_direction':attempt['direction'],
         '_generation_snapshot':{'resolution':attempt['resolution'],'max_auto_retries':0}}

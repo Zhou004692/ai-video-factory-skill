@@ -7,7 +7,7 @@ import subprocess
 import array
 import threading
 from http.server import ThreadingHTTPServer
-from urllib import request
+from urllib import request,error
 import httpx
 import unittest
 from unittest.mock import patch, AsyncMock
@@ -35,18 +35,21 @@ class NativeRepairTests(unittest.TestCase):
             self.database.execute("INSERT INTO production_nodes(job_id,node_id,node_type,state,spec_hash,idempotency_key,input_json,actual_cost_cents) VALUES('J',?,?,'SUCCEEDED','frozen',?,?,?)",(name,kind,'original-'+name,json.dumps({'master_idx':1} if kind=='master' else {}),123 if kind=='master' else 0))
         self.database.commit()
 
-    def media(self, path, color='red', seconds=4, tone=440, width=720, height=720):
-        subprocess.run([ffmpeg.executable('ffmpeg'),'-y','-loglevel','error','-f','lavfi','-i',f'color=c={color}:s={width}x{height}:r=24:d={seconds}',
+    def media(self, path, color='red', seconds=4, tone=440, width=720, height=720, fps=24):
+        subprocess.run([ffmpeg.executable('ffmpeg'),'-y','-loglevel','error','-f','lavfi','-i',f'color=c={color}:s={width}x{height}:r={fps}:d={seconds}',
             '-f','lavfi','-i',f'sine=frequency={tone}:duration={seconds}', '-c:v','libx264','-preset','ultrafast','-pix_fmt','yuv420p','-c:a','aac',str(path)],check=True,capture_output=True)
 
     def prepare(self, source='active',kind='edit'):
-        args={'source':source,'source_confirmed':source=='candidate'}
+        args={'source':source,'source_confirmed':source=='candidate','expected_preview_identity':self.preview(source)}
         if kind=='extend': return self.service.prepare_master_extension('J',1,extension_sec=4,direction='Continue to conclusion',continuation_only_confirmed=True,**args)
         return self.service.prepare_master_lip_sync_repair('J',1,start_sec=1,end_sec=2,reason='Fix gesture without changing identity',**args)
 
     def start(self, attempt):
         with patch.object(self.service,'_require_transport_preflight'), patch.object(self.service,'dispatch_production_queue',return_value={'dispatched_jobs':[]}):
-            return self.service.start_video_job('J',confirmed=True,approved_budget_cents=attempt['required_cumulative_budget_cents'])
+            return self.service.start_video_job('J',confirmed=True,approved_budget_cents=attempt['required_cumulative_budget_cents'],
+                native_repair_attempt_id=attempt['attempt_id'],native_repair_request_fingerprint=attempt['request_fingerprint'])
+    def preview(self,source='active'):
+        return self.service.content_review_detail('J',1,source)['repair_preview_identity']
 
     def execute(self, attempt, provider, *, full=True, hard_qa=False):
         calls=[]; uploaded={}
@@ -123,7 +126,8 @@ class NativeRepairTests(unittest.TestCase):
         self.real_graph(); self.database.execute('BEGIN')
         attempt=self.prepare()
         with patch.object(self.service,'_require_transport_preflight'),patch.object(self.service,'dispatch_production_queue') as dispatch:
-            result=self.service.start_video_job('J',confirmed=True,approved_budget_cents=attempt['required_cumulative_budget_cents'])
+            result=self.service.start_video_job('J',confirmed=True,approved_budget_cents=attempt['required_cumulative_budget_cents'],
+                native_repair_attempt_id=attempt['attempt_id'],native_repair_request_fingerprint=attempt['request_fingerprint'])
         self.assertTrue(self.database.in_transaction);self.assertTrue(result['dispatch_deferred']); dispatch.assert_not_called()
         self.database.rollback()
         self.assertIsNone(native_visual_repair.current(self.database,'J'))
@@ -187,7 +191,7 @@ class NativeRepairTests(unittest.TestCase):
         self.assertAlmostEqual(float(picture['duration']),4.25,places=2)
 
     def test_failed_target_coverage_preserves_raw_candidate_without_approval(self):
-        self.real_graph(); attempt=self.service.prepare_master_lip_sync_repair('J',1,start_sec=3,end_sec=4,reason='Repair critical ending')
+        self.real_graph(); attempt=self.service.prepare_master_lip_sync_repair('J',1,start_sec=3,end_sec=4,reason='Repair critical ending',expected_preview_identity=self.preview())
         self.start(attempt); provider=self.base/'short.mov';self.media(provider,seconds=3.6,color='blue')
         # Assembly cannot claim retention; the raw paid artifact remains reviewable.
         with patch.object(native_visual_repair,'assemble',wraps=native_visual_repair.assemble) as assembly:
@@ -299,10 +303,11 @@ class NativeRepairTests(unittest.TestCase):
             response=request.urlopen(request.Request(base+path,data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST'))
             return json.load(response)
         try:
-            attempt=post('/masters/1/lip-sync-repair',{'repair_start_sec':1,'repair_end_sec':2,'reason':'Fix hand','source':'candidate','source_confirmed':True})
+            attempt=post('/masters/1/lip-sync-repair',{'repair_start_sec':1,'repair_end_sec':2,'reason':'Fix hand','source':'candidate','source_confirmed':True,'expected_preview_identity':self.preview('candidate')})
             self.assertEqual(request.urlopen(base+'/masters/1/repair-source').read(),self.candidate.read_bytes())
             with patch.object(self.service,'_require_transport_preflight'),patch.object(self.service,'dispatch_production_queue',return_value={'dispatched_jobs':[]}):
-                result=post('/produce',{'confirmed':True,'approved_budget_cents':attempt['required_cumulative_budget_cents']})
+                result=post('/produce',{'confirmed':True,'approved_budget_cents':attempt['required_cumulative_budget_cents'],
+                    'native_repair_attempt_id':attempt['attempt_id'],'native_repair_request_fingerprint':attempt['request_fingerprint']})
             self.assertEqual(result['attempt_id'],attempt['attempt_id'])
             self.assertEqual(self.database.execute('SELECT COUNT(*) FROM provider_calls').fetchone()[0],0)
         finally:server.shutdown();server.server_close();thread.join()
@@ -313,23 +318,26 @@ const fs=require('fs'), vm=require('vm');
 const source=fs.readFileSync('scripts/management_ui/app.js','utf8');
 const fragment=source.slice(source.indexOf('function confirmLipSyncRepair('),source.indexOf('function masterRepairActions('));
 const elements={}; const calls=[];let html='';
-const attempt={master_idx:1,source_guards:{source:'candidate',current_cost_cents:123},direction:'Fix hand',start_sec:1,end_sec:2,affected_requirement_ids:['hand'],estimate_basis:{input_seconds:4,provider_output_seconds:4,input_rate_cents_per_second:153,output_rate_cents_per_second:153,area_rate_cents_per_second:153},estimated_cost_cents:1224,required_cumulative_budget_cents:1347,retained_candidate_duration_sec:4};
-const context={console,Number,JSON,encodeURIComponent,esc:String,money:String,detailRow:(a,b)=>a+b,openModal:(_a,_b,text)=>{html=text},$:id=>elements[id]||(elements[id]={value:'',checked:false}),closeModal:()=>{},closeDrawer:()=>{},toast:()=>{},loadPage:()=>{},api:async(path,options)=>{calls.push([path,JSON.parse(options.body)]);return attempt}};
+const attempt={attempt_id:'attempt-A',request_fingerprint:'scope-A',master_idx:1,source_guards:{source:'candidate',current_cost_cents:123},direction:'Fix hand',start_sec:1,end_sec:2,affected_requirement_ids:['hand'],estimate_basis:{input_seconds:4,provider_output_seconds:4,input_rate_cents_per_second:153,output_rate_cents_per_second:153,area_rate_cents_per_second:153},estimated_cost_cents:1224,required_cumulative_budget_cents:1347,retained_candidate_duration_sec:4};
+const context={console,Number,JSON,encodeURIComponent,esc:String,money:String,detailRow:(a,b)=>a+b,openModal:(_a,_b,text)=>{html=text},$:id=>elements[id]||(elements[id]={value:'',checked:false}),closeModal:()=>{},closeDrawer:()=>{},toast:()=>{},loadPage:()=>{},api:async(path,options)=>{if(!options)return {preview_url:'/preview?source=candidate',repair_preview_identity:{source:'candidate',asset_sha256:'preview-A'}};calls.push([path,JSON.parse(options.body)]);return attempt}};
 vm.createContext(context);vm.runInContext(fragment,context);
 for(const id of ['#native-source-confirmed','#native-direction','#native-start','#native-end','#native-budget'])context.$(id);
-(async()=>{context.confirmLipSyncRepair({job_id:'J'},{idx:1,duration_sec:4,candidate_preview_url:'/candidate'});elements['#native-source'].value='candidate';elements['#native-source-confirmed'].checked=true;elements['#native-direction'].value='Fix hand';elements['#native-start'].value='1';elements['#native-end'].value='2';await elements['#native-prepare'].onclick();if(calls.length!==1||calls[0][0].includes('produce'))throw Error('Preparation auto purchased');elements['#native-budget'].value='13.47';await elements['#native-budget-confirm'].onclick();console.log(JSON.stringify(calls));})().catch(e=>{console.error(e);process.exit(1)});
+(async()=>{context.confirmLipSyncRepair({job_id:'J',execution_engine:'graph_v2'},{idx:1,duration_sec:4,candidate_preview_url:'/candidate'});elements['#native-source'].value='candidate';await elements['#native-source'].onchange();elements['#native-source-confirmed'].checked=true;elements['#native-direction'].value='Fix hand';elements['#native-start'].value='1';elements['#native-end'].value='2';await elements['#native-prepare'].onclick();if(calls.length!==1||calls[0][0].includes('produce'))throw Error('Preparation auto purchased');elements['#native-budget'].value='13.47';await elements['#native-budget-confirm'].onclick();console.log(JSON.stringify(calls));})().catch(e=>{console.error(e);process.exit(1)});
 '''
         result=subprocess.run(['node','-e',script],cwd=Path(__file__).resolve().parents[1],capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
         calls=json.loads(result.stdout.strip())
         self.assertEqual(calls[0][1]['source'],'candidate');self.assertTrue(calls[0][1]['source_confirmed'])
         self.assertEqual(calls[1][0],'/api/videos/J/produce');self.assertEqual(calls[1][1]['approved_budget_cents'],1347)
+        self.assertEqual(calls[0][1]['expected_preview_identity']['asset_sha256'],'preview-A')
+        self.assertEqual(calls[1][1]['native_repair_attempt_id'],'attempt-A')
+        self.assertEqual(calls[1][1]['native_repair_request_fingerprint'],'scope-A')
 
     def test_existing_prepare_then_frozen_adapter_must_execute_authorized_edit(self):
         self.graph()
         original = self.database.execute('SELECT production_spec_json FROM jobs').fetchone()[0]
         with patch.object(native_visual_repair,'probe_source',return_value={'picture_duration_sec':4,'width':720,'height':720,'fps':24,'size_bytes':5,'has_audio':True}):
-            result = self.service.prepare_master_lip_sync_repair('J',1,start_sec=1,end_sec=2,reason='Match mouth')
+            result = self.service.prepare_master_lip_sync_repair('J',1,start_sec=1,end_sec=2,reason='Match mouth',expected_preview_identity=self.preview())
         node = self.database.execute("SELECT * FROM production_nodes WHERE node_id='master:1'").fetchone()
         with patch('factory.steps.s3_shots.run',new=AsyncMock()) as run:
             try: asyncio.run(production_adapters.run_master_node(self.database,node))
@@ -338,6 +346,105 @@ for(const id of ['#native-source-confirmed','#native-direction','#native-start',
         self.assertEqual(run.await_args.kwargs['storyboard_override']['masters'][0],self.sb['masters'][0])
         self.assertIn('attempt_id',result, 'Native preparation must freeze an independent attempt instead of losing its mode at start')
         self.assertEqual(self.database.execute('SELECT production_spec_json FROM jobs').fetchone()[0],original)
+
+    def test_graph_preparation_requires_preview_identity(self):
+        self.real_graph()
+        with self.assertRaisesRegex(ValueError,'preview identity'):
+            self.service.prepare_master_lip_sync_repair('J',1,start_sec=1,end_sec=2,reason='Fix',source='candidate',source_confirmed=True)
+
+    def test_old_confirmation_cannot_authorize_new_same_price_attempt(self):
+        self.real_graph();a=self.prepare();self.service.discard_native_repair_preparation('J')
+        b=self.prepare()
+        with self.assertRaisesRegex(ValueError,'attempt identity'):
+            self.start(a)
+        self.assertEqual(self.database.execute("SELECT COUNT(*) FROM production_nodes WHERE node_type='native_repair'").fetchone()[0],0)
+
+    def test_boolean_scope_is_not_a_numeric_interval(self):
+        self.real_graph()
+        with self.assertRaisesRegex(ValueError,'boolean'):
+            self.service.prepare_master_lip_sync_repair('J',1,start_sec=False,end_sec=True,reason='Fix')
+
+    def test_aba_source_swap_cannot_change_actual_submitted_bytes(self):
+        import base64,hashlib
+        self.real_graph();attempt=self.prepare();self.start(attempt)
+        a=self.active.read_bytes();alternate=self.base/'alternate.mp4';self.media(alternate,color='blue');b=alternate.read_bytes()
+        provider=self.base/'reply.mov';self.media(provider,color='blue');push=seedance._push_video
+        def swap(content,role,path):
+            self.active.write_bytes(b)
+            try:return push(content,role,path)
+            finally:self.active.write_bytes(a)
+        with patch.object(seedance,'_push_video',side_effect=swap):calls,_=self.execute(attempt,provider)
+        uri=next(c[2] for c in calls if c[0]=='POST')['content'][1]['video_url']['url']
+        self.assertEqual(hashlib.sha256(base64.b64decode(uri.split(',',1)[1])).hexdigest(),attempt['source_guards']['asset_sha256'])
+
+    def test_previewed_candidate_A_changed_to_B_is_rejected_without_mutation(self):
+        self.real_graph();expected=self.preview('candidate');self.media(self.candidate,color='blue')
+        before='\n'.join(self.database.iterdump())
+        with self.assertRaisesRegex(ValueError,'preview identity'):
+            self.service.prepare_master_lip_sync_repair('J',1,start_sec=1,end_sec=2,reason='Fix A',source='candidate',source_confirmed=True,expected_preview_identity=expected)
+        self.assertEqual(before,'\n'.join(self.database.iterdump()))
+
+    def test_real_http_rejects_bool_stale_preview_and_old_budget_modal(self):
+        import management_server
+        self.real_graph();management_server.ConsoleHandler.service=self.service
+        server=ThreadingHTTPServer(('127.0.0.1',0),management_server.ConsoleHandler)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        base=f'http://127.0.0.1:{server.server_port}/api/videos/J'
+        def post(path,body):
+            return json.load(request.urlopen(request.Request(base+path,data=json.dumps(body).encode(),headers={'Content-Type':'application/json'},method='POST')))
+        def rejected(path,body,text):
+            before='\n'.join(self.database.iterdump())
+            with self.assertRaises(error.HTTPError) as failed:post(path,body)
+            self.assertEqual(failed.exception.code,400)
+            self.assertIn(text,json.loads(failed.exception.read())['error'])
+            self.assertEqual(before,'\n'.join(self.database.iterdump()))
+        try:
+            preview=json.load(request.urlopen(base+'/masters/1/content-review?source=candidate'))
+            payload={'repair_start_sec':1,'repair_end_sec':2,'reason':'Fix A','source':'candidate','source_confirmed':True,'expected_preview_identity':preview['repair_preview_identity']}
+            rejected('/masters/1/lip-sync-repair',{**payload,'repair_start_sec':False,'repair_end_sec':True},'boolean')
+            rejected('/masters/1/extend',{'extension_sec':True,'direction':'Continue'},'boolean')
+            self.media(self.candidate,color='blue')
+            rejected('/masters/1/lip-sync-repair',payload,'preview identity')
+            with self.assertRaises(error.HTTPError):request.urlopen(base+'/masters/1/content-preview?source=candidate&expected_sha256='+preview['asset_sha256'])
+            payload['expected_preview_identity']=self.preview('candidate')
+            a=post('/masters/1/lip-sync-repair',payload)
+            post('/native-repair/discard',{'expected_attempt_id':a['attempt_id']})
+            b=post('/masters/1/lip-sync-repair',{**payload,'reason':'Different scope B','repair_start_sec':2,'repair_end_sec':3})
+            self.assertEqual(a['required_cumulative_budget_cents'],b['required_cumulative_budget_cents'])
+            with patch.object(self.service,'_require_transport_preflight'),patch.object(self.service,'dispatch_production_queue',return_value={'dispatched_jobs':[]}):
+                rejected('/produce',{'confirmed':True,'approved_budget_cents':a['required_cumulative_budget_cents'],'native_repair_attempt_id':a['attempt_id'],'native_repair_request_fingerprint':a['request_fingerprint']},'attempt identity')
+                rejected('/produce',{'confirmed':True,'approved_budget_cents':b['required_cumulative_budget_cents']},'attempt identity')
+            self.assertEqual(self.database.execute('SELECT COUNT(*) FROM provider_calls').fetchone()[0],0)
+        finally:server.shutdown();server.server_close();thread.join()
+
+    def test_60fps_source_declares_conservative_calibration_and_matches_runtime(self):
+        self.real_graph();self.media(self.active,fps=60);attempt=self.prepare()
+        basis=attempt['estimate_basis'];self.assertEqual(basis['source_fps'],60);self.assertEqual(basis['calibration_fps'],24)
+        self.assertEqual(basis['fps_multiplier'],2.5);self.assertIn('not a verified',basis['fps_assumption'])
+        self.assertEqual(attempt['estimated_cost_cents'],8*383)
+        self.start(attempt);provider=self.base/'reply.mov';self.media(provider,color='blue')
+        self.execute(attempt,provider)
+
+    def test_unsubmitted_stale_rejection_can_discard_prepare_and_confirm_again(self):
+        self.real_graph();attempt=self.prepare();self.start(attempt)
+        sb=json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0]);sb['production_settings']['budget_cents']+=1
+        self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(sb),));self.database.commit()
+        provider=self.base/'reply.mov';self.media(provider,color='blue')
+        with self.assertRaises(AssertionError):self.execute(attempt,provider)
+        node=self.database.execute("SELECT * FROM production_nodes WHERE node_type='native_repair'").fetchone()
+        self.assertIsNone(node['provider_task_id']);self.assertEqual(node['actual_cost_cents'],0)
+        self.service.discard_native_repair_preparation('J',expected_attempt_id=attempt['attempt_id'])
+        fresh=self.prepare();self.assertNotEqual(fresh['attempt_id'],attempt['attempt_id']);self.start(fresh)
+        calls,_=self.execute(fresh,provider)
+        self.assertEqual(sum(c[0]=='POST' for c in calls),1)
+
+    def test_discard_unsubmitted_started_attempt_does_not_restore_old_final_approval(self):
+        self.real_graph();self.database.execute("UPDATE jobs SET state='READY_TO_PUBLISH'");self.database.commit()
+        attempt=self.prepare();self.start(attempt)
+        self.service.discard_native_repair_preparation('J',expected_attempt_id=attempt['attempt_id'])
+        self.assertEqual(self.database.execute('SELECT state FROM jobs').fetchone()[0],'PRODUCTION_REVIEW_REQUIRED')
+        self.assertEqual(self.database.execute("SELECT state FROM production_nodes WHERE node_id='final_review'").fetchone()[0],'PENDING')
+        fresh=self.prepare();self.assertNotEqual(fresh['attempt_id'],attempt['attempt_id'])
 
 
 if __name__ == '__main__': unittest.main()

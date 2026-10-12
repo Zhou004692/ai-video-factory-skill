@@ -633,6 +633,7 @@ async def text_to_video(
     on_task_created=None,
     on_task_updated=None,
     before_submit=None,
+    expected_reference_video_sha256: str | None = None,
     timeout: int = 600,
 ) -> bytes:
     """文+多 reference → 视频。返回 mp4 字节。
@@ -760,6 +761,15 @@ async def text_to_video(
 
     async with httpx.AsyncClient(timeout=timeout, headers=_headers()) as cli:
         # 1. 提交任务
+        if expected_reference_video_sha256 is not None:
+            import hashlib
+            videos=[item for item in payload['content'] if item.get('role')=='reference_video']
+            if len(videos)!=1:raise SeedanceParameterError('sealed native source must contain exactly one reference video')
+            uri=videos[0].get('video_url',{}).get('url','')
+            try:consumed=base64.b64decode(uri.split(',',1)[1],validate=True) if uri.startswith('data:video/') else b''
+            except (ValueError,IndexError):consumed=b''
+            if hashlib.sha256(consumed).hexdigest()!=expected_reference_video_sha256:
+                raise SeedanceParameterError('actual native POST source bytes differ from authorized source')
         if before_submit is not None:
             before_submit()
         try:

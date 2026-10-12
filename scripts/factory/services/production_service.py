@@ -58,6 +58,7 @@ class ProductionService:
         confirmed: bool,
         approved_budget_cents: int | None = None,
         high_risk_confirmed: bool = False,
+        native_repair_attempt_id: str | None = None,native_repair_request_fingerprint: str | None = None,
     ) -> dict:
         """Enter the frozen production graph through one control boundary."""
         if self._start_handler is None:
@@ -67,6 +68,8 @@ class ProductionService:
             confirmed=confirmed,
             approved_budget_cents=approved_budget_cents,
             high_risk_confirmed=high_risk_confirmed,
+            **({'native_repair_attempt_id':native_repair_attempt_id,'native_repair_request_fingerprint':native_repair_request_fingerprint}
+               if native_repair_attempt_id is not None or native_repair_request_fingerprint is not None else {}),
         )
 
     def resume(self, job_id: str) -> dict:
