@@ -6,7 +6,7 @@ test-pattern pixels. Tone audio is never represented as recognized speech.
 from __future__ import annotations
 import argparse
 import array
-from contextlib import contextmanager
+from contextlib import contextmanager, closing, ExitStack
 import hashlib
 import json
 import os
@@ -131,8 +131,11 @@ class Journey:
         ids=json.loads((self.root/'ids.json').read_text())
         database=sqlite3.connect(self.root/'factory.db'); database.row_factory=sqlite3.Row
         from playwright.sync_api import sync_playwright
-        with database, sync_playwright() as playwright:
+        # sqlite's transaction context does not close the connection. Close
+        # it explicitly on success/failure before deleting the isolated root.
+        with closing(database), database, sync_playwright() as playwright, ExitStack() as resources:
             browser=playwright.chromium.launch(headless=True,executable_path=_edge_path(),args=['--disable-background-networking','--disable-component-update','--no-first-run'])
+            resources.callback(browser.close)
             self.browser_pid=None
             page=browser.new_page(viewport={'width':1440,'height':980})
             page.on('pageerror',lambda e:self.errors.append(str(e)))
