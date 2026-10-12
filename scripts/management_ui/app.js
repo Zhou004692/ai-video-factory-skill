@@ -1567,7 +1567,9 @@ function openFreeVisualRecut(job,shot,detail,repair){
 }
 function openCachedVisualAlignment(job,shot,repair){
   const discards=repair.local_alignment_recovery?.discards_prior_overlay;
-  openModal('CACHED LOCAL ALIGNMENT','确认已有语音时序并重新对齐',`<div class="form-stack"><p>${discards?'将放弃上次已批准的画面重剪，并保留操作记录。':''}仅使用与当前素材绑定的已有语音缓存，不发起新语音识别或母片生成。</p><p>本次单独确认按语音边界调整本地画面和音轨起点 / 时长，保持对白、素材、BGM 和历史成本。对齐后若完整动作未保留，将再次停在内容复核；请预览新时序，再确认画面重剪。最终成片仍须重新验收。</p></div><div class="modal-actions"><button class="mini-action" id="cancel-cached-alignment">返回内容复核</button><button class="primary-action" id="confirm-cached-alignment">确认${discards?'放弃旧重剪并':''}按已有时序对齐</button></div>`);
+  const baseline=repair.local_alignment_recovery?.alignment_baseline;
+  const baselinePreview=baseline?`<section class="detail-section"><h3>本次确认的对齐输入</h3><p>当前开场文案：${esc(repair.local_alignment_recovery.current_hook||'无')}；对齐输入文案：${esc(baseline.hook||'无')}。</p>${(baseline.shots||[]).map(edit=>`<p>片段 #${esc(edit.idx)}：画面 ${esc(edit.video_start??0)} 秒起，音轨 ${esc(edit.audio_start??0)} 秒起，时长 ${esc(edit.duration)} 秒；将使用已绑定语音缓存对齐。</p>`).join('')}<small>确认后新的本地改动需要重新预览和确认，不会沿用本次授权覆盖。</small></section>`:'';
+  openModal('CACHED LOCAL ALIGNMENT','确认已有语音时序并重新对齐',`<div class="form-stack">${baselinePreview}<p>${discards?'将放弃上次已批准的画面重剪，并保留操作记录。':''}仅使用与当前素材绑定的已有语音缓存，不发起新语音识别或母片生成。</p><p>本次单独确认按语音边界调整本地画面和音轨起点 / 时长，保持对白、素材、BGM 和历史成本。对齐后若完整动作未保留，将再次停在内容复核；请预览新时序，再确认画面重剪。最终成片仍须重新验收。</p></div><div class="modal-actions"><button class="mini-action" id="cancel-cached-alignment">返回内容复核</button><button class="primary-action" id="confirm-cached-alignment">确认${discards?'放弃旧重剪并':''}按已有时序对齐</button></div>`);
   $('#cancel-cached-alignment').onclick=()=>openVisualContentReview(job,shot,repair.source);
   $('#confirm-cached-alignment').onclick=async()=>{const button=$('#confirm-cached-alignment');button.disabled=true;try{
     await api(`/api/videos/${encodeURIComponent(job.job_id)}/masters/${shot.idx}/align-local-timeline`,{method:'POST',body:JSON.stringify({...repair.guards,source:'active',confirmed:true})});

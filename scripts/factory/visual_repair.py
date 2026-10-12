@@ -254,18 +254,23 @@ def plan(database, assets_dir, job_id, master_idx, source='candidate'):
         proposal = None; reason = 'on_screen_or_unknown_coverage'
     alignment = {'available': False, 'missing_master_ids': [], 'cache_bindings': {}, 'audio_timing_changes': False}
     recovery = {'executable_now': False}
+    frozen_alignment_fingerprint = None
     if active_ok and not pending and job['state'] not in TERMINATED:
         try:
             alignment = cached_alignment(database, job_id, sb, rows)
             from . import production_compiler
             spec = cr.object_json(job['production_spec_json'])
             frozen = production_compiler.ensure_director_timeline(spec.get('runtime_storyboard') or {})
+            frozen_alignment_fingerprint = edit_fingerprint(frozen)
             frozen_alignment = cached_alignment(database, job_id, frozen, rows)
             recovery = {'executable_now': graph and node is not None and node['state'] in {'SUCCEEDED', 'REVIEW_REQUIRED'} and
                          (node['state'] == 'SUCCEEDED' or node['error_code'] == 'content_review_required') and
-                         frozen_alignment['available'] and (OVERLAY_KEY in sb or alignment['audio_timing_changes']),
+                         frozen_alignment['available'] and frozen_alignment_fingerprint is not None and
+                         (OVERLAY_KEY in sb or ALIGNMENT_KEY in sb or alignment['audio_timing_changes']),
                         'discards_prior_overlay': OVERLAY_KEY in sb,
                         'cache_bindings': frozen_alignment['cache_bindings'],
+                        'alignment_baseline': {'hook': frozen.get('hook'), 'shots': deepcopy(frozen.get('shots') or [])},
+                        'current_hook': sb.get('hook'),
                         'preserved_scope': ['source_assets', 'dialogue', 'BGM', 'anchors', 'accepted_masters', 'cost_ledger'],
                         'changes_scope': ['abandon_authorized_picture_overlay', 'align_local_audio_picture_boundaries_to_cached_speech'],
                         'approval_requirement': 'explicit_discard_and_cached_alignment_confirmation'}
@@ -291,6 +296,7 @@ def plan(database, assets_dir, job_id, master_idx, source='candidate'):
     guards = {'expected_asset_sha256': sha, 'expected_requirement_set_hash': cr.visual_contract.requirement_set_hash(reqs),
               'expected_edit_plan_fingerprint': edit_fingerprint(sb), 'expected_spec_hash': job['production_spec_hash'] or '',
               'expected_contract_hash': cr.contract_hash(sb), 'expected_source_bindings': bindings,
+              'expected_frozen_alignment_edit_plan_fingerprint': frozen_alignment_fingerprint,
               'expected_asr_cache_bindings': {'current': alignment['cache_bindings'], 'frozen': recovery.get('cache_bindings', {})}}
     scope = {'master_idx': int(master_idx), 'requirement_ids': [r['id'] for r in reqs]}
     preserved = ['dialogue', 'audio_source', 'audio_start', 'duration', 'BGM', 'anchors', 'accepted_masters', 'task_ids', 'cost_ledger']
@@ -363,15 +369,41 @@ def verify_asr_bindings(database, job_id, rows, bindings):
             raise ValueError('content authorized ASR cache changed; new ASR requests are not authorized')
 
 
+def verify_consumed_transcription(sb, master_idx, transcription):
+    """Bind the exact object about to supply timing/text, not an earlier read."""
+    authorization = sb.get(OVERLAY_KEY) or sb.get(ALIGNMENT_KEY)
+    if authorization is None:
+        return
+    expected = (authorization.get('asr_cache_bindings') or {}).get(str(master_idx))
+    try:
+        actual = cr.digest(master_transcriptions._payload(transcription)) if transcription is not None else None
+    except (ValueError, TypeError, AttributeError):
+        actual = None
+    if expected is None or actual != expected:
+        raise visual_evidence.ContentReviewRequired({'passed': False,
+            'reasons': ['content_authorized_asr_payload_changed']})
+
+
 def verify_alignment(database, job_id, sb, rows):
     marker = sb.get(ALIGNMENT_KEY)
     if marker is None:
         return
     if not rows or any(dict(r).get('state', 'OK') != 'OK' or pending_candidate(cr.object_json(r['video_qa'])) for r in rows):
         raise ValueError('content cached alignment requires accepted masters without pending candidates')
-    job = database.execute('SELECT production_spec_hash FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+    job = database.execute('SELECT storyboard,production_spec_json,production_spec_hash FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+    live = cr.object_json(job['storyboard'])
     if marker.get('authority') != AUTHORITY or marker.get('spec_hash') != job['production_spec_hash'] or marker.get('contract_hash') != cr.contract_hash(sb):
         raise ValueError('content authorized cached alignment is stale')
+    if marker.get('live_edit_plan_fingerprint') != cr.edit_plan_fingerprint(live):
+        raise ValueError('content cached alignment live edit changed after confirmation')
+    from . import production_compiler
+    frozen = production_compiler.ensure_director_timeline(cr.object_json(job['production_spec_json']).get('runtime_storyboard') or {})
+    if marker.get('frozen_alignment_edit_plan_fingerprint') != cr.edit_plan_fingerprint(frozen):
+        raise ValueError('content cached alignment frozen baseline changed after confirmation')
+    execution_fingerprint = cr.edit_plan_fingerprint(sb)
+    if execution_fingerprint not in {marker.get('frozen_alignment_edit_plan_fingerprint'),
+                                    marker.get('effective_aligned_edit_plan_fingerprint')}:
+        raise ValueError('content cached alignment input differs from authorized frozen/effective baseline')
     bindings = marker['source_bindings']
     if {str(r['idx']): str(Path(r['video_path']).resolve()) for r in rows} != {idx: b['asset_path'] for idx,b in bindings.items()}:
         raise ValueError('content authorized cached alignment source path changed')

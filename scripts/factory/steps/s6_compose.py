@@ -312,6 +312,7 @@ async def _refresh_director_speech_timeline(
             # after preparation. A free command never authorizes a new request.
             raise visual_evidence.ContentReviewRequired({'passed': False,
                 'reasons': ['content_authorized_asr_cache_missing']})
+        visual_repair.verify_consumed_transcription(storyboard, master_idx, transcription)
         derived_artifact_missing = transcription is None
         try:
             transcription = transcription or await asyncio.to_thread(
@@ -378,6 +379,10 @@ async def _refresh_director_speech_timeline(
     # ASR still runs for speech/subtitles. Approved silent/reaction coverage is
     # restored afterwards, only if all protected audio clocks stayed identical.
     changed = visual_repair.restore_after_asr(storyboard, approved_shots) or changed
+    if visual_repair.ALIGNMENT_KEY in storyboard:
+        marker = storyboard[visual_repair.ALIGNMENT_KEY]
+        marker['live_edit_plan_fingerprint'] = content_review.edit_plan_fingerprint(storyboard)
+        marker['effective_aligned_edit_plan_fingerprint'] = marker['live_edit_plan_fingerprint']
 
     if changed:
         if content_review.enabled(storyboard):

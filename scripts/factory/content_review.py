@@ -112,6 +112,8 @@ def effective_storyboard(live, actual):
     from . import visual_repair
     if visual_repair.OVERLAY_KEY in actual:
         merged[visual_repair.OVERLAY_KEY] = deepcopy(actual[visual_repair.OVERLAY_KEY])
+    if visual_repair.ALIGNMENT_KEY in actual:
+        merged[visual_repair.ALIGNMENT_KEY] = deepcopy(actual[visual_repair.ALIGNMENT_KEY])
     for field in ('production_mode', 'shots', 'hook'):
         if field in actual:
             merged[field] = deepcopy(actual[field])

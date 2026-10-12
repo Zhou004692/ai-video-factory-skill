@@ -284,6 +284,120 @@ class LocalVisualRepairTests(unittest.TestCase):
                 asyncio.run(s6_compose._refresh_director_speech_timeline('J',stored,rows,self.database))
             asr.assert_not_called()
 
+    def test_replacement_cache_at_actual_consumption_is_rejected_before_subtitle_persistence(self):
+        self.prepare();self.sb['shots'][0]['subtitle']='Approved';self.save()
+        approved=s6_compose.bigasr.Transcription('Approved',0,1000,(s6_compose.bigasr.TimedUtterance('Approved',0,1000),))
+        replacement=s6_compose.bigasr.Transcription('UNAPPROVED REPLACEMENT',0,1000,(s6_compose.bigasr.TimedUtterance('UNAPPROVED REPLACEMENT',0,1000),))
+        master_transcriptions.persist(self.database,'J',1,self.active,approved);self.database.commit()
+        self.service.apply_visual_recut('J',1,self.command(self.plan()))
+        stored=json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0]);before=deepcopy(stored)
+        rows=self.database.execute('SELECT * FROM shots').fetchall()
+        with patch.object(s6_compose,'ASSETS_DIR',self.root/'data'/'assets'), \
+             patch.object(master_transcriptions,'load_matching',side_effect=[approved,approved,replacement]), \
+             patch.object(s6_compose.ffmpeg,'probe_duration',new=AsyncMock(return_value=4)), \
+             patch.object(s6_compose.bigasr,'transcribe_detailed',side_effect=AssertionError('New ASR POST forbidden')) as asr:
+            with self.assertRaises(visual_evidence.ContentReviewRequired):
+                asyncio.run(s6_compose._refresh_director_speech_timeline('J',stored,rows,self.database))
+            asr.assert_not_called()
+        self.assertEqual(stored,before)
+        self.assertEqual(json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0]),before)
+
+    def queued_alignment(self, with_speech=False):
+        self.prepare()
+        if with_speech:
+            self.sb['masters'][0]['type']='dialogue';self.sb['shots'][0]['subtitle']='Approved'
+            spec=json.loads(self.database.execute('SELECT production_spec_json FROM jobs').fetchone()[0]);spec['runtime_storyboard']=deepcopy(self.sb)
+            self.database.execute('UPDATE jobs SET production_spec_json=?',(json.dumps(spec),));self.save()
+            approved=s6_compose.bigasr.Transcription('Approved',0,1000,(s6_compose.bigasr.TimedUtterance('Approved',0,1000),))
+            master_transcriptions.persist(self.database,'J',1,self.active,approved);self.database.commit()
+        self.service.apply_visual_recut('J',1,self.command(self.plan()))
+        node_state_machine.transition_node(self.database,'J','local_compose','start',event_id='fingerprint-align:start')
+        node_state_machine.transition_node(self.database,'J','local_compose','require_review',event_id='fingerprint-align:review')
+        self.database.execute("UPDATE production_nodes SET error_code='content_review_required',next_action='review_visual_content' WHERE node_id='local_compose'")
+        production_projection.persist(self.database,'J');self.database.commit()
+        plan=self.plan();self.service.align_cached_visual_timeline('J',1,{**plan['guards'],'source':'active','confirmed':True})
+        return json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0])
+
+    def test_cached_alignment_rejects_replacement_at_exact_asr_consumption(self):
+        from factory import visual_repair, production_compiler
+        approved_live=self.queued_alignment(with_speech=True)
+        spec=json.loads(self.database.execute('SELECT production_spec_json FROM jobs').fetchone()[0])
+        execution=visual_repair.adapter_storyboard(self.database,'J',production_compiler.ensure_director_timeline(spec['runtime_storyboard']),'frozen')
+        original=deepcopy(execution);rows=self.database.execute('SELECT * FROM shots').fetchall()
+        approved=s6_compose.bigasr.Transcription('Approved',0,1000,(s6_compose.bigasr.TimedUtterance('Approved',0,1000),))
+        replacement=s6_compose.bigasr.Transcription('UNAPPROVED REPLACEMENT',0,1000,(s6_compose.bigasr.TimedUtterance('UNAPPROVED REPLACEMENT',0,1000),))
+        with patch.object(s6_compose,'ASSETS_DIR',self.root/'data'/'assets'), \
+             patch.object(master_transcriptions,'load_matching',side_effect=[approved,approved,replacement]), \
+             patch.object(s6_compose.ffmpeg,'probe_duration',new=AsyncMock(return_value=4)), \
+             patch.object(s6_compose.bigasr,'transcribe_detailed',side_effect=AssertionError('New ASR POST forbidden')) as asr:
+            with self.assertRaises(visual_evidence.ContentReviewRequired):
+                asyncio.run(s6_compose._refresh_director_speech_timeline('J',execution,rows,self.database))
+            asr.assert_not_called()
+        self.assertEqual(execution,original)
+        self.assertEqual(json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0]),approved_live)
+
+    def test_queued_alignment_does_not_overwrite_later_picture_or_hook_edits(self):
+        approved=self.queued_alignment()
+        self.database.execute("UPDATE jobs SET final_path='existing-final'");self.database.commit()
+        node=self.database.execute("SELECT * FROM production_nodes WHERE node_id='local_compose'").fetchone()
+        for field in ['video_start','hook']:
+            with self.subTest(field=field):
+                changed=deepcopy(approved)
+                if field=='video_start':changed['shots'][0]['video_start']=.75
+                else:changed['hook']='New approved operator hook'
+                self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(changed),));self.database.commit()
+                with patch.object(s6_compose,'run',new=AsyncMock()) as run:
+                    with self.assertRaises(visual_evidence.ContentReviewRequired):asyncio.run(production_adapters.run_local_compose_node(self.database,node))
+                    run.assert_not_awaited()
+                self.assertEqual(json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0]),changed)
+
+    def test_cached_alignment_rechecks_live_edit_after_adapter_before_actual_s6(self):
+        from factory import visual_repair, production_compiler
+        approved=self.queued_alignment()
+        spec=json.loads(self.database.execute('SELECT production_spec_json FROM jobs').fetchone()[0])
+        frozen=production_compiler.ensure_director_timeline(spec['runtime_storyboard'])
+        execution=visual_repair.adapter_storyboard(self.database,'J',frozen,'frozen')
+        changed=deepcopy(approved);changed['shots'][0]['video_start']=.75;changed['hook']='Changed after adapter'
+        self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(changed),));self.database.commit()
+        with patch.object(s6_compose,'ASSETS_DIR',self.root/'data'/'assets'), \
+             patch.object(s6_compose,'_refresh_director_speech_timeline',new=AsyncMock()) as refresh:
+            with self.assertRaises(visual_evidence.ContentReviewRequired):asyncio.run(s6_compose._run('J',self.database,storyboard_override=execution))
+            refresh.assert_not_awaited()
+        self.assertEqual(json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0]),changed)
+
+    def test_later_edit_requires_fresh_confirmation_of_displayed_frozen_baseline(self):
+        from factory import visual_repair, production_compiler
+        approved=self.queued_alignment();changed=deepcopy(approved)
+        changed['shots'][0]['video_start']=.75;changed['hook']='New operator hook'
+        self.database.execute('UPDATE jobs SET storyboard=?',(json.dumps(changed),));self.database.commit()
+        node_state_machine.transition_node(self.database,'J','local_compose','start',event_id='fresh-align:start')
+        node_state_machine.transition_node(self.database,'J','local_compose','require_review',event_id='fresh-align:review')
+        self.database.execute("UPDATE production_nodes SET error_code='content_review_required',next_action='review_visual_content' WHERE node_id='local_compose'")
+        production_projection.persist(self.database,'J');self.database.commit()
+        fresh=self.plan();self.assertTrue(fresh['local_alignment_recovery']['executable_now'])
+        self.assertEqual(fresh['local_alignment_recovery']['current_hook'],'New operator hook')
+        self.assertIsNone(fresh['local_alignment_recovery']['alignment_baseline']['hook'])
+        self.service.align_cached_visual_timeline('J',1,{**fresh['guards'],'source':'active','confirmed':True})
+        queued=json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0])
+        marker=queued[visual_repair.ALIGNMENT_KEY]
+        self.assertEqual(marker['confirmed_live_edit_plan_fingerprint'],fresh['guards']['expected_edit_plan_fingerprint'])
+        self.assertEqual(marker['frozen_alignment_edit_plan_fingerprint'],fresh['guards']['expected_frozen_alignment_edit_plan_fingerprint'])
+        self.assertEqual(queued['hook'],'New operator hook');self.assertEqual(queued['shots'][0]['video_start'],.75)
+        self.assertTrue(queued['local_visual_edit_history'][-1]['prior_alignment_authorization'])
+        spec=json.loads(self.database.execute('SELECT production_spec_json FROM jobs').fetchone()[0])
+        execution=visual_repair.adapter_storyboard(self.database,'J',production_compiler.ensure_director_timeline(spec['runtime_storyboard']),'frozen')
+        self.assertEqual(content_review.edit_plan_fingerprint(execution),marker['frozen_alignment_edit_plan_fingerprint'])
+
+    def test_cached_alignment_rechecks_frozen_input_identity_after_confirmation(self):
+        approved=self.queued_alignment()
+        spec=json.loads(self.database.execute('SELECT production_spec_json FROM jobs').fetchone()[0]);spec['runtime_storyboard']['hook']='Changed frozen alignment input'
+        self.database.execute('UPDATE jobs SET production_spec_json=?',(json.dumps(spec),));self.database.commit()
+        node=self.database.execute("SELECT * FROM production_nodes WHERE node_id='local_compose'").fetchone()
+        with patch.object(s6_compose,'run',new=AsyncMock()) as run:
+            with self.assertRaises(visual_evidence.ContentReviewRequired):asyncio.run(production_adapters.run_local_compose_node(self.database,node))
+            run.assert_not_awaited()
+        self.assertEqual(json.loads(self.database.execute('SELECT storyboard FROM jobs').fetchone()[0]),approved)
+
     def test_stale_conflict_is_review_first_and_provider_junk_does_not_crash_routing(self):
         self.prepare()
         qa={'status':'passed','diagnostic':{'visual_evidence':{'provenance':'automatic','asset_sha256':'old-source',

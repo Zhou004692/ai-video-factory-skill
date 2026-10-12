@@ -5990,7 +5990,7 @@ class ManagementService:
             prior = next((item for item in sb.get('local_visual_edit_history') or []
                           if item.get('request_fingerprint') == request_fingerprint), None)
             if prior:
-                stable_guards = ('expected_asset_sha256', 'expected_requirement_set_hash', 'expected_spec_hash', 'expected_contract_hash', 'expected_source_bindings')
+                stable_guards = ('expected_asset_sha256', 'expected_requirement_set_hash', 'expected_spec_hash', 'expected_contract_hash', 'expected_source_bindings', 'expected_frozen_alignment_edit_plan_fingerprint')
                 if (any(payload.get(key) != current['guards'][key] for key in stable_guards) or
                     prior['cache_bindings'] != current['guards']['expected_asr_cache_bindings']['frozen']):
                     raise ValueError('content cached alignment repeat is stale')
@@ -6002,11 +6002,16 @@ class ManagementService:
                 raise ValueError('content alignment requires matching cached ASR and accepted, paused local graph')
             self._assert_no_unresolved_provider_tasks(job_id)
             overlay = sb.pop(visual_repair.OVERLAY_KEY, None)
+            prior_alignment = sb.get(visual_repair.ALIGNMENT_KEY)
             if overlay:
                 sb['shots'] = deepcopy(overlay['base_shots'])
             sb[visual_repair.ALIGNMENT_KEY] = {'authority': visual_repair.AUTHORITY,
                 'spec_hash': current['guards']['expected_spec_hash'], 'contract_hash': current['guards']['expected_contract_hash'],
                 'source_bindings': current['guards']['expected_source_bindings'],
+                'confirmed_live_edit_plan_fingerprint': current['guards']['expected_edit_plan_fingerprint'],
+                'queued_live_edit_plan_fingerprint': content_review.edit_plan_fingerprint(sb),
+                'live_edit_plan_fingerprint': content_review.edit_plan_fingerprint(sb),
+                'frozen_alignment_edit_plan_fingerprint': current['guards']['expected_frozen_alignment_edit_plan_fingerprint'],
                 'asr_cache_bindings': current['local_alignment_recovery']['cache_bindings']}
             epoch = content_review.digest({'payload': payload, 'prior_overlay': overlay})
             history = sb.setdefault('local_visual_edit_history', [])
@@ -6014,6 +6019,7 @@ class ManagementService:
                 raise ValueError('content local edit audit history is invalid')
             history.append({'authority': visual_repair.AUTHORITY, 'action': 'discard_overlay_and_align_cached_speech',
                 'prior_overlay': overlay, 'cache_bindings': current['local_alignment_recovery']['cache_bindings'],
+                'prior_alignment_authorization': prior_alignment,
                 'command_fingerprint': epoch, 'request_fingerprint': request_fingerprint})
             self.database.execute('UPDATE jobs SET storyboard=? WHERE job_id=?', (json.dumps(sb, ensure_ascii=False, allow_nan=False), job_id))
             node = self.database.execute("SELECT state FROM production_nodes WHERE job_id=? AND node_id='local_compose'", (job_id,)).fetchone()
