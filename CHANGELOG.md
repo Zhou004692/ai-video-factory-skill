@@ -2,6 +2,26 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.2.0.8] - 2026-10-13
+
+### Added
+
+- Project presentation facts, stage gates and decision-based todo counts without turning planned shots into running tasks.
+- Responsive workspaces, accessible modal/drawer focus, object/version-specific nonsecret drafts, grouped production settings and same-screen media review.
+- Durable exact command identity before transport, read-only outcome reconciliation and explicit cancellation of unclaimed requests; late cancelled requests cannot dispatch work.
+- Append-only human reconciliation for terminal unknown results and proven orphaned requests; active requests and uncertain remote work remain protected from a no-execution override.
+- Seen-version guards for scripts, briefs, source analysis, production costs, final media and candidate acceptance; preserve local input on conflict.
+
+### Fixed
+
+- Move media streaming, provider inspection, feed reads and cold asset hashing outside the shared business lock and active SQLite read snapshots.
+- Require six separate final checks, retain playback on failed review saves and separate immutable publication versions from current performance observations.
+- Ship all production UI resources with exact ZIP/HTTP byte and MIME checks; omit unused private prototype bundles from direct Skill distribution.
+
+### Delivery
+
+- Direct Skill folder/ZIP delivery remains the update path. No new end-user Node build or Windows installer is required. Offline and synthetic workflow evidence does not establish real provider quality or platform posting success.
+
 ## [3.2.0.7] - 2026-10-13
 
 ### Added

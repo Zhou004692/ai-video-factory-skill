@@ -74,16 +74,34 @@ EXCLUDED_PARTS = {
 
 TEXT_EXTENSIONS = {
     ".md", ".yaml", ".yml", ".json", ".py", ".ps1", ".cmd", ".txt", ".example",
+    ".js", ".css", ".html",
+}
+
+MANAGEMENT_UI_REQUIRED_FILES = {
+    'scripts/management_ui/' + name for name in (
+        'index.html', 'styles.css', 'app.js', 'api-client.js', 'presentation.js',
+        'ui-components.js', 'ui-tokens.css', 'workbench.js', 'workbench.css',
+        'review-workspace.js', 'review-workspace.css', 'production-settings.js',
+        'content-workspace.js', 'publication-workspace.js',
+    )
+}
+
+# Local design experiments have private fixture characters and no production
+# dependency. Keep their source intact while excluding the entire page bundles.
+MANAGEMENT_UI_DESIGN_FILES = {
+    'scripts/management_ui/' + stem + suffix
+    for stem in ('design-options', 'studio-concepts')
+    for suffix in ('.html', '.js', '.css')
 }
 
 AUDIT_RULES = {
     "credential-assignment": re.compile(
         r"(?im)(?:"
-        r"^\s*[\"']?(?:ARK_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|VOLC_AK|"
+        r"^\s*(?:(?:const|let|var)\s+)?[\"']?(?:ARK_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|VOLC_AK|"
         r"VOLC_SK|VOLC_ASR_API_KEY|VOLC_ASR_TOKEN|VOLC_TTS_API_KEY|KLING_SECRET_KEY|SUNO_API_KEY|"
         r"DOUYIN_CLIENT_SECRET|API_KEY|CLIENT_SECRET)[\"']?\s*(?:=|:)\s*"
         r"(?:[\"'](?!<|\.\.\.|optional|required)[^\"'\r\n]{8,}[\"']|"
-        r"(?!<|\.\.\.|optional|required)[A-Za-z0-9][A-Za-z0-9._/-]{7,})\s*(?:#.*)?$"
+        r"(?!<|\.\.\.|optional|required)[A-Za-z0-9][A-Za-z0-9._/-]{7,})\s*;?\s*(?:(?:#|//).*)?$"
         r"|[\"'](?:ARK_API_KEY|ANTHROPIC_API_KEY|OPENAI_API_KEY|VOLC_AK|"
         r"VOLC_SK|VOLC_ASR_API_KEY|VOLC_ASR_TOKEN|VOLC_TTS_API_KEY|KLING_SECRET_KEY|SUNO_API_KEY|"
         r"DOUYIN_CLIENT_SECRET|API_KEY|CLIENT_SECRET)[\"']\s*:\s*"
@@ -107,6 +125,8 @@ AUDIT_RULES = {
 
 def _allowed(path: Path, root: Path) -> bool:
     relative = path.relative_to(root)
+    if relative.as_posix() in MANAGEMENT_UI_DESIGN_FILES:
+        return False
     if any(part in EXCLUDED_PARTS for part in relative.parts):
         return False
     if relative.as_posix() in SCRIPT_ROOT_FILES | REFERENCE_FILES:
@@ -247,7 +267,7 @@ def build_distribution(source_root: Path, output_root: Path) -> Path:
     committed = False
     try:
         _populate_distribution(source_root, staged)
-        required = SCRIPT_ROOT_FILES | {
+        required = SCRIPT_ROOT_FILES | MANAGEMENT_UI_REQUIRED_FILES | {
             "SKILL.md", "VERSION", "templates/env.example",
             "scripts/factory/db.py", "scripts/management_ui/index.html",
             "scripts/management_ui/styles.css", "scripts/management_ui/app.js",

@@ -215,7 +215,9 @@ class SkillDistributionTests(unittest.TestCase):
             )
             with patch.dict(
                 os.environ,
-                {"FACTORY_RUNTIME_HOME": str(root / "runtime-home")},
+                {"FACTORY_RUNTIME_HOME": str(root / "runtime-home"),
+                 "FACTORY_ENV_FILE": str(root / '.env'), "FACTORY_DATA_DIR": str(root / 'data'),
+                 "FACTORY_DB_PATH": str(root / 'data/factory.db')},
                 clear=False,
             ), patch("doctor.shutil.which", return_value="binary"):
                 report = diagnose(root, profile="video")
@@ -235,7 +237,9 @@ class SkillDistributionTests(unittest.TestCase):
             )
             with patch.dict(
                 os.environ,
-                {"FACTORY_RUNTIME_HOME": str(root / "runtime-home")},
+                {"FACTORY_RUNTIME_HOME": str(root / "runtime-home"),
+                 "FACTORY_ENV_FILE": str(root / '.env'), "FACTORY_DATA_DIR": str(root / 'data'),
+                 "FACTORY_DB_PATH": str(root / 'data/factory.db')},
                 clear=False,
             ), patch("doctor.shutil.which", return_value="binary"):
                 report = diagnose(root, profile="video")
