@@ -53,14 +53,16 @@ class SkillReplacementTests(unittest.TestCase):
         self.assertEqual(tree_bytes(self.target), self.before)
 
     def test_promotion_failure_restores_previous_skill(self):
-        original = os.replace
+        # Inject at the logical promotion boundary; Windows physical paths use
+        # the extended prefix and must not make this failure silently miss.
+        original = distribute_skill._promote_staging_directory
 
         def fail_promotion(source, destination):
             if Path(destination) == self.target and Path(source).name == 'next':
                 raise OSError('injected promotion failure')
             return original(source, destination)
 
-        with mock.patch.object(distribute_skill.os, 'replace', side_effect=fail_promotion):
+        with mock.patch.object(distribute_skill, '_promote_staging_directory', side_effect=fail_promotion):
             with self.assertRaisesRegex(OSError, 'injected promotion'):
                 distribute_skill.build_distribution(ROOT, self.output)
         self.assertEqual(tree_bytes(self.target), self.before)
@@ -100,14 +102,14 @@ class SkillReplacementTests(unittest.TestCase):
             self.assertEqual(tree_bytes(self.target), self.before)
 
     def test_failed_rollback_keeps_recoverable_previous_directory(self):
-        original = os.replace
+        original = distribute_skill._promote_staging_directory
 
         def fail_publish_and_restore(source, destination):
             if Path(destination) == self.target:
                 raise OSError('injected rename failure')
             return original(source, destination)
 
-        with mock.patch.object(distribute_skill.os, 'replace', side_effect=fail_publish_and_restore):
+        with mock.patch.object(distribute_skill, '_promote_staging_directory', side_effect=fail_publish_and_restore):
             with self.assertRaises(OSError):
                 distribute_skill.build_distribution(ROOT, self.output)
         previous = list(self.output.glob('.skill-replacement-*/previous'))

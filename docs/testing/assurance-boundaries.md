@@ -1,5 +1,11 @@
 # Flow Guard 测试证据边界
 
+## 2026-10-13 创意交付有限证据
+
+结构化导演输入、作者画外音与受控标签是意图，不能当媒体识别事实。新增媒体/要求哈希、时间窗证据、人工内容门、本地重剪、原生完整候选与冻结反馈，具体验收见 [创意交付](creative-delivery-acceptance.md)。真实浏览器/HTTP/Worker 中断恢复使用高层合成 handler，红像素/正弦音频仅证明技术保留，脚本终审不证明质量，`speech_verified=false`。
+
+这些不能升级整体 `strict_transport_replay`、`recognition_accuracy`、`actual_content_quality`。原生测试以离线响应与实际合成文件证明单次提交、SHA/候选/历史保护，不证明账号资格或编辑效果。人工作品关联不证明上传或因果效果，可空数据不能当 0。
+
 `passed` / `partial` / `attention` / `failed` 保留原有套件状态语义和退出码兼容性，但都不是“整个产品已验证”。`assurance.level=full` 只表示配置检查层未跳过，不表示真实生产 handler 全链路、识别准确率或内容质量验收通过。
 
 ## 当前证据分层

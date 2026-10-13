@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 class RuntimeBackupTests(unittest.TestCase):
     def test_snapshot_restore_preserves_paid_asset_beyond_windows_max_path(self):
         from factory.runtime_backup import create_upgrade_snapshot, restore_upgrade_snapshot
-        from test_legacy_long_paths import disk, disposable_tree, long_asset, paid_database
+        from tests.test_legacy_long_paths import disk, disposable_tree, long_asset, paid_database
 
         with disposable_tree() as tmp:
             root, data = tmp / "skill", tmp / "runtime"

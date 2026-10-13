@@ -2,6 +2,24 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.2.0.7] - 2026-10-13
+
+### Added
+
+- Carry structured visual requirements and director intent from explicit script approval into frozen production, prompts, independent timed QA evidence, human content review and final content retention.
+- Preview confirmed local recuts without new provider submissions; preview native edit/extend against a durable bounded source, request fingerprint and explicit budget, then assemble and review a complete candidate.
+- Preserve every publication version and its immutable asset/intent/source context, with nullable performance snapshots and exact known experiment tag matching.
+
+### Fixed
+
+- Reject incompatible frame/omni modes, audio-only edits and unknown or excessive cumulative reference durations before paid submission; recover owned existing tasks with GET only.
+- Protect review cycles, selected candidates, accepted/final/published assets, repeat decisions and repair recovery from stale or conflicting changes.
+- Preserve complete legacy state through versioned migration markers, consistent SQLite/WAL snapshots, fail-closed nonempty conflicts and Windows long-path filesystem operations.
+
+### Delivery
+
+- Direct Skill folder/ZIP delivery only; no desktop launcher, scheduled task or system service. Historical cost calibration is an estimate, not a verified current tariff. Offline synthetic workflow evidence does not establish actual recognition accuracy or content quality.
+
 ## [3.2.0.6] - 2026-10-03
 
 ### Fixed

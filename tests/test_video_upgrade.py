@@ -1288,7 +1288,7 @@ class MusicFallbackTests(unittest.IsolatedAsyncioTestCase):
             )
 
     def test_edit_contract_requires_reference_media_before_api_call(self):
-        with self.assertRaisesRegex(ValueError, "reference_video or reference_audio"):
+        with self.assertRaisesRegex(ValueError, "reference_video"):
             seedance._video_task_payload(
                 model="doubao-seedance-2-5-260628",
                 content=[{"type": "text", "text": "edit this"}],
