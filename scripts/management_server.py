@@ -5,6 +5,7 @@ import argparse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import escape
+import hashlib
 import json
 import mimetypes
 import os
@@ -26,7 +27,7 @@ load_dotenv(environment_file(SERVER_ROOT, os.environ))
 from factory import SKILL_ROOT
 from factory.db import conn
 from factory.management_api import (
-    CUSTOM_CHARACTER_IMAGE_MAX_BYTES, ManagementService,
+    CUSTOM_CHARACTER_IMAGE_MAX_BYTES, ManagementService, ScriptRevisionConflict, ProductionSpecConflict, BriefRevisionConflict, SourceAnalysisConflict, FinalMediaConflict, CandidateMediaConflict,
 )
 from factory.runtime_profile import RuntimeProfile, resolve_runtime_profile
 from factory.server_auth import AuthRejected, COOKIE_NAME, ServerSessionManager
@@ -35,6 +36,21 @@ from factory.server_auth import AuthRejected, COOKIE_NAME, ServerSessionManager
 UI_ROOT = Path(__file__).resolve().parent / "management_ui"
 MEDIA_UPLOAD_MAX_BYTES = 512 * 1024 * 1024
 MEDIA_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+class _LockedServiceReads:
+    """Serialize service evaluation, never socket reads or response transfer."""
+    def __init__(self, service, lock):
+        self._service, self._lock = service, lock
+
+    def __getattr__(self, name):
+        value = getattr(self._service, name)
+        if not callable(value):
+            return value
+        def snapshot(*args, **kwargs):
+            with self._lock:
+                return value(*args, **kwargs)
+        return snapshot
 
 
 def configure_console_runtime(
@@ -102,6 +118,8 @@ def run_source_feed_scheduler(
     interval_sec: float = 300.0,
 ) -> None:
     """Collect enabled public feeds periodically, never during server startup."""
+    if isinstance(service, ManagementService):
+        service.bind_service_lock(service_lock)
     while not stop_event.wait(interval_sec):
         try:
             with service_lock:
@@ -121,6 +139,8 @@ def run_provider_reconcile_sweeper(
     limit: int = 10,
 ) -> None:
     """Periodically inspect known remote tasks; never submit paid work."""
+    if isinstance(service, ManagementService):
+        service.bind_service_lock(service_lock)
     while not stop_event.wait(max(0.0, float(interval_sec))):
         try:
             with service_lock:
@@ -179,6 +199,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def _json(
         self, payload: dict, status: int = 200, *, headers: dict[str, str] | None = None
     ) -> None:
+        command_id = getattr(self, '_command_receipt', None)
+        if command_id:
+            # Commit acknowledgment before writing any socket bytes. A dropped
+            # response can then be reconciled by this exact authenticated ID.
+            self._command_receipt = None
+            receipt = self.service.finish_management_command(command_id, payload, status)
+            payload = {**payload, 'command_receipt': receipt}
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -212,6 +239,24 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return False
             self.close_connection = True
+            # Windows can reset a socket closed with unread POST bytes before
+            # the client sees the rejection. Only discard small, unambiguous
+            # bodies, with a 100ms bound and no business lock or service call.
+            lengths = self.headers.get_all('Content-Length', [])
+            if self.command in {'POST', 'DELETE'} and len(lengths) == 1 and not self.headers.get('Transfer-Encoding'):
+                try:
+                    length = int(lengths[0])
+                except ValueError:
+                    length = 0
+                if 0 < length <= 64 * 1024:
+                    previous_timeout = self.connection.gettimeout()
+                    try:
+                        self.connection.settimeout(0.1)
+                        self.rfile.read(length)
+                    except (TimeoutError, OSError):
+                        pass
+                    finally:
+                        self.connection.settimeout(previous_timeout)
             self._json(
                 {"error": str(exc)}, exc.status,
                 headers={"Connection": "close"},
@@ -259,8 +304,9 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length > 1_000_000:
             raise ValueError("请求内容过大")
-        raw = self.rfile.read(length) if length else b"{}"
-        payload = json.loads(raw.decode("utf-8"))
+        raw = self.rfile.read(length) if length else b""
+        self._request_body_sha256 = hashlib.sha256(raw).hexdigest()
+        payload = json.loads((raw or b'{}').decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("请求必须是 JSON 对象")
         return payload
@@ -358,8 +404,16 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
     def do_GET(self) -> None:
         if not self._authorize_server_request():
             return
-        with self.service_lock:
+        service = self.service
+        if isinstance(service, ManagementService):
+            service.bind_service_lock(self.service_lock)
+        self.service = _LockedServiceReads(service, self.service_lock)
+        try:
             return self._do_GET()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        finally:
+            self.service = service
 
     def _serve_binary_file(self, path: Path, *, cache_control: str) -> None:
         size = path.stat().st_size
@@ -389,9 +443,70 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
 
+    def _serve_verified_final(self, path: Path, expected_sha: str, *, job_id: str, download: bool) -> None:
+        # No service/SQLite lock is held here. Spill large media to a temporary
+        # file instead of buffering the whole asset in process memory, and send
+        # these same verified bytes even if the original path changes afterward.
+        with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode='w+b') as sealed:
+            digest = hashlib.sha256()
+            size = 0
+            with path.open('rb') as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    sealed.write(chunk)
+                    size += len(chunk)
+            current_sha = digest.hexdigest()
+            if current_sha != expected_sha:
+                return self._json(FinalMediaConflict(current_sha, expected_sha).payload, 409)
+            byte_range = self.headers.get('Range')
+            start, end = (0, size - 1)
+            if byte_range:
+                start, end = parse_byte_range(byte_range, size)
+            length = end - start + 1
+            self.send_response(HTTPStatus.PARTIAL_CONTENT if byte_range else HTTPStatus.OK)
+            self.send_header('Content-Type', 'video/mp4')
+            self.send_header('Content-Length', str(length))
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Cache-Control', 'no-store')
+            if byte_range:
+                self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+            if download:
+                self.send_header('Content-Disposition', f'attachment; filename="{job_id}.mp4"')
+            self.end_headers()
+            sealed.seek(start)
+            remaining = length
+            while remaining:
+                chunk = sealed.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+
     def _do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path in {"/healthz", "/readyz"}:
+        if parsed.path.startswith('/api/commands/'):
+            try:
+                result = self.service.management_command_result(parsed.path.removeprefix('/api/commands/'))
+                return self._json(result, 404 if result.get('code') == 'command_not_found' else 200)
+            except ValueError as exc:
+                return self._json({'error': str(exc)}, 400)
+        if parsed.path == "/readyz":
+            acquired = self.service_lock.acquire(timeout=0.15)
+            ok = False
+            try:
+                ok = acquired and UI_ROOT.is_dir()
+                if ok and isinstance(self.service, _LockedServiceReads) and isinstance(self.service._service, ManagementService):
+                    self.service._service.database.execute('SELECT 1').fetchone()
+            except Exception:
+                ok = False
+            finally:
+                if acquired:
+                    self.service_lock.release()
+            return self._json({'ok': bool(ok), 'runtime': self.runtime_mode}, 200 if ok else 503)
+        if parsed.path == "/healthz":
             return self._json({"ok": True, "runtime": self.runtime_mode})
         if parsed.path == "/login":
             return self._login_html()
@@ -627,6 +742,9 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 job_id = parsed.path.split("/")[3]
                 path = self.service.video_file(job_id)
                 download = parse_qs(parsed.query).get("download", ["0"])[0] == "1"
+                expected_sha = parse_qs(parsed.query, keep_blank_values=True).get('expected_sha256', [None])[0]
+                if expected_sha is not None:
+                    return self._serve_verified_final(path, expected_sha, job_id=job_id, download=download)
                 size = path.stat().st_size
                 byte_range = self.headers.get("Range")
                 start, end = (0, size - 1)
@@ -716,10 +834,25 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
         self._static(parsed.path)
 
     def do_POST(self) -> None:
+        self._command_receipt = None
+        self._command_owner = None
         if not self._authorize_server_request():
             return
-        with self.service_lock:
+        if isinstance(self.service, ManagementService):
+            self.service.bind_service_lock(self.service_lock)
+        service = self.service
+        self.service = _LockedServiceReads(service, self.service_lock)
+        try:
             return self._do_POST()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        finally:
+            self.service = service
+            self._command_receipt = None
+            if self._command_owner:
+                with self.service_lock:
+                    service.release_management_command(self._command_owner)
+                self._command_owner = None
 
     def _do_POST(self) -> None:
         try:
@@ -745,6 +878,42 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
             if character_upload:
                 return self._character_image_upload(character_upload.group(1))
             payload = self._body()
+            resolution = re.fullmatch('/api/commands/([^/]+)/resolve', request_path)
+            if resolution:
+                from factory.services.management_commands import CommandIdentityConflict, CommandResolutionError
+                try:
+                    return self._json(self.service.resolve_management_command(resolution.group(1), payload))
+                except (CommandIdentityConflict, CommandResolutionError) as exc:
+                    return self._json(exc.payload, 409)
+            cancellation = re.fullmatch('/api/commands/([^/]+)/cancel-unclaimed', request_path)
+            if cancellation:
+                from factory.services.management_commands import CommandIdentityConflict
+                try:
+                    result = self.service.cancel_unclaimed_management_command(cancellation.group(1), payload.get('path'), payload.get('request_sha256'))
+                except CommandIdentityConflict as exc:
+                    return self._json(exc.payload, 409)
+                return self._json(result, 409 if result.get('code') == 'submission_pending' else 200)
+            command_id = self.headers.get('X-AVF-Command-Id')
+            if command_id:
+                supplied_digest = self.headers.get('X-AVF-Command-Hash')
+                if supplied_digest is not None and supplied_digest != self._request_body_sha256:
+                    return self._json({'code': 'command_hash_mismatch', 'submission_known': False, 'error': 'Command hash does not match request bytes'}, 409)
+                if not request_path.startswith('/api/') or request_path.startswith('/api/auth/'):
+                    return self._json({'error': 'Command receipts require a business API'}, 400)
+                from factory.services.management_commands import CommandIdentityConflict
+                try:
+                    claim = self.service.claim_management_command(command_id, request_path, self._request_body_sha256)
+                except CommandIdentityConflict as exc:
+                    return self._json(exc.payload, 409)
+                if claim['disposition'] == 'pending':
+                    return self._json(claim, 409)
+                if claim['disposition'] == 'resolved':
+                    return self._json({'code': 'command_already_resolved', 'replayed': True, 'command_receipt': claim['receipt']}, 409)
+                if claim['disposition'] == 'replay':
+                    receipt = claim['receipt']
+                    return self._json({**receipt['result'], 'replayed': True, 'command_receipt': receipt}, receipt['http_status'])
+                self._command_receipt = claim['command_id']
+                self._command_owner = claim['command_id']
             if request_path == "/api/auth/login" and self.runtime_mode == "server":
                 issued = self.auth_manager.login(str(payload.get("password") or ""))
                 return self._json(
@@ -854,12 +1023,14 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     brief_id,
                     angle_index=int(payload.get("angle_index", -1)),
                     generation_preferences=generation_preferences,
+                    **({'expected_revision': payload['expected_revision']} if 'expected_revision' in payload else {}),
                 )
             elif request_path.endswith("/edit") and request_path.startswith("/api/briefs/"):
                 brief_id = request_path.split("/")[3]
                 result = self.service.update_brief(
                     brief_id, payload.get("brief") or {},
                     change_note=str(payload.get("change_note") or ""),
+                    **({'expected_revision': payload['expected_revision']} if 'expected_revision' in payload else {}),
                 )
             elif request_path.endswith("/edit") and request_path.startswith("/api/scripts/"):
                 draft_id = request_path.split("/")[3]
@@ -869,10 +1040,11 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     auto_adjust_durations=(
                         payload.get("auto_adjust_durations") is True
                     ),
+                    **({'expected_revision': payload['expected_revision']} if 'expected_revision' in payload else {}),
                 )
             elif self.path.endswith("/approve") and self.path.startswith("/api/scripts/"):
                 draft_id = self.path.split("/")[3]
-                result = self.service.approve_script(draft_id)
+                result = self.service.approve_script(draft_id, **({'expected_revision': payload['expected_revision']} if 'expected_revision' in payload else {}))
             elif self.path == "/api/characters":
                 result = self.service.bind_character(
                     character_id=str(payload.get("character_id") or ""),
@@ -932,6 +1104,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                         payload.get("high_risk_confirmed") is True
                     ),
                     **({key:payload[key] for key in ('native_repair_attempt_id','native_repair_request_fingerprint') if key in payload}),
+                    **({'expected_production_spec_hash': payload['expected_production_spec_hash']} if 'expected_production_spec_hash' in payload else {}),
                 )
             elif (request_path.startswith("/api/videos/")
                   and request_path.endswith("/budget-confirmation")):
@@ -1044,6 +1217,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                 result = self.service.review_master_candidate(
                     parts[3], int(parts[5]),
                     decision=str(payload.get("decision") or ""),
+                    **({'expected_candidate_sha256': payload['expected_candidate_sha256']} if 'expected_candidate_sha256' in payload else {}),
                 )
             elif self.path.endswith("/configure") and self.path.startswith("/api/videos/"):
                 job_id = self.path.split("/")[3]
@@ -1058,6 +1232,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     notes=str(payload.get("notes") or ""),
                     first_pass=(first_pass if isinstance(first_pass, bool) else None),
                     checks=(payload.get("checks") if isinstance(payload.get("checks"), dict) else None),
+                    **({'expected_final_sha256': payload['expected_final_sha256']} if 'expected_final_sha256' in payload else {}),
                 )
             elif self.path.endswith("/submit-publish") and self.path.startswith("/api/videos/"):
                 job_id = self.path.split("/")[3]
@@ -1075,6 +1250,8 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
             else:
                 return self._json({"error": "接口不存在"}, 404)
             return self._json(result)
+        except (ScriptRevisionConflict, ProductionSpecConflict, BriefRevisionConflict, SourceAnalysisConflict, FinalMediaConflict, CandidateMediaConflict) as exc:
+            return self._json(exc.payload, 409)
         except (ValueError, json.JSONDecodeError) as exc:
             return self._json({"error": str(exc)}, 400)
         except OverflowError as exc:
@@ -1085,8 +1262,14 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
     def do_DELETE(self) -> None:
         if not self._authorize_server_request():
             return
-        with self.service_lock:
+        service = self.service
+        self.service = _LockedServiceReads(service, self.service_lock)
+        try:
             return self._do_DELETE()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        finally:
+            self.service = service
 
     def _do_DELETE(self) -> None:
         try:
@@ -1118,7 +1301,7 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
         if UI_ROOT.resolve() not in target.parents and target != UI_ROOT.resolve():
             return self._json({"error": "not found"}, 404)
         if not target.is_file():
-            target = UI_ROOT / "index.html"
+            return self._json({"error": "not found"}, 404)
         body = target.read_bytes()
         media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)

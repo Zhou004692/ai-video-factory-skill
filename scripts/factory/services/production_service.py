@@ -8,7 +8,7 @@ import sqlite3
 from typing import Callable
 
 from .. import (
-    production_adapters, production_contract, production_graph,
+    node_state_machine, production_adapters, production_contract, production_graph,
     production_planner,
 )
 from ..clients import music
@@ -59,6 +59,7 @@ class ProductionService:
         approved_budget_cents: int | None = None,
         high_risk_confirmed: bool = False,
         native_repair_attempt_id: str | None = None,native_repair_request_fingerprint: str | None = None,
+        expected_production_spec_hash: str | None = None,
     ) -> dict:
         """Enter the frozen production graph through one control boundary."""
         if self._start_handler is None:
@@ -70,6 +71,7 @@ class ProductionService:
             high_risk_confirmed=high_risk_confirmed,
             **({'native_repair_attempt_id':native_repair_attempt_id,'native_repair_request_fingerprint':native_repair_request_fingerprint}
                if native_repair_attempt_id is not None or native_repair_request_fingerprint is not None else {}),
+            **({'expected_production_spec_hash': expected_production_spec_hash} if expected_production_spec_hash is not None else {}),
         )
 
     def resume(self, job_id: str) -> dict:
@@ -87,6 +89,7 @@ class ProductionService:
         notes: str = "",
         first_pass: bool | None = None,
         checks: dict[str, bool] | None = None,
+        expected_final_sha256: str | None = None,
     ) -> dict:
         """Persist the final human decision through one control boundary."""
         if self._review_handler is None:
@@ -98,6 +101,7 @@ class ProductionService:
             notes=notes,
             first_pass=first_pass,
             checks=checks,
+            **({'expected_final_sha256': expected_final_sha256} if expected_final_sha256 is not None else {}),
         )
 
     def reconcile(self, job_id: str, task_id: str) -> dict:
@@ -284,8 +288,8 @@ class ProductionService:
     def persist_compiled_execution(self, spec) -> None:
         """Commit the graph, executable rows and frozen job spec as one unit."""
         graph = production_graph.compile_graph(spec)
-        production_graph.assert_graph_replaceable(self.database, graph)
-        with self.database:
+        with node_state_machine.atomic(self.database):
+            production_graph.assert_graph_replaceable(self.database, graph)
             production_adapters.materialize_frozen_execution_inputs(
                 self.database, spec, commit=False,
             )

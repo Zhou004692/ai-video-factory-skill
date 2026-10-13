@@ -131,6 +131,7 @@ def project_snapshot(row) -> dict:
         result['provenance'] = 'recorded_measurement'
     result['provided_fields'] = [f for f in COUNT_FIELDS + ('completion_rate','average_watch_sec') if result.get(f) is not None]
     result['creative_context'] = content_review.object_json(result.get('context_json'))
+    result['metadata'] = content_review.object_json(result.get('metadata_json'))
     return result
 
 

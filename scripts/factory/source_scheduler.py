@@ -335,6 +335,7 @@ def collect_feed(
     feed_id: str,
     *,
     now: datetime | None = None,
+    external_io=None,
 ) -> dict[str, Any]:
     feed = database.execute(
         "SELECT * FROM source_feeds WHERE feed_id=?", (feed_id,)
@@ -345,8 +346,19 @@ def collect_feed(
     current = _utc_now(now)
     now_text = _timestamp(current)
     next_text = _timestamp(current + timedelta(minutes=int(feed["interval_minutes"] or 60)))
+    feed_identity = dict(feed)
+    def still_current():
+        row = database.execute('SELECT * FROM source_feeds WHERE feed_id=?', (feed_id,)).fetchone()
+        return row is not None and dict(row) == feed_identity
     try:
-        items, cursor = connector.collect(feed["cursor"])
+        operation = lambda: connector.collect(feed["cursor"])
+        items, cursor = external_io(operation, step='source_collection', target={'feed_id': feed_id}) if external_io else operation()
+        if not database.in_transaction:
+            database.execute('BEGIN IMMEDIATE')
+        if not still_current():
+            database.rollback()
+            return {'feed_id': feed_id, 'created': 0, 'updated': 0, 'duplicates': 0,
+                    'error': '', 'stale': True, 'applied': False}
         created = updated = duplicates = 0
         for item in items:
             occurrence = database.execute(
@@ -404,6 +416,11 @@ def collect_feed(
         }
     except Exception as exc:
         database.rollback()
+        database.execute('BEGIN IMMEDIATE')
+        if not still_current():
+            database.rollback()
+            return {'feed_id': feed_id, 'created': 0, 'updated': 0, 'duplicates': 0,
+                    'error': '', 'stale': True, 'applied': False}
         message = _safe_collect_error(exc)
         database.execute(
             "UPDATE source_feeds SET last_collected_at=?,next_collect_at=?,"
@@ -422,6 +439,7 @@ def collect_due_feeds(
     database: sqlite3.Connection,
     *,
     now: datetime | None = None,
+    external_io=None,
 ) -> list[dict[str, Any]]:
     current = _utc_now(now)
     feed_ids = [row["feed_id"] for row in database.execute(
@@ -430,7 +448,7 @@ def collect_due_feeds(
         "ORDER BY COALESCE(next_collect_at,created_at),feed_id",
         (_timestamp(current),),
     ).fetchall()]
-    return [collect_feed(database, feed_id, now=current) for feed_id in feed_ids]
+    return [collect_feed(database, feed_id, now=current, external_io=external_io) for feed_id in feed_ids]
 
 
 def collect_enabled_feeds(database: sqlite3.Connection) -> list[dict[str, Any]]:

@@ -24,7 +24,7 @@ def anchor_row(database, node):
     return table, column, key, rows[0]
 
 
-def reconcile(database, data_dir, job_id, task_id, inspected):
+def reconcile(database, data_dir, job_id, task_id, inspected, *, external_io=None):
     rows = database.execute('SELECT * FROM production_nodes WHERE job_id=? AND provider_task_id=?',
                             (job_id, task_id)).fetchall()
     if len(rows) != 1:
@@ -63,13 +63,18 @@ def reconcile(database, data_dir, job_id, task_id, inspected):
         directory.mkdir(parents=True)
         video_path = directory / 'anchor.mp4'
         video_path.write_bytes(video)
-        frames = asyncio.run(ffmpeg.extract_frames(video_path,directory / 'preview',[1.0]))
+        extract = lambda: asyncio.run(ffmpeg.extract_frames(video_path,directory / 'preview',[1.0]))
+        frames = external_io(extract, step='anchor_ffmpeg_extract',
+            target={'job_id': job_id, 'task_id': task_id, 'anchor_id': str(key)}) if external_io else extract()
         if not frames or not Path(frames[0]).is_file() or not Path(frames[0]).stat().st_size:
             raise RuntimeError('Recovered anchor has no decodable preview')
         image_path = Path(frames[0])
         token = hashlib.sha256(f'{job_id}:{task_id}'.encode()).hexdigest()[:24]
-        video_url = tos.upload(video_path,key_hint=f'{token}-recovered-video')
-        image_url = tos.upload(image_path,key_hint=f'{token}-recovered-preview')
+        def upload():
+            return (tos.upload(video_path,key_hint=f'{token}-recovered-video'),
+                    tos.upload(image_path,key_hint=f'{token}-recovered-preview'))
+        video_url, image_url = external_io(upload, step='anchor_tos_upload',
+            target={'job_id': job_id, 'task_id': task_id, 'anchor_id': str(key)}) if external_io else upload()
         output = {'video_path':str(video_path),'image_path':str(image_path),
                   'video_url':video_url,'image_url':image_url,'task_id':task_id}
 

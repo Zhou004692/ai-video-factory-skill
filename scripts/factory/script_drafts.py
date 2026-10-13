@@ -1558,7 +1558,7 @@ def _approved_payload(row) -> dict:
     }
 
 
-def approve_draft(db, draft_id: str) -> dict:
+def approve_draft(db, draft_id: str, *, commit: bool = True) -> dict:
     row = db.execute(
         "SELECT d.*,b.approved_job_id AS brief_job_id,"
         "b.approved_topic_id,b.recommended_title,b.brief_json,b.approved_angle_index "
@@ -1677,7 +1677,8 @@ def approve_draft(db, draft_id: str) -> dict:
             job_id,
         ),
     )
-    db.commit()
+    if commit:
+        db.commit()
     approved = db.execute(
         "SELECT * FROM script_drafts WHERE draft_id=?", (row["draft_id"],)
     ).fetchone()

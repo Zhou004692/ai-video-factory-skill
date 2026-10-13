@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
+from collections import Counter, deque
+from contextlib import nullcontext
 from copy import deepcopy
 import hashlib
 import json
@@ -43,6 +44,53 @@ CUSTOM_CHARACTER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 CUSTOM_CHARACTER_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 CUSTOM_CHARACTER_IMAGE_MAX_COUNT = 24
 WEIXIN_CHANNELS_ASSISTANT_URL = "https://channels.weixin.qq.com/login"
+
+
+class ScriptRevisionConflict(ValueError):
+    """Optimistic editor conflict; callers retain their unsaved draft."""
+    def __init__(self, row, expected_revision):
+        super().__init__('剧本版本已变化，请核对最新内容；当前编辑已保留')
+        self.payload = {'error': str(self), 'code': 'script_revision_conflict',
+                        'expected_revision': expected_revision,
+                        'current_revision': int(row['revision'] or 1),
+                        'current_script': json.loads(row['script_json'] or '{}')}
+
+
+class ProductionSpecConflict(ValueError):
+    def __init__(self, current, expected):
+        super().__init__('生产规格已变化，请重新读取预检并确认费用')
+        self.payload = {'error': str(self), 'code': 'production_spec_conflict',
+                        'current_production_spec_hash': current,
+                        'expected_production_spec_hash': expected}
+
+
+class BriefRevisionConflict(ValueError):
+    def __init__(self, row, expected):
+        super().__init__('选题简报版本已变化，请核对最新内容；当前编辑已保留')
+        self.payload = {'error': str(self), 'code': 'brief_revision_conflict',
+                        'current_revision': int(row['revision'] or 1), 'expected_revision': expected,
+                        'current_brief': json.loads(row['brief_json'] or '{}')}
+
+
+class SourceAnalysisConflict(ValueError):
+    def __init__(self, current, expected):
+        super().__init__('来源解析已变化，请读取最新分段；当前校正已保留')
+        self.payload = {'error': str(self), 'code': 'analysis_revision_conflict',
+                        'current_digest': current, 'expected_analysis_digest': expected}
+
+
+class FinalMediaConflict(ValueError):
+    def __init__(self, current, expected):
+        super().__init__('成片版本已变化，请重新预览并逐项验收；当前勾选已保留')
+        self.payload = {'error': str(self), 'code': 'final_media_conflict',
+                        'current_final_sha256': current, 'expected_final_sha256': expected}
+
+
+class CandidateMediaConflict(ValueError):
+    def __init__(self, current, expected):
+        super().__init__('候选母片版本已变化，请重新预览；当前复核决定已保留')
+        self.payload = {'error': str(self), 'code': 'candidate_media_conflict',
+                        'current_candidate_sha256': current, 'expected_candidate_sha256': expected}
 
 FINAL_COST_STATES = {"COMPOSED", "READY_TO_PUBLISH", "PUBLISHED"}
 
@@ -718,6 +766,11 @@ class ManagementService:
         transport_preflight_enabled: bool = False,
     ):
         self.database = database
+        self._service_lock = None
+        self._final_hash_cache = {}
+        self._media_hash_inflight = set()
+        self._management_io_observations = deque(maxlen=100)
+        self._io_observation_lock = threading.RLock()
         self.root = Path(root).resolve()
         self.data_dir = (
             Path(data_dir).resolve() if data_dir is not None else self.root / "data"
@@ -818,6 +871,45 @@ class ManagementService:
         self._reconcile_orphaned_production_workers()
         production_invariants.repair_all_safe(self.database)
         self._clear_stale_success_errors()
+
+    def bind_service_lock(self, lock) -> None:
+        """HTTP and background workers share short SQLite critical sections."""
+        self._service_lock = lock
+
+    def external_io(self, operation, *, step='external_io', target=None):
+        """Drop the business mutex only at an explicit DB-free adapter boundary.
+
+        RLock's save/restore protocol is also used by threading.Condition. It
+        preserves nesting when a command already owns the application lock.
+        Releasing with an open shared transaction would let another request
+        commit it, so fail closed before touching the remote adapter.
+        """
+        if self.database.in_transaction:
+            raise RuntimeError('external I/O cannot run inside a SQLite transaction')
+        lock = self._service_lock
+        owned = lock is not None and lock._is_owned()
+        safe_step = step if isinstance(step, str) and step in {'external_io', 'provider_inspection', 'source_collection',
+            'anchor_ffmpeg_extract', 'anchor_tos_upload', 'cold_media_sha', 'oauth_exchange', 'voice_catalog'} else 'external_io'
+        safe_target = {key: value for key, value in (target.items() if isinstance(target, dict) else [])
+            if key in {'job_id', 'task_id', 'feed_id', 'anchor_id', 'asset_key'}
+            and isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_:-]{1,128}', value)}
+        token = lock._release_save() if owned else None
+        started = time.perf_counter()
+        outcome = 'error'
+        try:
+            result = operation()
+            outcome = 'ok'
+            return result
+        finally:
+            elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
+            if owned:
+                lock._acquire_restore(token)
+            # Technical observations are bounded ephemeral metadata. No result,
+            # exception text, URL, path, or SQL write crosses this boundary.
+            with lock if lock is not None else nullcontext():
+                with self._io_observation_lock:
+                    self._management_io_observations.append({'step': safe_step, 'target': safe_target,
+                        'outcome': outcome, 'elapsed_ms': elapsed_ms})
 
     def diagnose_video_task(self, job_id: str) -> dict:
         """Return a read-only, business-facing diagnosis for one video task."""
@@ -1409,18 +1501,55 @@ class ManagementService:
         if not terminal_reconciliation and existing_usage.get('status') in {'completed','failed'}:
             return {'job_id':job_id,'task_id':str(task_id),'remote_status':existing_usage['status'],
                     'state':job['state'],'cost_delta_cents':0}
+        # Snapshot identity, lease, state and ledger before external I/O. A
+        # late response cannot overwrite a decision or a replacement worker.
+        job_guard = tuple(self.database.execute(
+            "SELECT state,updated_at,worker_lease_id,production_worker_pid,"
+            "production_spec_hash,storyboard,cost_cents FROM jobs WHERE job_id=?", (job_id,),
+        ).fetchone())
+        call_guard = tuple(self.database.execute(
+            "SELECT job_id,shot_idx,provider,intent,cost_cents,usage_json FROM provider_calls WHERE task_id=?",
+            (str(task_id),),
+        ).fetchone())
+        nodes_guard = [tuple(row) for row in self.database.execute(
+            "SELECT node_id,state,lease_id,provider_task_id,output_json FROM production_nodes WHERE job_id=? ORDER BY node_id",
+            (job_id,),
+        ).fetchall()]
+        def identity_matches():
+            current_job = self.database.execute(
+                "SELECT state,updated_at,worker_lease_id,production_worker_pid,"
+                "production_spec_hash,storyboard,cost_cents FROM jobs WHERE job_id=?", (job_id,),
+            ).fetchone()
+            current_call = self.database.execute(
+                "SELECT job_id,shot_idx,provider,intent,cost_cents,usage_json FROM provider_calls WHERE task_id=?",
+                (str(task_id),),
+            ).fetchone()
+            current_nodes = [tuple(row) for row in self.database.execute(
+                "SELECT node_id,state,lease_id,provider_task_id,output_json FROM production_nodes WHERE job_id=? ORDER BY node_id",
+                (job_id,),
+            ).fetchall()]
+            return (current_job is not None and current_call is not None
+                    and tuple(current_job) == job_guard and tuple(current_call) == call_guard
+                    and current_nodes == nodes_guard)
         if provider in {"seedance", "seedance_scene", "seedance_identity"}:
-            inspected = asyncio.run(seedance.inspect_task(str(task_id)))
+            inspected = self.external_io(lambda: asyncio.run(seedance.inspect_task(str(task_id))),
+                step='provider_inspection', target={'job_id': job_id, 'task_id': str(task_id)})
         elif provider == "suno":
-            inspected = asyncio.run(
+            inspected = self.external_io(lambda: asyncio.run(
                 music.inspect_task(str(task_id), provider=provider)
-            )
+            ), step='provider_inspection', target={'job_id': job_id, 'task_id': str(task_id)})
         else:
             raise ValueError(f"provider {provider} 不支持远端任务核对")
+        if not identity_matches():
+            current_job = self.database.execute('SELECT state FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            return {'job_id': job_id, 'task_id': str(task_id), 'remote_status': 'stale',
+                    'state': current_job['state'] if current_job else None, 'applied': False,
+                    'reason': '任务身份、租约或状态已变化；保留远端证据并重新核对'}
         if provider in {"seedance_scene", "seedance_identity"} and not terminal_reconciliation:
             from . import anchor_recovery
             return anchor_recovery.reconcile(
-                self.database, self.data_dir, job_id, str(task_id), inspected
+                self.database, self.data_dir, job_id, str(task_id), inspected,
+                external_io=self.external_io,
             )
         status = str(inspected.get("status") or "unknown").strip().casefold()
         if status not in {"completed", "failed"}:
@@ -1437,6 +1566,8 @@ class ManagementService:
         if terminal_reconciliation:
             try:
                 self.database.execute("BEGIN IMMEDIATE")
+                if not identity_matches():
+                    raise ValueError('模型任务身份或租约已被其他请求处理')
                 current = self.database.execute(
                     "SELECT state FROM jobs WHERE job_id=?", (job_id,)
                 ).fetchone()
@@ -1552,6 +1683,8 @@ class ManagementService:
 
         try:
             self.database.execute("BEGIN IMMEDIATE")
+            if not identity_matches():
+                raise ValueError('模型任务身份或租约已被其他请求处理')
             current = self.database.execute(
                 "SELECT state FROM jobs WHERE job_id=?", (job_id,)
             ).fetchone()
@@ -1849,6 +1982,8 @@ class ManagementService:
         self.database.commit()
 
     def production_health(self, *, supervisor_alive: bool) -> dict:
+        with self._io_observation_lock:
+            io_observations = deepcopy(list(self._management_io_observations))
         running = _rows(self.database.execute(
             "SELECT job_id,title,state,production_started_at,updated_at FROM jobs "
             "WHERE state='PRODUCTION_RUNNING' "
@@ -1886,8 +2021,10 @@ class ManagementService:
             "master_capacity": provider_capacity.status(
                 self.database, "seedance",
                 configured_limit=configured_master_limit,
+                persist=False,
             ),
             "provider_recovery": dict(self._last_provider_sweep),
+            "management_io_observations": io_observations,
             "transport_preflight": transport_diagnostics.load_report(
                 self.transport_diagnostic_path
             ),
@@ -1943,7 +2080,13 @@ class ManagementService:
 
     def compile_video_job(self, job_id: str) -> dict:
         """Compile and explain v2 production without any provider submission."""
-        return self.production_service.compile(job_id)
+        with node_state_machine.atomic(self.database):
+            result = self.production_service.compile(job_id)
+            if result.get('compilable') and result.get('spec_hash'):
+                current = self.videos(job_id=job_id)['jobs']
+                if current and current[0].get('production_spec_hash') == result['spec_hash']:
+                    result = {**result, 'confirmation_job': current[0]}
+            return result
 
         # Kept temporarily below as a rollback reference during the gray period.
         from . import production_graph
@@ -2314,10 +2457,19 @@ class ManagementService:
         }
 
     def todo_center(self) -> dict:
+        with self._service_lock or nullcontext():
+            self._prewarm_media_sha()
+            self.database.execute('SAVEPOINT management_todos_read')
+            try:
+                return self._todo_center_snapshot()
+            finally:
+                self.database.execute('RELEASE SAVEPOINT management_todos_read')
+
+    def _todo_center_snapshot(self) -> dict:
         content_items: list[dict] = []
         for row in self.database.execute(
             "SELECT candidate_id,title FROM source_candidates "
-            "WHERE status='candidate' ORDER BY created_at LIMIT 30"
+            "WHERE status='candidate' ORDER BY created_at"
         ).fetchall():
             content_items.append({
                 "id": str(row["candidate_id"]), "title": str(row["title"]),
@@ -2326,7 +2478,7 @@ class ManagementService:
         for row in self.database.execute(
             "SELECT s.source_id,s.title FROM script_sources s WHERE NOT EXISTS ("
             "SELECT 1 FROM topic_brief_sources r WHERE r.source_id=s.source_id) "
-            "ORDER BY s.created_at LIMIT 30"
+            "ORDER BY s.created_at"
         ).fetchall():
             content_items.append({
                 "id": str(row["source_id"]),
@@ -2336,7 +2488,7 @@ class ManagementService:
         for row in self.database.execute(
             "SELECT b.brief_id,b.recommended_title FROM topic_briefs b "
             "WHERE NOT EXISTS (SELECT 1 FROM script_drafts d WHERE d.brief_id=b.brief_id) "
-            "ORDER BY b.created_at LIMIT 30"
+            "ORDER BY b.created_at"
         ).fetchall():
             content_items.append({
                 "id": str(row["brief_id"]),
@@ -2344,8 +2496,9 @@ class ManagementService:
                 "kind": "brief", "page": "scripts", "stage": "briefs",
             })
         for row in self.database.execute(
-            "SELECT draft_id,script_json FROM script_drafts "
-            "WHERE status='candidate' ORDER BY created_at LIMIT 60"
+            "SELECT draft_id,brief_id,script_json FROM script_drafts "
+            "WHERE status='candidate' AND NOT EXISTS (SELECT 1 FROM script_drafts d "
+            "WHERE d.brief_id=script_drafts.brief_id AND d.status='approved') ORDER BY created_at"
         ).fetchall():
             try:
                 script = json.loads(row["script_json"] or "{}")
@@ -2355,6 +2508,7 @@ class ManagementService:
                 "id": str(row["draft_id"]),
                 "title": str(script.get("title") or row["draft_id"]),
                 "kind": "draft", "page": "scripts", "stage": "drafts",
+                "decision_id": f"script:{row['brief_id']}", "brief_id": str(row['brief_id']),
             })
 
         def job_items(state: str, *, kind: str, stage: str) -> list[dict]:
@@ -2364,7 +2518,7 @@ class ManagementService:
                 "kind": kind, "page": "videos", "stage": stage,
             } for row in self.database.execute(
                 "SELECT job_id,title FROM jobs WHERE state=? "
-                "ORDER BY updated_at LIMIT 50", (state,),
+                "ORDER BY updated_at", (state,),
             ).fetchall()]
 
         manual_review_ids: list[str] = []
@@ -2403,6 +2557,16 @@ class ManagementService:
             )
             if item["id"] not in represented_review_ids
         )
+        for row in self.database.execute(
+            "SELECT j.job_id,j.title,n.node_id FROM jobs j JOIN production_nodes n ON n.job_id=j.job_id "
+            "WHERE j.state='PRODUCTION_REVIEW_REQUIRED' AND n.node_type='local_compose' "
+            "AND n.state='REVIEW_REQUIRED' AND n.error_code='content_review_required' ORDER BY j.updated_at",
+        ).fetchall():
+            manual_review_items.append({'id': str(row['job_id']), 'title': str(row['title'] or row['job_id']),
+                'kind': 'content_review', 'page': 'videos', 'stage': 'PRODUCTION_REVIEW_REQUIRED',
+                'decision_id': f"content_review:{row['job_id']}:{row['node_id']}",
+                'target': {'id': str(row['job_id']), 'page': 'videos', 'stage': 'PRODUCTION_REVIEW_REQUIRED',
+                           'job_id': str(row['job_id']), 'node_id': str(row['node_id'])}})
 
         acceptance_items = []
         for item in job_items("COMPOSED", kind="final_acceptance", stage="COMPOSED"):
@@ -2419,6 +2583,7 @@ class ManagementService:
             "kind": "performance", "page": "publishing", "stage": "performance",
             "window_hours": int(item["window_hours"]),
             "due_at": str(item["due_at"]),
+            "job_id": str(item.get('job_id') or ''),
         } for item in performance_feedback.performance_due_tasks(self.database)]
         provider_action_items = job_items(
             "PROVIDER_ACTION_REQUIRED",
@@ -2443,13 +2608,39 @@ class ManagementService:
             )),
             ("performance", "需绩效录入", performance_items),
         ]
-        return {
-            "total": sum(len(items) for _, _, items in groups),
-            "groups": [
-                {"key": key, "title": title, "count": len(items), "items": items}
-                for key, title, items in groups
-            ],
-        }
+        output_groups = []
+        project_ids = set()
+        for key, title, items in groups:
+            decisions = {}
+            for item in items:
+                decision_id = item.get('decision_id') or f"{item['kind']}:{item['id']}"
+                if item['kind'] == 'performance':
+                    decision_id += f":{item['window_hours']}"
+                item['decision_id'] = decision_id
+                item.setdefault('target', {'id': item['id'], 'page': item['page'], 'stage': item['stage']})
+                kind = item['kind']
+                if kind == 'source':
+                    lineage = [item['id']]
+                elif kind in {'brief', 'draft'}:
+                    brief_id = item.get('brief_id') or item['id']
+                    lineage = [r[0] for r in self.database.execute('SELECT source_id FROM topic_brief_sources WHERE brief_id=?', (brief_id,))]
+                elif item['page'] == 'videos' or item.get('job_id'):
+                    lineage = [r[0] for r in self.database.execute('SELECT r.source_id FROM topic_brief_sources r JOIN script_drafts d ON d.brief_id=r.brief_id WHERE d.approved_job_id=?', (item.get('job_id') or item['id'],))]
+                else:
+                    lineage = []
+                item['project_ids'] = sorted(set(lineage))
+                project_ids.update(lineage)
+                if decision_id in decisions:
+                    decisions[decision_id].setdefault('candidate_ids', [decisions[decision_id]['id']]).append(item['id'])
+                else:
+                    decisions[decision_id] = item
+            unique = list(decisions.values())
+            output_groups.append({'key': key, 'title': title, 'count': len(unique),
+                                  'item_count': len(unique), 'items': unique})
+        count = sum(group['count'] for group in output_groups)
+        return {'total': count, 'item_count': count, 'project_count': len(project_ids),
+                'unit': 'decision', 'filter': {'scope': 'all_actionable', 'page': 'all', 'truncated': False},
+                'groups': output_groups}
 
     def scripts(self) -> dict:
         sources = _rows(self.database.execute(
@@ -2469,6 +2660,7 @@ class ManagementService:
                 source["metadata"] = json.loads(source.pop("metadata_json") or "{}")
             except json.JSONDecodeError:
                 source["metadata"] = {}
+            source['analysis_digest'] = self._source_analysis_digest(source['metadata'].get('structure_analysis') or {})
         briefs = _rows(self.database.execute(
             "SELECT brief_id,status,recommended_title,brief_json,approved_job_id,"
             "approved_angle_index,revision,created_at,updated_at "
@@ -2516,13 +2708,13 @@ class ManagementService:
         )
 
     def collect_source_feed(self, feed_id: str) -> dict:
-        result = source_scheduler.collect_feed(self.database, feed_id)
+        result = source_scheduler.collect_feed(self.database, feed_id, external_io=self.external_io)
         if result.get("error"):
             raise ValueError(f"采集失败：{result['error']}")
         return result
 
     def collect_enabled_source_feeds(self) -> list[dict]:
-        return source_scheduler.collect_enabled_feeds(self.database)
+        return source_scheduler.collect_due_feeds(self.database, external_io=self.external_io)
 
     def source_candidates(self, status: str | None = "candidate") -> dict:
         return {
@@ -2583,8 +2775,18 @@ class ManagementService:
         return {"feed_id": feed_id, "deleted": True}
 
     def content_projects(self) -> dict:
+        with self._service_lock or nullcontext():
+            self._prewarm_media_sha(include_projects=True)
+            self.database.execute('SAVEPOINT management_projects_read')
+            try:
+                return self._content_projects_snapshot()
+            finally:
+                self.database.execute('RELEASE SAVEPOINT management_projects_read')
+
+    def _content_projects_snapshot(self) -> dict:
         """Return one user-facing content object across every internal stage."""
         projects: list[dict] = []
+        video_by_id = {item['job_id']: item for item in self.videos()['jobs']}
         source_rows = self.database.execute(
             "SELECT source_id,source_type,title,source_uri,content,created_at "
             "FROM script_sources ORDER BY created_at DESC"
@@ -2626,7 +2828,12 @@ class ManagementService:
                     "SELECT job_id,title,state,cost_cents,final_path,updated_at FROM jobs WHERE job_id=?",
                     (job_id,),
                 ).fetchone()
-                video = dict(job) if job else None
+                video = video_by_id.get(job_id)
+                if video is None and job:
+                    details = self.videos(job_id=job_id)['jobs']
+                    video = details[0] if details else None
+                if video and 'presentation' not in video:
+                    video['presentation'] = self._present_production(video)
                 publications = sorted(
                     item["platform"] for item in self.database.execute(
                         "SELECT platform FROM platform_publications WHERE job_id=? AND is_current=1", (job_id,),
@@ -2652,6 +2859,7 @@ class ManagementService:
                 stage, action = "performance", "record_performance"
             else:
                 stage, action = "production", "view_progress"
+            stage_gates = self._content_stage_gates(source, brief, selected, video, publications)
             projects.append({
                 # The source title is the user-owned content-project name.  A
                 # brief's recommended title is an AI output and must not rename
@@ -2661,8 +2869,53 @@ class ManagementService:
                 "source": source, "quality_gate": _source_quality(source.get("content")),
                 "brief": brief, "selected_script_id": selected, "video": video,
                 "published_platforms": publications, "stage": stage, "next_action": action,
+                "stage_gates": stage_gates,
+                "presentation": video.get('presentation') if video else None,
+                "error_summary": video.get('error_summary') if video else None,
             })
         return {"projects": projects}
+
+    def _content_stage_gates(self, source, brief, selected, video, publications):
+        """Expose prerequisites independently from plans and quality scores."""
+        target = {'project_id': source['source_id']}
+        if video:
+            target['job_id'] = video['job_id']
+        def gate(checks, extra_blockers=None):
+            rows = [{'code': code, 'label': label, 'passed': bool(passed), 'target': target}
+                    for code, label, passed in checks]
+            blockers = [{'code': row['code'], 'message': row['label'], 'target': target}
+                        for row in rows if not row['passed']]
+            blockers.extend(extra_blockers or [])
+            return {'can_advance': not blockers, 'checks': rows, 'blockers': blockers}
+        brief_valid = False
+        if brief:
+            allowed = {r[0] for r in self.database.execute('SELECT source_id FROM topic_brief_sources WHERE brief_id=?', (brief['brief_id'],))}
+            try:
+                topic_briefs.normalize_brief(brief.get('brief') or {}, allowed_source_ids=allowed)
+                brief_valid = True
+            except (ValueError, TypeError, KeyError, AttributeError):
+                pass
+        presentation = (video or {}).get('presentation') or {}
+        media = presentation.get('production') or {}
+        media_complete = media.get('total', 0) > 0 and media.get('completed', 0) == media.get('total')
+        video_blockers = [b for b in (presentation.get('gate') or {}).get('blockers') or []
+                          if b['code'] != 'final_review_required' and (b.get('target') or {}).get('node_id') != 'final_review']
+        final_exists = bool((video or {}).get('final_exists'))
+        review_approved = bool(((video or {}).get('latest_review') or {}).get('decision') == 'approved')
+        return {
+            'source': gate([('source_usable', '来源内容可用', _source_quality(source.get('content'))['passed'])]),
+            'brief': gate([('brief_structure_valid', '简报结构与引用完整', brief_valid),
+                           ('brief_confirmed', '选题已确认', brief and brief.get('status') == 'approved')]),
+            'script': gate([('script_approved', '已选定并审核剧本', selected),
+                            ('production_job_exists', '已生成制作任务', video)]),
+            'video': gate([('accepted_media_complete', '可用母片全部完成', media_complete),
+                           ('final_media_exists', '成片文件可用', final_exists)], video_blockers),
+            'review': gate([('final_media_exists', '成片文件可用', final_exists),
+                            ('final_review_approved', '成片人工验收通过', review_approved)]),
+            'publish': gate([('final_media_exists', '成片文件可用', final_exists),
+                             ('final_review_approved', '成片人工验收通过', review_approved),
+                             ('publication_recorded', '已记录发布结果', publications)]),
+        }
 
     def add_source(self, *, source_type: str, title: str, content: str) -> dict:
         kind = str(source_type or "manual").strip().lower()
@@ -2795,6 +3048,14 @@ class ManagementService:
         return path
 
     def review_source_performance(self, source_id: str, payload: dict) -> dict:
+        with node_state_machine.atomic(self.database):
+            return self._review_source_performance_in_transaction(source_id, payload)
+
+    @staticmethod
+    def _source_analysis_digest(analysis):
+        return content_review.digest(analysis)
+
+    def _review_source_performance_in_transaction(self, source_id: str, payload: dict) -> dict:
         """Persist human speaker resolution without rerunning paid analysis."""
         source_id = str(source_id or "").strip()
         row = self.database.execute(
@@ -2807,6 +3068,9 @@ class ManagementService:
             raise ValueError("仅音视频来源支持人物表演校正")
         metadata = json.loads(row["metadata_json"] or "{}")
         analysis = metadata.get("structure_analysis") or {}
+        current_digest = self._source_analysis_digest(analysis)
+        if 'expected_analysis_digest' in payload and payload['expected_analysis_digest'] != current_digest:
+            raise SourceAnalysisConflict(current_digest, payload['expected_analysis_digest'])
         segments = analysis.get("segments") or []
         assignments = payload.get("assignments") or []
         if not isinstance(assignments, list) or not assignments:
@@ -2850,7 +3114,6 @@ class ManagementService:
             "UPDATE script_sources SET metadata_json=? WHERE source_id=?",
             (json.dumps(metadata, ensure_ascii=False), source_id),
         )
-        self.database.commit()
         review_required_count = sum(
             1 for segment in segments
             if segment.get("speaker_review_required") is True
@@ -2858,6 +3121,7 @@ class ManagementService:
         return {
             "source_id": source_id,
             "analysis": analysis,
+            'analysis_digest': self._source_analysis_digest(analysis),
             "review_required_count": review_required_count,
         }
 
@@ -2889,14 +3153,18 @@ class ManagementService:
     def confirm_brief_and_generate_scripts(
         self, brief_id: str, *, angle_index: int,
         generation_preferences: dict | None = None,
+        expected_revision: int | None = None,
     ) -> dict:
         brief_id = str(brief_id or "").strip()
         row = self.database.execute(
-            "SELECT brief_json,approved_topic_id,approved_job_id FROM topic_briefs "
+            "SELECT brief_json,approved_topic_id,approved_job_id,revision FROM topic_briefs "
             "WHERE brief_id=?", (brief_id,),
         ).fetchone()
         if not row:
             raise ValueError("选题简报不存在")
+        if expected_revision is not None and (isinstance(expected_revision, bool) or not isinstance(expected_revision, int)
+                or expected_revision != int(row['revision'] or 1)):
+            raise BriefRevisionConflict(row, expected_revision)
         brief = json.loads(row["brief_json"] or "{}")
         angles = brief.get("angles") or []
         if int(angle_index) not in range(len(angles)):
@@ -2913,6 +3181,7 @@ class ManagementService:
                 target_audience=str(brief.get("audience") or ""),
                 angle_index=int(angle_index),
                 commit=False,
+                **({'expected_revision': expected_revision} if expected_revision is not None else {}),
             )
             self._load_runtime_env()
             result = script_drafts.generate_drafts(
@@ -2921,6 +3190,9 @@ class ManagementService:
                 preferences=generation_preferences,
             )
             self.database.commit()
+        except topic_briefs.TopicBriefRevisionConflict as exc:
+            self.database.rollback()
+            raise BriefRevisionConflict(exc.row, exc.expected) from exc
         except Exception:
             self.database.rollback()
             raise
@@ -2949,8 +3221,12 @@ class ManagementService:
         )
 
     def update_brief(
-        self, brief_id: str, payload: dict, *, change_note: str = ""
+        self, brief_id: str, payload: dict, *, change_note: str = "", expected_revision: int | None = None,
     ) -> dict:
+        with node_state_machine.atomic(self.database):
+            return self._update_brief_in_transaction(brief_id, payload, change_note=change_note, expected_revision=expected_revision)
+
+    def _update_brief_in_transaction(self, brief_id, payload, *, change_note='', expected_revision=None):
         brief_id = str(brief_id or "").strip()
         row = self.database.execute(
             "SELECT status,recommended_title,brief_json,approved_topic_id,"
@@ -2959,6 +3235,12 @@ class ManagementService:
         ).fetchone()
         if not row:
             raise ValueError("选题简报不存在")
+        current_revision = int(row['revision'] or 1)
+        if expected_revision is not None:
+            if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+                raise ValueError('expected_revision 必须是正整数版本号')
+            if expected_revision != current_revision:
+                raise BriefRevisionConflict(row, expected_revision)
         source_ids = {
             str(item["source_id"]) for item in self.database.execute(
                 "SELECT source_id FROM topic_brief_sources WHERE brief_id=?",
@@ -3018,7 +3300,6 @@ class ManagementService:
                 current_revision + 1, brief_id,
             ),
         )
-        self.database.commit()
         return {
             "brief_id": brief_id, "status": "candidate",
             "revision": current_revision + 1, "brief": normalized,
@@ -3028,6 +3309,7 @@ class ManagementService:
     def update_script_draft(
         self, draft_id: str, payload: dict, *, change_note: str = "",
         auto_adjust_durations: bool = False,
+        expected_revision: int | None = None,
     ) -> dict:
         draft_id = str(draft_id or "").strip()
         row = self.database.execute(
@@ -3038,6 +3320,12 @@ class ManagementService:
             raise ValueError("剧本不存在")
         if row["status"] != "candidate":
             raise ValueError("剧本已提交视频制作，不能覆盖；请复制为新版本")
+        current_revision = int(row['revision'] or 1)
+        if expected_revision is not None:
+            if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+                raise ValueError('expected_revision 必须是正整数版本号')
+            if expected_revision != current_revision:
+                raise ScriptRevisionConflict(row, expected_revision)
         source_ids = {
             str(item["source_id"]) for item in self.database.execute(
                 "SELECT source_id FROM topic_brief_sources WHERE brief_id=?",
@@ -3073,14 +3361,20 @@ class ManagementService:
             entity_type="script", entity_id=draft_id, revision=current_revision,
             payload=current_payload, change_note=change_note,
         )
-        self.database.execute(
+        updated = self.database.execute(
             "UPDATE script_drafts SET script_json=?,revision=?,"
-            "updated_at=CURRENT_TIMESTAMP WHERE draft_id=?",
+            "updated_at=CURRENT_TIMESTAMP WHERE draft_id=? AND revision=? AND status='candidate'",
             (
                 json.dumps(normalized, ensure_ascii=False),
-                current_revision + 1, draft_id,
+                current_revision + 1, draft_id, current_revision,
             ),
         )
+        if int(updated.rowcount or 0) != 1:
+            self.database.rollback()
+            current = self.database.execute('SELECT script_json,revision FROM script_drafts WHERE draft_id=?', (draft_id,)).fetchone()
+            if current:
+                raise ScriptRevisionConflict(current, expected_revision or current_revision)
+            raise ValueError('剧本已删除，请保留当前编辑并刷新')
         self.database.commit()
         return {
             "draft_id": draft_id, "status": "candidate",
@@ -3146,8 +3440,18 @@ class ManagementService:
             "deleted_briefs": len(linked),
         }
 
-    def approve_script(self, draft_id: str) -> dict:
-        return script_drafts.approve_draft(self.database, draft_id)
+    def approve_script(self, draft_id: str, *, expected_revision: int | None = None) -> dict:
+        if expected_revision is None:
+            return script_drafts.approve_draft(self.database, draft_id)
+        with node_state_machine.atomic(self.database):
+            row = self.database.execute('SELECT revision,script_json FROM script_drafts WHERE draft_id=?', (draft_id,)).fetchone()
+            if not row:
+                raise ValueError('剧本不存在')
+            if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+                raise ValueError('expected_revision 必须是正整数版本号')
+            if expected_revision != int(row['revision'] or 1):
+                raise ScriptRevisionConflict(row, expected_revision)
+            return script_drafts.approve_draft(self.database, draft_id, commit=False)
 
     def delete_script(self, draft_id: str) -> dict:
         row = self.database.execute(
@@ -3262,16 +3566,27 @@ class ManagementService:
             "jobs": reports,
         }
 
-    def videos(self) -> dict:
+    def videos(self, *, job_id: str | None = None) -> dict:
+        with self._service_lock or nullcontext():
+            self._prewarm_media_sha(job_id=job_id)
+            self.database.execute('SAVEPOINT management_videos_read')
+            try:
+                return self._videos_snapshot(job_id=job_id)
+            finally:
+                self.database.execute('RELEASE SAVEPOINT management_videos_read')
+
+    def _videos_snapshot(self, *, job_id: str | None = None) -> dict:
         jobs = _rows(self.database.execute(
             "SELECT j.job_id,j.title,j.state,j.cost_cents,j.final_path,j.error,"
-            "j.failure_code,j.storyboard,j.execution_engine,j.production_spec_json,"
+            "j.failure_code,j.storyboard,j.execution_engine,j.production_spec_json,j.production_spec_hash,"
             "j.created_at,j.updated_at "
             "FROM jobs j WHERE NOT ("
             "j.state='PENDING' AND NOT EXISTS (SELECT 1 FROM script_drafts d "
             "WHERE d.approved_job_id=j.job_id AND d.status='approved') "
             "AND NOT EXISTS (SELECT 1 FROM shots s WHERE s.job_id=j.job_id)) "
-            "ORDER BY j.created_at DESC LIMIT 80"
+            + ("AND j.job_id=? " if job_id is not None else "")
+            + "ORDER BY j.created_at DESC LIMIT 80",
+            (job_id,) if job_id is not None else (),
         ))
         for job in jobs:
             final_file = Path(job["final_path"]) if job.get("final_path") else None
@@ -3279,6 +3594,10 @@ class ManagementService:
             job["final_version"] = (
                 final_file.stat().st_mtime_ns if job["final_exists"] else None
             )
+            controlled_final = controlled_job_asset_path(self.data_dir / 'assets', job['job_id'], job.get('final_path'), require_file=True)
+            job['final_sha256'] = None
+            if controlled_final:
+                job['final_sha256'] = self._cached_media_sha(controlled_final)
             try:
                 storyboard = json.loads(job.pop("storyboard") or "{}")
             except json.JSONDecodeError:
@@ -3554,6 +3873,7 @@ class ManagementService:
                     in {"accept_candidate", "keep_prior"}
                 )
                 shot["candidate_preview_url"] = None
+                shot['candidate_sha256'] = None
                 shot["previous_master_preview_url"] = previous_master_preview_url
                 video_path = str(shot.get("video_path") or "").strip()
                 shot["has_prior_master"] = bool(
@@ -3561,7 +3881,8 @@ class ManagementService:
                 )
                 if shot["manual_review_required"]:
                     try:
-                        self.master_candidate_file(job["job_id"], shot["idx"])
+                        candidate_path = self.master_candidate_file(job["job_id"], shot["idx"])
+                        shot['candidate_sha256'] = self._cached_media_sha(candidate_path)
                         shot["candidate_preview_url"] = (
                             f"/api/videos/{job['job_id']}/masters/"
                             f"{shot['idx']}/candidate"
@@ -4188,7 +4509,216 @@ class ManagementService:
                 job.get('failure_code') == 'content_review_required' or (self.data_dir / 'assets' / job['job_id'] / 'content_retention.review.json').is_file()):
                 job['next_action'] = {'id': 'review_visual_content', 'label': '复核画面内容并恢复本地合成'}
                 job['allowed_actions'] = [job['next_action']]
+            job['presentation'] = self._present_production(job, storyboard)
+            job['error_summary'] = job['presentation']['error_summary']
+            job['completed_master_count'] = job['presentation']['production']['completed']
+            job['generating_master_count'] = job['presentation']['activity']['running']
+            job['waiting_master_count'] = (
+                max(0, job['presentation']['production']['total'] - job['completed_master_count'])
+                if job['presentation']['activity']['queued'] else 0
+            )
         return {"jobs": jobs}
+
+    def _cached_media_sha(self, path):
+        # Snapshot projection consumes verified cache entries only. A nested
+        # SAVEPOINT must never release its lock or start a cold file read.
+        signature = self._media_stat_signature(path)
+        cached = self._final_hash_cache.get(str(path))
+        return cached[1] if signature is not None and cached and cached[0] == signature else None
+
+    @staticmethod
+    def _media_stat_signature(path):
+        try:
+            stat = path.stat()
+            return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        except OSError:
+            return None
+
+    def _prewarm_media_sha(self, *, job_id=None, include_projects=False):
+        if self.database.in_transaction:
+            return
+        # This runs under the service mutex before a read snapshot begins.
+        # Default scope matches the recent video list; projects also include
+        # their linked approved jobs without loading historical job DTOs.
+        if job_id is not None:
+            job_ids = {job_id}
+        else:
+            job_ids = {row['job_id'] for row in self.database.execute(
+                "SELECT j.job_id FROM jobs j WHERE NOT (j.state='PENDING' "
+                "AND NOT EXISTS(SELECT 1 FROM script_drafts d WHERE d.approved_job_id=j.job_id AND d.status='approved') "
+                "AND NOT EXISTS(SELECT 1 FROM shots s WHERE s.job_id=j.job_id)) ORDER BY j.created_at DESC LIMIT 80"
+            ).fetchall()}
+            if include_projects:
+                job_ids.update(row['approved_job_id'] for row in self.database.execute(
+                    "SELECT DISTINCT d.approved_job_id FROM script_drafts d WHERE d.status='approved' "
+                    "AND d.approved_job_id IS NOT NULL AND EXISTS(SELECT 1 FROM topic_brief_sources r WHERE r.brief_id=d.brief_id)"
+                ).fetchall())
+        paths = set()
+        assets = self.data_dir / 'assets'
+        for identity in sorted(job_ids):
+            row = self.database.execute('SELECT final_path FROM jobs WHERE job_id=?', (identity,)).fetchone()
+            if row:
+                path = controlled_job_asset_path(assets, identity, row['final_path'], require_file=True)
+                if path:
+                    paths.add(path)
+            for shot in self.database.execute('SELECT video_qa FROM shots WHERE job_id=?', (identity,)).fetchall():
+                qa = content_review.object_json(shot['video_qa'])
+                path = controlled_candidate_path(assets, identity, qa.get('candidate_path'))
+                if path:
+                    paths.add(path)
+        pending = []
+        for path in sorted(paths):
+            key = str(path)
+            signature = self._media_stat_signature(path)
+            cached = self._final_hash_cache.get(key)
+            if signature is not None and key not in self._media_hash_inflight and (not cached or cached[0] != signature):
+                pending.append((path, signature))
+                self._media_hash_inflight.add(key)
+        if not pending:
+            return
+        def hash_paths():
+            results = []
+            for path, signature in pending:
+                try:
+                    digest = _file_sha256(path)
+                except OSError:
+                    digest = None
+                results.append((path, signature, digest))
+            return results
+        try:
+            asset_key = hashlib.sha256('|'.join(str(path) for path, _ in pending).encode('utf-8')).hexdigest()[:24]
+            results = self.external_io(hash_paths, step='cold_media_sha', target={'asset_key': asset_key})
+            # The mutex has been reacquired. Replaced/deleted files are never
+            # assigned the hash computed for their prior identity.
+            for path, signature, digest in results:
+                if digest is not None and self._media_stat_signature(path) == signature:
+                    self._final_hash_cache[str(path)] = (signature, digest)
+                else:
+                    self._final_hash_cache.pop(str(path), None)
+        finally:
+            for path, _ in pending:
+                self._media_hash_inflight.discard(str(path))
+
+    def _present_production(self, job: dict, storyboard: dict | None = None) -> dict:
+        """Collect local evidence, then hand a plain snapshot to the pure DTO."""
+        from datetime import datetime, timezone
+        from .services.production_presentation import present_production
+        now = datetime.now(timezone.utc)
+        def lease_valid(identity, heartbeat):
+            if not identity or not heartbeat:
+                return False
+            try:
+                stamp = datetime.fromisoformat(str(heartbeat).replace('Z', '+00:00'))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                return 0 <= (now - stamp).total_seconds() <= 60
+            except (ValueError, TypeError):
+                return False
+        stored = self.database.execute('SELECT * FROM jobs WHERE job_id=?', (job['job_id'],)).fetchone()
+        evidence = {**dict(stored), **job} if stored else dict(job)
+        nodes = _rows(self.database.execute('SELECT * FROM production_nodes WHERE job_id=?', (job['job_id'],)))
+        for node in nodes:
+            node['lease_valid'] = lease_valid(node.get('lease_id'), node.get('heartbeat_at'))
+        shots = _rows(self.database.execute('SELECT * FROM shots WHERE job_id=? ORDER BY idx', (job['job_id'],)))
+        def media_exists(path):
+            controlled = controlled_job_asset_path(self.data_dir / 'assets', job['job_id'], path, require_file=True)
+            try:
+                return bool(controlled and controlled.stat().st_size > 0)
+            except OSError:
+                return False
+        for shot in shots:
+            shot['media_exists'] = media_exists(shot.get('video_path'))
+        calls = _rows(self.database.execute('SELECT * FROM provider_calls WHERE job_id=?', (job['job_id'],)))
+        try:
+            runtime = storyboard if storyboard is not None else json.loads(evidence.get('storyboard') or '{}')
+        except (ValueError, TypeError):
+            runtime = {}
+        review = self.database.execute('SELECT decision FROM review_events WHERE job_id=? ORDER BY id DESC LIMIT 1',
+                                      (job['job_id'],)).fetchone()
+        anchors = []
+        for table in ('character_identity_anchors', 'scene_visual_anchors'):
+            anchors.extend(_rows(self.database.execute(f'SELECT state,approval_state FROM {table} WHERE job_id=?', (job['job_id'],))))
+        receipts = []
+        queue_receipt = self.database.execute(
+            "SELECT event_id,event,created_at FROM job_transitions WHERE job_id=? AND to_state='PRODUCTION_QUEUED' ORDER BY transition_id DESC LIMIT 1",
+            (job['job_id'],),
+        ).fetchone()
+        if queue_receipt:
+            receipts.append({'id': queue_receipt['event_id'], 'kind': 'queue_transition',
+                'event': queue_receipt['event'], 'created_at': queue_receipt['created_at'], 'target': {'job_id': job['job_id']}})
+        authorization = self.database.execute(
+            "SELECT id,message,ts AS created_at FROM events WHERE job_id=? AND step='native_visual_repair_authorized' ORDER BY id DESC LIMIT 1",
+            (job['job_id'],),
+        ).fetchone()
+        if authorization:
+            try:
+                authorized = json.loads(authorization['message'])
+                attempt_id = (authorized.get('attempt') or {}).get('attempt_id')
+            except (ValueError, TypeError, AttributeError):
+                attempt_id = None
+            if attempt_id:
+                receipts.append({'id': f"native-authorized:{authorization['id']}:{attempt_id}",
+                    'kind': 'native_authorization', 'event': 'native_visual_repair_authorized',
+                    'created_at': authorization['created_at'], 'target': {'job_id': job['job_id'], 'attempt_id': attempt_id}})
+        approved_script = self.database.execute("SELECT brief_id,draft_id FROM script_drafts WHERE approved_job_id=? AND status='approved' LIMIT 1",
+                                                (job['job_id'],)).fetchone()
+        plan_passed = 0
+        if approved_script:
+            source_row = self.database.execute('SELECT s.* FROM script_sources s JOIN topic_brief_sources r ON s.source_id=r.source_id WHERE r.brief_id=? ORDER BY s.source_id LIMIT 1',
+                                               (approved_script['brief_id'],)).fetchone()
+            brief_row = self.database.execute('SELECT * FROM topic_briefs WHERE brief_id=?', (approved_script['brief_id'],)).fetchone()
+            if source_row and brief_row:
+                brief = dict(brief_row)
+                try:
+                    brief['brief'] = json.loads(brief.get('brief_json') or '{}')
+                except (TypeError, ValueError):
+                    brief['brief'] = {}
+                gates = self._content_stage_gates(dict(source_row), brief, approved_script['draft_id'], job, [])
+                plan_passed = sum(gates[key]['can_advance'] for key in ('source', 'brief', 'script'))
+        evidence.update({'nodes': nodes, 'shots': shots, 'provider_calls': calls,
+            'lease_valid': lease_valid(evidence.get('worker_lease_id'), evidence.get('production_heartbeat_at')),
+            'plan_passed': plan_passed, 'plan_total': 3,
+            'production_total': len(runtime.get('masters') or []),
+            'anchor_blocked': any(a['state'] not in {'OK', 'READY'} or a['approval_state'] != 'APPROVED' for a in anchors)
+                or any(n['node_type'] in {'character_anchor', 'scene_anchor'} and n['state'] != 'SUCCEEDED' for n in nodes),
+            'content_blocked': any(n['error_code'] == 'content_review_required' for n in nodes)
+                or (content_review.enabled(runtime) and not any(n['node_type'] == 'local_compose' and n['state'] == 'SUCCEEDED' for n in nodes)),
+            'final_exists': media_exists(evidence.get('final_path')),
+            'final_review_approved': bool(review and review['decision'] == 'approved'),
+            'submission_receipts': receipts,
+            'observed_at': now.isoformat()})
+        # Keep existing action authority and augment its explicit targets.
+        actions = deepcopy(evidence.get('allowed_actions') or [])
+        evidence['allowed_actions'] = actions
+        for action in actions:
+            if isinstance(action, dict):
+                self._decorate_production_action(action, job, calls, nodes)
+        action = deepcopy(evidence.get('next_action'))
+        evidence['next_action'] = action
+        if isinstance(action, dict):
+            self._decorate_production_action(action, job, calls, nodes)
+        return present_production(evidence)
+
+    @staticmethod
+    def _decorate_production_action(action, job, calls, nodes):
+        key = action.get('id') or ''
+        target = {'job_id': job['job_id']}
+        if key.startswith('reconcile_'):
+            unresolved = [call for call in calls if provider_tasks.effective_task_id(call['task_id'], call['usage_json'])
+                in {item.get('task_id') for item in job.get('unresolved_provider_tasks') or []}]
+            if unresolved:
+                target['task_ids'] = [provider_tasks.effective_task_id(c['task_id'], c['usage_json']) for c in unresolved]
+        if 'master' in key:
+            target['node_ids'] = [n['node_id'] for n in nodes if n['node_type'] == 'master' and n['state'] == 'REVIEW_REQUIRED']
+        action.setdefault('target', target)
+        paid = key in {'confirm_budget', 'start_video', 'start_video_job', 'retry_network_failures', 'increase_job_budget'}
+        if key == 'resume_failed_video':
+            paid = not nodes or any(n['paid'] and n['state'] in {'READY', 'PENDING', 'FAILED'} for n in nodes)
+            if (job.get('recovery') or {}).get('recovery_kind') == 'completed_master_download':
+                paid = False
+        action.setdefault('needs_paid_confirmation', paid)
+        if paid:
+            action.setdefault('reason', '继续生成可能产生费用，请确认剩余预算')
 
     def upgrade_director_plan(self, job_id: str) -> dict:
         job = self.database.execute(
@@ -5468,6 +5998,7 @@ class ManagementService:
         self, job_id: str, *, decision: str, manual_minutes: float = 0,
         notes: str = "", first_pass: bool | None = None,
         checks: dict[str, bool] | None = None,
+        expected_final_sha256: str | None = None,
     ) -> dict:
         return self.production_service.review(
             job_id,
@@ -5476,13 +6007,25 @@ class ManagementService:
             notes=notes,
             first_pass=first_pass,
             checks=checks,
+            **({'expected_final_sha256': expected_final_sha256} if expected_final_sha256 is not None else {}),
         )
+
+    def _assert_expected_final_sha(self, job_id, expected):
+        if expected is None:
+            return
+        row = self.database.execute('SELECT final_path FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+        path = controlled_job_asset_path(self.data_dir / 'assets', job_id, row['final_path'] if row else None, require_file=True)
+        current = _file_sha256(path) if path else None
+        if current != expected:
+            raise FinalMediaConflict(current, expected)
 
     def _review_video_impl(
         self, job_id: str, *, decision: str, manual_minutes: float = 0,
         notes: str = "", first_pass: bool | None = None,
         checks: dict[str, bool] | None = None,
+        expected_final_sha256: str | None = None,
     ) -> dict:
+        self._assert_expected_final_sha(job_id, expected_final_sha256)
         row = self.database.execute(
             "SELECT state,final_path,execution_engine FROM jobs WHERE job_id=?",
             (job_id,)
@@ -5491,6 +6034,7 @@ class ManagementService:
             raise ValueError("视频任务不存在")
         if row['state'] == 'READY_TO_PUBLISH' and decision == 'approved':
             with self._final_review_lock, node_state_machine.atomic(self.database):
+                self._assert_expected_final_sha(job_id, expected_final_sha256)
                 live = self.database.execute('SELECT state FROM jobs WHERE job_id=?', (job_id,)).fetchone()
                 report = content_review.require_final(self.database, self.data_dir / 'assets', job_id)
                 if live and live['state'] == 'READY_TO_PUBLISH' and report and all(bool((checks or {}).get(key)) for key in REVIEW_CHECKS):
@@ -5525,6 +6069,7 @@ class ManagementService:
                 ).fetchone()
                 if locked_row is None or str(locked_row["state"]) != "COMPOSED":
                     raise ValueError("final_review is stale: job is not COMPOSED")
+                self._assert_expected_final_sha(job_id, expected_final_sha256)
                 if decision == 'approved':
                     binding = content_review.require_final(self.database, self.data_dir / 'assets', job_id)
                 if not locked_row["final_path"] or not Path(
@@ -5613,6 +6158,7 @@ class ManagementService:
                 )
                 if updated.rowcount != 1:
                     raise ValueError("final_review lost its job-state compare-and-swap")
+                self._assert_expected_final_sha(job_id, expected_final_sha256)
                 self.database.commit()
             except Exception:
                 self.database.rollback()
@@ -6353,9 +6899,25 @@ class ManagementService:
         )
         return True
 
+    def _assert_expected_candidate_sha(self, job_id, master_idx, expected):
+        if expected is None:
+            return
+        shot = self.database.execute('SELECT video_qa,video_path FROM shots WHERE job_id=? AND idx=?', (job_id, int(master_idx))).fetchone()
+        qa = content_review.object_json(shot['video_qa']) if shot else {}
+        operation = qa.get('review_operation') or qa.get('content_candidate_acceptance') or {}
+        path = controlled_candidate_path(self.data_dir / 'assets', job_id, qa.get('candidate_path'))
+        current = _file_sha256(path) if path else None
+        if current is None and operation.get('phase') == 'committed' and operation.get('candidate_sha256') == expected:
+            active = controlled_job_asset_path(self.data_dir / 'assets', job_id, shot['video_path'], require_file=True)
+            if active and _file_sha256(active) == operation.get('selected_sha256', operation.get('candidate_sha256')):
+                return
+        if current != expected:
+            raise CandidateMediaConflict(current, expected)
+
     def review_master_candidate(
-        self, job_id: str, master_idx: int, *, decision: str
+        self, job_id: str, master_idx: int, *, decision: str, expected_candidate_sha256: str | None = None,
     ) -> dict:
+        self._assert_expected_candidate_sha(job_id, master_idx, expected_candidate_sha256)
         normalized = str(decision or "").strip()
         if normalized not in {
             "accept_candidate", "regenerate_master", "reject_job", "keep_prior",
@@ -6546,6 +7108,7 @@ class ManagementService:
         claimed_qa["review_operation"] = operation
         try:
             self.database.execute("BEGIN IMMEDIATE")
+            self._assert_expected_candidate_sha(job_id, master_idx, expected_candidate_sha256)
             if normalized != "reject_job":
                 recovery_plan.require_review_decision(self.database, job_id, normalized)
             if normalized in {'accept_candidate', 'keep_prior'}:
@@ -7248,6 +7811,37 @@ class ManagementService:
         return result
 
     def publishing(self) -> dict:
+        self.database.execute('SAVEPOINT management_publishing_read')
+        try:
+            return self._publishing_snapshot()
+        finally:
+            self.database.execute('RELEASE SAVEPOINT management_publishing_read')
+
+    def claim_management_command(self, command_id, path, payload):
+        from .services import management_commands
+        return management_commands.claim(self.database, command_id, path, payload)
+
+    def finish_management_command(self, command_id, payload, status):
+        from .services import management_commands
+        return management_commands.finish(self.database, command_id, payload, status)
+
+    def management_command_result(self, command_id):
+        from .services import management_commands
+        return management_commands.read(self.database, command_id)
+
+    def cancel_unclaimed_management_command(self, command_id, path, request_sha256):
+        from .services import management_commands
+        return management_commands.cancel_unclaimed(self.database, command_id, path, request_sha256)
+
+    def resolve_management_command(self, command_id, payload):
+        from .services import management_commands
+        return management_commands.resolve(self.database, command_id, payload)
+
+    def release_management_command(self, command_id):
+        from .services import management_commands
+        return management_commands.release(self.database, command_id)
+
+    def _publishing_snapshot(self) -> dict:
         ready = _rows(self.database.execute(
             "SELECT job_id,title,state,final_path,publish_url,updated_at FROM jobs "
             "WHERE state='READY_TO_PUBLISH' ORDER BY updated_at DESC LIMIT 60"
@@ -7289,6 +7883,11 @@ class ManagementService:
                 (publication["publication_id"],),
             ).fetchone()
             publication["latest_snapshot"] = performance_feedback.project_snapshot(snapshot) if snapshot else None
+            history = self.database.execute('SELECT * FROM performance_snapshots WHERE publication_id=? ORDER BY captured_at DESC,snapshot_id DESC LIMIT 20',
+                                            (publication['publication_id'],)).fetchall()
+            publication['snapshot_history'] = [performance_feedback.project_snapshot(row) for row in history]
+            publication['snapshot_history_total'] = int(self.database.execute('SELECT COUNT(*) FROM performance_snapshots WHERE publication_id=?',
+                                                                               (publication['publication_id'],)).fetchone()[0])
             publication["creative_context"] = content_review.object_json(publication.pop("context_json",None))
             publication["binding_status"] = publication["creative_context"].get("binding_status", "legacy_unverified")
             metadata = _publication_metadata(publication.pop("metadata_json", None))
@@ -7298,10 +7897,31 @@ class ManagementService:
             )
         for item in unverified:
             item["verification_status"] = "legacy_unverified"
+        # A publication registration is not proof that a timed-out external
+        # submission was accepted. Only the existing submission ledger supplies
+        # identities; lifecycle updates cannot manufacture a new receipt.
+        job_ids = {str(item['job_id']) for item in ready + publications + unverified}
+        submission_evidence = {}
+        for job_id in sorted(job_ids):
+            receipts = _rows(self.database.execute(
+                'SELECT submission_id,platform,state,upload_id,item_id,created_at FROM platform_submissions WHERE job_id=? ORDER BY submission_id',
+                (job_id,),
+            ))
+            identities = [str(row['submission_id']) for row in receipts]
+            known = bool(receipts) and all(row['state'] in {'submitted', 'pending_review', 'published', 'rejected'} for row in receipts)
+            submission_evidence[job_id] = {
+                'receipt_id': hashlib.sha256(json.dumps(identities, separators=(',', ':')).encode('utf-8')).hexdigest() if identities else None,
+                'submission_known': known,
+                'accepted': any(row['state'] in {'submitted', 'pending_review', 'published'} for row in receipts),
+                'receipts': receipts,
+            }
+        for item in ready + publications + unverified:
+            item['submission_evidence'] = submission_evidence[str(item['job_id'])]
         return {
             "ready": ready,
             "publications": publications,
             "unverified": unverified,
+            "submission_evidence": submission_evidence,
             "performance_due": performance_feedback.performance_due_tasks(
                 self.database
             ),
@@ -7685,13 +8305,15 @@ class ManagementService:
         values = _read_env(self.env_path)
         client = douyin.DouyinClient()
         try:
-            token = client.exchange_code(
+            token = self.external_io(lambda: client.exchange_code(
                 client_key=str(values.get("DOUYIN_CLIENT_KEY") or ""),
                 client_secret=str(values.get("DOUYIN_CLIENT_SECRET") or ""),
                 code=code,
-            )
+            ), step='oauth_exchange')
         finally:
             client.close()
+        if not self.database.execute("SELECT 1 FROM platform_oauth_states WHERE state=? AND platform='douyin' AND used_at IS NOT NULL", (state,)).fetchone():
+            raise ValueError('抖音授权已取消，请重新发起绑定')
         self._save_douyin_account(token)
         return self.douyin_account_status()
 
@@ -7699,6 +8321,7 @@ class ManagementService:
         removed = self.database.execute(
             "DELETE FROM platform_accounts WHERE platform='douyin'"
         ).rowcount
+        self.database.execute("DELETE FROM platform_oauth_states WHERE platform='douyin'")
         self.database.commit()
         return {"platform": "douyin", "disconnected": bool(removed)}
 
@@ -7832,7 +8455,7 @@ class ManagementService:
     def voice_catalog(self) -> dict:
         client = self._volc_speech_client()
         try:
-            speakers = client.list_speakers()
+            speakers = self.external_io(client.list_speakers, step='voice_catalog')
         finally:
             client.close()
         return {
@@ -8327,17 +8950,39 @@ class ManagementService:
         approved_budget_cents: int | None = None,
         high_risk_confirmed: bool = False,
         native_repair_attempt_id: str | None = None,native_repair_request_fingerprint: str | None = None,
+        expected_production_spec_hash: str | None = None,
     ) -> dict:
+        self._assert_expected_production_spec(job_id, expected_production_spec_hash)
         if confirmed:
             self._require_transport_preflight()
-        return self.production_service.start(
-            job_id,
-            confirmed=confirmed,
-            approved_budget_cents=approved_budget_cents,
+        kwargs = dict(
+            confirmed=confirmed, approved_budget_cents=approved_budget_cents,
             high_risk_confirmed=high_risk_confirmed,
-            **({'native_repair_attempt_id':native_repair_attempt_id,'native_repair_request_fingerprint':native_repair_request_fingerprint}
-               if native_repair_attempt_id is not None or native_repair_request_fingerprint is not None else {}),
         )
+        if native_repair_attempt_id is not None or native_repair_request_fingerprint is not None:
+            kwargs.update(native_repair_attempt_id=native_repair_attempt_id,
+                          native_repair_request_fingerprint=native_repair_request_fingerprint)
+        if expected_production_spec_hash is not None:
+            kwargs['expected_production_spec_hash'] = expected_production_spec_hash
+            with node_state_machine.atomic(self.database):
+                self._assert_expected_production_spec(job_id, expected_production_spec_hash)
+                result = self.production_service.start(job_id, **kwargs)
+            if result.pop('dispatch_deferred', False):
+                dispatch = self.dispatch_production_queue()
+                result['status'] = 'started' if job_id in dispatch['dispatched_jobs'] else 'queued'
+            return result
+        return self.production_service.start(job_id, **kwargs)
+
+    def _assert_expected_production_spec(self, job_id, expected):
+        if expected is None:
+            return
+        if not isinstance(expected, str) or not expected.strip():
+            raise ValueError('expected_production_spec_hash 必须是预检返回的规格哈希')
+        row = self.database.execute('SELECT production_spec_hash FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+        if not row:
+            raise ValueError('视频任务不存在')
+        if row['production_spec_hash'] != expected:
+            raise ProductionSpecConflict(row['production_spec_hash'], expected)
 
     def confirm_video_budget(
         self, job_id: str, *, confirmed: bool,
@@ -8492,7 +9137,10 @@ class ManagementService:
         approved_budget_cents: int | None = None,
         high_risk_confirmed: bool = False,
         native_repair_attempt_id: str | None = None,native_repair_request_fingerprint: str | None = None,
+        expected_production_spec_hash: str | None = None,
     ) -> dict:
+        caller_owns_transaction = self.database.in_transaction
+        self._assert_expected_production_spec(job_id, expected_production_spec_hash)
         if not confirmed:
             raise ValueError("开始付费生成前必须明确确认预算")
         from . import native_visual_repair
@@ -8692,7 +9340,7 @@ class ManagementService:
             job_id,
             self.root,
             storyboard_override=storyboard,
-            persist=(execution_engine != "graph_v2"),
+            persist=(execution_engine != "graph_v2" and not caller_owns_transaction),
             target_version=target_spec_version,
         )
         if not final_contract.payable:
@@ -8701,6 +9349,9 @@ class ManagementService:
             self.production_service.persist_compiled_execution(
                 final_contract.spec,
             )
+        elif caller_owns_transaction:
+            from . import production_contract
+            production_contract.persist_production_spec(self.database, final_contract.spec, commit=False)
         executable_storyboard = (
             final_contract.spec.runtime_storyboard
             if execution_engine == "graph_v2"
@@ -8722,6 +9373,8 @@ class ManagementService:
                 "failure_code": None,
             },
         )
+        if caller_owns_transaction:
+            return {'job_id': job_id, 'status': 'queued', 'dispatch_deferred': True}
         dispatch = self.dispatch_production_queue()
         status = "started" if job_id in dispatch["dispatched_jobs"] else "queued"
         return {"job_id": job_id, "status": status}

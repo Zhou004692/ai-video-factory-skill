@@ -433,17 +433,26 @@ def generate_brief(db, source_ids: list[str], *, force: bool = False,
     }
 
 
+class TopicBriefRevisionConflict(ValueError):
+    def __init__(self, row, expected):
+        super().__init__('选题简报版本已变化，请重新核对后确认')
+        self.row, self.expected = row, expected
+
+
 def approve_brief(db, brief_id: str, *, topic_id: str, track: str = "",
                   target_audience: str = "", priority: int = 3,
                   angle_index: int | None = None,
-                  commit: bool = True) -> str:
+                  commit: bool = True, expected_revision: int | None = None) -> str:
     row = db.execute(
         "SELECT status, recommended_title, brief_json, approved_topic_id, "
-        "approved_job_id, approved_angle_index "
+        "approved_job_id, approved_angle_index, revision "
         "FROM topic_briefs WHERE brief_id=?", (brief_id,),
     ).fetchone()
     if not row:
         raise ValueError(f"topic brief not found: {brief_id}")
+    if expected_revision is not None and (isinstance(expected_revision, bool) or not isinstance(expected_revision, int)
+                                         or expected_revision != int(row['revision'] or 1)):
+        raise TopicBriefRevisionConflict(row, expected_revision)
     topic_id = _text(topic_id)
     if not topic_id:
         raise ValueError("topic_id is required")
@@ -471,12 +480,15 @@ def approve_brief(db, brief_id: str, *, topic_id: str, track: str = "",
             "INSERT OR IGNORE INTO topic_script_sources(topic_id, source_id) "
             "VALUES(?,?)", (topic_id, source["source_id"]),
         )
-    db.execute(
+    changed = db.execute(
         "UPDATE topic_briefs SET status='approved', approved_topic_id=?, "
         "approved_job_id=NULL, approved_angle_index=?, "
-        "updated_at=CURRENT_TIMESTAMP WHERE brief_id=?",
-        (topic_id, selected_index, brief_id),
+        "updated_at=CURRENT_TIMESTAMP WHERE brief_id=? AND revision=?",
+        (topic_id, selected_index, brief_id, int(row['revision'] or 1)),
     )
+    if changed.rowcount != 1:
+        current = db.execute('SELECT revision,brief_json FROM topic_briefs WHERE brief_id=?', (brief_id,)).fetchone()
+        raise TopicBriefRevisionConflict(current or row, expected_revision or int(row['revision'] or 1))
     if commit:
         db.commit()
     return job_id

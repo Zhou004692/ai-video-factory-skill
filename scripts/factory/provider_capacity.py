@@ -74,13 +74,17 @@ def _payload(row: sqlite3.Row, configured_limit: int) -> dict:
 
 
 def status(database: sqlite3.Connection, provider: str, *,
-           configured_limit: int) -> dict:
+           configured_limit: int, persist: bool = True) -> dict:
     configured = _limit(configured_limit)
-    _ensure_row(database, provider, configured)
-    database.commit()
+    if persist:
+        _ensure_row(database, provider, configured)
+        database.commit()
     row = database.execute(
         "SELECT * FROM provider_capacity WHERE provider=?", (provider,)
     ).fetchone()
+    if row is None:
+        row = {'provider': provider, 'learned_limit': configured, 'success_streak': 0,
+               'cooldown_until': None, 'last_reason': 'initial_config', 'updated_at': ''}
     return _payload(row, configured)
 
 
