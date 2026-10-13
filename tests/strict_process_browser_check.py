@@ -83,7 +83,7 @@ def run_browser_recovery(work_root=None):
                     open_job()
                     page.wait_for_function("() => [...document.querySelectorAll('video')].some(v => v.readyState >= 1 && v.videoWidth > 0)")
                     page.locator("#drawer-next-action").click()
-                    page.locator("#review-check-all").click()
+                    [page.locator("[data-review-check]").nth(i).check() for i in range(6)]
                     page.locator("#review-notes").fill("Authored transport replay review; not real content acceptance")
                     page.locator("#review-submit").click()
                     page.wait_for_function("() => state.videos?.jobs?.some(j => j.state === 'READY_TO_PUBLISH')")

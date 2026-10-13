@@ -349,8 +349,8 @@ def main() -> int:
 
                     page.reload(wait_until="networkidle")
                     _open_job(page, job_id)
-                    page.wait_for_selector("#review-check-all")
-                    page.locator("#review-check-all").click()
+                    page.wait_for_selector("[data-review-check]")
+                    [page.locator("[data-review-check]").nth(i).check() for i in range(6)]
                     page.locator("#review-first-pass").check()
                     page.locator("#review-notes").fill("零费用回归验收通过")
                     page.locator("#review-submit").click()

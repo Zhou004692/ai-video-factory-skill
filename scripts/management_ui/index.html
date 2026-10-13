@@ -6,6 +6,9 @@
   <title>AI Video Factory · 本地管理台</title>
   <link rel="stylesheet" href="/styles.css?v=20260825-studio-v3">
   <link rel="stylesheet" href="/studio-preview-parity.css?v=20260825-v3">
+  <link rel="stylesheet" href="/ui-tokens.css?v=interaction-v1">
+  <link rel="stylesheet" href="/workbench.css?v=interaction-v1">
+  <link rel="stylesheet" href="/review-workspace.css?v=interaction-v1">
 </head>
 <body data-page="overview">
   <a class="skip-link" href="#main-content">跳到主要内容</a>
@@ -183,10 +186,18 @@
     <div class="drawer-body" id="drawer-body"></div>
   </aside>
   <aside class="studio-task-drawer" id="studio-task-drawer" aria-label="后台任务">
-    <button class="studio-task-toggle" id="studio-task-toggle" type="button" aria-expanded="false"><span><i></i><b id="studio-task-title">后台任务</b></span><em id="studio-task-chevron">⌃</em></button>
+    <button class="studio-task-toggle" id="studio-task-toggle" type="button" aria-label="查看后台任务" aria-expanded="false"><span><i></i><b id="studio-task-title">后台任务</b></span><em id="studio-task-chevron">⌃</em></button>
     <div class="studio-task-list" id="studio-task-list"><p>暂无进行中的后台任务</p></div>
   </aside>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="/app.js?v=20260825-studio-v3"></script>
+  <script src="/api-client.js?v=interaction-v1"></script>
+  <script src="/review-workspace.js?v=interaction-v1"></script>
+  <script src="/ui-components.js?v=interaction-v1"></script>
+  <script src="/production-settings.js?v=interaction-v1"></script>
+  <script src="/presentation.js?v=interaction-v1"></script>
+  <script src="/workbench.js?v=interaction-v1"></script>
+  <script src="/content-workspace.js?v=interaction-v1"></script>
+  <script src="/publication-workspace.js?v=interaction-v1"></script>
+  <script src="/app.js?v=interaction-v1"></script>
 </body>
 </html>

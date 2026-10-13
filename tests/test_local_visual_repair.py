@@ -482,6 +482,7 @@ class LocalVisualRepairTests(unittest.TestCase):
         source=(Path(__file__).resolve().parents[1]/'scripts'/'management_ui'/'app.js').read_text(encoding='utf-8')
         ui=source.split('async function openVisualContentReview',1)[1].split('const openCandidateWithContentBase',1)[0]
         setup=r"""
+        const AVFComponents={guardTransition:action=>action()};
         const elements=new Map(),toasts=[],posts=[];let markup='';
         function $(selector){if(!elements.has(selector))elements.set(selector,{value:selector==='#content-sha'?'sha':'req',listeners:{},insertAdjacentHTML(_where,html){markup+=html},addEventListener(type,handler){this.listeners[type]=handler}});return elements.get(selector)}
         function $$(selector){return []}function esc(value){return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;')}
@@ -549,6 +550,8 @@ class LocalVisualRepairTests(unittest.TestCase):
         setup=r"""
         const elements=new Map(),toasts=[],posts=[];let markup='',resolveOld,rejectOld,announceOld;
         const oldStarted=new Promise(resolve=>announceOld=resolve);
+        // This boundary tests stale responses; dirty-close behavior has a real-browser suite.
+        const AVFComponents={guardTransition:action=>action()};
         function $(selector){if(!elements.has(selector))elements.set(selector,{value:'value',listeners:{},insertAdjacentHTML(_where,html){markup+=html},addEventListener(type,handler){this.listeners[type]=handler}});return elements.get(selector)}
         function $$(selector){return []}function esc(value){return String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}
         function toast(value){toasts.push(value)}function openModal(_type,_title,html){markup=html}function closeModal(){}async function loadPage(){}

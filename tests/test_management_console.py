@@ -9532,7 +9532,7 @@ class ManagementUiContractTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "const videoNextActionLabel=job=>job.next_action?.label||'查看任务详情'",
+            "const videoNextActionLabel=job=>videoNextAction(job)?.label||'查看任务详情'",
             js,
         )
         self.assertIn('id="drawer-next-action"', js)
@@ -9637,8 +9637,9 @@ class ManagementUiContractTests(unittest.TestCase):
         self.assertIn("ASR 未配置时自动使用估算字幕", js)
         self.assertIn("approved_budget_cents", js)
         self.assertIn("确认新预算并开始生成", js)
-        self.assertIn("review-check-all", js)
-        self.assertIn("一键勾选全部六项", js)
+        self.assertNotIn("review-check-all", js)
+        self.assertIn("data-review-check", js)
+        self.assertIn("review-version-summary", js)
         self.assertIn("1–24 张", js)
         self.assertNotIn("建议总时长需在 15–72 秒之间", js)
         self.assertNotIn("建议分镜数需在 4–8 个之间", js)
@@ -10458,7 +10459,8 @@ class ManagementUiContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("/app.js?v=20260825-studio-v3", html)
+        self.assertIn("/app.js?v=interaction-v1", html)
+        self.assertIn("/api-client.js?v=interaction-v1", html)
 
     def test_audio_mode_is_selectable_globally_and_per_video(self):
         html = (ROOT / "scripts" / "management_ui" / "index.html").read_text(
@@ -12067,9 +12069,9 @@ class ManagementMediaServerTests(unittest.TestCase):
         self.assertIn("02 · 内容工作区", js)
         self.assertIn("03 / STAGE DECISION", html)
         self.assertIn("function studioStageContract", js)
-        self.assertIn("进入下一阶段前需满足", inspector)
-        self.assertIn("本阶段产物", inspector)
-        self.assertIn("影响下一阶段", inspector)
+        self.assertIn("当前阶段要求", inspector)
+        self.assertIn("交付内容", inspector)
+        self.assertIn("后续阶段", inspector)
         self.assertNotIn("<b>项目上下文</b>", inspector)
         self.assertNotIn("title:'来源信息'", source_stage)
         self.assertNotIn("title:'生成输入'", source_stage)

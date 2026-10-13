@@ -88,7 +88,7 @@ class Journey:
         self.env.update(FACTORY_RUNTIME_HOME=str(root), FACTORY_ENV_FILE=str(root/'.env'), FACTORY_DB_PATH=str(root/'factory.db'), FACTORY_DATA_DIR=str(root), FACTORY_PROVIDER_MODE='replay', FACTORY_REPLAY_DISABLE_WORKERS='0',
                         FACTORY_FLOW_GUARD_ZERO_COST_WORKER='1', FACTORY_FLOW_GUARD_MEDIA_ROOT=str(root/'assets'), PRODUCTION_EXECUTION_ENGINE='graph_v2',
                         PROVIDER_RECONCILE_ENABLED='false', FACTORY_ZERO_COST_SOCKET_TELEMETRY=str(root/'external.jsonl'), APPEND_CTA='false', GEN_THUMBNAIL='false', GEN_MARKETING_THUMBNAIL='false')
-        self.server_pids=[]; self.worker_pids=set(); self.requests=[]; self.errors=[]; self.external=[]
+        self.server_pids=[]; self.worker_pids=set(); self.requests=[]; self.errors=[]; self.external=[];self.lost_acceptance_command=None
 
     @contextmanager
     def server(self):
@@ -143,6 +143,11 @@ class Journey:
             def local(route):
                 if urlsplit(route.request.url).hostname not in {'127.0.0.1','localhost'}:
                     self.external.append(route.request.url);route.abort()
+                elif route.request.method=='POST' and urlsplit(route.request.url).path.endswith('/produce') and self.lost_acceptance_command is None:
+                    # The real service accepts once; only its browser response is lost.
+                    response=route.fetch();assert response.ok,response.text()
+                    self.lost_acceptance_command={'path':urlsplit(route.request.url).path,'body':route.request.post_data,'command_id':route.request.headers['x-avf-command-id'],'request_sha256':route.request.headers['x-avf-command-hash']}
+                    route.abort()
                 else:route.continue_()
             page.route('**/*',local)
             with self.server() as base:
@@ -169,9 +174,16 @@ class Journey:
                 page.locator('#save-production-settings').click();page.wait_for_selector('#produce-confirm')
                 if page.locator('#high-risk-master-confirm').count():page.locator('#high-risk-master-confirm').check()
                 assert page.locator('#produce-confirm').is_enabled(), page.locator('#modal-body').inner_text()
-                with page.expect_response(lambda r:r.request.method=='POST' and r.url.endswith('/produce')) as started:
-                    page.locator('#produce-confirm').click()
-                assert started.value.ok,started.value.text()
+                page.locator('#produce-confirm').click()
+                page.wait_for_function("() => document.querySelector('[data-uncertain-submit]') || AVFRequest.pending().length>0")
+                page.wait_for_function("() => AVFRequest.pending().length===0")
+                assert self.lost_acceptance_command, 'Real acceptance response was not interrupted'
+                receipt=http(base,'/api/commands/'+self.lost_acceptance_command['command_id'])
+                assert receipt['submission_known'] and receipt['outcome']=='accepted'
+                assert receipt['path']==self.lost_acceptance_command['path'] and receipt['request_sha256']==self.lost_acceptance_command['request_sha256']
+                # View existing work; closing the UI does not cancel the accepted task.
+                page.locator('#modal-close').click()
+                if page.locator('#unsaved-confirm').count():page.get_by_text('放弃修改',exact=True).click()
                 self.worker_pids|=_wait_for_job_state(database,job,'ANCHOR_REVIEW_REQUIRED')
                 frozen=database.execute('SELECT production_spec_json,production_spec_hash FROM jobs').fetchone()
                 assert json.loads(frozen[0])['runtime_storyboard']['script_metadata']['creative_tags']==TAGS_A
@@ -221,7 +233,7 @@ class Journey:
                 final_audio=tone_measure(final)
                 assert abs(source_audio['zero_crossing_frequency_hz']-final_audio['zero_crossing_frequency_hz'])<6
                 page.reload(wait_until='networkidle');_open_job(page,job)
-                page.wait_for_selector('#review-check-all');page.locator('#review-check-all').click()
+                page.wait_for_selector('[data-review-check]');[page.locator('[data-review-check]').nth(i).check() for i in range(6)]
                 page.locator('#review-notes').fill('回归夹具：仅技术像素/音轨/保留证据通过，不验证台词或人物身份')
                 page.locator('#review-submit').click();page.wait_for_selector('#drawer-next-action');page.locator('#drawer-next-action').click()
                 page.wait_for_function("id=>state.videos?.jobs?.some(j=>j.job_id===id&&j.state==='READY_TO_PUBLISH')",arg=job)
@@ -256,7 +268,7 @@ class Journey:
             report={'status':'passed','ids':ids,'server_pids':self.server_pids,'worker_pids':sorted(self.worker_pids),'worker_node_types':worker_nodes,
                     'source_sha256':source_hash,'bgm_sha256':bgm_hash,'final_sha256':sha(final),'production_spec_hash':self.spec_hash,
                     'pixel_measurements':{'source':physical,'final':final_physical},'audio_measurements':{'source':source_audio,'final':final_audio},'content_retention':retention,'publication_context':context,
-                    'http_posts':self.requests,'paid_provider_calls':0,'external_requests':0,
+                    'http_posts':self.requests,'lost_acceptance_command':self.lost_acceptance_command,'paid_provider_calls':0,'external_requests':0,
                     'limitations':['Synthetic high-level provider handlers; no actual generated person or business action','No ASR measurement: sine-tone audio; fixture text is authored intent','Process interrupt at durable review gate; no provider in-flight interrupt in this slice']}
             (self.root/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
             return report

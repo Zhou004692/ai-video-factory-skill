@@ -1,0 +1,22 @@
+:root{
+  --ui-primary:#356bff;--ui-primary-hover:#2457df;--ui-nav:#203251;--ui-bg:#f5f7fa;--ui-panel:#fff;
+  --ui-text:#222;--ui-secondary:#606266;--ui-border:#e5e5e5;--ui-warning:#ff6500;--ui-danger:#d93931;--ui-success:#287445;
+  --ui-font:Inter,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;--ui-font-body:14px;--ui-font-meta:12px;
+  --ui-radius:12px;--ui-control-radius:6px;--ui-shadow:0 2px 10px rgb(32 50 81 / 5%);
+  --studio-bg:var(--ui-bg);--studio-panel:var(--ui-panel);--studio-panel-soft:#f8fafc;--studio-line:var(--ui-border);
+  --studio-text:var(--ui-text);--studio-muted:var(--ui-secondary);--studio-subtle:#667085;--studio-blue:var(--ui-primary);--studio-blue-soft:#edf2ff;--studio-shadow:var(--ui-shadow);
+}
+html,body{font-family:var(--ui-font);color:var(--ui-text);font-size:14px}
+button,input,select,textarea{font-family:var(--ui-font)}
+body h1,body h2,body h3,body h4,.cost-total,.cost-pill strong{font-family:var(--ui-font)}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--ui-primary);outline-offset:3px}
+.persistent-alert{padding:12px 16px;border:1px solid #ffd591;border-radius:8px;background:#fff7e8;color:#73410d;display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:14px}
+.persistent-alert button{min-height:32px;padding:0 12px;border:1px solid #ffc078;background:white;border-radius:6px}
+.request-status{padding:8px 16px;font-size:12px;display:flex;align-items:center;gap:10px;background:#edf2ff;color:#254dba;flex-wrap:wrap}
+.request-status[data-state=error],.request-status[data-state=unknown]{background:#fff7e8;color:#73410d}
+.request-status[hidden]{display:none}
+.request-status button{font-size:12px;min-height:28px;background:white;border:1px solid currentColor;border-radius:6px;padding:0 10px}
+.suspended-by-dialog{visibility:hidden!important;pointer-events:none!important}
+.unsaved-confirm{position:absolute;z-index:20;inset:50% 24px auto;transform:translateY(-50%);padding:24px;background:white;border:1px solid #d6e0f5;border-radius:12px;box-shadow:0 0 0 100vmax rgb(32 50 81 / 30%);font-size:14px}
+.unsaved-confirm h3{font-size:18px;margin:0 0 12px}.unsaved-confirm p{margin:0 0 20px}.unsaved-confirm>div{display:flex;gap:8px;flex-wrap:wrap}.unsaved-confirm button{min-height:36px;padding:0 12px;border:1px solid var(--ui-border);border-radius:6px}
+.ui-blank-preview{display:grid;place-content:center;gap:8px;background:#edf2ff;color:#606266;text-align:center;font-size:14px;padding:16px;min-height:140px}
