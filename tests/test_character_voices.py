@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import wave
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
@@ -596,7 +597,14 @@ class FixedVoiceGenerationTests(unittest.IsolatedAsyncioTestCase):
                 output = ROOT / "artifacts" / "fixed-voice-test.mp4"
                 voice = ROOT / "artifacts" / "fixed-voice-test.wav"
                 voice.parent.mkdir(parents=True, exist_ok=True)
-                voice.write_bytes(b"voice")
+                # A real 1.2s PCM silence fixture lets the production preflight
+                # probe duration. The transcript above is authored test data,
+                # not speech recognized from this synthetic audio.
+                with wave.open(str(voice), "wb") as audio_fixture:
+                    audio_fixture.setnchannels(1)
+                    audio_fixture.setsampwidth(2)
+                    audio_fixture.setframerate(16000)
+                    audio_fixture.writeframes(b"\x00\x00" * 19200)
                 try:
                     result = await s3_shots._generate_seedance_video(
                         prompt="visual",
