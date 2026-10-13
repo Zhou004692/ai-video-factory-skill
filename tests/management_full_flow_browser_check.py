@@ -141,7 +141,13 @@ def _open_job(page, job_id: str) -> None:
     page.locator(f'[data-video-id="{job_id}"]').click()
     page.wait_for_selector("#page-overview.active")
     page.wait_for_function(
-        "jobId => state.videos?.jobs?.some(item => item.job_id === jobId)",
+        """jobId => {
+            const project=state.projects?.projects?.find(item=>item.video?.job_id===jobId);
+            const primary=document.querySelector('#studio-primary-action');
+            return state.page==='overview' && project?.project_id===state.studioProjectId
+                && primary && !primary.hidden && !primary.disabled && primary.onclick
+                && state.studioStage===studioStageOrder[studioStageIndex(project.stage)];
+        }""",
         arg=job_id,
     )
     page.locator("#studio-primary-action").click()

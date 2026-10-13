@@ -7760,9 +7760,11 @@ class ManagementServiceTests(unittest.TestCase):
                 "master_capacity",
                 "provider_recovery",
                 "transport_preflight",
+                "management_io_observations",
             },
         )
         self.assertFalse(payload["supervisor_alive"])
+        self.assertEqual(payload["management_io_observations"], [])
         self.assertEqual(payload["concurrency_limit"], 1)
         self.assertEqual([item["job_id"] for item in payload["running"]], ["J-HEALTH-RUN"])
         self.assertEqual([item["job_id"] for item in payload["queued"]], ["J-HEALTH-QUEUE"])

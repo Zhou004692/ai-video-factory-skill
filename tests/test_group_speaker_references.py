@@ -111,6 +111,7 @@ for (const name of ['speaker','dialogue','duration_sec','visual_intent','emotion
 const section = {dataset:{editScriptBeat:'0'},classList:{toggle(){}}};
 let html='', saved;
 const context = {esc:String,openModal:(a,b,c)=>html=c,
+  AVFContentWorkspace:{decorate(){},conflict(error){throw error}},
   $:(selector,parent)=>{
     if(parent===section){if(selector==='[data-duration-input]')return fields.duration_sec;return fields[selector.match(/data-name="([^"]+)"/)[1]]}
     return controls[selector] ||= {value:'',checked:false};
