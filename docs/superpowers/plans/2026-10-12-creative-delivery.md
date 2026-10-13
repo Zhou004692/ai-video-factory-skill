@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python, SQLite, unittest, existing HTTP management server and JavaScript UI, FFmpeg/ffprobe for local assets. Tests use disposable runtime directories, cleared credentials and mocked/replayed provider transports. Skill distribution only; no Windows installer.
 
-**Current status (2026-10-13):** Tasks 1–5 are complete and independently approved; the latest implementation is `56bce62`. Task6 documentation, broad offline verification and candidate Skill 3.2.0.7 packaging are in progress. No main merge, GitHub push, paid sample or live deployment has occurred. Detailed review notes below record earlier findings and fixes; their intermediate pending/failure statements are historical, not the current acceptance state.
+**Current status (2026-10-13):** Tasks 1–6 implementation and offline delivery are complete. Final Task6 SPEC, QUALITY and fresh whole-change review approved `48fa6fa`; canonical Skill 3.2.0.7 ZIP SHA is `3272fdf410d95e6a0a8f376a5d16495da92dbcf347d87619851a5b707457591e`. The full run's sole invalid WAV fixture error was fixed and independently rechecked; no final-tree full rerun is claimed. No main merge, GitHub push, paid sample or live deployment has occurred. Integration awaits the user's finishing-workflow choice. Detailed notes below retain historical findings and fixes; intermediate pending/failure statements are historical, not current unresolved findings.
 
 ## Scope and safeguards
 
@@ -163,10 +163,12 @@ Task5B stable `f45ba27` is submitted for fresh SPEC review, then fresh quality r
 
 **Files:** README, `docs/testing/stable-delivery-progress.md`, assurance boundaries and release documentation; existing version/distribution metadata only if required by release gates.
 
-- [ ] Document new user behavior, compatibility, offline evidence, remaining paid comparison work and clean/legacy update checks.
-- [ ] Run appropriate broad offline suite and Skill release gates once integrations stabilize; fix new failures, avoid repetitive unrelated reruns.
-- [ ] Final whole-change review; verify git status and recorded commits. Keep delivery as directly updated/distributed Skill.
-- [ ] Complete branch using finishing-a-development-branch workflow. Report reviewable branch/result and empirical limits; do not claim paid quality experiments or deploy code into running main.
+- [x] Document new user behavior, compatibility, offline evidence, remaining paid comparison work and clean/legacy update checks.
+- [x] Run appropriate broad offline suite and Skill release gates once integrations stabilize; fix new failures, avoid repetitive unrelated reruns.
+- [x] Final whole-change review; verify git status and recorded commits. Keep delivery as directly updated/distributed Skill.
+- [x] Prepare the finishing-a-development-branch integration choices after verification. The branch and package are retained; merge/push/PR/discard awaits the user's choice. No paid quality experiments or main deployment.
+
+Task6 **completed/dual approved at `48fa6fa`**, followed by fresh whole-change **Approved** at the same revision. SPEC independently checked four rollback/backup/contract tests plus the real PCM fixture; QUALITY passed 98 relevant cases (4.932 seconds); whole-change review passed ten cross-phase cases (30.651 seconds). The actual canonical 159-file, 831016-byte ZIP matches the genuine `d99ea18`→3.2.0.7 fresh/update report: 22 distinct checks, zero paid calls and external requests, history/archive/feedback/cost preservation and interruption/rollback recovery. The initial full discovery ran 2036 cases in 1139.461 seconds, exit 1: 2034 passed, one error, one skipped. Its only error was a test WAV containing `b'voice'`; `e554def` replaces it with real 1.2-second PCM without changing product preflight, and 95 affected checks passed. Final-tree full discovery was not repeated. R4 unit/Smoke passed but Flow Guard remains partial, with Full-only, recognition and real-quality evidence unchanged. Package audit, source byte identity, Python AST, Node and diff checks passed. The previous 3.2.0.6 ZIP, main service/data and untracked launcher remain intact. See `docs/testing/creative-delivery-acceptance.md` and `.verification/releases/creative-delivery-3.2.0.7-evidence.json` for exact source, package and log identities.
 
 ## Verification baseline
 
