@@ -214,6 +214,12 @@ Flow Guard Full 新增独立 `strict_master_recovery` 维度，检查原始浏�
 
 ## 相关文档
 
+## 2026-10-13：创意交付合入 main
+
+用户明确授权直接推送 main 后，`feat/creative-delivery-20261012` 从 `d99ea18` 快进合入为 `f05f0cc`，并已推送 GitHub main；远端 `refs/heads/main` 查询确认相同提交。合并后的独立临时运行目录检查 102 项通过（13.357 秒），覆盖角色音轨、提交契约、批准输入冻结、发布版本与关键内容计划。未重复声明最终测试树全量通过，完整阶段验收仍见 [创意交付验收](creative-delivery-acceptance.md)。
+
+已验收的 3.2.0.7 ZIP 保留在主仓库 `.verification/releases/ai-video-factory-3.2.0.7.zip`，SHA256 为 `3272fdf410d95e6a0a8f376a5d16495da92dbcf347d87619851a5b707457591e`；原工作树发布证据同时保留在 `.verification/creative-delivery-20261013-preserved/`。旧 3.2.0.6 ZIP、未跟踪启动脚本及正式运行数据保留；运行服务未重启，新代码的运行时启用不属于本次 GitHub 推送。此前记录中的“未合并/未推送”为验收分支提交时的历史状态。
+
 - [测试证据边界](assurance-boundaries.md)
 - [严格客户端传输回放](strict-transport-replay.md)
 - [声音与出镜语义](speech-visibility-contract.md)

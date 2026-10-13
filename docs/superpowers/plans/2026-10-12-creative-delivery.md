@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python, SQLite, unittest, existing HTTP management server and JavaScript UI, FFmpeg/ffprobe for local assets. Tests use disposable runtime directories, cleared credentials and mocked/replayed provider transports. Skill distribution only; no Windows installer.
 
-**Current status (2026-10-13):** Tasks 1–6 implementation and offline delivery are complete. Final Task6 SPEC, QUALITY and fresh whole-change review approved `48fa6fa`; canonical Skill 3.2.0.7 ZIP SHA is `3272fdf410d95e6a0a8f376a5d16495da92dbcf347d87619851a5b707457591e`. The full run's sole invalid WAV fixture error was fixed and independently rechecked; no final-tree full rerun is claimed. No main merge, GitHub push, paid sample or live deployment has occurred. Integration awaits the user's finishing-workflow choice. Detailed notes below retain historical findings and fixes; intermediate pending/failure statements are historical, not current unresolved findings.
+**Current status (2026-10-13):** Tasks 1–6 implementation and offline delivery are complete. Final Task6 SPEC, QUALITY and fresh whole-change review approved `48fa6fa`; canonical Skill 3.2.0.7 ZIP SHA is `3272fdf410d95e6a0a8f376a5d16495da92dbcf347d87619851a5b707457591e`. The full run's sole invalid WAV fixture error was fixed and independently rechecked; no final-tree full rerun is claimed. The user authorized direct main integration: `d99ea18`→`f05f0cc` fast-forward and GitHub main push are complete, with 102 post-merge offline checks passing. No paid sample or runtime restart/deployment occurred. Detailed notes below retain historical findings and fixes; intermediate pending/failure statements are historical, not current unresolved findings.
 
 ## Scope and safeguards
 
