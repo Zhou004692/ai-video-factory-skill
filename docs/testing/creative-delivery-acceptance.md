@@ -27,7 +27,29 @@
 
 ## 最终候选
 
-最终全量、独立 R4、包审计与真实 d99→最终 ZIP 的干净首次启动/更新、源码及包 SHA 另行补录。开发 docs/tests 不进入 ZIP；新增行为已写入包内 SKILL/workflow/troubleshooting。原 3.2.0.6 发布 ZIP 保留。
+运行实现保持 `56bce62`；文档/版本检查点 `52ee57c`，包内供应商说明经规格复核修正于 `2210372`。最终包包含 159 个文件、831016 字节，路径为 `.verification/releases/ai-video-factory-3.2.0.7.zip`，SHA256 为 `3272fdf410d95e6a0a8f376a5d16495da92dbcf347d87619851a5b707457591e`。它是下面最终升级旅程实际使用的 ZIP，不是只根据相同版本号认定的包。
+
+| 验证 | 实际结果与边界 |
+|---|---|
+| 更新门禁 | 63 项通过，81.507 秒；实际付费/外部请求均 0。首次 2 失败/1 错误的日志保留，测试注入与导入修订不修改产品 |
+| 稳定树全量 | 2036 项，1139.461 秒，1 错误、1 跳过、2034 通过，退出 1。唯一错误是固定声线 mux 测试使用不可解码 `b"voice"` WAV，被新时长预检正确拦截 |
+| 唯一错误修复 | 独立 RED 1 错误（0.138 秒）；改为真实 1.2 秒/16kHz/单声道/16-bit PCM 静音，独立 GREEN 1 项（0.118 秒），整个声线模块和直接提交邻居 95 项通过（1.144 秒）。测试提交 `e554def`，未放宽产品预检、未伪造时长。没有重跑最终新测试树的 2036 项，不能称其全量通过 |
+| 独立 R4 | 原门禁 R4 命令/护栏：28 项单元通过（269.646 秒），Smoke 6 条路径均通过，总 699.063 秒，退出 0；矩阵库存 10，付费/外部请求/不变量问题均 0。Flow Guard 自身为 `partial`，Full 专属维度跳过，不代表 Full |
+| 最终真实旧包旅程 | 从 Git `d99ea1861b23a058e5ecdb97ed6b382e3a48fe49` 的真实 3.2.0.6 升级到最终 3.2.0.7 ZIP，同时做干净 Python/首次自举/HTTP/持锁检查；22 个不同检查、21 条命令或服务记录，退出 0，实际付费/外联 0 |
+| 包检查 | 脱敏审计无发现；ZIP 完整性、源码逐文件字节绑定、Python AST、管理台 1 个 JavaScript 块的 Node 语法均通过；包含新运行模块与 runtime_filesystem，排除凭证/数据库/业务媒体/private paths/tests/docs/venv/git/worktree；只保留空 data/.gitkeep |
+
+最终旧包旅程验证旧来源归档、历史审核/发布/反馈、944 分模拟历史账本、重复替换、失败升级回滚和更新器硬退出恢复。旧/新 `script_drafts.py` SHA256 分别为 `247bc07b494cd9784af52990b573be344b4bb6c87deccf05378bc6fded4dd3fa` / `ce9ac13f3d261feb186d33350050f549af034de2fc923bcb6cfc25807f7af64c`；不是改 VERSION 冒充旧包。首次在长证据路径运行的真实旧包因旧 pip/MAX_PATH 失败，保留失败报告；短目录重跑才通过。较早修正文档前的包结果独立保留，不替代本包。
+
+运行源码指纹 `8f6d1aba6ee81b0b4bc35e2431f0d277aad64104a6375cad1a33d0c06f4c529f`，算法为排序 scripts 相对路径 + NUL + 实际文件 bytes + NUL，排除 pycache。R4 自身输入指纹为 `5386a7dcd5aba97b4b44e8f6f161222f0fbcd6b14a231206a9069964e77f6b45`，算法/输入范围不同，不能当作同一指纹。测试修订与本节补录不在 ZIP 中。原 `.verification/releases/ai-video-factory-3.2.0.6.zip` 保持 SHA256 `6a9562d569c18d063000c2561b00dc8856d9c3132a2033190c2c08e80694145f`。
+
+## 可复核原始证据
+
+- 最终包旅程：[report.json](D:/WORK/github/my-claude-ai/.codex-tmp/avf-t6d99b/report.json)。修正文档前较早候选位于 `avf-t6d99`，长目录失败报告位于 `factory-implementation-20261012/evidence/task6-skill-final-d99`，不混用。
+- 包身份/源码与采用记录：工作树 `.verification/releases/creative-delivery-3.2.0.7-evidence.json` 和 `creative-delivery-archive-adoption.json`；早先 `2f659…` 初包和 `1abcf…` 旧候选分别另名保留为 `pre-journey` / `pre-provider-doc` ZIP。
+- [全量原始日志](D:/WORK/github/my-claude-ai/.codex-tmp/factory-implementation-20261012/evidence/task6-discovery-final.log)、[95 项补验](D:/WORK/github/my-claude-ai/.codex-tmp/factory-implementation-20261012/evidence/task6-fixed-voice-green.log)、[R4 原始日志](D:/WORK/github/my-claude-ai/.codex-tmp/factory-implementation-20261012/evidence/task6-r4.log)、[更新门禁](D:/WORK/github/my-claude-ai/.codex-tmp/factory-implementation-20261012/evidence/task6-update-gate-green.log)。
+- 首轮加载旧测试对象的全量被有界终止，没有最终结论，单独记录在 `task6-discovery-interrupted.json`；不是成功或失败结果。
+
+全量使用隔离 `run_tests.py --root <worktree> discover`；95 项使用 `tests.test_character_voices tests.test_seedance_submission_contracts tests.test_video_upgrade.SeedancePayloadTests tests.test_video_upgrade.ReferenceAttentionTests tests.test_video_upgrade.MusicFallbackTests`。R4 使用旁路 `run_r4_only.py` 选择原 R4 命令，原 socket/凭证/状态签名护栏不变，不重跑已证实相同产品码 R0–R3。最终旅程入口为 `tests/skill_delivery_journey.py --legacy-ref d99ea1861b23a058e5ecdb97ed6b382e3a48fe49 --legacy-expected-version 3.2.0.6`，使用已有离线 wheelhouse 和短独立证据目录。
 
 ## 证明范围
 
