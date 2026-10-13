@@ -1,12 +1,12 @@
 :root{
   --ui-primary:#356bff;--ui-primary-hover:#2457df;--ui-nav:#203251;--ui-bg:#f5f7fa;--ui-panel:#fff;
   --ui-text:#222;--ui-secondary:#606266;--ui-border:#e5e5e5;--ui-warning:#ff6500;--ui-danger:#d93931;--ui-success:#287445;
-  --ui-font:Inter,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;--ui-font-body:14px;--ui-font-meta:12px;
+  --ui-font:"Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC",Arial,sans-serif;--ui-font-body:14px;--ui-font-meta:12px;
   --ui-radius:12px;--ui-control-radius:6px;--ui-shadow:0 2px 10px rgb(32 50 81 / 5%);
   --studio-bg:var(--ui-bg);--studio-panel:var(--ui-panel);--studio-panel-soft:#f8fafc;--studio-line:var(--ui-border);
   --studio-text:var(--ui-text);--studio-muted:var(--ui-secondary);--studio-subtle:#667085;--studio-blue:var(--ui-primary);--studio-blue-soft:#edf2ff;--studio-shadow:var(--ui-shadow);
 }
-html,body{font-family:var(--ui-font);color:var(--ui-text);font-size:14px}
+html,body{font-family:var(--ui-font);color:var(--ui-text);font-size:var(--ui-font-body);line-height:1.6}
 button,input,select,textarea{font-family:var(--ui-font)}
 body h1,body h2,body h3,body h4,.cost-total,.cost-pill strong{font-family:var(--ui-font)}
 button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--ui-primary);outline-offset:3px}
