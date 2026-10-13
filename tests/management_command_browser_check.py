@@ -54,6 +54,17 @@ def run(root: Path):
                 context.route('**/*',route)
                 def ready():page.wait_for_function("() => typeof state!=='undefined' && state.projects")
                 page.goto(base+'/',wait_until='domcontentloaded');ready()
+                for suffix in ('produce','publish/douyin'):
+                    count=len(captured)
+                    page.evaluate("suffix=>{window.storageFailure=null;window.originalStorageSet=Storage.prototype.setItem;Storage.prototype.setItem=function(key,value){if(key==='avf_unconfirmed_commands_v1')throw new DOMException('isolated quota error','QuotaExceededError');return window.originalStorageSet.call(this,key,value)};openModal('COMMAND TEST','提交身份保存失败','<input id=storage-input value=输入保留><button id=storage-submit>提交</button>');document.querySelector('#storage-submit').onclick=()=>api('/api/videos/J-E2E-SETUP/'+suffix,{method:'POST',body:'{}'}).catch(error=>window.storageFailure={code:error.code,message:error.message})}",suffix)
+                    try:
+                        page.locator('#storage-input').fill('无法存储时保留输入');page.locator('#storage-submit').click()
+                        page.wait_for_function('() => !!window.storageFailure')
+                        assert page.evaluate('storageFailure.code')=='command_identity_unavailable'
+                        assert page.evaluate('AVFRequest.pending().length')==0 and len(captured)==count
+                        assert page.locator('#storage-input').input_value()=='无法存储时保留输入'
+                    finally:page.evaluate('() => {Storage.prototype.setItem=window.originalStorageSet;AVFComponents.markClean();closeModal()}')
+                results.append('storage failure blocks generation and publication before transport and retains input')
                 def cancel_and_prove(command,remaining=0):
                     page.locator('[data-cancel-unclaimed]').click();page.wait_for_function('(n) => AVFRequest.pending().length===n',arg=remaining)
                     token=page.evaluate('() => ensureServerCsrf()')

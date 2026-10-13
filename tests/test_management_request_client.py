@@ -14,7 +14,7 @@ class ManagementRequestClientTests(unittest.TestCase):
         self.assertTrue(CLIENT.is_file(),'JSON requests have no bounded client')
         node=shutil.which('node')
         if not node:self.skipTest('Node unavailable for JavaScript unit boundary')
-        script="globalThis.window=globalThis;require('vm').runInThisContext(require('fs').readFileSync(process.argv[1],'utf8'));(async()=>{"+source+"})().then(r=>console.log(JSON.stringify(r))).catch(e=>{console.error(e);process.exitCode=1});"
+        script="globalThis.window=globalThis;const localStore=new Map();globalThis.sessionStorage={getItem:k=>localStore.get(k)??null,setItem:(k,v)=>localStore.set(k,v)};require('vm').runInThisContext(require('fs').readFileSync(process.argv[1],'utf8'));(async()=>{"+source+"})().then(r=>console.log(JSON.stringify(r))).catch(e=>{console.error(e);process.exitCode=1});"
         result=subprocess.run([node,'-e',script,str(CLIENT)],capture_output=True,text=True,encoding='utf-8',timeout=10)
         self.assertEqual(result.returncode,0,result.stderr)
         return json.loads(result.stdout)
@@ -50,10 +50,16 @@ class ManagementRequestClientTests(unittest.TestCase):
         self.assertEqual(value['X-AVF-Command-Hash'],hashlib.sha256(body.encode('utf-8')).hexdigest())
         self.assertRegex(value['X-AVF-Command-Id'],r'^[0-9a-f-]{36}$')
     def test_inflight_command_identity_survives_refresh_and_known_result_clears_it(self):
-        value=self.evaluate("let stored,finish;globalThis.sessionStorage={setItem:(_k,v)=>stored=JSON.parse(v)};fetch=()=>new Promise(resolve=>finish=resolve);const request=AVFRequest.request('/api/videos/job/produce',{method:'POST',body:'{\\\"confirmed\\\":true}',timeoutMs:1000});while(!finish)await new Promise(r=>setTimeout(r,1));const saved=stored?.[0],inflight=AVFRequest.pending().length;finish({ok:true,status:200,json:async()=>({ok:true})});await request;return{inflight,identity:!!saved?.command_id&&!!saved?.request_sha256,bodySaved:!!saved?.body,remaining:AVFRequest.pending().length,stored:stored.length}")
+        value=self.evaluate("let stored,finish;globalThis.sessionStorage={getItem:()=>stored?JSON.stringify(stored):null,setItem:(_k,v)=>stored=JSON.parse(v)};fetch=()=>new Promise(resolve=>finish=resolve);const request=AVFRequest.request('/api/videos/job/produce',{method:'POST',body:'{\\\"confirmed\\\":true}',timeoutMs:1000});while(!finish)await new Promise(r=>setTimeout(r,1));const saved=stored?.[0],inflight=AVFRequest.pending().length;finish({ok:true,status:200,json:async()=>({ok:true})});await request;return{inflight,identity:!!saved?.command_id&&!!saved?.request_sha256,bodySaved:!!saved?.body,remaining:AVFRequest.pending().length,stored:stored.length}")
         self.assertEqual(value,{'inflight':1,'identity':True,'bodySaved':False,'remaining':0,'stored':0})
     def test_exact_command_reconciliation_rejects_mismatched_or_unfinished_proof(self):
         value=self.evaluate("fetch=(_p,o)=>new Promise((_r,reject)=>o.signal.addEventListener('abort',()=>reject(Error('aborted'))));try{await AVFRequest.request('/api/videos/job/produce',{method:'POST',timeoutMs:100})}catch{};const p=AVFRequest.pending()[0],base={...p,submission_known:true,outcome:'accepted'};const refused=[{...base,command_id:'other'},{...base,request_sha256:'other'},{...base,path:'/api/videos/other/produce'},{...base,outcome:'pending'}].map(proof=>AVFRequest.markReconciled(p.path,proof));return{refused,remaining:AVFRequest.pending().length}")
         self.assertEqual(value,{'refused':[False]*4,'remaining':1})
+    def test_failed_identity_persistence_blocks_paid_transport_before_any_effect(self):
+        for kind in ('throw','missing','discard'):
+            with self.subTest(kind=kind):
+                setup={'throw':"sessionStorage.setItem=()=>{throw Error('quota exceeded')}",'missing':'globalThis.sessionStorage=null','discard':'sessionStorage.setItem=()=>{}'}[kind]
+                value=self.evaluate(setup+";let calls=0;fetch=async()=>{calls++;return{ok:true,status:200,json:async()=>({})}};try{await AVFRequest.request('/api/videos/job/produce',{method:'POST',body:'{}'})}catch(e){return{code:e.code,calls,pending:AVFRequest.pending().length,unknown:e.submissionUnknown}};return{code:'success',calls,pending:AVFRequest.pending().length,unknown:false}")
+                self.assertEqual(value,{'code':'command_identity_unavailable','calls':0,'pending':0,'unknown':False})
 
 if __name__=='__main__':unittest.main()

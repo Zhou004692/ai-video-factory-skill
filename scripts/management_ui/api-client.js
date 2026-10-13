@@ -5,7 +5,7 @@
   let observer=()=>{};
   const storageKey='avf_unconfirmed_commands_v1';
   try{for(const item of JSON.parse(global.sessionStorage?.getItem(storageKey)||'[]'))if(item.path&&(paidPath(item.path)||publicationPath(item.path)))uncertain.set(item.path,item)}catch{}
-  function persist(){try{global.sessionStorage?.setItem(storageKey,JSON.stringify([...uncertain.values()]))}catch{}}
+  function persist(){try{const storage=global.sessionStorage;if(!storage||typeof storage.setItem!=='function'||typeof storage.getItem!=='function')return false;const value=JSON.stringify([...uncertain.values()]);storage.setItem(storageKey,value);return storage.getItem(storageKey)===value}catch{return false}}
   function notify(record,phase,extra={}){if(record.feedback===false)return;try{observer({path:record.path,method:record.method,phase,at:new Date().toISOString(),...extra})}catch{}}
   class RequestError extends Error{
     constructor(message,code,{status=0,submissionUnknown=false,details=null}={}){super(message);this.name='RequestError';this.code=code;this.status=status;this.submissionUnknown=submissionUnknown;this.details=details}
@@ -33,7 +33,7 @@
     const timeout=new Promise((_resolve,reject)=>{deadline=setTimeout(()=>{record.timedOut=true;controller.abort();reject(new Error('request deadline exceeded'))},Math.max(1,Number(timeoutMs)||15000))});
     waiting=setTimeout(()=>notify(record,'waiting'),2000);
     const transport=async()=>{
-      if(paid){record.command_id=global.crypto.randomUUID();record.request_sha256=await commandDigest(init.body);if(record.timedOut||record.controller.signal.aborted)throw new RequestError('请求尚未发送，请重新确认当前参数。','command_not_sent');init.headers={...(init.headers||{}),'X-AVF-Command-Id':record.command_id,'X-AVF-Command-Hash':record.request_sha256};uncertain.set(pathname,{path:pathname,kind,command_id:record.command_id,request_sha256:record.request_sha256,at:new Date().toISOString(),baseline_captured:submissionBaseline!==undefined,baseline_receipt_id:submissionBaseline?.receipt_id??null});persist()}
+      if(paid){record.command_id=global.crypto.randomUUID();record.request_sha256=await commandDigest(init.body);if(record.timedOut||record.controller.signal.aborted)throw new RequestError('请求尚未发送，请重新确认当前参数。','command_not_sent');init.headers={...(init.headers||{}),'X-AVF-Command-Id':record.command_id,'X-AVF-Command-Hash':record.request_sha256};uncertain.set(pathname,{path:pathname,kind,command_id:record.command_id,request_sha256:record.request_sha256,at:new Date().toISOString(),baseline_captured:submissionBaseline!==undefined,baseline_receipt_id:submissionBaseline?.receipt_id??null});if(!persist()){uncertain.delete(pathname);throw new RequestError('本页无法保存提交凭据，请使用允许本页存储的浏览器窗口；当前输入保留，尚未发送生成或投稿。','command_identity_unavailable')}}
       record.transportStarted=true;
       const response=await global.fetch(path,init);
       const data=await response.json();
@@ -44,11 +44,11 @@
       }
       return data;
     };
-    const clearKnown=()=>{if(uncertain.get(pathname)?.command_id===record.command_id){uncertain.delete(pathname);persist()}};
+    const clearKnown=()=>{if(record.paid&&uncertain.get(pathname)?.command_id===record.command_id){uncertain.delete(pathname);persist()}};
     return Promise.race([transport(),timeout]).then(data=>{clearKnown();notify(record,'success');return data}).catch(error=>{
       if(record.superseded)throw new RequestError('当前读取已被新的对象选择替代。','request_superseded');
       if(error.code==='http_error'){clearKnown();notify(record,'error',{message:error.message});throw error}
-      if(paid&&!record.transportStarted){const failure=new RequestError('请求尚未发送，请重新确认当前参数。','command_not_sent');notify(record,'error',{message:failure.message});throw failure}
+      if(paid&&!record.transportStarted){const failure=error instanceof RequestError?error:new RequestError('请求尚未发送，请重新确认当前参数。','command_not_sent');notify(record,'error',{message:failure.message});throw failure}
       if(paid){
         uncertain.set(pathname,{path:pathname,kind,command_id:record.command_id,request_sha256:record.request_sha256,at:new Date().toISOString(),baseline_captured:submissionBaseline!==undefined,baseline_receipt_id:submissionBaseline?.receipt_id??null});persist();
         const failure=new RequestError(kind==='publication'?'投稿结果尚未确认，请核对当前渠道记录；不会自动重复投稿。':'提交结果尚未确认，请核对当前任务后再决定下一步；不会自动重新扣费。','submission_unknown',{status:error.status||0,submissionUnknown:true});
