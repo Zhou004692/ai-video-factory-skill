@@ -1,4 +1,4 @@
 interface:
   display_name: "AI Video Factory"
-  short_description: "用自然语言完成短视频剧本、审批与 Seedance 标准成片"
-  default_prompt: "使用 $ai-video-factory 接管初始化和全部后台操作。我只提供素材、选择剧本并确认成片预算。"
+  short_description: "短视频剧本与成片制作、独立原片动作复刻，按需准备最小依赖"
+  default_prompt: "使用 $ai-video-factory 按我的目标选择标准制作或独立复刻，自动准备当前功能的最小依赖并处理后台操作，付费前由我确认预算。"

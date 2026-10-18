@@ -1,9 +1,17 @@
 ---
 name: ai-video-factory
-description: 用自然语言完成可追溯短视频剧本与标准成片。自动处理首次初始化、配置诊断、人工材料或用户提供的公开网页/字幕/音视频归档、Brief、三版剧本、人工审批、Seedance 2.5 原生母片、可选固定火山 TTS 或 Seedance 原生声线、本地导演剪辑、成本控制、发布映射和绩效回流。用户提到短视频剧本、热点材料、竞品结构分析、固定角色口播、Seedance 成片、批量视频、成本复盘或视频实验时使用；普通用户不需要执行命令或理解内部 ID。
+description: 用户需要短视频剧本、来源分析、固定角色口播、Seedance成片、批量视频或成本复盘时使用；也适用于基于原片复刻动作、人物替换动物、本地CG动作参考与复刻排错。复刻是独立子功能，按需初始化，不依赖管理台或原视频制作管线。普通用户无需执行命令或理解内部ID。
 ---
 
 # AI Video Factory
+
+## 先选择子功能
+
+- 用户提供原片，要求动作复刻、人物换动物、CG动作参考或复刻排错：进入**独立复刻子功能**，先读 [复刻工作流](references/recreation/workflow.md) 和 [独立初始化](references/recreation/initialization.md)。默认先做本地免费分析。不要执行下面的管理台或剧本/视频自举，也不要求Brief、剧本批准、业务数据库、旧管线凭证。
+- 用户要求主题创作、标准制作或管理台：执行下方原有工作流。
+- 两类需求混合时分开保存状态和产物；只有用户明确要求时才设计接入。复刻结果不自动导入管理台或变更原管线任务。
+
+复刻最小入口由Agent后台执行：`<system-python> scripts/recreation/bootstrap.py --stage inspect --json`。该入口仅用Python标准库检查FFmpeg/ffprobe，不创建完整`.venv`、`.env`或数据库。姿态、拟合、渲染按当前阶段分别准备；详见初始化参考。用户指定保留的模型路线优先，本次沉淀的默认路线为RTMPose。独立初始化就绪只证明所选阶段依赖可用，不代表模型权重、动物rig或复刻效果已经验收。
 
 ## 零命令启动约定（优先）
 
@@ -89,7 +97,7 @@ description: 用自然语言完成可追溯短视频剧本与标准成片。自�
 
 ## 首次触发：自动自举
 
-每次开始新工作前，Agent 在后台运行：
+每次开始原剧本、视频制作或数据复盘工作前，Agent 在后台运行（独立复刻不执行此入口）：
 
 ```text
 <runtime-python> scripts/bootstrap.py --profile <script|video|learning> --json

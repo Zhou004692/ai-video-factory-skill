@@ -60,6 +60,15 @@ REFERENCE_FILES = {
     "references/quality_canary_scripts.json",
 }
 
+# Explicit independent feature allowlist: never package private experiments,
+# model weights, media or local dependency trees alongside the reusable entry.
+RECREATION_FILES = {
+    'scripts/recreation/bootstrap.py',
+    'scripts/recreation/inspect_media.py',
+    'references/recreation/initialization.md',
+    'references/recreation/workflow.md',
+}
+
 EXCLUDED_PARTS = {
     ".git",
     ".venv",
@@ -129,7 +138,7 @@ def _allowed(path: Path, root: Path) -> bool:
         return False
     if any(part in EXCLUDED_PARTS for part in relative.parts):
         return False
-    if relative.as_posix() in SCRIPT_ROOT_FILES | REFERENCE_FILES:
+    if relative.as_posix() in SCRIPT_ROOT_FILES | REFERENCE_FILES | RECREATION_FILES:
         return True
     if relative.parts[:2] == ("scripts", "factory") and path.suffix == ".py":
         return True
@@ -246,7 +255,7 @@ def build_distribution(source_root: Path, output_root: Path) -> Path:
         raise ValueError("Skill source must be staged outside the replacement target")
     if target.is_symlink() or target.resolve() != target:
         raise ValueError("Skill replacement target must stay inside the output directory")
-    for key in ("FACTORY_RUNTIME_HOME", "FACTORY_ENV_FILE", "FACTORY_DATA_DIR", "FACTORY_DB_PATH"):
+    for key in ("FACTORY_RUNTIME_HOME", "FACTORY_ENV_FILE", "FACTORY_DATA_DIR", "FACTORY_DB_PATH", "AI_VIDEO_RECREATION_HOME"):
         value = str(os.environ.get(key) or "").strip()
         if value:
             candidate = Path(value).expanduser()
@@ -267,7 +276,7 @@ def build_distribution(source_root: Path, output_root: Path) -> Path:
     committed = False
     try:
         _populate_distribution(source_root, staged)
-        required = SCRIPT_ROOT_FILES | MANAGEMENT_UI_REQUIRED_FILES | {
+        required = SCRIPT_ROOT_FILES | MANAGEMENT_UI_REQUIRED_FILES | RECREATION_FILES | {
             "SKILL.md", "VERSION", "templates/env.example",
             "scripts/factory/db.py", "scripts/management_ui/index.html",
             "scripts/management_ui/styles.css", "scripts/management_ui/app.js",
