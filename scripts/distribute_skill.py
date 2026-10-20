@@ -83,6 +83,7 @@ RECREATION_FILES = {
     'references/recreation/initialization.md',
     'references/recreation/workflow.md',
     'references/recreation/user-guide.md',
+    'references/recreation/generation-guidance.md',
 }
 
 EXCLUDED_PARTS = {

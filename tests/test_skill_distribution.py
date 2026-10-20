@@ -57,6 +57,7 @@ class SkillDistributionTests(unittest.TestCase):
                 "scripts/recreation/articulated_source.py",
                 "scripts/recreation/priority_tracking.py",
                 "references/recreation/user-guide.md",
+                "references/recreation/generation-guidance.md",
                 "templates/env.example",
                 "references/characters/roster.yaml",
                 "references/quality_canary_scripts.json",
@@ -96,6 +97,10 @@ class SkillDistributionTests(unittest.TestCase):
             self.assertEqual(
                 (package / "references/recreation/user-guide.md").read_bytes(),
                 (ROOT / "references/recreation/user-guide.md").read_bytes(),
+            )
+            self.assertEqual(
+                (package / "references/recreation/generation-guidance.md").read_bytes(),
+                (ROOT / "references/recreation/generation-guidance.md").read_bytes(),
             )
 
     def test_audit_rejects_secrets_and_machine_bound_paths(self):
