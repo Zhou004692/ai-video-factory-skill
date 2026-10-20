@@ -54,6 +54,9 @@ class SkillDistributionTests(unittest.TestCase):
                 "scripts/doctor.py",
                 "scripts/install.py",
                 "scripts/factory/script_drafts.py",
+                "scripts/recreation/articulated_source.py",
+                "scripts/recreation/priority_tracking.py",
+                "references/recreation/user-guide.md",
                 "templates/env.example",
                 "references/characters/roster.yaml",
                 "references/quality_canary_scripts.json",
@@ -90,6 +93,10 @@ class SkillDistributionTests(unittest.TestCase):
 
             report = audit_distribution(package)
             self.assertTrue(report["ok"], json.dumps(report, ensure_ascii=False))
+            self.assertEqual(
+                (package / "references/recreation/user-guide.md").read_bytes(),
+                (ROOT / "references/recreation/user-guide.md").read_bytes(),
+            )
 
     def test_audit_rejects_secrets_and_machine_bound_paths(self):
         from distribute_skill import audit_distribution

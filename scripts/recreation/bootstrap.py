@@ -15,11 +15,11 @@ SKILL_ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 STAGES = {
     'inspect': (),
-    'pose': ('numpy>=1.26,<3', 'opencv-python-headless>=4.10,<6', 'onnxruntime>=1.20,<2', 'tqdm>=4.66,<5', 'rtmlib==0.0.16'),
+    'pose': ('numpy>=1.26,<3', 'opencv-python-headless>=4.10,<6', 'onnxruntime>=1.20,<2'),
     'fit': ('numpy>=1.26,<3', 'scipy>=1.11,<2'),
     'render': (),
 }
-IMPORTS = {'pose': ('numpy', 'cv2', 'onnxruntime', 'tqdm', 'rtmlib'), 'fit': ('numpy', 'scipy')}
+IMPORTS = {'pose': ('numpy', 'cv2', 'onnxruntime'), 'fit': ('numpy', 'scipy')}
 
 def default_home() -> Path:
     override = os.environ.get('AI_VIDEO_RECREATION_HOME')
@@ -49,7 +49,7 @@ def _packages(python: Path, stage: str) -> dict:
         return {'ok': True, 'missing': []}
     if not python.is_file():
         return {'ok': False, 'missing': list(names)}
-    # Import libraries only: never construct RTMPose/Wholebody, which may fetch weights.
+    # Import libraries only: no model construction, downloads or pipeline imports.
     code = ('import importlib,importlib.metadata as meta,json,re\nmissing=[]\n'
             f'for name in {names!r}:\n'
             ' try: importlib.import_module(name)\n'
@@ -108,13 +108,7 @@ def bootstrap(*, stage: str = 'inspect', runtime_root: Path | None = None,
             if r['returncode'] != 0:
                 return _report(stage, home, python, deps, {}, {'ok': False, 'missing': list(IMPORTS[stage])}, False, 'dependency_install_failed')
         if not _packages(python, stage)['ok']:
-            ordinary = [d for d in deps if not d.startswith('rtmlib')]
-            commands = [[str(python), '-I', '-m', 'pip', 'install', '--disable-pip-version-check', *ordinary]]
-            # rtmlib declares TWO GUI OpenCV distributions. Its CPU inference uses
-            # cv2/numpy/onnxruntime/tqdm; use one headless OpenCV instead, then
-            # verify real imports. Never install both OpenCV variants together.
-            if stage == 'pose':
-                commands.append([str(python), '-I', '-m', 'pip', 'install', '--disable-pip-version-check', '--no-deps', 'rtmlib==0.0.16'])
+            commands = [[str(python), '-I', '-m', 'pip', 'install', '--disable-pip-version-check', *deps]]
             for cmd in commands:
                 if _run(cmd, timeout=900)['returncode'] != 0:
                     return _report(stage, home, python, deps, {}, _packages(python, stage), False, 'dependency_install_failed')
@@ -150,7 +144,9 @@ def _report(stage, home, python, deps, tools, packages, installed, status):
             'runtime_root': str(home), 'runtime_python': str(python), 'python_dependencies': deps,
             'packages': packages, 'tools': tools, 'installed_dependencies': installed,
             'model_downloads': 0, 'paid_provider_calls': 0, 'source_uploads': 0,
-            'production_pipeline_initialized': False}
+            'production_pipeline_initialized': False,
+            'pose_model_family': 'vitpose', 'pose_schema': 'coco_wholebody133',
+            'pose_decoder': 'mmpose-msra-default'}
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)

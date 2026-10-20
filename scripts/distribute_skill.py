@@ -63,10 +63,26 @@ REFERENCE_FILES = {
 # Explicit independent feature allowlist: never package private experiments,
 # model weights, media or local dependency trees alongside the reusable entry.
 RECREATION_FILES = {
+    'scripts/recreation/articulated_source.py',
+    'scripts/recreation/priority_tracking.py',
+    'scripts/recreation/rig_contract.py',
+    'scripts/recreation/motion_control.py',
+    'scripts/recreation/kinematic_fit.py',
+    'scripts/recreation/temporal.py',
+    'scripts/recreation/vitpose_inference.py',
+    'scripts/recreation/pose_schema.py',
+    'scripts/recreation/retarget.py',
+    'scripts/recreation/vendor_mmpose_msra.py',
+    'scripts/recreation/wholebody133.json',
+    'scripts/recreation/LICENSE-mmpose.txt',
+    'scripts/recreation/LICENSE-HRNet-MIT.txt',
+    'scripts/recreation/vitpose-provenance.json',
+    'references/recreation/vitpose.md',
     'scripts/recreation/bootstrap.py',
     'scripts/recreation/inspect_media.py',
     'references/recreation/initialization.md',
     'references/recreation/workflow.md',
+    'references/recreation/user-guide.md',
 }
 
 EXCLUDED_PARTS = {

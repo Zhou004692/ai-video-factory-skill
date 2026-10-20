@@ -7,11 +7,15 @@ description: 用户需要短视频剧本、来源分析、固定角色口播、S
 
 ## 先选择子功能
 
+独立复刻首次使用、初始化缺项、CG确认、生成配置和继续项目时，先读[使用引导](references/recreation/user-guide.md)，用当前对话逐阶段说明和确认。先帮助使用者提供原片及替换范围，不提前索要云Key；已有信息和有效确认不重复询问。
+
 - 用户提供原片，要求动作复刻、人物换动物、CG动作参考或复刻排错：进入**独立复刻子功能**，先读 [复刻工作流](references/recreation/workflow.md) 和 [独立初始化](references/recreation/initialization.md)。默认先做本地免费分析。不要执行下面的管理台或剧本/视频自举，也不要求Brief、剧本批准、业务数据库、旧管线凭证。
 - 用户要求主题创作、标准制作或管理台：执行下方原有工作流。
 - 两类需求混合时分开保存状态和产物；只有用户明确要求时才设计接入。复刻结果不自动导入管理台或变更原管线任务。
 
-复刻最小入口由Agent后台执行：`<system-python> scripts/recreation/bootstrap.py --stage inspect --json`。该入口仅用Python标准库检查FFmpeg/ffprobe，不创建完整`.venv`、`.env`或数据库。姿态、拟合、渲染按当前阶段分别准备；详见初始化参考。用户指定保留的模型路线优先，本次沉淀的默认路线为RTMPose。独立初始化就绪只证明所选阶段依赖可用，不代表模型权重、动物rig或复刻效果已经验收。
+独立复刻的Seedance生成是**可选步骤**，可以只交付本地CG，不要求开通视频模型。需要生成时，按使用者当前账号实际开通且满足本次参考/编辑需求的模型提供选择，不固定2.5，也不自动选择Mini。**每次新增付费生成前，先询问使用者选择的模型并展示本次预算，取得明确确认后才上传/提交**；具体遵守[模型选择与预算确认](references/recreation/workflow.md#可选seedance生成模型选择与预算确认)。下文“Seedance 2.5生产约定”仅用于原标准制作管线，不覆盖独立复刻的模型选择。
+
+复刻最小入口由Agent后台执行：`<system-python> scripts/recreation/bootstrap.py --stage inspect --json`。该入口仅用Python标准库检查FFmpeg/ffprobe，不创建完整`.venv`、`.env`或数据库。姿态、拟合、渲染按当前阶段分别准备；详见初始化参考。独立复刻默认全面使用[ViTPose WholeBody133](references/recreation/vitpose.md)，不自动回退RTMPose或用17点模型替代全身模型；已有项目与历史候选保持。独立初始化就绪只证明所选阶段依赖可用，不代表模型权重、动物rig或复刻效果已经验收。
 
 ## 零命令启动约定（优先）
 

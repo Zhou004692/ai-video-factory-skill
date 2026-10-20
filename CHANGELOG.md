@@ -2,6 +2,13 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [Unreleased] - Independent recreation
+
+- Add CPU ViTPose WholeBody133 observations with explicit local model hashes, official MSRA preprocessing/decoding, retained hand/face/foot landmarks, and bundled provenance/licenses.
+- Add optional fixed-shape fitting, source/target rig contracts, content-time mapping, contact eligibility, limb reach checks and moving-camera projection tools. These components do not certify full-body reconstruction, physical grounding or final video quality.
+- Guide independent users through minimal initialization, CG preview acceptance and optional video generation. Choose a compatible model actually activated by the user and confirm its budget before each new paid generation; explain ARK and implementation-specific TOS credentials only when needed.
+- Include independent helpers and user guidance in sanitized direct Skill distribution. Preserve external project state and historical candidates; no management pipeline integration or general paid submission adapter is added.
+
 ## [3.2.0.8] - 2026-10-13
 
 ### Added

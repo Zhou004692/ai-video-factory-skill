@@ -1,0 +1,30 @@
+{
+  "revision": "c050ed29112da7704797cc1a65af0234b525010d",
+  "repository": "https://github.com/ViTAE-Transformer/ViTPose",
+  "extraction": [
+    {
+      "file": "official-post-transforms.py",
+      "sha256": "9e992809898931b3bd0dfbe9dc52494ccaf71a1c23ee46fae1fb8ee2e4fbea59",
+      "symbols": [
+        "flip_back",
+        "transform_preds",
+        "get_affine_transform",
+        "affine_transform",
+        "_get_3rd_point",
+        "rotate_point"
+      ]
+    },
+    {
+      "file": "official-decoder.py",
+      "sha256": "ee67e9c4b929c3ac37de6c80a7fb169c95338069b790f5ea4707c6dd8e9d7339",
+      "symbols": [
+        "_get_max_preds",
+        "_gaussian_blur",
+        "_taylor",
+        "post_dark_udp",
+        "keypoints_from_heatmaps"
+      ]
+    }
+  ],
+  "runtime": "official MSRA/default, RGB affine, flip and shift; no UDP fallback"
+}

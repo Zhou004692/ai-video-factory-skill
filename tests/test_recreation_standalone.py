@@ -67,7 +67,9 @@ class StandaloneRecreationTests(unittest.TestCase):
             commands = [c.args[0] for c in run.call_args_list]
             installs = [c for c in commands if 'install' in c]
             self.assertTrue(installs)
-            self.assertTrue(any('--no-deps' in c and 'rtmlib==0.0.16' in c for c in installs))
+            self.assertEqual(mod.IMPORTS['pose'], ('numpy', 'cv2', 'onnxruntime'))
+            self.assertEqual(mod.STAGES['pose'], ('numpy>=1.26,<3', 'opencv-python-headless>=4.10,<6', 'onnxruntime>=1.20,<2'))
+            self.assertFalse(any('rtmlib' in ' '.join(c) for c in installs))
             self.assertFalse(any('opencv-contrib-python' in ' '.join(c) or 'torch' in ' '.join(c) for c in installs))
 
     def test_render_rejects_node_older_than_documented_runtime(self):
@@ -91,10 +93,10 @@ class StandaloneRecreationTests(unittest.TestCase):
             return {'returncode': 0, 'stdout': output.getvalue(), 'stderr': ''}
         with patch.object(mod, '_run', side_effect=execute_probe):
             self.assertTrue(mod._packages(Path(sys.executable), 'pose')['ok'])
-            for version in ['0.0.16rc1', '0.0.16.post1', '0.0.16.1']:
-                versions['rtmlib'] = version
+            for version in ['1.31.0rc1', '1.31.0.post1', '2.0.0']:
+                versions['onnxruntime'] = version
                 self.assertFalse(mod._packages(Path(sys.executable), 'pose')['ok'], version)
-            versions['rtmlib'] = '0.0.16'
+            versions['onnxruntime'] = '1.31.0'
             versions['opencv-python'] = '5.0.0.93'
             self.assertFalse(mod._packages(Path(sys.executable), 'pose')['ok'])
 
@@ -128,8 +130,18 @@ class StandaloneRecreationTests(unittest.TestCase):
         from distribute_skill import build_distribution
         with tempfile.TemporaryDirectory() as tmp:
             package = build_distribution(ROOT, Path(tmp)/'packed')
-            for name in ['scripts/recreation/bootstrap.py', 'scripts/recreation/inspect_media.py', 'references/recreation/workflow.md', 'references/recreation/initialization.md']:
+            for name in ['scripts/recreation/bootstrap.py', 'scripts/recreation/inspect_media.py', 'references/recreation/workflow.md', 'references/recreation/initialization.md', 'scripts/recreation/vitpose_inference.py', 'scripts/recreation/pose_schema.py', 'scripts/recreation/retarget.py', 'scripts/recreation/temporal.py', 'scripts/recreation/kinematic_fit.py', 'scripts/recreation/motion_control.py', 'scripts/recreation/vendor_mmpose_msra.py', 'scripts/recreation/wholebody133.json', 'scripts/recreation/LICENSE-mmpose.txt', 'scripts/recreation/vitpose-provenance.json', 'references/recreation/vitpose.md']:
                 self.assertTrue((package/name).is_file(), name)
+            control = subprocess.run([sys.executable, '-I', '-S', str(package/'scripts/recreation/motion_control.py')], capture_output=True, text=True, encoding='utf-8')
+            self.assertEqual(control.returncode, 0, control.stderr)
+            temporal = subprocess.run([sys.executable, '-I', '-S', '-c',
+                "import runpy,sys; m=runpy.run_path(sys.argv[1]); r=m['content_time_map']([0,1],[0.,.033],[{'source_frames':[0,1],'same_content':True,'evidence_id':'review'}]); assert r['representative_source_frames']==[0,0]; assert not any(x in sys.modules for x in ['numpy','scipy','factory'])",
+                str(package/'scripts/recreation/temporal.py')], capture_output=True, text=True, encoding='utf-8')
+            self.assertEqual(temporal.returncode, 0, temporal.stderr)
+            measurement = subprocess.run([sys.executable, '-I', '-S', '-c',
+                "import runpy,sys; m=runpy.run_path(sys.argv[1]); r=m['source_body_measurements']([[0.,0.]]*17); assert r['independent_fit_indices']==[1,2,3,4,5,6,11,12,13,14,15,16]; assert r['xy_h36m17'][9] is None; assert not any(x in sys.modules for x in ['numpy','scipy','factory'])",
+                str(package/'scripts/recreation/pose_schema.py')], capture_output=True, text=True, encoding='utf-8')
+            self.assertEqual(measurement.returncode, 0, measurement.stderr)
             p = subprocess.run([sys.executable, '-I', str(package/'scripts/recreation/bootstrap.py'), '--check-only', '--runtime-root', str(Path(tmp)/'state'), '--json'], capture_output=True, text=True, encoding='utf-8')
             r = json.loads(p.stdout)
             self.assertEqual(r['stage'], 'inspect')
