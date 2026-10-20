@@ -77,18 +77,22 @@ def run(source, tracks_path, manifest_path, output):
     tracks=json.loads(tracks_path.read_text(encoding='utf-8'))
     sha=file_sha256(source)
     if tracks.get('source_sha256')!=sha:raise ValueError('Identity tracks do not match source SHA256')
-    manifest=json.loads(manifest_path.read_text(encoding='utf-8'));model=ViTPose(manifest)
     rows=tracks['rows'];indices=[r['source_frame_index'] for r in rows]
     if indices!=list(range(len(rows))):raise ValueError('Complete contiguous tracks starting at frame zero required')
-    x,y,w,h=tracks['crop_xywh'];cap=cv2.VideoCapture(str(source));fps=cap.get(cv2.CAP_PROP_FPS)
-    if abs(fps-tracks['fps'])>1e-4:raise ValueError('Track FPS differs from video')
-    if int(cap.get(cv2.CAP_PROP_FRAME_COUNT))!=len(rows):raise ValueError('Track/video frame count mismatch')
+    crop=tracks.get('crop_xywh')
+    if (not isinstance(crop,(list,tuple)) or len(crop)!=4 or any(type(v) is not int for v in crop)
+            or min(crop[:2])<0 or min(crop[2:])<=0):
+        raise ValueError('Crop requires integer nonnegative x/y and positive width/height')
+    x,y,w,h=crop
+    manifest=json.loads(manifest_path.read_text(encoding='utf-8'));model=ViTPose(manifest)
+    cap=cv2.VideoCapture(str(source));fps=cap.get(cv2.CAP_PROP_FPS)
     result=[];start=time.monotonic()
     try:
+        if abs(fps-tracks['fps'])>1e-4:raise ValueError('Track FPS differs from video')
         for row in rows:
             ok,frame=cap.read()
             if not ok:raise ValueError('Video ended before all identity tracks')
-            if frame[y:y+h,x:x+w].shape[:2]!=(h,w):raise ValueError('Crop extends outside video')
+            if x+w>frame.shape[1] or y+h>frame.shape[0]:raise ValueError('Crop extends outside video')
             roles=row['roles'];ids=[r['id'] for r in roles]
             if len(set(ids))!=len(ids):raise ValueError('Duplicate role identities')
             active=[r for r in roles if r.get('bbox_xyxy') is not None]
@@ -104,6 +108,10 @@ def run(source, tracks_path, manifest_path, output):
             n=row['source_frame_index']
             result.append({'source_frame_index':n,'timestamp_seconds':float(cap.get(cv2.CAP_PROP_POS_MSEC))/1000,'roles':out})
             if n%30==0:print(json.dumps({'frame':n,'total':len(rows),'elapsed_s':round(time.monotonic()-start,1)}),flush=True)
+        # Container frame-count metadata can be an estimate (notably for VFR).
+        # Validate actual coverage in both directions, retaining decoder PTS.
+        extra,_=cap.read()
+        if extra:raise ValueError('Video contains frames without identity tracks')
     finally:cap.release()
     report={'schema_version':1,'pose_family':'vitpose','keypoint_schema':'coco_wholebody133',
             'source_sha256':sha,'source_path':str(source.resolve()),'fps':fps,'crop_xywh':[x,y,w,h],

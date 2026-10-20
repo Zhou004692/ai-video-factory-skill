@@ -90,7 +90,12 @@ class AngleGuide:
             return {'angle':self.angle,'state':'observed','limited':False,'source_verified':False}
         if dt is None:
             return {'angle':self.angle,'state':'prior_unknown','limited':False,'source_verified':False}
-        raw=self.angle+math.atan2(math.sin(angle-self.angle),math.cos(angle-self.angle))
+        # Unwrap consecutive observations against their own history. The render
+        # guide may lag by several turns under its authored speed limit.
+        # After unknown input, lost turn count is not observable: reacquire the
+        # branch nearest the held render prior and reset the derivative below.
+        anchor=self.angle if self.missing else self.raw
+        raw=anchor+math.atan2(math.sin(angle-anchor),math.cos(angle-anchor))
         previous=self.angle;reacquiring=self.missing
         derivative=0. if self.missing else (raw-self.raw)/dt
         a=self.alpha(dt,self.dc);self.derivative+=a*(derivative-self.derivative)

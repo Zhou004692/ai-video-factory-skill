@@ -10,6 +10,34 @@ def load():
     m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
 
 class TemporalGuideTests(unittest.TestCase):
+    def test_multiple_turns_keep_raw_direction_when_speed_limited_far_behind(self):
+        for direction in [-1, 1]:
+            with self.subTest(direction=direction):
+                g=load().AngleGuide(max_speed=.1)
+                observed=[];rendered=[]
+                for n in range(121):
+                    raw=direction*n*.2
+                    wrapped=math.atan2(math.sin(raw),math.cos(raw))
+                    observed.append(wrapped)
+                    rendered.append(g.update(n*.1,wrapped)['angle'])
+                    self.assertAlmostEqual(g.raw,raw,places=10)
+                    self.assertGreaterEqual(direction*g.derivative,-1e-10)
+                self.assertTrue(all(direction*(b-a)>=-1e-10 for a,b in zip(rendered,rendered[1:])))
+                self.assertTrue(all(abs(b-a)<=.01+1e-10 for a,b in zip(rendered,rendered[1:])))
+                self.assertGreater(direction*(direction*24-rendered[-1]),math.pi)
+                self.assertEqual(len(observed),121)
+
+    def test_reacquisition_after_lag_does_not_guess_missing_turns(self):
+        g=load().AngleGuide(max_speed=.1)
+        for n in range(41):g.update(n*.1,math.atan2(math.sin(n*.2),math.cos(n*.2)))
+        previous=g.angle
+        self.assertEqual(g.update(4.1,None)['angle'],previous)
+        result=g.update(4.2,-.3)
+        self.assertEqual(result['state'],'reacquiring')
+        self.assertAlmostEqual(g.raw,-.3,places=10)
+        self.assertEqual(g.derivative,0.)
+        self.assertLessEqual(abs(result['angle']-previous),.01+1e-10)
+
     def test_first_measurement_after_unknown_opening_respects_explicit_render_prior(self):
         g=load().AngleGuide(max_speed=math.pi*4,initial_angle=0.)
         for n in range(8):self.assertEqual(g.update(n/30,None)['angle'],0.)

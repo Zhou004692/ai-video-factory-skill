@@ -2,7 +2,7 @@
 
 All notable changes to AI Video Factory are documented here.
 
-## [Unreleased] - Independent recreation
+## [3.2.0.9] - 2026-10-20
 
 - Capture event-based CG-to-animal-video prompting: preserve key choreography while allowing agreed local joint, stride and weight-transfer adaptation. Include a reusable template, failure patterns and explicit single-sample evidence limits; no Mini equivalence or automatic paid repair is claimed.
 
@@ -10,6 +10,8 @@ All notable changes to AI Video Factory are documented here.
 - Add optional fixed-shape fitting, source/target rig contracts, content-time mapping, contact eligibility, limb reach checks and moving-camera projection tools. These components do not certify full-body reconstruction, physical grounding or final video quality.
 - Guide independent users through minimal initialization, CG preview acceptance and optional video generation. Choose a compatible model actually activated by the user and confirm its budget before each new paid generation; explain ARK and implementation-specific TOS credentials only when needed.
 - Include independent helpers and user guidance in sanitized direct Skill distribution. Preserve external project state and historical candidates; no management pipeline integration or general paid submission adapter is added.
+- Keep continuous angle observations unwrapped against raw history even when the render guide lags by multiple turns; reacquisition after missing observations resets to the nearest held branch without inventing turn counts.
+- Reject invalid or out-of-frame crop coordinates before publishing pose observations. Validate track coverage against actual decoded frames instead of estimated container frame counts, preserving decoder timestamps for variable-rate sources.
 
 ## [3.2.0.8] - 2026-10-13
 
