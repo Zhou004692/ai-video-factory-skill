@@ -89,6 +89,50 @@ class RunnerInputTests(unittest.TestCase):
                     with self.assertRaises(ValueError):m.run(*paths)
                 self.assertFalse(paths[-1].exists());self.assertTrue(cap.released)
 
+    def test_bound_pts_accepts_different_average_fps_but_rejects_wrong_clock(self):
+        for offset in [0, .1]:
+            with self.subTest(offset=offset),tempfile.TemporaryDirectory() as tmp:
+                m=load();paths=self.fixtures(Path(tmp),rows=2)
+                payload=json.loads(paths[1].read_text(encoding='utf-8'))
+                payload['fps']=15  # ffprobe average may differ from decoder nominal FPS.
+                for i,row in enumerate(payload['rows']):row['timestamp_seconds']=i/30+offset
+                paths[1].write_text(json.dumps(payload),encoding='utf-8')
+                cap=self.fake_capture([np.zeros((100,200,3),np.uint8) for _ in range(2)])
+                with patch.object(m,'ViTPose',self.fake_model([])),patch.object(m.cv2,'VideoCapture',return_value=cap),patch.object(m,'source_pts',return_value=[0,1/30]):
+                    if offset:
+                        with self.assertRaisesRegex(ValueError,'PTS'):m.run(*paths)
+                        self.assertFalse(paths[-1].exists())
+                    else:
+                        result=m.run(*paths)
+                        self.assertEqual([r['timestamp_seconds'] for r in result['rows']],[0,1/30])
+
+    def test_invalid_or_partial_pts_is_not_treated_as_legacy_fps(self):
+        for values in [[0,None],[0,0],[0,float('nan')],[False,1/30]]:
+            with self.subTest(values=values),tempfile.TemporaryDirectory() as tmp:
+                m=load();paths=self.fixtures(Path(tmp),rows=2)
+                payload=json.loads(paths[1].read_text(encoding='utf-8'))
+                for row,value in zip(payload['rows'],values):
+                    if value is not None:row['timestamp_seconds']=value
+                paths[1].write_text(json.dumps(payload),encoding='utf-8')
+                cap=self.fake_capture([np.zeros((100,200,3),np.uint8) for _ in range(2)])
+                with patch.object(m,'ViTPose',self.fake_model([])),patch.object(m.cv2,'VideoCapture',return_value=cap):
+                    with self.assertRaises(ValueError):m.run(*paths)
+                self.assertFalse(paths[-1].exists())
+
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'FFmpeg/ffprobe required')
+    def test_real_nonzero_pts_is_preserved_while_decoder_normalizes_origin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp);m=load();_,tracks,manifest,output=self.fixtures(directory,rows=3)
+            source=directory/'offset.mkv'
+            subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=size=200x100:rate=10:duration=0.3',
+                '-vf','setpts=PTS+2/TB','-fps_mode','passthrough','-c:v','ffv1',str(source)],check=True,capture_output=True)
+            payload=json.loads(tracks.read_text(encoding='utf-8'))
+            payload.update(source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),fps=10)
+            for i,row in enumerate(payload['rows']):row['timestamp_seconds']=2+i/10
+            tracks.write_text(json.dumps(payload),encoding='utf-8')
+            with patch.object(m,'ViTPose',self.fake_model([])):r=m.run(source,tracks,manifest,output)
+            self.assertEqual([row['timestamp_seconds'] for row in r['rows']],[2,2.1,2.2])
+
     @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'),'FFmpeg/ffprobe required')
     def test_real_variable_rate_video_uses_decoded_frames_and_preserves_pts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,6 +148,8 @@ class RunnerInputTests(unittest.TestCase):
                 '-show_entries','frame=best_effort_timestamp_time','-of','json',str(source)],check=True,capture_output=True).stdout)
             expected=[float(f['best_effort_timestamp_time']) for f in decoded['frames']]
             self.assertEqual(len(expected),5)
+            for row,pts in zip(payload['rows'],expected):row['timestamp_seconds']=pts
+            tracks.write_text(json.dumps(payload),encoding='utf-8')
             with patch.object(m,'ViTPose',self.fake_model([])):r=m.run(source,tracks,manifest,output)
             self.assertEqual(len(r['rows']),5)
             for row,t in zip(r['rows'],expected):self.assertAlmostEqual(row['timestamp_seconds'],t,places=5)

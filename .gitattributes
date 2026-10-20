@@ -1,0 +1,4 @@
+# Hash-bound reusable renderer assets must retain the same bytes on every host.
+assets/recreation/** -text whitespace=cr-at-eol
+# Preserve the pinned upstream build, including its original indentation.
+assets/recreation/vendor/** -whitespace

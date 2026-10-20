@@ -18,8 +18,9 @@ STAGES = {
     'pose': ('numpy>=1.26,<3', 'opencv-python-headless>=4.10,<6', 'onnxruntime>=1.20,<2'),
     'fit': ('numpy>=1.26,<3', 'scipy>=1.11,<2'),
     'render': (),
+    'generate-tos': ('tos>=2.8,<3',),
 }
-IMPORTS = {'pose': ('numpy', 'cv2', 'onnxruntime'), 'fit': ('numpy', 'scipy')}
+IMPORTS = {'pose': ('numpy', 'cv2', 'onnxruntime'), 'fit': ('numpy', 'scipy'), 'generate-tos': ('tos',)}
 
 def default_home() -> Path:
     override = os.environ.get('AI_VIDEO_RECREATION_HOME')

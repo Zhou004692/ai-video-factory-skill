@@ -15,7 +15,11 @@ description: 用户需要短视频剧本、来源分析、固定角色口播、S
 
 独立复刻的Seedance生成是**可选步骤**，可以只交付本地CG，不要求开通视频模型。需要生成时，按使用者当前账号实际开通且满足本次参考/编辑需求的模型提供选择，不固定2.5，也不自动选择Mini。**每次新增付费生成前，先询问使用者选择的模型并展示本次预算，取得明确确认后才上传/提交**；具体遵守[模型选择与预算确认](references/recreation/workflow.md#可选seedance生成模型选择与预算确认)。下文“Seedance 2.5生产约定”仅用于原标准制作管线，不覆盖独立复刻的模型选择。
 
-复刻最小入口由Agent后台执行：`<system-python> scripts/recreation/bootstrap.py --stage inspect --json`。该入口仅用Python标准库检查FFmpeg/ffprobe，不创建完整`.venv`、`.env`或数据库。姿态、拟合、渲染按当前阶段分别准备；详见初始化参考。独立复刻默认全面使用[ViTPose WholeBody133](references/recreation/vitpose.md)，不自动回退RTMPose或用17点模型替代全身模型；已有项目与历史候选保持。独立初始化就绪只证明所选阶段依赖可用，不代表模型权重、动物rig或复刻效果已经验收。
+复刻由 Agent 后台运行 `scripts/recreation/recreate.py`：先 `inspect --source SOURCE --output SELECTION_DIR` 帮助选人，再 `init --source SOURCE --project PROJECT --roles ROLES_JSON` 固定源清单/角色，`--runtime-root RUNTIME local --project PROJECT` 按缺项执行跟踪、观测与犬体 CG。普通用户不执行这些命令。项目、模型、依赖与配置保存在 Skill 外，`status/select/accept` 支持继续、纠正与逐产物 SHA 接受；格式见[项目格式](references/recreation/project-format.md)。
+
+按当前阶段运行独立 bootstrap，不初始化完整旧管线。`doctor` 分开报告 `dependencies_ready` 和含权重/浏览器/动物资产的 `execution_ready`，都不等同于效果验收。WholeBody133 B 模型显式登记已验证缓存或经授权下载，固定文件 **360242862 字节**、SHA `017c08e161bfa2c72a96297b3b6de975ecd83c65c4fd56fb5b0bfc1298709069`；不自动回退17点/RTMPose。模型与命令见[初始化](references/recreation/initialization.md)。
+
+当前默认仅 `husky/golden`、`screen-space-2.5d`：锚框光流只保守平移传播，遮挡/交叉等缺测不自动认回；缺失躯段隐藏并报告。原始 WholeBody133 全量保留，但默认 CG 不声称完整手指、脸部或情绪重定向，也未恢复真实相机、深度、地面或接触。已分发的可选[生成适配器](references/recreation/generation-adapter.md)由 `generation` 子命令独立处理 prepare/approve/upload/submit/status/download/package，TOS SDK 仅按需 `generate-tos` 准备；本轮确认前不上传，PUT/POST一次持久 journal，结果未知不重提。下载保留真实原生覆盖并纯本地回装原音/对比/审阅；真实云端权限、TOS、计费与生成质量尚未实测。
 
 ## 零命令启动约定（优先）
 

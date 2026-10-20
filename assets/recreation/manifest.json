@@ -1,0 +1,20 @@
+{
+  "schema": "animal-recreation-assets-v1",
+  "three_version": "0.181.0",
+  "three_revision": "181",
+  "three_license": "MIT",
+  "authored_asset_license": "User-authorized reuse in this Skill; see ASSET-NOTICE.md",
+  "files": {
+    "animal-body.js": "38d8de5bc3c33995cf26b302bec4bf83a47949dc2677a8beec1a7e33e5164e15",
+    "ASSET-NOTICE.md": "2520c4f54b6587d3f3e64d340ad7742cbd203a1a719a3007a3b673d9a8ccf4bf",
+    "face-geometry.js": "e7987a19d14310afc3ef5c4a3adb74434904019fbdca7039bdbd79fc4e54c77b",
+    "head-binding.js": "9e397c7cb134fd2c895c45b9d884756b7dafce9c031fbb766f7a634ce901d93e",
+    "mouth-shapes.js": "40e9df75ff2e286b3c5794f12079179380669cc2ee16edf0fe5451712309e603",
+    "projected-limbs.mjs": "7ed8ae741b254213f9a1c6be2576465f405b887dacbd08b078671b92cbb6fcca",
+    "rig.js": "fb2eb996c55519666e387bf822de535161baf60f51be3a69417278be359db2ef",
+    "scene.mjs": "059b7b100d5efe62ab75e8b107c01be8986cad47832678dc0c39df9319100a39",
+    "vendor/LICENSE": "bfe119ea4fd413f5f7ca3fcd63adb0c4a073ed39daa2fe7d3e6b769e21272601",
+    "vendor/three.core.js": "03fb6e9fa08628385a9096948593251ae473239c7039496d7c280cba73d84631",
+    "vendor/three.module.js": "1bb0b770bac5da2b59b21aa5fff4c547eeb864d4e408e4c36fbc6ced1dce0e9e"
+  }
+}

@@ -2,6 +2,14 @@
 
 All notable changes to AI Video Factory are documented here.
 
+## [3.2.1.0] - 2026-10-20
+
+- Ship the independent recreation entry with explicit source/role anchors, CPU identity tracking, pinned WholeBody133 model preparation and optional authored husky/golden CG previews. Minimal stages do not initialize the management pipeline or require cloud keys.
+- Preserve native frame clocks, source audio and versioned synchronized reviews. The default renderer is a screen-space 2.5D reference with reported gaps and projection residuals; it does not recover physical grounding, depth or certify motion quality.
+- Bind project artifacts, human acceptance and downstream invalidation to source/input hashes, with atomic batch publication and restart-safe process locks. Keep project data and weights outside replaceable Skill code.
+- Add opt-in generation profiles, per-run model/account/price/budget confirmation, external credentials, verified references and durable single-attempt upload/submission journals. Unknown outcomes require read-only reconciliation; no automatic paid repair or real cloud integration success is claimed.
+- Distinguish dependency readiness from model/renderer readiness and include portable renderer assets and independent user guidance in sanitized Skill distribution.
+
 ## [3.2.0.9] - 2026-10-20
 
 - Capture event-based CG-to-animal-video prompting: preserve key choreography while allowing agreed local joint, stride and weight-transfer adaptation. Include a reusable template, failure patterns and explicit single-sample evidence limits; no Mini equivalence or automatic paid repair is claimed.

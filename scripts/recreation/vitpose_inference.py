@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import time
 import numpy as np
 import cv2
@@ -72,6 +73,12 @@ class ViTPose:
         xy,score=decode_heatmaps(self.heatmaps(x),c,s)
         return [wholebody_record(p.tolist(),v[:,0].tolist()) for p,v in zip(xy,score)]
 
+def source_pts(source):
+    result=subprocess.run(['ffprobe','-v','error','-select_streams','v:0','-show_frames',
+        '-show_entries','frame=best_effort_timestamp_time','-of','json',str(source)],
+        capture_output=True,check=True,timeout=300)
+    return [float(row['best_effort_timestamp_time']) for row in json.loads(result.stdout)['frames']]
+
 def run(source, tracks_path, manifest_path, output):
     if output.exists():raise ValueError('Refusing to overwrite observations; choose a new output')
     tracks=json.loads(tracks_path.read_text(encoding='utf-8'))
@@ -79,6 +86,15 @@ def run(source, tracks_path, manifest_path, output):
     if tracks.get('source_sha256')!=sha:raise ValueError('Identity tracks do not match source SHA256')
     rows=tracks['rows'];indices=[r['source_frame_index'] for r in rows]
     if indices!=list(range(len(rows))):raise ValueError('Complete contiguous tracks starting at frame zero required')
+    bound_pts=any('timestamp_seconds' in r for r in rows)
+    if bound_pts:
+        stamps=[r.get('timestamp_seconds') for r in rows]
+        if (any(type(t) not in (int,float) or not np.isfinite(t) for t in stamps)
+                or any(b<=a for a,b in zip(stamps,stamps[1:]))):
+            raise ValueError('Identity PTS must be finite, complete and strictly increasing')
+        native_pts=source_pts(source)
+        if len(native_pts)!=len(stamps) or any(not np.isfinite(a) or abs(a-b)>.002 for a,b in zip(native_pts,stamps)):
+            raise ValueError('Identity PTS differs from source container clock (2ms tolerance)')
     crop=tracks.get('crop_xywh')
     if (not isinstance(crop,(list,tuple)) or len(crop)!=4 or any(type(v) is not int for v in crop)
             or min(crop[:2])<0 or min(crop[2:])<=0):
@@ -86,12 +102,21 @@ def run(source, tracks_path, manifest_path, output):
     x,y,w,h=crop
     manifest=json.loads(manifest_path.read_text(encoding='utf-8'));model=ViTPose(manifest)
     cap=cv2.VideoCapture(str(source));fps=cap.get(cv2.CAP_PROP_FPS)
-    result=[];start=time.monotonic()
+    result=[];start=time.monotonic();decoded_origin=None
     try:
-        if abs(fps-tracks['fps'])>1e-4:raise ValueError('Track FPS differs from video')
+        # A VFR average is not the decoder's nominal FPS. New source-bound tracks
+        # carry an actual per-frame clock; validate that clock instead. Legacy
+        # tracks without timestamps retain their previous strict FPS gate.
+        if not bound_pts and abs(fps-tracks['fps'])>1e-4:raise ValueError('Track FPS differs from video')
         for row in rows:
             ok,frame=cap.read()
             if not ok:raise ValueError('Video ended before all identity tracks')
+            decoded_pts=float(cap.get(cv2.CAP_PROP_POS_MSEC))/1000
+            if decoded_origin is None:decoded_origin=decoded_pts
+            # OpenCV normalizes many nonzero source origins. Verify intervals
+            # separately after the absolute source clock was checked above.
+            if bound_pts and (not np.isfinite(decoded_pts) or abs((decoded_pts-decoded_origin)-(row['timestamp_seconds']-stamps[0]))>.002):
+                raise ValueError('Identity PTS differs from decoded video (2ms tolerance)')
             if x+w>frame.shape[1] or y+h>frame.shape[0]:raise ValueError('Crop extends outside video')
             roles=row['roles'];ids=[r['id'] for r in roles]
             if len(set(ids))!=len(ids):raise ValueError('Duplicate role identities')
@@ -106,7 +131,7 @@ def run(source, tracks_path, manifest_path, output):
                 record.update(byid.get(role['id'],{'missing_observation':True}))
                 out.append(record)
             n=row['source_frame_index']
-            result.append({'source_frame_index':n,'timestamp_seconds':float(cap.get(cv2.CAP_PROP_POS_MSEC))/1000,'roles':out})
+            result.append({'source_frame_index':n,'timestamp_seconds':row['timestamp_seconds'] if bound_pts else decoded_pts,'roles':out})
             if n%30==0:print(json.dumps({'frame':n,'total':len(rows),'elapsed_s':round(time.monotonic()-start,1)}),flush=True)
         # Container frame-count metadata can be an estimate (notably for VFR).
         # Validate actual coverage in both directions, retaining decoder PTS.

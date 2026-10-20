@@ -63,6 +63,15 @@ REFERENCE_FILES = {
 # Explicit independent feature allowlist: never package private experiments,
 # model weights, media or local dependency trees alongside the reusable entry.
 RECREATION_FILES = {
+    'scripts/recreation/project_store.py',
+    'scripts/recreation/identity_tracks.py',
+    'scripts/recreation/model_assets.py',
+    'scripts/recreation/doctor.py',
+    'scripts/recreation/recreate.py',
+    'scripts/recreation/render_preview.py',
+    'scripts/recreation/render_scene.mjs',
+    'scripts/recreation/generation.py',
+    'scripts/recreation/generation_package.py',
     'scripts/recreation/articulated_source.py',
     'scripts/recreation/priority_tracking.py',
     'scripts/recreation/rig_contract.py',
@@ -84,6 +93,20 @@ RECREATION_FILES = {
     'references/recreation/workflow.md',
     'references/recreation/user-guide.md',
     'references/recreation/generation-guidance.md',
+    'references/recreation/project-format.md',
+    'references/recreation/generation-adapter.md',
+    'assets/recreation/manifest.json',
+    'assets/recreation/ASSET-NOTICE.md',
+    'assets/recreation/rig.js',
+    'assets/recreation/animal-body.js',
+    'assets/recreation/face-geometry.js',
+    'assets/recreation/mouth-shapes.js',
+    'assets/recreation/head-binding.js',
+    'assets/recreation/scene.mjs',
+    'assets/recreation/projected-limbs.mjs',
+    'assets/recreation/vendor/three.module.js',
+    'assets/recreation/vendor/three.core.js',
+    'assets/recreation/vendor/LICENSE',
 }
 
 EXCLUDED_PARTS = {
@@ -100,7 +123,7 @@ EXCLUDED_PARTS = {
 
 TEXT_EXTENSIONS = {
     ".md", ".yaml", ".yml", ".json", ".py", ".ps1", ".cmd", ".txt", ".example",
-    ".js", ".css", ".html",
+    ".js", ".mjs", ".css", ".html",
 }
 
 MANAGEMENT_UI_REQUIRED_FILES = {
@@ -140,7 +163,7 @@ AUDIT_RULES = {
     "jwt-token": re.compile(
         r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b"
     ),
-    "machine-bound-path": re.compile(r"(?i)(?:[A-Z]:\\Users\\|/Users/|/home/[^/\s]+/)"),
+    "machine-bound-path": re.compile(r"(?i)(?:[A-Z]:[\\/]Users[\\/]|/Users/|/home/[^/\s]+/)"),
     "private-character": re.compile(
         r"小玲|sales_xiaoneng|asset://asset-(?!\.\.\.|<)[A-Za-z0-9._/-]+"
     ),
@@ -217,7 +240,7 @@ def _configured_in_skill_state(target: Path) -> bool:
 def _populate_distribution(source_root: Path, target: Path) -> None:
     target.mkdir(parents=True)
     # Do not traverse local runtimes, verification venvs or nested worktrees.
-    top_directories = set(DIRECTORY_RULES) | {"scripts", "references"}
+    top_directories = set(DIRECTORY_RULES) | {"scripts", "references", "assets"}
     for directory, children, files in os.walk(source_root):
         parent = Path(directory)
         if parent == source_root:

@@ -10,13 +10,15 @@
 
 当前交付方式：直接分发 Skill 文件夹或压缩包，由使用方的 Skill 更新机制同步版本。
 
-原片动作复刻、人物替换动物与本地CG参考是Skill内的**独立子功能**，与下述标准制作管线分开。Agent根据请求路由到[复刻工作流](references/recreation/workflow.md)，通过[独立初始化](references/recreation/initialization.md)只准备当前阶段最低依赖；原片分析无需模型密钥、旧管线数据库或管理台。独立姿态观测默认采用[ViTPose WholeBody133](references/recreation/vitpose.md)，附可分发的本地推理入口、明确的模型/关节契约和固定骨长、双骨IK、角度连续性工具。完整复刻仍由Agent按素材执行，不把实验样片或付费适配器冒充通用成品引擎。
+原片动作复刻、人物替换动物与本地CG参考是Skill内的**独立子功能**，与下述标准制作管线分开。Agent通过 `scripts/recreation/recreate.py` 完成 inspect → init → track/observe/preview → status/accept，并按[独立初始化](references/recreation/initialization.md)只准备当前阶段依赖；原片分析无需云 Key、旧管线数据库或管理台。[外部项目](references/recreation/project-format.md)记录真实源帧时钟、角色、产物 SHA、依赖和人工接受，更新或纠正后可以继续，历史候选保留。
 
 > 标准制作管线默认通过本地管理台使用；独立复刻由Agent在对话中处理。普通用户不需要执行命令、编辑数据库或理解内部任务 ID。
 
 首次使用可以直接说“把这个视频中的人物换成动物，先做CG预览”。Agent按[使用引导](references/recreation/user-guide.md)帮助明确原片与范围、准备本地依赖、审阅CG，再按需配置生成模型和预算；本地CG阶段不索要云Key。
 
-独立复刻可只交付本地CG；Seedance生成是可选步骤，不固定型号。需要生成时，Agent按使用者实际开通且兼容的模型提供选择，生成前询问模型并提示本次预算，明确确认后执行；不自动换模型、开通充值或付费返修。详见[模型选择与预算确认](references/recreation/workflow.md#可选seedance生成模型选择与预算确认)。
+当前本地观测显式准备固定 ViTPose WholeBody133 B 权重（360242862 字节，SHA 见[初始化](references/recreation/initialization.md)），保存完整133点；默认犬体仅 `husky/golden` 与 `screen-space-2.5d`。它使用保守平移框跟踪并报告/隐藏缺测部位，不声称完整手指/脸部重定向、真实相机/深度/地面或物理接触恢复。doctor 分开检查阶段依赖与实际执行资源，不能把 `dependencies_ready` 当作 `execution_ready` 或效果验收。
+
+独立复刻可只交付本地CG；已分发的可选[生成适配器](references/recreation/generation-adapter.md)提供显式 prepare/approve/upload/submit/status/download/package。型号根据实际开通和兼容项选择，不固定2.5/Mini；本轮模型、输入、预算及一次生成明确确认后才上传/提交，TOS SDK仅按需安装，不继承旧凭证。结果未知不重复购买；下载保留原生视频与真实 probe，再本地回装原音、按共同窗口对比和审阅。真实云端权限、TOS、计费和生成质量尚未实测，不自动开通充值或付费返修。
 
 ## 产品定位
 

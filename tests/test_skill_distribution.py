@@ -16,6 +16,13 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 class SkillDistributionTests(unittest.TestCase):
+    def test_mjs_renderer_assets_are_included_in_private_path_audit(self):
+        from distribute_skill import audit_distribution
+        with tempfile.TemporaryDirectory() as tmp:
+            package=Path(tmp)
+            (package/'scene.mjs').write_text('const local = "C:/Users/example/private.mp4";',encoding='utf-8')
+            self.assertFalse(audit_distribution(package)['ok'])
+
     def test_distributed_template_defaults_to_seedance_native_audio(self):
         template = (ROOT / "templates" / "env.example").read_text(
             encoding="utf-8"
@@ -56,6 +63,23 @@ class SkillDistributionTests(unittest.TestCase):
                 "scripts/factory/script_drafts.py",
                 "scripts/recreation/articulated_source.py",
                 "scripts/recreation/priority_tracking.py",
+                "scripts/recreation/recreate.py",
+                "scripts/recreation/generation.py",
+                "scripts/recreation/generation_package.py",
+                "scripts/recreation/project_store.py",
+                "scripts/recreation/identity_tracks.py",
+                "scripts/recreation/model_assets.py",
+                "scripts/recreation/doctor.py",
+                "scripts/recreation/render_preview.py",
+                "scripts/recreation/render_scene.mjs",
+                "assets/recreation/manifest.json",
+                "assets/recreation/scene.mjs",
+                "assets/recreation/projected-limbs.mjs",
+                "assets/recreation/vendor/three.module.js",
+                "assets/recreation/vendor/three.core.js",
+                "assets/recreation/vendor/LICENSE",
+                "references/recreation/project-format.md",
+                "references/recreation/generation-adapter.md",
                 "references/recreation/user-guide.md",
                 "references/recreation/generation-guidance.md",
                 "templates/env.example",

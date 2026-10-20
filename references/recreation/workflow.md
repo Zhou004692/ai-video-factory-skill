@@ -6,7 +6,7 @@
 
 ## 明确目标与路线
 
-先看真实原片，冻结本地SHA、视频尺寸、有效画面裁切、帧数/帧率/时间戳、原音和目标时长。用`scripts/recreation/inspect_media.py`得到事实；它不自动决定裁切，也不保证VFR源帧映射。抽取首尾、转身、遮挡、交叉、抬腿、镜头运动等代表帧，保留源帧号和时间。
+先看真实原片，冻结本地SHA、视频尺寸、有效画面裁切、帧数/帧率/时间戳、原音和目标时长。`recreate.py inspect` 生成事实与本地选择页，帮助选人；`init` 再由项目 store 记录实际解码帧、逐帧 PTS/时长和裁切，不用 FPS 元数据推算 VFR 源时钟。抽取首尾、转身、遮挡、交叉、抬腿、镜头运动等代表帧，保留源帧号和时间。
 
 将用户要求写成项目契约：
 
@@ -19,7 +19,28 @@
 
 免费本地分析不依赖供应商人物素材ID；供应商资产资格在实际准备上传/提交相关素材时核查，不能用付费提交的前置条件阻断可独立完成的离线工作。
 
-用户指定模型路线优先；当前默认全面使用[ViTPose WholeBody133](vitpose.md)。不能用17点B模型冒充全身迁移，不能只迁移身体而丢失手脚脸信息。旧检测框与身份纠正可作为搜索元数据继承，旧姿态坐标不得混入新观测。换姿态模型仍需确认故障层，不能把身份切换、相机、rig和拟合问题都归因于模型精度。
+用户指定模型路线优先；当前观测默认使用固定的[ViTPose WholeBody133](vitpose.md)，登记入口仅支持已校验的 WholeBody B 权重。不能用17点B模型冒充全身观测；保存全部133点与原始置信度，不把默认犬体当前只实现的部分控制说成完整手指/脸部重定向。旧检测框与身份纠正可作为搜索元数据继承，旧姿态坐标不得混入新观测。换姿态模型仍需确认故障层，不能把身份切换、相机、rig和拟合问题都归因于模型精度。
+
+## 当前可执行的默认路径
+
+普通用户通过对话说明目标，Agent 后台操作 `scripts/recreation/recreate.py`。项目在 Skill 外，格式见[项目格式](project-format.md)，依赖/模型准备见[初始化](initialization.md)。
+
+```text
+<python> scripts/recreation/recreate.py inspect --source SOURCE --output SELECTION_DIR
+<python> scripts/recreation/recreate.py init --source SOURCE --project PROJECT --roles ROLES_JSON
+<python> scripts/recreation/recreate.py --runtime-root RUNTIME local --project PROJECT
+<python> scripts/recreation/recreate.py status --project PROJECT
+```
+
+`local` 按当前状态执行或复用 `track → observe → preview`；也可以逐步运行对应子命令。`track` 仅以显式身份锚点和 CPU LK 前后向光流传播**平移框**，不恢复框旋转/尺度，不在缺测后自动重新认人。锚点前、遮挡、重叠、纹理不足或大位移区间保持 missing，等待额外锚点，传播结果均需审阅。
+
+默认 renderer 仅实现 `screen-space-2.5d` 与已分发 `husky/golden` 犬体；角色共享图像坐标和固定体型比例，没有真实相机分解、度量深度、地面、支撑或物理接触恢复。其他动物或 world-space 模式会拒绝。原始133点完整保留；当前身体/犬体手脸提示只使用已实现且可见的控制，不声称完整表情、全指或遮挡动作迁移。
+
+低置信躯干、头、肢段显式隐藏并在 `observation_gaps` 报告；不用插值或上一帧姿态填空。没有可靠躯干尺度时停止渲染。背景材质、原场景物件、真人世界轨迹等属于本次尚未恢复项，不能把默认背景和占位阴影当作原场景重建。
+
+renderer 生成干净 CG、本地原音版、原片同步对比和 `review.html/report.json`，按实际源帧时钟核验输出帧数/PTS/视频覆盖。原音仅本地转换/对齐，源无音轨时明确无原音；不上传原片或原音。整组产物一次登记，新数据使旧下游接受失效，历史媒体保留。只有用户实际接受该版后，Agent 才用精确 SHA 执行 `accept --artifact cg_silent`；接受 CG 不授权付费。
+
+`doctor` 区分阶段 `dependencies_ready` 与含权重/浏览器/资产检查的 `execution_ready`。二者都不能代替身份、内容和效果验收。以下拟合、相机、接触与成熟方法章节用于按问题选择额外研究工具和质量检查，不表示 `local` 已自动完成这些层。
 
 ## 本地执行与阶段验收
 
@@ -59,6 +80,8 @@
 浮空必须检查全部帧，包括“没有预测接触”的帧；自动候选全为false不代表角色正在腾空。将源片确认的支撑、真实跳跃和未知状态分开。可见动作按原片复核；用户允许对信息不足部分做自然补全时，另立带推断标记的物理参考候选，不将其写成实测复刻。时序拟合和全片准入详见[ViTPose补全边界](vitpose.md)。
 
 不要把本次已知秒点、角度阈值、裁切、人物数量或遮挡区间固化为新原片的通用规则。每个原片需重新观察和建立契约。
+
+迁移已接受的犬体资产时，模板 `apply()` 的默认骨长不一定是最终渲染骨长；应追踪旧场景在表情驱动之后是否还覆盖骨段、足爪及躯干。默认便携版从当前可靠二维观测一次性估计固定投影段长，再以有界两骨链覆盖实际网格；它是屏幕空间形状估计，不是解剖骨长或三维深度。检验实际 mesh 段长、肘膝/手足投影与残差，而非只检查输入 skeleton 数值或帧间平滑；不可达或弯曲分支未知须报告，不拉伸骨头掩盖。
 
 ## 场景、物件、接触与生成衔接
 
@@ -100,9 +123,22 @@
 
 1. **核对实际可用模型**：先读取使用者已有的本项目模型选择/开通记录；能只读核实时，核对实际凭证对应账号及区域的开通状态。无查询能力时只询问使用者已开通哪些模型，标记为“用户提供，未独立核验”。拥有API Key、官方列出某型号或其他账号已开通，均不能证明本账号已开通；禁止用付费生成POST探测权限。
 2. **筛选兼容候选**：按实际开通情况列出可用型号（例如Mini、常规版、2.5，名称仅作示例），核对当前官方文档中的视频参考/编辑、混合素材、时长、分辨率、声音和输出格式限制，以及素材资格。标出不兼容项并说明原因；未知不写成已支持。没有兼容模型时交付CG，说明缺项，不自动开通、充值、购买套餐或切换账号/模型。
-3. **先准备可审阅方案**：冻结CG/身份图、提示词和真实请求预览，按候选型号分别编译参数；不得将2.5专属字段或提示方式直接照搬到Mini/其他版本。此子功能尚未提供通用独立付费提交适配器，应验证本次独立适配器，不冒用原管线任务，也不将项目实验脚本称为已分发能力。
+3. **先准备可审阅方案**：使用已分发的[独立生成适配器](generation-adapter.md) `prepare`，冻结当前已接受 CG/合成身份图 SHA、账号/区域、型号 profile、提示词、请求参数、价格依据、预算与一次生成次数。只编译已明确支持的2.0/fast/mini/2.5保守子集，不将2.5专属字段或 MOV 直接照搬到 Mini/其他2.0版本。未知型号或规格明确拒绝；不冒用原管线任务。prepare 不上传、不读旧 Key，可先完成供用户审阅。
 4. **生成前询问模型并提示预算**：展示型号、版本/区域、开通状态及依据、输入视频总时长、输出时长/分辨率/声音、本次生成次数、单次及本轮总预估、预算上限、费率来源/核查时间、计费假设和是否含返修。按所选型号及有无视频输入等实际计费类别估算，计入计费参考输入；优惠须核对有效期和账号资格。预算未知时明确未知，不能复用旧2.5费率或声称固定价格。存储/下载等已知额外费用单列，未核对的列为未知；开通预留/充值门槛与生成费用分开。向使用者提供“兼容已开通模型＋对应预算”与“仅保留CG/暂不生成”选项，取得**明确模型选择和本次预算确认**后才上传/提交。当前上下文已明确确认同一模型、素材、次数和预算时复用该有效确认，不重复提问；“继续分析”“看参考”或旧版本的一次授权不算新生成确认。
-5. **绑定并执行一次**：将账号/区域的非敏感标识、model ID、素材SHA、提示词/请求指纹、定价依据、次数、预算上限和用户确认原文保存在项目外部运行目录。仅使用用户指定的凭证来源，不自动继承旧管线密钥。模型/素材/规格/次数或超预算变化时重做预览并再次确认，不静默降级或自动付费返修。网络超时/结果未知先核查原请求；已取得task ID只GET恢复，不重复POST。`ModelNotOpen`等明确拒绝后保留原始记录，说明开通条件，条件改变并核实后才建立关联的新尝试，不能删除记录绕过一次保护。
+5. **绑定并执行一次**：`approve` 记录用户本轮实际确认表述与完整 plan hash，随后才 `upload/submit`。凭证必须由使用方显式选择 Skill 外独立 JSON，不读环境或旧 `.env`。TOS SDK 仅在该上传实现按需准备；已有 HTTPS 引用则 GET 真实全部字节核对 SHA，不信 URL 名称。PUT/POST 各有排他持久 journal，超时、无 ID、5xx、进程重启或明确拒绝均不重复。已取得 task ID 只 GET 恢复；没有 ID 时人工核对供应商。媒体/型号/规格/次数/预算变化重新准备并确认，不能删除 journal 或复用已消耗授权绕过一次保护。
+
+价格依据必须在24小时内核查，匹配账号/区域/分辨率并覆盖参考输入和最大输出窗口，估计上界不超过本轮预算；2.0 的 `duration=-1` 至少覆盖15秒，2.5编辑则覆盖实际输入窗口。该门禁是本地保守估计检查，不是供应商账单硬上限；无法给出可信报价时不执行。profile、外部配置字段及确切命令见[生成适配器](generation-adapter.md)。
+
+```text
+<python> scripts/recreation/recreate.py --runtime-root RUNTIME generation prepare PROJECT --model MODEL --prompt-file PROMPT --account-file ACCOUNT_JSON --pricing-file PRICING_JSON --budget-cents BUDGET --duration DURATION --resolution RESOLUTION
+<python> scripts/recreation/recreate.py --runtime-root RUNTIME generation approve PROJECT RUN --plan-sha256 EXACT_HASH --user-confirmation ACTUAL_USER_STATEMENT --synthetic-inputs-only
+<python> scripts/recreation/recreate.py --runtime-root RUNTIME generation upload PROJECT RUN --credentials-file CREDENTIALS_JSON [--reference-config-file REFERENCE_JSON]
+<python> scripts/recreation/recreate.py --runtime-root RUNTIME generation submit PROJECT RUN --credentials-file CREDENTIALS_JSON
+<python> scripts/recreation/recreate.py generation status PROJECT RUN --credentials-file CREDENTIALS_JSON
+<python> scripts/recreation/recreate.py generation download PROJECT RUN --credentials-file CREDENTIALS_JSON
+```
+
+`status` 不带凭证只读本地状态；带凭证只 GET，即使 CG 后来失效或报价过期仍能恢复已购任务。下载保留原生字节与真实逐帧 probe，随后纯本地回装原音、生成原片对比/审阅；模型时长不假定等于输入，比较只覆盖真实共同窗口。不冻结、循环、变速或加帧补足原片；包装失败保留原始结果，可 `generation package PROJECT RUN` 本地重做。云端传输/状态已完成离线回归，真实供应商账号、TOS、计费与生成质量尚未实测。
 
 对话示例（金额与候选必须来自本次核对，不填固定报价）：
 
