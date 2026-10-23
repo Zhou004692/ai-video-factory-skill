@@ -507,7 +507,8 @@ def _fingerprint(
 
 
 def _prompt(
-    context: dict, sources: list[dict], preferences: dict | None = None
+    context: dict, sources: list[dict], preferences: dict | None = None,
+    *, _single_variant_index: int | None = None,
 ) -> str:
     preferences = normalize_generation_preferences(preferences)
     prompt_sources = deepcopy(sources)
@@ -576,8 +577,15 @@ def _prompt(
         "recommended_index": 0,
         "recommendation_reason": "推荐理由",
     }
+    single = _single_variant_index is not None
+    if single:
+        contract = {"variant": contract["variants"][0]}
+        example_source_id = sources[0]["source_id"]
+        contract["variant"]["beats"][0]["source_ids"] = [example_source_id]
+        contract["variant"]["beats"][0]["visual_requirements"][0]["source_ids"] = [example_source_id]
     return (
-        "你是设备租赁行业短视频编剧。根据已批准的创意角度，目标生成三版完整剧本。"
+        (f"Generate only complete script variant {_single_variant_index + 1}. "
+         if single else "你是设备租赁行业短视频编剧。根据已批准的创意角度，目标生成三版完整剧本。")
         + reconstruction_guidance
         +
         "每版应覆盖 hook、conflict、evidence、reversal、solution、cta 等必要叙事功能；"
@@ -637,6 +645,40 @@ def _prompt(
         + "\n\n可用来源：\n"
         + json.dumps(prompt_sources, ensure_ascii=False)
     )
+
+
+
+def _single_variant_prompt(
+    context: dict, sources: list[dict], preferences: dict | None = None, *,
+    variant_index: int, previous_variants: list[dict] | None = None,
+    repair_reason: str | None = None,
+) -> str:
+    """New engine contract: one whole script, with administrative IDs hidden."""
+    def creative(value):
+        if isinstance(value, dict):
+            return {key: creative(item) for key, item in value.items()
+                    if key not in {"brief_id", "approved_job_id", "job_id", "topic_id", "approved_topic_id", "fingerprint", "metadata_json", "content_sha256"}}
+        if isinstance(value, list):
+            return [creative(item) for item in value]
+        return value
+    prompt = _prompt(creative(context), creative(sources), preferences,
+                     _single_variant_index=variant_index)
+    prompt += (
+        "\n\nReturn exactly one complete variant object: {\"variant\":{...}}. "
+        "Never return a variants array, multiple scripts, a continuation fragment, "
+        "or incomplete JSON. Preserve all director fields. Administrative brief/job "
+        "identities are not evidence. source_ids, including those inside visual_requirements, "
+        "must come exclusively from this whitelist: "
+        + json.dumps([source["source_id"] for source in sources], ensure_ascii=False)
+    )
+    if previous_variants:
+        prompt += "\nAlready saved version summaries; create a distinct complete version without rewriting these: " + json.dumps([
+            {"title": item.get("title"), "creative_thesis": item.get("creative_thesis")}
+            for item in previous_variants], ensure_ascii=False)
+    if repair_reason:
+        prompt += ("\nTargeted repair of the current version only: " + repair_reason
+                   + "\nReturn this one complete variant. Remove redundant prose while preserving dialogue, evidence and every director field; never regenerate the whole group.")
+    return prompt
 
 
 def _repair_prompt(
@@ -713,8 +755,22 @@ def generate_drafts(db, brief_id: str, *, force: bool = False,
             )
         except json.JSONDecodeError as syntax_error:
             if attempt == 1:
+                diagnostic = getattr(syntax_error, "response_diagnostic", {})
+                if diagnostic.get("kind") == "truncated":
+                    reason = (
+                        "最后一次输出被长度上限截断"
+                        f"（回答上限 {diagnostic.get('max_tokens', 12000)} tokens）"
+                    )
+                elif diagnostic.get("kind") == "response_json":
+                    reason = "最后一次模型接口响应不是有效JSON，尚未解析剧本内容"
+                else:
+                    reason = (
+                        "最后一次发生JSON语法错误"
+                        f"（解析位置：第{syntax_error.lineno}行、第{syntax_error.colno}列）"
+                    )
                 raise ValueError(
-                    "AI 连续两次返回的剧本 JSON 格式无效，请重新生成"
+                    "AI 剧本生成未返回可用JSON，已用完2次尝试；"
+                    + reason + "。未保存候选剧本，请先核查诊断记录，避免重复提交"
                 ) from syntax_error
             prompt = _syntax_repair_prompt(
                 context, sources, syntax_error, preferences

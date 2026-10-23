@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import hashlib
 import os
 import sys
 import unittest
@@ -38,7 +39,7 @@ class StructuredJsonRecoveryTests(unittest.TestCase):
         body = {
             "choices": [{
                 "finish_reason": "length",
-                "message": {"content": '{"variants":['},
+                "message": {"content": '{"private_source_text":"must-not-log-this"'},
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 20},
         }
@@ -62,8 +63,52 @@ class StructuredJsonRecoveryTests(unittest.TestCase):
         with patch.dict(os.environ, {"ARK_API_KEY": "test-key"}), patch(
             "factory.clients.doubao_llm.httpx.Client", return_value=Client()
         ):
-            with self.assertRaisesRegex(json.JSONDecodeError, "truncated"):
-                doubao_llm.complete_json("prompt", max_tokens=100)
+            with self.assertLogs("factory.clients.doubao_llm", level="WARNING") as logs:
+                with self.assertRaisesRegex(json.JSONDecodeError, "truncated") as raised:
+                    doubao_llm.complete_json("private-prompt", max_tokens=100)
+
+        diagnostic = raised.exception.response_diagnostic
+        self.assertEqual(diagnostic["kind"], "truncated")
+        self.assertEqual(diagnostic["finish_reason"], "length")
+        self.assertEqual(diagnostic["max_tokens"], 100)
+        self.assertEqual(diagnostic["output_tokens"], 20)
+        self.assertEqual(diagnostic["output_sha256"], hashlib.sha256(
+            body["choices"][0]["message"]["content"].encode("utf-8")
+        ).hexdigest())
+        self.assertNotIn("must-not-log-this", " ".join(logs.output))
+        self.assertNotIn("private-prompt", " ".join(logs.output))
+        self.assertNotIn("test-key", " ".join(logs.output))
+
+    def test_doubao_distinguishes_syntax_errors_without_logging_source(self):
+        text = '{"private_source_text":"must-not-log-this", "broken": @}'
+        body = {
+            "choices": [{"finish_reason": "stop", "message": {"content": text}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        class Response:
+            status_code = 200
+            def json(self):
+                return body
+        class Client:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def post(self, *args, **kwargs):
+                return Response()
+        with patch.dict(os.environ, {"ARK_API_KEY": "test-key"}), patch(
+            "factory.clients.doubao_llm.httpx.Client", return_value=Client()
+        ), self.assertLogs("factory.clients.doubao_llm", level="WARNING") as logs:
+            with self.assertRaises(json.JSONDecodeError) as raised:
+                doubao_llm.complete_json("private-prompt", max_tokens=12000)
+        diagnostic = raised.exception.response_diagnostic
+        self.assertEqual(diagnostic["kind"], "syntax")
+        self.assertEqual(diagnostic["finish_reason"], "stop")
+        self.assertEqual(diagnostic["max_tokens"], 12000)
+        self.assertGreater(diagnostic["column"], 0)
+        self.assertNotIn("must-not-log-this", " ".join(logs.output))
+        self.assertNotIn("private-prompt", " ".join(logs.output))
+        self.assertNotIn("test-key", " ".join(logs.output))
 
     def test_doubao_uses_configurable_timeout_for_complex_script_generation(self):
         observed_timeouts = []
@@ -105,6 +150,27 @@ class StructuredJsonRecoveryTests(unittest.TestCase):
             doubao_llm.complete_json("prompt", max_tokens=6000)
 
         self.assertEqual(observed_timeouts, [300.0])
+
+    def test_doubao_distinguishes_invalid_http_json_from_script_json(self):
+        class Response:
+            status_code = 200
+            text = "private-invalid-http-response"
+            def json(self):
+                raise json.JSONDecodeError("Expecting value", self.text, 0)
+        class Client:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def post(self, *args, **kwargs):
+                return Response()
+        with patch.dict(os.environ, {"ARK_API_KEY": "test-key"}), patch(
+            "factory.clients.doubao_llm.httpx.Client", return_value=Client()
+        ), self.assertLogs("factory.clients.doubao_llm", level="WARNING") as logs:
+            with self.assertRaises(json.JSONDecodeError) as raised:
+                doubao_llm.complete_json("private-prompt")
+        self.assertEqual(raised.exception.response_diagnostic["kind"], "response_json")
+        self.assertNotIn(Response.text, " ".join(logs.output))
 
 
 if __name__ == "__main__":

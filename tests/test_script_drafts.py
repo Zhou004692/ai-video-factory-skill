@@ -630,7 +630,7 @@ class ScriptDraftGenerationTests(unittest.TestCase):
             )
 
         with self.assertRaisesRegex(
-            ValueError, "AI 连续两次返回的剧本 JSON 格式无效"
+            ValueError, "已用完2次尝试.*JSON语法错误"
         ) as raised:
             script_drafts.generate_drafts(
                 self.database, self.brief_id, generate_json=invalid_json
@@ -655,6 +655,22 @@ class ScriptDraftGenerationTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertNotIn("Traceback", message)
         self.assertNotRegex(message.casefold(), r"authorization|api[_-]?key|bearer\s+")
+
+    def test_generation_reports_truncation_without_claiming_two_syntax_failures(self):
+        calls = []
+        def invalid_json(prompt, max_tokens):
+            calls.append(max_tokens)
+            error = json.JSONDecodeError("LLM JSON output truncated by token limit", "private-response", 16)
+            error.response_diagnostic = {"kind": "truncated", "max_tokens": max_tokens}
+            raise error
+        with self.assertRaisesRegex(ValueError, "最后一次输出被长度上限截断.*12000") as raised:
+            script_drafts.generate_drafts(self.database, self.brief_id, generate_json=invalid_json)
+        self.assertEqual(calls, [6000, 12000])
+        self.assertNotIn("private-response", str(raised.exception))
+        self.assertNotIn("语法错误", str(raised.exception))
+        self.assertEqual(self.database.execute(
+            "SELECT COUNT(*) FROM script_drafts WHERE brief_id=?", (self.brief_id,)
+        ).fetchone()[0], 0)
 
     def test_standard_generation_preserves_explicit_speaker_roles(self):
         variants = [_variant(i, self.source_id) for i in range(3)]

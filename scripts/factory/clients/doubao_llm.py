@@ -5,7 +5,9 @@
   ARK_LLM_MODEL      豆包模型 ID,默认 doubao-1-5-pro-32k-250115
                      如方舟要求带日期版本,以控制台为准
 """
+import hashlib
 import json
+import logging
 import os
 
 import httpx
@@ -20,6 +22,29 @@ DEFAULT_TIMEOUT_SEC = 300.0
 DEFAULT_SYSTEM_PROMPT = (
     "你必须输出严格的 JSON,不要任何额外解释文字、不要 markdown 代码块。"
 )
+logger = logging.getLogger(__name__)
+
+
+def _record_json_failure(error: json.JSONDecodeError, *, text: str,
+                         payload: dict, kind: str, choice: dict | None = None,
+                         usage: dict | None = None) -> json.JSONDecodeError:
+    """Keep failure evidence without logging prompts, credentials or content."""
+    text = str(text or "")
+    diagnostic = {
+        "kind": kind,
+        "model": payload["model"],
+        "max_tokens": payload["max_tokens"],
+        "finish_reason": (choice or {}).get("finish_reason"),
+        "input_tokens": (usage or {}).get("prompt_tokens"),
+        "output_tokens": (usage or {}).get("completion_tokens"),
+        "output_chars": len(text),
+        "output_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "line": error.lineno,
+        "column": error.colno,
+    }
+    error.response_diagnostic = diagnostic
+    logger.warning("LLM JSON response rejected: %s", json.dumps(diagnostic, sort_keys=True))
+    return error
 
 
 def _timeout_seconds() -> float:
@@ -50,7 +75,7 @@ def request_payload(prompt: str, system: str | None = None,
 
 def complete_json(prompt: str, system: str | None = None,
                   max_tokens: int = 4000,
-                  model: str | None = None) -> tuple[dict, dict]:
+                  model: str | None = None, *, strict_json: bool = False) -> tuple[dict, dict]:
     """同步调用,返回 (JSON, usage_dict)。签名与 claude.complete_json 完全一致。"""
     payload = request_payload(
         prompt, system=system, max_tokens=max_tokens, model=model
@@ -87,15 +112,32 @@ def complete_json(prompt: str, system: str | None = None,
                 f"FIX: open this model in 方舟 console, or set ARK_LLM_MODEL "
                 f"in .env to a model your account has activated"
             )
-        body = r.json()
+        try:
+            body = r.json()
+        except json.JSONDecodeError as error:
+            _record_json_failure(
+                error, text=r.text, payload=payload, kind="response_json"
+            )
+            raise
 
     choice = body["choices"][0]
     text = choice["message"]["content"]
     if choice.get("finish_reason") in {"length", "max_tokens"}:
-        raise json.JSONDecodeError(
+        error = json.JSONDecodeError(
             "LLM JSON output truncated by token limit", text, len(text)
         )
-    data = _extract_json(text)
+        raise _record_json_failure(
+            error, text=text, payload=payload, kind="truncated",
+            choice=choice, usage=body.get("usage"),
+        )
+    try:
+        data = json.loads(text) if strict_json else _extract_json(text)
+    except json.JSONDecodeError as error:
+        _record_json_failure(
+            error, text=text, payload=payload, kind="syntax",
+            choice=choice, usage=body.get("usage"),
+        )
+        raise
     usage = {
         "input_tokens": body["usage"]["prompt_tokens"],
         "output_tokens": body["usage"]["completion_tokens"],

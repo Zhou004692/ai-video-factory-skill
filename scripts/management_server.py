@@ -487,6 +487,11 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
 
     def _do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if re.fullmatch(r"/api/script-generation-runs/[^/]+", parsed.path):
+            try:
+                return self._json(self.service.script_generation_run(parsed.path.split("/")[3]))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, 404)
         if parsed.path.startswith('/api/commands/'):
             try:
                 result = self.service.management_command_result(parsed.path.removeprefix('/api/commands/'))
@@ -1019,11 +1024,22 @@ else document.querySelector('#error').textContent=p.error||'登录失败';};</sc
                     )
                     if payload.get(key) not in (None, "")
                 }
-                result = self.service.confirm_brief_and_generate_scripts(
+                generate = (self.service.start_script_generation
+                            if payload.get("background") is True
+                            else self.service.confirm_brief_and_generate_scripts)
+                result = generate(
                     brief_id,
-                    angle_index=int(payload.get("angle_index", -1)),
+                    angle_index=(payload.get("angle_index", -1) if payload.get("background") is True
+                                 else int(payload.get("angle_index", -1))),
                     generation_preferences=generation_preferences,
                     **({'expected_revision': payload['expected_revision']} if 'expected_revision' in payload else {}),
+                )
+            elif re.fullmatch(r"/api/script-generation-runs/[^/]+/resume", request_path):
+                if payload.get("confirmed") is not True:
+                    raise ValueError("请确认后再继续生成候选剧本")
+                result = self.service.resume_script_generation(
+                    request_path.split("/")[3],
+                    confirm_unknown=payload.get("confirm_unknown") is True,
                 )
             elif request_path.endswith("/edit") and request_path.startswith("/api/briefs/"):
                 brief_id = request_path.split("/")[3]
@@ -1361,6 +1377,10 @@ def _serve_locked(
         env_path=environment_file(SKILL_ROOT, os.environ),
         transport_preflight_enabled=True,
     )
+    # The process-wide runtime lock makes old in-flight attempts unambiguously
+    # interrupted. Reading/restoring the UI must never resubmit them.
+    from factory import script_generation
+    script_generation.recover_interrupted(database)
     stop_event = threading.Event()
     supervisor = None
     ConsoleHandler.queue_supervisor = supervisor

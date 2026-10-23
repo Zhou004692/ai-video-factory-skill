@@ -21,6 +21,57 @@ class ManagementRequestClientTests(unittest.TestCase):
     def test_queries_finish_with_recoverable_timeout(self):
         value=self.evaluate("fetch=(_p,o)=>new Promise((_r,reject)=>o.signal.addEventListener('abort',()=>reject(Object.assign(new Error('aborted'),{name:'AbortError'}))));try{await AVFRequest.request('/api/videos',{timeoutMs:100})}catch(e){return{code:e.code,unknown:e.submissionUnknown}}")
         self.assertEqual(value,{'code':'query_timeout','unknown':False})
+    def test_script_generation_submits_background_run_without_waiting_for_model(self):
+        value=self.evaluate(r"""
+const fs=require('fs'),vm=require('vm'),path=require('path');
+const app=fs.readFileSync(path.join(path.dirname(process.argv[1]),'app.js'),'utf8');
+const start=app.includes('function scriptGenerationRuns(')?app.indexOf('function scriptGenerationRuns('):app.indexOf('function confirmGenerateScripts(');
+const end=app.indexOf('const confirmBriefAndGenerateScripts=',start);
+let now=0,nextTimer=0,finish,calls=0,requestBody,signal,closed=false,loaded=false;
+const timers=new Map(),deadlines=[],messages=[];
+globalThis.setTimeout=(fn,ms)=>{const id=++nextTimer;timers.set(id,{fn,at:now+ms});deadlines.push(ms);return id};
+globalThis.clearTimeout=id=>timers.delete(id);
+const flush=async()=>{for(let i=0;i<20;i++)await Promise.resolve()};
+const advance=async target=>{
+  while(true){const item=[...timers.entries()].filter(([,t])=>t.at<=target).sort((a,b)=>a[1].at-b[1].at)[0];
+    if(!item)break;now=item[1].at;timers.delete(item[0]);item[1].fn();await flush()}
+  now=target;await flush();
+};
+const button={disabled:false},elements={
+  '#modal':{classList:{add(){}}},'#confirm-generate-scripts':button,
+  '#script-suggest-duration':{value:'55'},'#script-suggest-shots':{value:'15'},
+  '#script-suggest-characters':{value:'3'}
+};
+globalThis.$=id=>elements[id];globalThis.$$=()=>[];globalThis.openModal=()=>{};
+globalThis.document={visibilityState:'hidden'};
+globalThis.closeModal=()=>{closed=true};globalThis.state={page:'scripts',scripts:{generation_runs:[]}};
+globalThis.loadPage=async()=>{loaded=true;return true};
+globalThis.toast=(message,error)=>messages.push({message,error:!!error});
+globalThis.api=(url,options)=>AVFRequest.request(url,options);
+globalThis.fetch=(_url,options)=>{calls++;requestBody=JSON.parse(options.body);signal=options.signal;return new Promise(resolve=>finish=resolve)};
+vm.runInThisContext(app.slice(start,end));
+confirmGenerateScripts('brief-test',0,1);
+const pending=button.onclick();
+await advance(1000);
+const waiting=button.disabled&&!closed&&!loaded&&!signal.aborted&&messages.length===0;
+finish({ok:true,status:200,json:async()=>({run_id:'run-test',brief_id:'brief-test',status:'running',completed_count:0,target_count:3})});await pending;
+const scriptDeadline=deadlines[0];
+deadlines.length=0;
+globalThis.fetch=async()=>({ok:true,status:200,json:async()=>({})});
+await AVFRequest.request('/api/projects');const readDeadline=deadlines[0];
+deadlines.length=0;
+await AVFRequest.request('/api/sources',{method:'POST',body:'{}'});const writeDeadline=deadlines[0];
+return{waiting,calls,scriptDeadline,readDeadline,writeDeadline,closed,loaded,stage:state.scriptStage,
+  errors:messages.filter(m=>m.error).length,requestBody,run:state.scripts.generation_runs[0]?.run_id};
+""")
+        self.assertEqual(value,{
+            'waiting':True,'calls':1,'scriptDeadline':15000,
+            'readDeadline':15000,'writeDeadline':60000,
+            'closed':True,'loaded':True,'stage':'drafts','errors':0,
+            'requestBody':{'confirmed':True,'angle_index':0,'expected_revision':1,'background':True,
+                           'suggested_duration_sec':55,'suggested_shot_count':15,
+                           'suggested_character_count':3},'run':'run-test',
+        })
     def test_paid_submission_timeout_blocks_duplicate_transport(self):
         value=self.evaluate("let calls=0;fetch=(_p,o)=>{calls++;return new Promise((_r,reject)=>o.signal.addEventListener('abort',()=>reject(Object.assign(new Error('aborted'),{name:'AbortError'}))))};const errors=[];for(let i=0;i<2;i++){try{await AVFRequest.request('/api/videos/job/start',{method:'POST',body:'{}',timeoutMs:100})}catch(e){errors.push(e.code)}}return{calls,errors}")
         self.assertEqual(value,{'calls':1,'errors':['submission_unknown','submission_unknown']})

@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -27,7 +28,7 @@ from . import (
     network_recovery, node_state_machine, production_config, production_executor, recovery_plan,
     production_invariants, production_projection, provider_capacity,
     provider_health, provider_tasks, recovery_controller, scene_assets,
-    script_drafts, script_sources, source_analysis, source_scheduler,
+    script_drafts, script_generation, script_sources, source_analysis, source_scheduler,
     state_machine, task_doctor, topic_briefs, transport_diagnostics,
     master_download_recovery, content_review,
 )
@@ -767,6 +768,9 @@ class ManagementService:
     ):
         self.database = database
         self._service_lock = None
+        self._script_generation_lock = threading.RLock()
+        self._script_generation_workers: dict[str, threading.Thread] = {}
+        self._script_generation_worker_lock = threading.RLock()
         self._final_hash_cache = {}
         self._media_hash_inflight = set()
         self._management_io_observations = deque(maxlen=100)
@@ -871,6 +875,7 @@ class ManagementService:
         self._reconcile_orphaned_production_workers()
         production_invariants.repair_all_safe(self.database)
         self._clear_stale_success_errors()
+        script_generation.ensure_schema(self.database)
 
     def bind_service_lock(self, lock) -> None:
         """HTTP and background workers share short SQLite critical sections."""
@@ -2673,7 +2678,7 @@ class ManagementService:
                 brief["brief"] = {}
         drafts = _rows(self.database.execute(
             "SELECT draft_id,brief_id,variant_index,status,recommended_index,"
-            "approved_job_id,script_json,recommendation_reason,revision,created_at,"
+            "approved_job_id,script_json,recommendation_reason,request_fingerprint,revision,created_at,"
             "updated_at FROM script_drafts "
             "ORDER BY created_at DESC,variant_index LIMIT 60"
         ))
@@ -2682,7 +2687,10 @@ class ManagementService:
                 draft["script"] = json.loads(draft.pop("script_json") or "{}")
             except json.JSONDecodeError:
                 draft["script"] = {}
-        return {"sources": sources, "briefs": briefs, "drafts": drafts}
+        runs = [{key: value for key, value in item.items() if key != "drafts"}
+                for item in script_generation.list_runs(self.database)]
+        return {"sources": sources, "briefs": briefs, "drafts": drafts,
+                "generation_runs": runs}
 
     def source_feeds(self) -> dict:
         return {"feeds": source_scheduler.list_feeds(self.database)}
@@ -3149,6 +3157,116 @@ class ManagementService:
                 and not metadata.get("structure_analysis")):
             source_analysis.analyze_source(self.database, source_id)
         return topic_briefs.generate_brief(self.database, [source_id])
+
+    def start_script_generation(
+        self, brief_id: str, *, angle_index: int,
+        generation_preferences: dict | None = None,
+        expected_revision: int | None = None,
+    ) -> dict:
+        """Persist user intent quickly; the worker never holds a DB txn over IO."""
+        if self._service_lock is None:
+            self.bind_service_lock(self._script_generation_lock)
+        with self._service_lock:
+            preferences = script_drafts.normalize_generation_preferences(generation_preferences)
+            if self.database.in_transaction:
+                raise RuntimeError("script generation submission requires a clean transaction")
+            row = self.database.execute(
+                "SELECT * FROM topic_briefs WHERE brief_id=?", (brief_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("选题简报不存在")
+            revision = int(row["revision"] or 1)
+            if expected_revision is not None and (
+                isinstance(expected_revision, bool) or not isinstance(expected_revision, int)
+                or expected_revision != revision
+            ):
+                raise BriefRevisionConflict(row, expected_revision)
+            brief = json.loads(row["brief_json"] or "{}")
+            if (isinstance(angle_index, bool) or not isinstance(angle_index, int)
+                    or angle_index not in range(len(brief.get("angles") or []))):
+                raise ValueError("请选择一个有效的创意角度")
+            if self.database.execute(
+                "SELECT 1 FROM script_drafts WHERE brief_id=? AND "
+                "(status='approved' OR approved_job_id IS NOT NULL OR storyboard_json IS NOT NULL) LIMIT 1",
+                (brief_id,),
+            ).fetchone():
+                raise ValueError("剧本已进入视频制作；请复制项目后创建新的候选")
+            self._load_runtime_env()
+            model = os.environ.get("ARK_LLM_MODEL") or script_drafts.doubao_llm.DEFAULT_MODEL
+            try:
+                job_id = topic_briefs.approve_brief(
+                    self.database, brief_id,
+                    topic_id=str(row["approved_topic_id"] or "TOPIC-" + brief_id.removeprefix("BRIEF-")),
+                    target_audience=str(brief.get("audience") or ""),
+                    angle_index=angle_index, expected_revision=revision, commit=False,
+                )
+                self.database.commit()
+            except Exception:
+                self.database.rollback()
+                raise
+            result = script_generation.create_run(
+                self.database, brief_id, preferences=preferences, model=model,
+            )
+            if result["status"] == "queued":
+                self._dispatch_script_generation(result["run_id"])
+            return {**result, "job_id": job_id}
+
+    def script_generation_run(self, run_id: str) -> dict:
+        return script_generation.get_run(self.database, run_id)
+
+    def resume_script_generation(self, run_id: str, *, confirm_unknown: bool = False) -> dict:
+        if self._service_lock is None:
+            self.bind_service_lock(self._script_generation_lock)
+        with self._service_lock:
+            worker = self._script_generation_workers.get(run_id)
+            if worker is not None and worker.is_alive():
+                return script_generation.get_run(self.database, run_id)
+            result = script_generation.resume_run(
+                self.database, run_id, confirm_unknown=confirm_unknown,
+            )
+            if result["status"] == "queued":
+                self._dispatch_script_generation(run_id)
+            return result
+
+    def _dispatch_script_generation(self, run_id: str) -> None:
+        with self._script_generation_worker_lock:
+            existing = self._script_generation_workers.get(run_id)
+            if existing is not None and existing.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._drive_script_generation, args=(run_id,),
+                name="script-generation-" + run_id[-12:], daemon=True,
+            )
+            self._script_generation_workers[run_id] = worker
+            worker.start()
+
+    def _drive_script_generation(self, run_id: str) -> None:
+        try:
+            while True:
+                with self._service_lock or self._script_generation_lock:
+                    result = script_generation.run_step(
+                        self.database, run_id,
+                        generate_json=script_drafts.doubao_llm.complete_json,
+                        external_io=lambda operation: self.external_io(operation),
+                    )
+                if result["status"] != "queued":
+                    break
+        except Exception as error:
+            # Never log prompt/response bodies or an exception that may echo a key.
+            logging.getLogger(__name__).error(
+                "Script generation worker stopped: run=%s exception=%s", run_id, type(error).__name__,
+            )
+            try:
+                with self._service_lock or self._script_generation_lock:
+                    if self.database.in_transaction:
+                        self.database.rollback()
+                    script_generation.interrupt_run(self.database, run_id)
+            except Exception:
+                pass  # Boot recovery will mark a persisted in-flight attempt unknown.
+        finally:
+            with self._script_generation_worker_lock:
+                if self._script_generation_workers.get(run_id) is threading.current_thread():
+                    self._script_generation_workers.pop(run_id, None)
 
     def confirm_brief_and_generate_scripts(
         self, brief_id: str, *, angle_index: int,
