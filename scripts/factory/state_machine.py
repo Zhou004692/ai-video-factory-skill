@@ -79,6 +79,9 @@ _EVENT_RULES: dict[str, tuple[frozenset[str], str | None]] = {
     "resume_generation": (
         frozenset({"FAILED", "PROVIDER_ACTION_REQUIRED"}), "STORYBOARDED",
     ),
+    'resume_anchor_generation': (
+        frozenset({'PRODUCTION_REVIEW_REQUIRED'}), 'STORYBOARDED',
+    ),
     "resume_review": (
         frozenset({"FAILED", "PROVIDER_ACTION_REQUIRED"}),
         "PRODUCTION_REVIEW_REQUIRED",

@@ -10,6 +10,44 @@ import httpx
 
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_FAKE_IP_NETWORK = ipaddress.ip_network('198.18.0.0/15')
+
+
+def _public_doh_records(host: str) -> list:
+    """Resolve only a provider hostname, never a signed URL or credentials.
+
+    This bounded fallback is used only for official Volcengine hosts whose
+    entire system answer is in the Fake-IP benchmark range. Neither that range
+    nor any private DoH answer is ever accepted as a media connection target.
+    The resolver connection is itself pinned, with normal TLS verification.
+    """
+    try:
+        with httpx.Client(timeout=10, trust_env=False, follow_redirects=False,
+                          headers={}) as client:
+            response = client.get(
+                'https://1.1.1.1/dns-query', params={'name': host, 'type': 'A'},
+                headers={'Host': 'cloudflare-dns.com', 'Accept': 'application/dns-json'},
+                extensions={'sni_hostname': 'cloudflare-dns.com'},
+            )
+            response.raise_for_status()
+            data = response.json()
+        if not isinstance(data, dict) or data.get('Status') != 0:
+            raise ValueError('DNS lookup failed')
+        answers = data.get('Answer')
+        if not isinstance(answers, list) or len(answers) > 64:
+            raise ValueError('Invalid DNS answer')
+        addresses = [item['data'] for item in answers
+                     if isinstance(item, dict) and item.get('type') == 1]
+        if not addresses:
+            raise ValueError('No public IPv4 answer')
+        for address in addresses:
+            _assert_public_address(address)
+            if ipaddress.ip_address(address).version != 4:
+                raise ValueError('Invalid IPv4 answer')
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (address, 443))
+                for address in addresses]
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+        raise ValueError('Provider media public DNS resolution failed; download remains blocked') from None
 
 
 def _assert_public_address(value: str) -> None:
@@ -51,6 +89,14 @@ def _validated_targets(url: str) -> tuple[str, list[str], str, str]:
             ) from exc
         if not records:
             raise ValueError("Provider media URL host did not resolve publicly")
+        # A mixed or private answer remains a hard failure. Only an exclusively
+        # Fake-IP answer for an official provider host can use independent DNS.
+        if ascii_host.endswith('.volces.com') and port in (None, 443) and all(
+            ipaddress.ip_address(str(record[4][0])).version == 4
+            and ipaddress.ip_address(str(record[4][0])) in _FAKE_IP_NETWORK
+            for record in records
+        ):
+            records = _public_doh_records(ascii_host)
         addresses = []
         seen_addresses: set[tuple[int, bytes]] = set()
         for record in records:

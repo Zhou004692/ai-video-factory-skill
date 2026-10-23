@@ -95,6 +95,74 @@ class AnchorNetworkRecoveryTests(unittest.TestCase):
         self.assertEqual(self.anchor()['state'],'FAILED')
         self.assertEqual(provider_tasks.unresolved_task_ids(self.c,'J-ANCHOR'),['remote-anchor'])
 
+    def test_failed_node_with_known_unresolved_task_recovers_existing_media(self):
+        self.c.execute("UPDATE production_nodes SET state='FAILED',error_code='ValueError' WHERE node_id=?",(self.node['node_id'],))
+        self.c.commit()
+        result=self.reconcile()
+        self.assertEqual(result['state'],'ANCHOR_REVIEW_REQUIRED')
+        self.assertEqual(self.anchor()['approval_state'],'PENDING_REVIEW')
+        self.assertEqual(provider_tasks.unresolved_task_ids(self.c,'J-ANCHOR'),[])
+
+    def test_failed_node_with_remote_failure_finalizes_once_without_purchase(self):
+        self.c.execute("UPDATE production_nodes SET state='FAILED' WHERE node_id=?",(self.node['node_id'],))
+        self.c.commit()
+        self.assertEqual(self.reconcile({'status':'failed','cost_cents':272})['state'],'FAILED')
+        self.assertEqual(self.c.execute('SELECT cost_cents FROM jobs').fetchone()[0],272)
+
+    def test_recovery_releases_only_proven_unsubmitted_anchor_gates(self):
+        from factory import recovery_plan
+        sibling=self.c.execute("SELECT * FROM production_nodes WHERE node_type='character_anchor' LIMIT 1").fetchone()
+        char_id=json.loads(sibling['input_json'])['character_id']
+        self.c.execute("UPDATE production_nodes SET state='ACTION_REQUIRED',error_code='ProviderTaskGateError',output_json='{}' WHERE node_id=?",(sibling['node_id'],))
+        self.c.execute("INSERT INTO character_identity_anchors(job_id,identity_key,character_id,display_name,source_type,state,error) VALUES('J-ANCHOR','sibling',?,'Sibling','seedance_identity_anchor','FAILED','gate paused')",(char_id,))
+        self.c.execute("UPDATE production_nodes SET state='FAILED' WHERE node_id=?",(self.node['node_id'],))
+        self.c.commit()
+        with mock.patch('factory.clients.seedance.text_to_video') as submit:
+            result=self.reconcile()
+        submit.assert_not_called()
+        self.assertEqual(self.c.execute('SELECT state FROM production_nodes WHERE node_id=?',(sibling['node_id'],)).fetchone()[0],'READY')
+        self.assertEqual(self.c.execute('SELECT state FROM character_identity_anchors').fetchone()[0],'PENDING')
+        plan=recovery_plan.resolve(self.c,'J-ANCHOR')
+        self.assertEqual(plan['next_action']['id'],'resume_failed_video')
+        self.assertEqual(plan['recovery_kind'],'unsubmitted_anchors')
+        self.assertEqual(result['state'],'PRODUCTION_REVIEW_REQUIRED')
+        self.assertEqual(self.service.resume_failed_video('J-ANCHOR')['state'],'STORYBOARDED')
+        self.assertEqual(self.anchor()['approval_state'],'PENDING_REVIEW')
+
+    def test_gate_with_ambiguous_paid_owner_is_not_released(self):
+        from factory import production_executor
+        sibling=self.c.execute("SELECT * FROM production_nodes WHERE node_type='character_anchor' LIMIT 1").fetchone()
+        char_id=json.loads(sibling['input_json'])['character_id']
+        self.c.execute("UPDATE production_nodes SET state='ACTION_REQUIRED',error_code='ProviderTaskGateError' WHERE node_id=?",(sibling['node_id'],))
+        self.c.execute("INSERT INTO character_identity_anchors(job_id,identity_key,character_id,display_name,source_type,state) VALUES('J-ANCHOR','sibling',?,'Sibling','seedance_identity_anchor','FAILED')",(char_id,))
+        self.c.execute("UPDATE provider_calls SET provider='seedance_identity',usage_json=?",(json.dumps({'status':'completed'}),))
+        self.c.commit()
+        with self.c:
+            self.assertEqual(production_executor.release_resolved_provider_gates(self.c,'J-ANCHOR'),[])
+        self.assertEqual(self.c.execute('SELECT state FROM production_nodes WHERE node_id=?',(sibling['node_id'],)).fetchone()[0],'ACTION_REQUIRED')
+
+    def test_mismatched_ledger_owner_cannot_publish_recovered_anchor(self):
+        self.c.execute("UPDATE provider_calls SET usage_json=?",(json.dumps({'status':'action_required','owner_node_id':'someone-else'}),))
+        self.c.commit()
+        with self.assertRaisesRegex(ValueError,'ledger owner'):
+            self.reconcile()
+        self.assertEqual(self.anchor()['state'],'FAILED')
+
+    def test_active_failed_node_lease_cannot_be_reconciled(self):
+        self.c.execute("UPDATE production_nodes SET state='FAILED',lease_id='active' WHERE node_id=?",(self.node['node_id'],))
+        self.c.commit()
+        with self.assertRaisesRegex(ValueError,'recovery state'):
+            self.reconcile()
+
+    def test_master_review_is_not_turned_into_anchor_resume(self):
+        from factory import recovery_plan
+        self.c.execute("UPDATE jobs SET state='PRODUCTION_REVIEW_REQUIRED'")
+        self.c.execute("UPDATE production_nodes SET state='REVIEW_REQUIRED' WHERE node_type='master'")
+        self.c.execute("UPDATE provider_calls SET usage_json=?",(json.dumps({'status':'completed'}),))
+        self.c.commit()
+        with self.assertRaises(ValueError):
+            self.service.resume_failed_video('J-ANCHOR')
+
     def test_another_unresolved_task_keeps_job_paused(self):
         self.c.execute("INSERT INTO provider_calls(task_id,job_id,shot_idx,provider,intent,usage_json) VALUES('other','J-ANCHOR',1,'seedance','generate',?)",(json.dumps({'status':'action_required'}),))
         self.c.commit()

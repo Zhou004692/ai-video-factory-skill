@@ -1148,7 +1148,17 @@ openVideoDrawer=function(job){openVideoDrawerWithAnchorReview(job);const footer=
 async function reconcileProviderTask(job,taskId){const button=$(`[data-provider-task="${CSS.escape(taskId)}"]`);if(button)button.disabled=true;try{const result=await api(`/api/videos/${encodeURIComponent(job.job_id)}/provider-task/reconcile`,{method:'POST',body:JSON.stringify({task_id:taskId})});closeModal();if(!await loadPage('videos'))return;const fresh=state.videos.jobs.find(item=>item.job_id===job.job_id);toast(result.state==='REJECTED'?'已终止任务的成本已核对':result.state==='REJECTED_PENDING_RECONCILIATION'?'已核对该远端任务；业务仍保持终止，继续核对剩余成本':result.state==='PROVIDER_ACTION_REQUIRED'?'远端任务仍未结束，任务继续保持暂停':`远端任务已核对，已恢复到 ${videoStateLabel(result.state)}`);if(fresh)openVideoDrawer(fresh)}catch(e){if(button)button.disabled=false;toast(e.message,true)}}
 function openProviderAccountGuide(job){const tasks=job?.unresolved_provider_tasks||[];const taskRows=tasks.map(task=>task.reconcilable===false?`<div class="record-row provider-task-manual"><span><strong>${esc(task.provider)} · ${esc(task.intent||'远端任务')}</strong><small>${esc(task.task_id)}</small><small>${esc(task.action_message||'缺少远端任务 ID，请人工处置')}</small></span><i>人工处置</i></div>`:`<button class="record-row interactive" data-provider-task="${esc(task.task_id)}"><span><strong>${esc(task.provider)} · ${esc(task.intent||'远端任务')}</strong><small>${esc(task.task_id)}</small></span><i>核对 ›</i></button>`).join('')||'<p class="candidate-context-empty">未提供可核对的远端 task_id，请查看技术详情</p>';openModal('PROVIDER ACTION','模型账号与远端任务待处理',`<div class="impact-callout"><strong>系统已暂停所有新的付费提交</strong><span>先处理模型账号问题，再逐个核对原 task_id。系统只查询原任务，不会重新 POST。</span></div><section class="detail-section"><h3>待核对远端任务</h3>${taskRows}</section><div class="modal-actions"><button class="mini-action" onclick="document.querySelector('#modal-close').click()">稍后处理</button></div>`);$$('[data-provider-task]',$('#modal')).forEach(button=>button.onclick=()=>reconcileProviderTask(job,button.dataset.providerTask))}
 const openVideoDrawerWithBusinessPauseAction=openVideoDrawer;
-openVideoDrawer=function(job){openVideoDrawerWithBusinessPauseAction(job);if(!['PRODUCTION_REVIEW_REQUIRED','PROVIDER_ACTION_REQUIRED','REJECTED_PENDING_RECONCILIATION'].includes(job?.state))return;const recoveryReady=job.state==='PROVIDER_ACTION_REQUIRED'&&job.resumable&&job.next_action?.id==='resume_failed_video';const summary=$('#drawer .drawer-summary p');if(summary)summary.textContent=job.state==='PRODUCTION_REVIEW_REQUIRED'?'已有候选母片等待人工判断；预览后选择接受或重做。':job.state==='REJECTED_PENDING_RECONCILIATION'?'业务已终止；仅保留远端成本核对，不会恢复生产或重新提交。':recoveryReady?'模型账号阻断已解除；可继续生成剩余母片。':'模型账号需要人工处理；系统已暂停且不会自动重试。'}
+openVideoDrawer=function(job){
+  openVideoDrawerWithBusinessPauseAction(job);
+  if(!['PRODUCTION_REVIEW_REQUIRED','PROVIDER_ACTION_REQUIRED','REJECTED_PENDING_RECONCILIATION'].includes(job?.state))return;
+  const summary=$('#drawer .drawer-summary p');if(!summary)return;
+  const recovery=job.recovery||{};
+  const continuing=job.resumable&&job.next_action?.id==='resume_failed_video';
+  summary.textContent=job.state==='REJECTED_PENDING_RECONCILIATION'?'业务已终止；仅核对远端成本，不会恢复生产或重新提交。':
+    continuing&&recovery.recovery_kind==='unsubmitted_anchors'?'已取回现有人物或场景候选；可确认预算后继续准备其余未提交内容，候选仍需审核。':
+    job.state==='PRODUCTION_REVIEW_REQUIRED'?'已有候选母片等待人工判断；预览后选择接受或重做。':
+    continuing?'远端阻断已解除；可继续处理未完成的生成项。':'远端任务或素材需要核对；系统已暂停新的付费提交，不会自动重试。';
+}
 const openVideoDrawerWithReconciliationDeleteGuard=openVideoDrawer;
 openVideoDrawer=function(job){openVideoDrawerWithReconciliationDeleteGuard(job);if(['PROVIDER_ACTION_REQUIRED','REJECTED_PENDING_RECONCILIATION'].includes(job?.state))$('#drawer-delete-video')?.remove()}
 const openVideoDrawerWithProductionStages=openVideoDrawer;

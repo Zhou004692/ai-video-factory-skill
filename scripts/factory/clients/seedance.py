@@ -918,6 +918,19 @@ async def text_to_video(
                         task_id=task_id,
                     )
                     raise _known_task_error(error, task_id) from None
+                except ValueError as exc:
+                    notify_task_updated('action_required', {
+                        'status': 'action_required', 'usage': data.get('usage') or {},
+                        'failure_code': 'provider_media_download_failed',
+                    })
+                    reason = str(exc) if str(exc) in {
+                        'Provider media URL must use HTTPS',
+                        'Provider media URL is not a public HTTPS address',
+                    } else 'Provider media download safety validation failed'
+                    error = _classified(ValueError(
+                        reason + '；Seedance 已生成完成，但素材下载安全校验未通过；请核对现有远端任务取回素材，不要重新生成。'
+                    ), 'provider_media_download_failed', retryable=False)
+                    raise _known_task_error(error, task_id) from None
                 notify_task_updated("completed", data)
                 return video
             if status == "failed":
@@ -1013,6 +1026,10 @@ async def inspect_task(task_id: str) -> dict:
             video, final_url = await provider_downloads.download_bytes(
                 video_url.strip(), timeout=120
             )
+        except ValueError:
+            return {**result, 'status': 'unknown',
+                    'failure_code': 'provider_media_download_failed',
+                    'message': '已生成素材的下载安全校验未通过；保留原任务，禁止重复提交。'}
         except httpx.HTTPError as exc:
             return {
                 **result,

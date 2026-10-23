@@ -5075,11 +5075,14 @@ class ManagementService:
         if not job:
             raise ValueError("视频任务不存在")
         resume_from_state = str(job["state"])
+        plan = recovery_plan.resolve(self.database, job_id)
+        if (resume_from_state == 'PRODUCTION_REVIEW_REQUIRED' and plan is not None
+                and plan.get('recovery_kind') == 'unsubmitted_anchors'):
+            return recovery_plan.resume_ready_graph(self.database, job_id)
         if resume_from_state not in {
             "FAILED", "PROVIDER_ACTION_REQUIRED", "BGM_OK",
         }:
             raise ValueError("只有失败或账号处理完成的视频任务可以继续生成")
-        plan = recovery_plan.resolve(self.database, job_id)
         if (
             plan is not None
             and "resume_failed_video" in plan["action_ids"]

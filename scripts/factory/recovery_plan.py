@@ -93,6 +93,18 @@ def _resolve(database, job_id):
         return result(['retry_network_failures', *review_actions], '仅重试已确认未提交的连接失败，保留已有锚点与母片', retry_indexes=retry, retry_anchor_ids=anchors)
     if candidate_reviews:
         return result(review_actions, '已有母片等待人工判断；接受或重做后重新判定剩余工作')
+    # A recovered anchor remains unapproved while unpaid siblings are ready.
+    # Let the user return to budget preflight without accepting that anchor or
+    # granting any master candidate a retry/approval.
+    if (state == 'PRODUCTION_REVIEW_REQUIRED' and not job['production_worker_pid']
+            and not states.intersection({'FAILED','ACTION_REQUIRED','BUDGET_REQUIRED'})
+            and any(r['node_type'] in {'character_anchor','scene_anchor'} and r['state']=='READY' for r in nodes)
+            and any(r['node_type'] in {'character_anchor','scene_anchor'} and r['state']=='REVIEW_REQUIRED' for r in nodes)
+            and not review_nodes
+            and all(r['node_type'] in {'character_anchor','scene_anchor'} for r in nodes if r['state']=='READY')):
+        plan = result(['resume_failed_video'], '已取回人物或场景候选；可确认预算后继续生成其余未提交锚点，候选保持待审核', recovery_kind='unsubmitted_anchors')
+        plan['next_action']['label'] = '继续准备剩余人物与场景'
+        return plan
     download_recovery = master_download_recovery.assess(database, job_id)
     if download_recovery is not None:
         if download_recovery.eligible:
@@ -163,7 +175,8 @@ def resume_ready_graph(database, job_id):
             "AND EXISTS(SELECT 1 FROM production_nodes n WHERE n.job_id=shots.job_id "
             "AND n.node_id='master:'||shots.idx AND n.state='READY')", (job_id,),
         )
-        state_machine.transition(database, job_id, 'resume_generation',
+        event = 'resume_anchor_generation' if plan.get('recovery_kind')=='unsubmitted_anchors' else 'resume_generation'
+        state_machine.transition(database, job_id, event,
             event_id=f'{job_id}:resume-graph:{uuid.uuid4().hex}',
             updates={'error': None, 'failure_code': None, 'retries': 0})
         shots = database.execute('SELECT state FROM shots WHERE job_id=?', (job_id,)).fetchall()

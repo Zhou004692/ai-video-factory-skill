@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import uuid
 
-from . import node_state_machine, production_adapters, production_projection, provider_tasks
+from . import node_state_machine, production_adapters, production_executor, production_projection, provider_tasks
 from .clients import ffmpeg, tos
 
 
@@ -38,8 +38,15 @@ def reconcile(database, data_dir, job_id, task_id, inspected, *, external_io=Non
     call = database.execute('SELECT * FROM provider_calls WHERE job_id=? AND task_id=?',
                             (job_id, task_id)).fetchone()
     expected_provider = 'seedance_scene' if node['node_type'] == 'scene_anchor' else 'seedance_identity'
-    if not call or call['provider'] != expected_provider or node['state'] != 'ACTION_REQUIRED' or node['lease_id']:
+    if (not call or call['provider'] != expected_provider
+            or node['state'] not in {'ACTION_REQUIRED', 'FAILED'} or node['lease_id']
+            or task_id not in provider_tasks.unresolved_task_ids(database, job_id)):
         raise ValueError('Anchor task ownership or recovery state changed')
+    usage = json.loads(call['usage_json'] or '{}')
+    if (call['intent'] != 'generate' or int(call['shot_idx'] or 0) >= 0
+            or usage.get('owner_node_id',node['node_id']) != node['node_id']
+            or usage.get('owner_spec_hash',node['spec_hash']) != node['spec_hash']):
+        raise ValueError('Anchor task ledger owner differs from frozen node')
     job = database.execute('SELECT * FROM jobs WHERE job_id=?',(job_id,)).fetchone()
     if job['state'] != 'PROVIDER_ACTION_REQUIRED' or job['production_worker_pid']:
         raise ValueError('Anchor job is not idle for reconciliation')
@@ -106,11 +113,13 @@ def reconcile(database, data_dir, job_id, task_id, inspected, *, external_io=Non
                 event_id=f'{job_id}:{task_id}:anchor-reconciled',payload=output)
         else:
             database.execute(f"UPDATE {table} SET cost_cents=cost_cents+?,error='远端锚点生成失败，需检查供应商错误' WHERE job_id=? AND {column}=?",(job_delta,job_id,key))
-            node_state_machine.transition_node_in_transaction(database,job_id,node['node_id'],'reconcile_failed',
-                event_id=f'{job_id}:{task_id}:anchor-failed',payload={'task_id':task_id})
+            if node['state'] != 'FAILED':
+                node_state_machine.transition_node_in_transaction(database,job_id,node['node_id'],'reconcile_failed',
+                    event_id=f'{job_id}:{task_id}:anchor-failed',payload={'task_id':task_id})
         database.execute('UPDATE production_nodes SET actual_cost_cents=?,output_json=?,error_code=?,next_action=? WHERE job_id=? AND node_id=?',
             (total,json.dumps(output,ensure_ascii=False),None if status=='completed' else 'provider_generation_failed',
              'review_candidate' if status=='completed' else 'preserve_and_diagnose',job_id,node['node_id']))
+        production_executor.release_resolved_provider_gates(database, job_id)
         next_state = production_projection.reconcile(database,job_id).projected_job_state
         database.execute('UPDATE jobs SET state=?,cost_cents=cost_cents+?,error=NULL,failure_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE job_id=?',
                          (next_state,job_delta,job_id))

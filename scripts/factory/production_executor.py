@@ -96,13 +96,13 @@ def release_resolved_provider_gates(database: sqlite3.Connection, job_id: str) -
 
     Caller owns the transaction. This does not start production or approve media.
     """
-    job = database.execute("SELECT state,execution_engine,production_spec_hash FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    job = database.execute("SELECT state,execution_engine,production_spec_hash,production_worker_pid FROM jobs WHERE job_id=?", (job_id,)).fetchone()
     if not job or job['execution_engine'] != 'graph_v2' or job['state'] not in {
         'PROVIDER_ACTION_REQUIRED', 'PRODUCTION_REVIEW_REQUIRED', 'PRODUCTION_QUEUED',
         'PRODUCTION_RUNNING', 'FAILED',
     } or provider_tasks.unresolved_task_ids(database, job_id):
         return []
-    released = []
+    released = _release_unsubmitted_anchor_gates(database, job_id, job)
     rows = database.execute(
         "SELECT n.node_id,s.idx FROM production_nodes n JOIN shots s ON s.job_id=n.job_id AND n.node_id='master:'||s.idx "
         "WHERE n.job_id=? AND n.node_type='master' AND n.state='ACTION_REQUIRED' "
@@ -125,6 +125,59 @@ def release_resolved_provider_gates(database: sqlite3.Connection, job_id: str) -
         )
         database.execute("UPDATE production_nodes SET error_code=NULL,next_action=NULL,output_json='{}' WHERE job_id=? AND node_id=?", (job_id, row['node_id']))
         released.append(str(row['node_id']))
+    return released
+
+
+def _release_unsubmitted_anchor_gates(database, job_id, job):
+    """Only remove a sibling submit gate proven to have no paid/accepted work."""
+    if job['production_worker_pid']:
+        return []
+    from . import anchor_recovery, production_adapters
+    calls = database.execute('SELECT provider,usage_json FROM provider_calls WHERE job_id=?', (job_id,)).fetchall()
+    rows = database.execute(
+        "SELECT * FROM production_nodes WHERE job_id=? AND node_type IN ('character_anchor','scene_anchor') "
+        "AND state='ACTION_REQUIRED' AND error_code='ProviderTaskGateError' AND spec_hash=? "
+        "AND COALESCE(provider_task_id,'')='' AND actual_cost_cents=0 AND lease_id IS NULL",
+        (job_id, job['production_spec_hash']),
+    ).fetchall()
+    released = []
+    for node in rows:
+        expected = 'seedance_identity' if node['node_type']=='character_anchor' else 'seedance_scene'
+        ambiguous = False
+        for call in calls:
+            if call['provider'] != expected:
+                continue
+            try:
+                usage = json.loads(call['usage_json'] or '{}')
+                owner = usage.get('owner_node_id') if isinstance(usage, dict) else None
+            except (ValueError, TypeError):
+                owner = None
+            if not owner or owner == node['node_id']:
+                ambiguous = True
+                break
+        if ambiguous:
+            continue
+        try:
+            production_adapters._frozen_spec(database, node)
+            table, column, key, anchor = anchor_recovery.anchor_row(database, node)
+        except (ValueError, KeyError, TypeError):
+            continue
+        if (anchor['state'] not in {'PENDING', 'FAILED'} or anchor['cost_cents']
+                or anchor['approval_state']=='APPROVED' or any(
+                    anchor[field] for field in ('video_path','video_url','image_path','image_url','preview_path'))
+                or ('asset_uri' in anchor.keys() and anchor['asset_uri'])):
+            continue
+        if database.execute(
+            "SELECT 1 FROM production_edges e JOIN production_nodes n ON n.job_id=e.job_id AND n.node_id=e.from_node_id "
+            "WHERE e.job_id=? AND e.to_node_id=? AND n.state!='SUCCEEDED' LIMIT 1", (job_id,node['node_id']),
+        ).fetchone():
+            continue
+        node_state_machine.transition_node_in_transaction(database,job_id,node['node_id'],'resume',
+            event_id=f"{job_id}:{node['node_id']}:resolved-gate:{uuid.uuid4().hex}",
+            payload={'reason':'all_provider_tasks_reconciled','no_prior_submission':True})
+        database.execute("UPDATE production_nodes SET error_code=NULL,next_action=NULL,output_json='{}' WHERE job_id=? AND node_id=?",(job_id,node['node_id']))
+        database.execute(f"UPDATE {table} SET state='PENDING',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE job_id=? AND {column}=?",(job_id,key))
+        released.append(str(node['node_id']))
     return released
 
 

@@ -626,7 +626,7 @@ class ProductionFailureOutcomeMatrixTests(
             calls={"model": 2, "provider_submit": 0, "provider_rows": 0},
             cost={"job": 0, "shots": ()},
             job_state="PENDING", shot_states=(), next_action=None,
-            message_contains="AI 连续两次返回的剧本 JSON 格式无效",
+            message_contains="AI 剧本生成未返回可用JSON，已用完2次尝试",
         )
 
     async def test_preconnect_failure_has_finite_retries_and_zero_new_cost(self):
@@ -2716,16 +2716,18 @@ class SeedanceHttpResponseParsingTests(unittest.IsolatedAsyncioTestCase):
                     ), patch.object(
                         seedance.asyncio, "sleep", new=AsyncMock()
                     ):
-                        with self.assertRaisesRegex(
-                            ValueError, "HTTPS|public|安全"
-                        ):
-                            if operation == "generate":
+                        if operation == "generate":
+                            with self.assertRaisesRegex(ValueError, "HTTPS|public|安全") as caught:
                                 await seedance.text_to_video(
                                     "equipment", duration=4,
                                     resolution="480p", timeout=5,
                                 )
-                            else:
-                                await seedance.inspect_task("task-unsafe")
+                            self.assertEqual(caught.exception.task_id, 'task-unsafe')
+                            self.assertTrue(caught.exception.non_retryable)
+                        else:
+                            result = await seedance.inspect_task("task-unsafe")
+                            self.assertEqual(result['status'], 'unknown')
+                            self.assertEqual(result['failure_code'], 'provider_media_download_failed')
                     self.assertEqual(downloads, 0)
 
     def test_submit_and_poll_account_errors_share_classification(self):
